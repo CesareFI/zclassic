@@ -323,6 +323,11 @@ static bool cr_match_tasks(const char *path, const char *key,
 static bool cr_match_fleet_steer(const char *path, const char *key,
                                const struct json_value *value, bool *type_ok)
 {
+    /* fleet.steer.grant list cursor: the ordinal a previous page returned. */
+    if (!strcmp(path, "fleet.steer.grant") && !strcmp(key, "before")) {
+        *type_ok = cr_int_range(value, 0, INT64_MAX);
+        return true;
+    }
     size_t j;
     if (!strcmp(path, "fleet.steer.wiki-write") && !strcmp(key, "text")) {
         *type_ok = cr_nonempty_str(value, FLEET_BOARD_WIKI_TEXT_MAX);

@@ -74,11 +74,11 @@ z23 discover schema <path> --side=input|output
 
 | Catalog fact | Count |
 |---|---|
-| Registry entries (branches + leaves) | 947 |
+| Registry entries (branches + leaves) | 948 |
 | Top-level roots | 15 |
 | Branches | 206 |
-| Leaves (dispatchable command paths) | 741 |
-| … `ready` (live handler in this build) | 648 |
+| Leaves (dispatchable command paths) | 742 |
+| … `ready` (live handler in this build) | 649 |
 | … `compat` (metadata only, names a fallback) | 63 |
 | … `planned` (fail-closed BLOCKED, exit 3) | 30 |
 | … dev-gated 🔧 (`ready` only in `z23-dev`) | 62 |
@@ -109,7 +109,7 @@ Per source file:
 | `engine/composition/commands/story.def` | 5 | 1 | 4 |
 | `engine/composition/commands/fleet_board.def` | 12 | 3 | 9 |
 | `engine/composition/commands/mind.def` | 4 | 1 | 3 |
-| `engine/composition/commands/fleet.def` | 36 | 8 | 28 |
+| `engine/composition/commands/fleet.def` | 37 | 8 | 29 |
 | `engine/composition/commands/fleet_agents.def` | 1 | 0 | 1 |
 | `engine/composition/commands/fleet_enrol.def` | 5 | 0 | 5 |
 | `engine/composition/commands/telemetry/root.def` | 6 | 2 | 4 |
@@ -1935,13 +1935,14 @@ represented by its children's sections.
 | `fleet steer brief` | ready | read / read / operator · fast/low | `grant`, `since`, `limit`, `json` | `zcl.fleet_steer_brief.v1` | `z23 fleet steer brief` | One-call fleet brief: tasks, workers, blockers, capacity, candidates |
 | `fleet steer send` | ready | mutate / dev-mutation / operator · fast/low | `grant`, **`items`**, `from` | `zcl.fleet_steer_send.v1` | `z23 fleet steer send --items=[...]` | One bounded batch of directives to named fleet agents |
 | `fleet steer evidence` | ready | read / read / operator · fast/low | `grant`, **`type`**, **`ref`**, `seq`, `attempt`, `stream`, `row_offset`, `row_sha3` | `zcl.fleet_steer_evidence.v1` | `z23 fleet steer evidence --type=mail --ref=<ref>` | One bounded evidence object by exact reference |
+| `fleet steer mailbox` | ready | read / read / operator · fast/low | `grant`, **`to`**, `from`, `ref`, `since`, `limit`, `json` | `zcl.fleet_steer_mailbox.v1` | `z23 fleet steer mailbox --to=<label>` | One recipient's mail, a bounded cursor page |
 | `fleet steer wiki-find` | ready | read / read / operator · foreground/low | `grant`, **`q`**, `topic`, `applies_to`, `after_slug` | `zcl.fleet_steer_wiki_find.v1` | `z23 fleet steer wiki-find --q=kernel` | Discover bounded untrusted wiki knowledge |
 | `fleet steer wiki-read` | ready | read / read / operator · foreground/low | `grant`, **`id`**, `offset`, `bytes` | `zcl.fleet_steer_wiki_read.v1` | `z23 fleet steer wiki-read --id=<64 hex> --offset=0 --bytes=1024` | Read an exact retained wiki revision in signed body chunks |
 | `fleet steer wiki-write` | ready | mutate / dev-mutation / operator · foreground/low | **`grant`**, **`request_key`**, **`expected`**, **`slug`**, **`title`**, **`text`** | `zcl.fleet_steer_wiki_write.v1` | `z23 fleet steer wiki-write --grant=<grant> --request_key=<stable-key> --expected=absent --slug=<slug> --title=<title> --text=<inline-text>` | Create or revise receiver-held wiki knowledge atomically |
 | `fleet steer deliver` | ready | mutate / dev-mutation / operator · fast/low | `grant`, **`from`**, **`ref`**, **`upload_id`**, **`name`**, **`size`**, **`sha3_512`**, **`offset`**, **`data_hex`** | `zcl.fleet_steer_deliver.v1` | `z23 fleet steer deliver --from=<label> --ref=<ref> --upload_id=<32 hex> ...` | Upload one C source file into the inert quarantine inbox |
 | `fleet steer inbox` | ready | read / read / operator · fast/low | `show` | `zcl.fleet_steer_inbox.v1` | `z23 fleet steer inbox [--show=<upload>]` | List quarantined uploads for the local reviewer |
 | `fleet steer drop` | ready | mutate / dev-mutation / **owner** · fast/low | **`upload`** | `zcl.fleet_steer_drop.v1` | `z23 fleet steer drop --upload=<identity>` | Remove one retained quarantine upload (owner cleanup) |
-| `fleet steer grant` | ready | mutate / dev-mutation / **owner** · fast/low | **`action`**, `scopes`, `ttl_seconds`, `label`, `id`, `peer` | `zcl.fleet_steer_grant.v1` | `z23 fleet steer grant --action=mint --scopes=brief,send` | Mint and revoke the adapter's scoped bearer grants |
+| `fleet steer grant` | ready | mutate / dev-mutation / **owner** · fast/low | **`action`**, `scopes`, `ttl_seconds`, `label`, `id`, `peer`, `limit`, `before` | `zcl.fleet_steer_grant.v1` | `z23 fleet steer grant --action=mint --scopes=brief,send` | Mint and revoke the adapter's scoped bearer grants |
 
 #### `fleet.nodes` — Inspect the recorded peers
 

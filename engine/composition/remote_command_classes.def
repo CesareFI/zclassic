@@ -1275,6 +1275,8 @@ REMOTE_COMMAND_CLASS("fleet.steer.brief", REMOTE_CLASS_OWNER_CAPABILITY,
     "one bounded brief behind a live owner-minted grant naming brief")
 REMOTE_COMMAND_CLASS("fleet.steer.evidence", REMOTE_CLASS_OWNER_CAPABILITY,
     "one bounded evidence object behind a live owner-minted grant naming evidence")
+REMOTE_COMMAND_CLASS("fleet.steer.mailbox", REMOTE_CLASS_OWNER_CAPABILITY,
+    "one recipient's bounded mail page behind a live owner-minted grant naming brief and bound to that label")
 REMOTE_COMMAND_CLASS("fleet.steer.send", REMOTE_CLASS_OWNER_CAPABILITY,
     "bounded directives behind a live owner-minted grant naming send, idempotent by key")
 REMOTE_COMMAND_CLASS("fleet.steer.deliver", REMOTE_CLASS_OWNER_CAPABILITY,

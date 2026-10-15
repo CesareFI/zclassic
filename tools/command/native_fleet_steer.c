@@ -5589,7 +5589,13 @@ static void fmc_grant_mint(const struct zcl_command_request *req,
  * would BE a credential file — anything that could read it could use every
  * grant in it. It prints the first 8 hex characters, which name a row for
  * a human without admitting anyone: every check demands the full 32. */
-#define FMC_GRANT_LIST_CAP 128u
+/* The store keeps every row; the listing HOLDS the newest 1024 distinct ids
+ * and serves them in pages of at most FMC_GRANT_PAGE_MAX rows. */
+#define FMC_GRANT_LIST_CAP 1024u
+#define FMC_GRANT_PAGE_DEFAULT 32u
+#define FMC_GRANT_PAGE_MAX 128u
+/* Row bytes one page may carry, so it always serializes inside the leaf budget. */
+#define FMC_GRANT_PAGE_BYTES 24000u
 #define FMC_GRANT_PREFIX 8u
 
 /* Keep the LAST row per id (later rows supersede), bounded, oldest id
@@ -5678,17 +5684,74 @@ static size_t fmc_list_collect(const char *path, struct fmc_grant *set,
     return n;
 }
 
+/* Page bounds: limit 1..128 (default 32) and before, the ordinal a previous
+ * page returned as `next` (default: the newest). False with reply failed. */
+static bool fmc_list_page_in(const struct zcl_command_request *req,
+                             struct zcl_command_reply *reply,
+                             size_t *limit, long long *before)
+{
+    long long v;
+    *limit = FMC_GRANT_PAGE_DEFAULT;
+    *before = -1;
+    if (fmc_int(req, "limit", &v)) {
+        if (v < 1 || v > (long long)FMC_GRANT_PAGE_MAX) {
+            fmc_fail(reply, "BAD_INPUT", "limit is 1..128", "grant list page");
+            return false;
+        }
+        *limit = (size_t)v;
+    }
+    if (fmc_int(req, "before", &v)) {
+        if (v < 0) {
+            fmc_fail(reply, "BAD_INPUT",
+                     "before is the next value of a previous page",
+                     "grant list cursor");
+            return false;
+        }
+        *before = v;
+    }
+    return true;
+}
+
+/* Newest-first page of the held ids below ordinal `before`. An id's ordinal
+ * is its position in first-seen order, so it never moves when a revoke row
+ * supersedes it and a newer mint never shifts an older page. *next is the
+ * ordinal to pass back as `before`, or -1 when this page reached the oldest
+ * held id. */
+static size_t fmc_list_page(const struct fmc_grant *set, size_t n,
+                            size_t total, long long before, size_t limit,
+                            long long now, struct json_value *arr,
+                            long long *next)
+{
+    size_t floor = total - n, shown = 0, bytes = 0;
+    size_t top = (before < 0 || (size_t)before > total) ? total : (size_t)before;
+    *next = -1;
+    while (top > floor && shown < limit) {
+        const struct fmc_grant *g = &set[top - 1 - floor];
+        size_t before_n = json_size(arr);
+        fmc_list_emit(arr, g, now);
+        bytes += json_write(json_at(arr, before_n), NULL, 0) + 1;
+        top--;
+        shown++;
+        if (bytes >= FMC_GRANT_PAGE_BYTES)
+            break;
+    }
+    if (top > floor)
+        *next = (long long)top;
+    return shown;
+}
+
 static void fmc_grant_list(const struct zcl_command_request *req,
                            struct zcl_command_reply *reply)
 {
     char steerdir[4096], path[4096 + 32];
     struct fmc_grant *set;
     struct json_value arr;
-    size_t n, i, total = 0, live = 0;
-    long long now;
+    size_t n, shown, limit, total = 0, live = 0;
+    long long now, before, next = -1;
     int r;
     bool complete;
-    (void)req;
+    if (!fmc_list_page_in(req, reply, &limit, &before))
+        return;
     if (!fmc_dirs(steerdir, sizeof(steerdir))) {
         fmc_fail(reply, "STATE_DIR_FAILED",
                  "cannot resolve the owner-private state root",
@@ -5712,11 +5775,11 @@ static void fmc_grant_list(const struct zcl_command_request *req,
     n = fmc_list_collect(path, set, &total, &complete);
     json_init(&arr);
     json_set_array(&arr);
-    for (i = 0; i < n; i++) {
-        fmc_list_emit(&arr, &set[i], now);
+    shown = fmc_list_page(set, n, total, before, limit, now, &arr,
+                          &next);
+    for (size_t i = 0; i < n; i++)
         if (strcmp(fmc_grant_state(&set[i], now), "live") == 0)
             live++;
-    }
     free(set);
     if (!complete) {
         json_free(&arr);
@@ -5725,10 +5788,16 @@ static void fmc_grant_list(const struct zcl_command_request *req,
     }
     (void)json_push_kv_str(&reply->data, "leaf", FMC_GRANT_LEAF);
     (void)json_push_kv(&reply->data, "grants", &arr);
-    (void)json_push_kv_int(&reply->data, "shown", (long long)n);
+    (void)json_push_kv_int(&reply->data, "shown", (long long)shown);
     (void)json_push_kv_int(&reply->data, "total", (long long)total);
     (void)json_push_kv_int(&reply->data, "live", (long long)live);
-    (void)json_push_kv_bool(&reply->data, "truncated", total > n);
+    /* truncated: older held grants remain; pass next back as before. */
+    (void)json_push_kv_bool(&reply->data, "truncated", next >= 0);
+    if (next >= 0)
+        (void)json_push_kv_int(&reply->data, "next", next);
+    /* Ids older than the held window cannot be listed; say so. */
+    (void)json_push_kv_int(&reply->data, "unlisted",
+                           (long long)(total - n));
     /* Say it in the reply, not only in the docs: the ids are cut short on
      * purpose, and revoke still needs the whole one. */
     (void)json_push_kv_str(&reply->data, "id_note",
@@ -6084,6 +6153,331 @@ void zcl_native_handle_fleet_steer_send(
     fmc_enter(request, reply, "send", "fleet.steer.send takes grant,items,from",
               fmc_do_send);
 }
+
+/* ── mailbox ─────────────────────────────────────────────────────────────
+ *
+ * One recipient's mail, a bounded page at a time. The mail leaf already
+ * pages the whole store with an exact `to`/`from` filter and a resume
+ * token; this verb adds the ref-prefix filter, the body bound and the
+ * authority rule (a grant reads only the inbox whose recipient label it
+ * holds), and returns rows newest-last with an opaque `cursor`.
+ *
+ * CURSOR. "<mail resume token>" or "<token>~<n>": resume at the token and
+ * skip its first n matching rows. A page therefore ends exactly at the
+ * row limit or the byte bound, and the next call starts on the very next
+ * row: no gap, no repeat. Pass the returned cursor back as `since`. */
+#define FMC_MBOX_LIMIT_DEFAULT 20
+#define FMC_MBOX_LIMIT_MAX 64
+#define FMC_MBOX_BODY_MAX 480u
+#define FMC_MBOX_ROW_BYTES 40000u
+#define FMC_MBOX_PAGES_MAX 64
+#define FMC_MBOX_SCREEN_BODY 72u
+
+/* Longest prefix of s within cap bytes that ends on a UTF-8 boundary. */
+static size_t fmc_mbox_cut(const char *s, size_t cap)
+{
+    size_t n = strlen(s);
+    if (n <= cap)
+        return n;
+    while (cap > 0 && ((unsigned char)s[cap] & 0xC0u) == 0x80u)
+        cap--;
+    return cap;
+}
+
+struct fmc_mbox {
+    struct json_value rows;
+    char screen[8192];
+    size_t screen_len;
+    size_t screen_dropped;
+    size_t bytes;
+    size_t emitted;
+    size_t limit;
+    size_t bodies_truncated;
+};
+
+static void fmc_mbox_screen_line(struct fmc_mbox *m, const struct fmc_row *v)
+{
+    char flat[FMC_MBOX_SCREEN_BODY + 4];
+    size_t take = fmc_mbox_cut(v->body, FMC_MBOX_SCREEN_BODY), i;
+    bool cut = strlen(v->body) > take;
+    int w;
+    for (i = 0; i < take; i++) {
+        char c = v->body[i];
+        flat[i] = (c == '\n' || c == '\r' || c == '\t') ? ' ' : c;
+    }
+    flat[take] = '\0';
+    w = snprintf(m->screen + m->screen_len,
+                 sizeof(m->screen) - 128 - m->screen_len,
+                 "#%lld %s %s\xe2\x86\x92%s %s %s: %s%s\n", v->seq, v->ts,
+                 v->from, v->to, v->kind, v->ref[0] ? v->ref : "-", flat,
+                 cut ? "..." : "");
+    if (w > 0 && (size_t)w < sizeof(m->screen) - 128 - m->screen_len)
+        m->screen_len += (size_t)w;
+    else
+        m->screen_dropped++;
+}
+
+/* Append one row; false when the row bytes would pass the page bound (the
+ * caller stops BEFORE this row so the cursor stays exact). */
+static bool fmc_mbox_add(struct fmc_mbox *m, const struct fmc_row *v)
+{
+    struct json_value o;
+    char body[FMC_MBOX_BODY_MAX + 1];
+    size_t full = strlen(v->body), take = fmc_mbox_cut(v->body, FMC_MBOX_BODY_MAX);
+    size_t size;
+    bool ok;
+    memcpy(body, v->body, take);
+    body[take] = '\0';
+    json_init(&o);
+    json_set_object(&o);
+    ok = json_push_kv_int(&o, "seq", v->seq) &&
+         json_push_kv_str(&o, "ts", v->ts) &&
+         json_push_kv_str(&o, "from", v->from) &&
+         json_push_kv_str(&o, "to", v->to) &&
+         json_push_kv_str(&o, "kind", v->kind) &&
+         json_push_kv_str(&o, "ref", v->ref) &&
+         json_push_kv_str(&o, "body", body) &&
+         json_push_kv_bool(&o, "body_truncated", take < full) &&
+         json_push_kv_int(&o, "body_bytes", (long long)full);
+    size = ok ? json_write(&o, NULL, 0) + 1 : 0;
+    if (!ok || (m->emitted > 0 && m->bytes + size > FMC_MBOX_ROW_BYTES) ||
+        !json_push_back(&m->rows, &o)) {
+        json_free(&o);
+        return false;
+    }
+    json_free(&o);
+    m->bytes += size;
+    m->emitted++;
+    if (take < full)
+        m->bodies_truncated++;
+    fmc_mbox_screen_line(m, v);
+    return true;
+}
+
+/* `since` as the (token, skip) pair; a bare integer is a token too. */
+static bool fmc_mbox_cursor(const struct zcl_command_request *req, char *tok,
+                            size_t cap, size_t *skip)
+{
+    const char *s = fmc_str(req, "since");
+    long long iv;
+    char *tilde;
+    *skip = 0;
+    tok[0] = '\0';
+    if (!s && fmc_int(req, "since", &iv) && iv >= 0)
+        return snprintf(tok, cap, "%lld", iv) > 0;
+    if (!s || !s[0])
+        return true;
+    if (strlen(s) >= cap)
+        return false;
+    memcpy(tok, s, strlen(s) + 1);
+    tilde = strrchr(tok, '~');
+    if (tilde) {
+        char *end;
+        long long n = strtoll(tilde + 1, &end, 10);
+        if (tilde[1] == '\0' || *end != '\0' || n < 0 || n > 1000000)
+            return false;
+        *skip = (size_t)n;
+        *tilde = '\0';
+    }
+    return tok[0] != '\0';
+}
+
+static bool fmc_mbox_inputs(const struct zcl_command_request *req,
+                            struct zcl_command_reply *reply,
+                            struct fmc_mbox *m, const char **to,
+                            const char **from, const char **prefix)
+{
+    long long lim;
+    *to = fmc_str(req, "to");
+    *from = fmc_str(req, "from");
+    *prefix = fmc_str(req, "ref");
+    m->limit = FMC_MBOX_LIMIT_DEFAULT;
+    if (!*to || !fmc_is_token(*to, FMC_NAME_MAX, false) ||
+        (*from && *from[0] && !fmc_is_token(*from, FMC_NAME_MAX, false)) ||
+        (*prefix && strlen(*prefix) > FMC_REF_MAX)) {
+        fmc_fail(reply, "BAD_INPUT",
+                 "mailbox needs to (a label); from and ref are optional",
+                 "to/from short tokens; ref prefix at most 128 bytes");
+        return false;
+    }
+    if (fmc_int(req, "limit", &lim)) {
+        if (lim < 1 || lim > FMC_MBOX_LIMIT_MAX) {
+            fmc_fail(reply, "BAD_INPUT", "limit is 1..64", "mailbox page");
+            return false;
+        }
+        m->limit = (size_t)lim;
+    }
+    return true;
+}
+
+/* The mail leaf takes a bare integer or a resume token as `since`. */
+static bool fmc_mbox_since_push(struct json_value *input, const char *tok)
+{
+    bool digits = tok[0] != '\0';
+    for (const char *p = tok; *p; p++)
+        digits = digits && *p >= '0' && *p <= '9';
+    if (digits)
+        return json_push_kv_int(input, "since", atoll(tok));
+    return json_push_kv_str(input, "since", tok);
+}
+
+/* One mail-leaf page for (tok, to, from) into sub. NULL on success. */
+static const char *fmc_mbox_pull(struct fmc_sub *sub,
+                                 const struct zcl_command_request *req,
+                                 const char *tok, const char *to,
+                                 const char *from)
+{
+    const struct json_value *next, *arr, *tr;
+    fmc_sub_begin(sub, "zcl.agent_mail.v1", req, "dev.agent.mail");
+    if (!sub->valid)
+        return "unknown_sibling";
+    if (!json_push_kv_str(&sub->input, "action", "pull") ||
+        !fmc_mbox_since_push(&sub->input, tok) ||
+        !json_push_kv_str(&sub->input, "to", to) ||
+        (from && from[0] && !json_push_kv_str(&sub->input, "from", from)))
+        return "allocation_failed";
+    fmc_mail_invoke(sub, false);
+    sub->ran = true;
+    next = json_get(&sub->reply.data, "next_since");
+    arr = json_get(&sub->reply.data, "rows");
+    tr = json_get(&sub->reply.data, "truncated");
+    if (!fmc_mail_page_valid(sub, next && next->type == JSON_STR
+                                      ? json_get_str(next) : NULL, arr, tr))
+        return "sibling_refused";
+    return NULL;
+}
+
+static void fmc_mbox_finish(struct zcl_command_reply *reply, struct fmc_mbox *m,
+                            const char *to, const char *cursor, bool more,
+                            bool json_only)
+{
+    bool ok = json_push_kv_str(&reply->data, "leaf", "fleet.steer.mailbox") &&
+        json_push_kv_str(&reply->data, "to", to) &&
+        json_push_kv(&reply->data, "rows", &m->rows) &&
+        json_push_kv_int(&reply->data, "count", (long long)m->emitted) &&
+        json_push_kv_str(&reply->data, "cursor", cursor) &&
+        json_push_kv_bool(&reply->data, "more", more) &&
+        json_push_kv_int(&reply->data, "body_cap_bytes", FMC_MBOX_BODY_MAX) &&
+        json_push_kv_int(&reply->data, "bodies_truncated",
+                         (long long)m->bodies_truncated);
+    if (ok && !json_only) {
+        if (m->screen_dropped)
+            (void)snprintf(m->screen + m->screen_len,
+                           sizeof(m->screen) - m->screen_len,
+                           "(+%zu rows not shown here; see rows)\n",
+                           m->screen_dropped);
+        ok = json_push_kv_str(&reply->data, "screen", m->screen);
+    }
+    if (!ok) {
+        fmc_fail(reply, "MAILBOX_FAILED", "the mailbox page could not be copied",
+                 "allocation");
+        return;
+    }
+    reply->status = ZCL_COMMAND_STATUS_PASSED;
+    reply->exit_code = 0;
+}
+
+/* The walk's moving position. */
+struct fmc_mbox_run {
+    const char *to, *from, *prefix;
+    char tok[FMC_MAIL_SINCE_CAP];
+    char out[FMC_MAIL_SINCE_CAP + 24];
+    size_t skip;
+    bool more, full;
+};
+
+/* Consume one mail page: emit the rows that match the prefix after the
+ * skipped ones, stopping at the row limit or byte bound with a cursor that
+ * names the row to resume on. NULL on success, else the refusal reason. */
+static const char *fmc_mbox_scan(struct fmc_mbox *m,
+                                 const struct zcl_command_request *req,
+                                 struct fmc_mbox_run *r)
+{
+    struct fmc_sub sub;
+    const struct json_value *arr;
+    char next[FMC_MAIL_SINCE_CAP];
+    size_t n, i, matched = 0, plen = r->prefix ? strlen(r->prefix) : 0;
+    const char *why = fmc_mbox_pull(&sub, req, r->tok, r->to, r->from);
+    if (why) {
+        fmc_sub_end(&sub);
+        return why;
+    }
+    arr = json_get(&sub.reply.data, "rows");
+    (void)snprintf(next, sizeof(next), "%s",
+                   json_get_str(json_get(&sub.reply.data, "next_since")));
+    r->more = json_get_bool(json_get(&sub.reply.data, "truncated"));
+    n = json_size(arr);
+    for (i = 0; i < n && !r->full; i++) {
+        struct fmc_row v;
+        if (!fmc_row_parse(json_at(arr, i), &v) ||
+            (plen && strncmp(v.ref, r->prefix, plen) != 0))
+            continue;
+        if (matched >= r->skip &&
+            (m->emitted >= m->limit || !fmc_mbox_add(m, &v)))
+            r->full = true;
+        else
+            matched++;
+    }
+    if (r->full) {
+        (void)snprintf(r->out, sizeof(r->out), "%s~%zu", r->tok, matched);
+        r->more = true;
+    } else {
+        (void)snprintf(r->tok, sizeof(r->tok), "%s", next);
+        (void)snprintf(r->out, sizeof(r->out), "%s", next);
+        r->skip = 0;
+        r->full = m->emitted >= m->limit;
+    }
+    fmc_sub_end(&sub);
+    return NULL;
+}
+
+static void fmc_do_mailbox(const struct zcl_command_request *req,
+                           struct zcl_command_reply *reply,
+                           const struct fmc_caller *who)
+{
+    struct fmc_mbox m;
+    struct fmc_mbox_run r = {.more = true};
+    const char *why = NULL;
+    memset(&m, 0, sizeof(m));
+    json_init(&m.rows);
+    json_set_array(&m.rows);
+    if (!fmc_mbox_inputs(req, reply, &m, &r.to, &r.from, &r.prefix))
+        goto done;
+    if (who->grant && strcmp(who->label, r.to) != 0) {
+        fmc_fail(reply, "STEER_MAILBOX_FOREIGN",
+                 "a grant reads only the mailbox of its own label",
+                 "grant label differs from to");
+        goto done;
+    }
+    if (!fmc_mbox_cursor(req, r.tok, sizeof(r.tok), &r.skip)) {
+        fmc_fail(reply, "BAD_INPUT", "since is a cursor this verb returned",
+                 "mailbox cursor");
+        goto done;
+    }
+    if (!r.tok[0])
+        (void)snprintf(r.tok, sizeof(r.tok), "0");
+    (void)snprintf(r.out, sizeof(r.out), "%s", r.tok);
+    for (int page = 0; page < FMC_MBOX_PAGES_MAX && r.more && !r.full && !why;
+         page++)
+        why = fmc_mbox_scan(&m, req, &r);
+    if (why) {
+        fmc_fail(reply, "MAILBOX_UNAVAILABLE", "the mail store did not answer",
+                 "dev.agent.mail");
+        goto done;
+    }
+    fmc_mbox_finish(reply, &m, r.to, r.out, r.more,
+                    json_get_bool(json_get(req->input, "json")));
+done:
+    json_free(&m.rows);
+}
+void zcl_native_handle_fleet_steer_mailbox(
+    const struct zcl_command_request *request, struct zcl_command_reply *reply)
+{
+    fmc_enter_who(request, reply, "brief",
+                  "fleet.steer.mailbox takes grant,to,from,ref,since,limit",
+                  fmc_do_mailbox);
+}
+
 
 void zcl_native_handle_fleet_steer_evidence(
     const struct zcl_command_request *request, struct zcl_command_reply *reply)

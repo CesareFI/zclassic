@@ -555,6 +555,31 @@ ZCL_COMMAND_READY_READ(
     ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_steer_evidence)
 
 ZCL_COMMAND_READY_READ(
+    "fleet.steer.mailbox", "fleet.steer", "",
+    "One recipient's mail, a bounded cursor page",
+    "Returns mail rows addressed to one recipient label (to, required), "
+    "optionally only from one sender (from) and a ref prefix (ref), "
+    "newest last. since is the cursor a previous page returned (omit for "
+    "the oldest); limit is 1..64 rows, default 20. Each row carries seq, "
+    "ts, from, to, kind, ref and body; a body is cut to 480 bytes and then "
+    "body_truncated=true with body_bytes naming the full length, never "
+    "silently. cursor resumes on the very next row with no gap or repeat; "
+    "more says rows remain. A grant needs the brief scope and may read only "
+    "the mailbox whose to equals its own label (STEER_MAILBOX_FOREIGN "
+    "otherwise); operator mode reads any. screen lists one line per row "
+    "unless json=true. Distinct from fleet.steer.inbox, which lists "
+    "quarantined uploads. It contacts no peer and never waits.", 65536,
+    "fleet,steer,mailbox,mail,inbox,recipient,cursor,steering,chatgpt",
+    "zcl.fleet_steer_mailbox.input.v1", "zcl.fleet_steer_mailbox.v1",
+    "grant,to,from,ref,since,limit,json", "to",
+    "z23 fleet steer mailbox --to=<label>",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_steer_mailbox)
+
+ZCL_COMMAND_READY_READ(
     "fleet.steer.wiki-find", "fleet.steer", "",
     "Discover bounded untrusted wiki knowledge",
     "Requires the evidence grant scope when a grant is supplied. Required q "
@@ -719,7 +744,9 @@ ZCL_COMMAND_READY_COMMAND(
     "the id is returned exactly once and never echoed elsewhere. list "
     "inventories the store so the owner can see what there is to revoke: "
     "one row per grant with its label, scopes, created, expires, revoked "
-    "and state, newest 128 kept, and the id cut to an 8-character prefix "
+    "and state, newest first in pages (limit 1..128, default 32; pass the "
+    "returned next as before for the following page; truncated says more "
+    "remain), and the id cut to an 8-character prefix "
     "so the listing is never itself a credential file (revoke still needs "
     "the whole 32). revoke "
     "appends a superseding revoked row (revoking twice re-affirms). "
@@ -734,10 +761,10 @@ ZCL_COMMAND_READY_COMMAND(
     "receiver admit a directive that came over the signed fleet board from "
     "that enrolled box under that label, and is refused as a bearer "
     "(STEER_GRANT_PEER_ONLY). This governs only fleet.steer verbs: it is not "
-    "wallet authority and not a fleet key role. It contacts no peer.", 0,
+    "wallet authority and not a fleet key role. It contacts no peer.", 32768,
     "fleet,steer,grant,list,revoke,bearer,scope,expiry,chatgpt",
     "zcl.fleet_steer_grant.input.v1", "zcl.fleet_steer_grant.v1",
-    "action,scopes,ttl_seconds,label,id,peer", "action",
+    "action,scopes,ttl_seconds,label,id,peer,limit,before", "action",
     "z23 fleet steer grant --action=mint --scopes=brief,send",
     ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_EFFECT_MUTATE,
     ZCL_COMMAND_RISK_DEV_MUTATION, ZCL_COMMAND_SCOPE_LOCAL,

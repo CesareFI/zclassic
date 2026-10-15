@@ -61,6 +61,9 @@ void zcl_native_handle_fleet_steer_brief(
 void zcl_native_handle_fleet_steer_send(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);
+void zcl_native_handle_fleet_steer_mailbox(
+    const struct zcl_command_request *request,
+    struct zcl_command_reply *reply);
 void zcl_native_handle_fleet_steer_evidence(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);

@@ -1570,6 +1570,7 @@ static int fmx_t_grant_list_full(void)
             ASSERT(fmx_mint("send", id, sizeof(id)));
         fmx_begin(&c, FMX_GRANT_PATH, "zcl.fleet_steer_grant.v1");
         (void)json_push_kv_str(&c.input, "action", "list");
+        (void)json_push_kv_int(&c.input, "limit", FMX_GRANT_CAP);
         ASSERT(fmx_run(&c, zcl_native_handle_fleet_steer_grant));
         ASSERT(fmx_ok(&c));
         ASSERT_EQ((int)fmx_int(&c, "shown"), FMX_GRANT_CAP);
@@ -1584,6 +1585,7 @@ static int fmx_t_grant_list_full(void)
         fmx_end(&c);
         fmx_begin(&c, FMX_GRANT_PATH, "zcl.fleet_steer_grant.v1");
         (void)json_push_kv_str(&c.input, "action", "list");
+        (void)json_push_kv_int(&c.input, "limit", FMX_GRANT_CAP);
         ASSERT(fmx_run(&c, zcl_native_handle_fleet_steer_grant));
         ASSERT(fmx_ok(&c));
         ASSERT_EQ((int)fmx_int(&c, "shown"), FMX_GRANT_CAP);
@@ -1593,6 +1595,7 @@ static int fmx_t_grant_list_full(void)
         ASSERT(fmx_mint("send", extra, sizeof(extra)));
         fmx_begin(&c, FMX_GRANT_PATH, "zcl.fleet_steer_grant.v1");
         (void)json_push_kv_str(&c.input, "action", "list");
+        (void)json_push_kv_int(&c.input, "limit", FMX_GRANT_CAP);
         ASSERT(fmx_run(&c, zcl_native_handle_fleet_steer_grant));
         ASSERT(fmx_ok(&c));
         ASSERT_EQ((int)fmx_int(&c, "shown"), FMX_GRANT_CAP);
@@ -4909,6 +4912,237 @@ _test_next:;
     return failures;
 }
 
+/* ── paged grant list: a 200-grant store still serializes ─────────────── */
+
+/* Run the grant leaf through the real wire serializer; the bounded reply
+ * text lands in `wire`. True when it parsed as an ok result. */
+static bool fmx_grant_wire(const struct json_value *input, char *wire,
+                           size_t cap, struct json_value *out)
+{
+    struct zcl_command_spec copy;
+    const struct zcl_command_spec *spec = zcl_command_registry_find(
+        zcl_command_catalog(), FMX_GRANT_PATH, NULL);
+    enum zcl_command_exit rc;
+    size_t n;
+    if (!spec)
+        return false;
+    copy = *spec;
+    copy.handler = zcl_native_handle_fleet_steer_grant;
+    n = zcl_command_registry_execute_json(zcl_command_catalog(), &copy, NULL,
+        input, false, FMX_GRANT_PATH, "full", 0, 0, NULL, wire, cap, &rc);
+    json_init(out);
+    return n > 0 && n < cap && rc == ZCL_COMMAND_EXIT_OK &&
+           json_read(out, wire, n);
+}
+
+static int fmx_t_grant_list_paged(void)
+{
+    int failures = 0;
+
+    TEST("steer: a 200-grant store lists in bounded pages to the oldest") {
+        enum { ROWS = 200 };
+        static char wire[262144];
+        char ids[ROWS][40];
+        struct json_value in, out;
+        long long before = -1;
+        size_t seen = 0, pages = 0;
+        bool reached_oldest = false;
+        fmx_isolate("grant_list_paged");
+        for (int i = 0; i < ROWS; i++)
+            ASSERT(fmx_mint("send", ids[i], sizeof(ids[i])));
+        for (;;) {
+            const struct json_value *data, *grants, *next;
+            json_init(&in);
+            json_set_object(&in);
+            (void)json_push_kv_str(&in, "action", "list");
+            if (before >= 0)
+                (void)json_push_kv_int(&in, "before", before);
+            ASSERT(fmx_grant_wire(&in, wire, sizeof(wire), &out));
+            json_free(&in);
+            ASSERT(strstr(wire, ids[0]) == NULL); /* never a full id */
+            ASSERT(strstr(wire, ids[ROWS - 1]) == NULL);
+            data = json_get(&out, "data");
+            grants = json_get(data, "grants");
+            ASSERT(grants != NULL && grants->type == JSON_ARR);
+            ASSERT(json_size(grants) >= 1 && json_size(grants) <= 32);
+            ASSERT_EQ((int)json_get_int(json_get(data, "total")), ROWS);
+            /* newest first, no repeats: this page starts where the last ended */
+            for (size_t i = 0; i < json_size(grants); i++) {
+                const char *p = json_get_str(json_get(json_at(grants, i),
+                                                      "id_prefix"));
+                ASSERT(p != NULL && strlen(p) == 8);
+                ASSERT(strncmp(p, ids[ROWS - 1 - (int)seen], 8) == 0);
+                seen++;
+            }
+            pages++;
+            next = json_get(data, "next");
+            if (!next) {
+                ASSERT(!json_get_bool(json_get(data, "truncated")));
+                reached_oldest = true;
+                json_free(&out);
+                break;
+            }
+            ASSERT(json_get_bool(json_get(data, "truncated")));
+            before = json_get_int(next);
+            json_free(&out);
+            ASSERT(pages < 64);
+        }
+        ASSERT(reached_oldest);
+        ASSERT_EQ((int)seen, ROWS);
+        ASSERT(pages >= 7);
+        fmx_restore();
+        PASS();
+    } _test_next:;
+    fmx_restore();
+    return failures;
+}
+
+/* ── mailbox: one recipient's cursor-paged mail ───────────────────────── */
+
+static void fmx_mbox_call(struct fmx_call *c, const char *grant, const char *to,
+                          const char *cursor, long long limit)
+{
+    fmx_begin(c, "fleet.steer.mailbox", "zcl.fleet_steer_mailbox.v1");
+    if (grant)
+        (void)json_push_kv_str(&c->input, "grant", grant);
+    (void)json_push_kv_str(&c->input, "to", to);
+    if (cursor && cursor[0])
+        (void)json_push_kv_str(&c->input, "since", cursor);
+    if (limit > 0)
+        (void)json_push_kv_int(&c->input, "limit", limit);
+}
+
+static void fmx_mbox_seed(void)
+{
+    char root[1100];
+    for (const char *sub = "z23"; sub; sub = strcmp(sub, "z23") ? NULL : "z23/dev") {
+        (void)snprintf(root, sizeof(root), "%s/%s", g_fmx_state, sub);
+        if (!platform_private_directory_ensure(root))
+            fmx_fixture_fail("cannot create isolated state dir");
+    }
+    char ts[32], ref[32];
+    /* alice: 40 rows over two streams (seq 1..20 and 101..120), carol: 10,
+     * plus 5 rows from dave and one 2000-byte body, all to alice. */
+    for (int i = 1; i <= 20; i++) {
+        (void)snprintf(ts, sizeof(ts), "2026-10-01T00:00:%02dZ", i);
+        (void)snprintf(ref, sizeof(ref), "t-%02d", i);
+        fmx_seed_inbox("s1", ts, i, "bob", "alice", "note", "hello", ref);
+        (void)snprintf(ts, sizeof(ts), "2026-10-01T00:01:%02dZ", i);
+        fmx_seed_inbox("s2", ts, 100 + i, "bob", "alice", "note", "again", ref);
+        (void)snprintf(ts, sizeof(ts), "2026-10-01T00:02:%02dZ", i);
+        if (i <= 10)
+            fmx_seed_inbox("s1", ts, 20 + i, "bob", "carol", "note", "private", ref);
+    }
+    for (int i = 1; i <= 5; i++) {
+        (void)snprintf(ts, sizeof(ts), "2026-10-01T00:03:%02dZ", i);
+        (void)snprintf(ref, sizeof(ref), "x-%02d", i);
+        fmx_seed_inbox("s2", ts, 200 + i, "dave", "alice", "note", "from dave", ref);
+    }
+    char big[2001];
+    memset(big, 'z', 2000);
+    big[2000] = '\0';
+    fmx_seed_inbox("s2", "2026-10-01T00:04:00Z", 300, "dave", "alice", "note", big, "big-1");
+}
+
+static int fmx_t_mailbox(void)
+{
+    int failures = 0;
+
+    TEST("steer: mailbox pages one recipient's mail without gaps, repeats or silent cuts") {
+        enum { ALICE = 46 };
+        bool seen[400] = {false};
+        char cursor[4200] = "", grant[64], other[64];
+        long long prev_seq_ts = 0;
+        size_t total = 0, pages = 0, truncated_rows = 0;
+        struct fmx_call c;
+        fmx_isolate("mailbox");
+        fmx_mbox_seed();
+        for (;;) {
+            const struct json_value *rows;
+            bool more;
+            fmx_mbox_call(&c, NULL, "alice", cursor, 20);
+            ASSERT(fmx_run(&c, zcl_native_handle_fleet_steer_mailbox));
+            ASSERT(fmx_ok(&c));
+            rows = fmx_arr(&c, "rows");
+            ASSERT(rows != NULL);
+            ASSERT(json_size(rows) <= 20);
+            for (size_t i = 0; i < json_size(rows); i++) {
+                const struct json_value *r = json_at(rows, i);
+                long long seq = json_get_int(json_get(r, "seq"));
+                ASSERT_STR_EQ(json_get_str(json_get(r, "to")), "alice");
+                ASSERT(seq > 0 && seq < 400);
+                ASSERT(!seen[seq]); /* no repeat */
+                seen[seq] = true;
+                total++;
+                if (json_get_bool(json_get(r, "body_truncated"))) {
+                    truncated_rows++;
+                    ASSERT_EQ((int)strlen(json_get_str(json_get(r, "body"))), 480);
+                    ASSERT_EQ((int)json_get_int(json_get(r, "body_bytes")), 2000);
+                } else {
+                    ASSERT(strlen(json_get_str(json_get(r, "body"))) < 480);
+                }
+            }
+            (void)prev_seq_ts;
+            ASSERT(strstr(fmx_str(&c, "screen"), "\xe2\x86\x92") != NULL);
+            more = fmx_bool(&c, "more");
+            (void)snprintf(cursor, sizeof(cursor), "%s", fmx_str(&c, "cursor"));
+            ASSERT(cursor[0] != '\0');
+            fmx_end(&c);
+            pages++;
+            if (!more)
+                break;
+            ASSERT(pages < 20);
+        }
+        ASSERT_EQ((int)total, ALICE);   /* no gap: every row addressed to alice */
+        ASSERT(pages >= 3);
+        ASSERT_EQ((int)truncated_rows, 1);
+        for (int s = 1; s <= 20; s++)
+            ASSERT(seen[s] && seen[100 + s]);
+        /* the cursor after the last page yields nothing and stays put */
+        fmx_mbox_call(&c, NULL, "alice", cursor, 20);
+        ASSERT(fmx_run(&c, zcl_native_handle_fleet_steer_mailbox));
+        ASSERT(fmx_ok(&c));
+        ASSERT_EQ((int)fmx_int(&c, "count"), 0);
+        ASSERT(!fmx_bool(&c, "more"));
+        fmx_end(&c);
+        /* from and ref-prefix filters */
+        fmx_mbox_call(&c, NULL, "alice", NULL, 64);
+        (void)json_push_kv_str(&c.input, "from", "dave");
+        ASSERT(fmx_run(&c, zcl_native_handle_fleet_steer_mailbox));
+        ASSERT(fmx_ok(&c));
+        ASSERT_EQ((int)fmx_int(&c, "count"), 6);
+        fmx_end(&c);
+        fmx_mbox_call(&c, NULL, "alice", NULL, 64);
+        (void)json_push_kv_str(&c.input, "ref", "x-");
+        ASSERT(fmx_run(&c, zcl_native_handle_fleet_steer_mailbox));
+        ASSERT(fmx_ok(&c));
+        ASSERT_EQ((int)fmx_int(&c, "count"), 5);
+        fmx_end(&c);
+        /* a grant reads only its own label's mailbox */
+        ASSERT(fmx_mint_as("brief", "alice", grant, sizeof(grant)));
+        ASSERT(fmx_mint_as("send", "alice", other, sizeof(other)));
+        fmx_mbox_call(&c, grant, "alice", NULL, 5);
+        ASSERT(fmx_run(&c, zcl_native_handle_fleet_steer_mailbox));
+        ASSERT(fmx_ok(&c));
+        ASSERT_EQ((int)fmx_int(&c, "count"), 5);
+        ASSERT(fmx_bool(&c, "more"));
+        fmx_end(&c);
+        fmx_mbox_call(&c, grant, "carol", NULL, 5);
+        ASSERT(fmx_run(&c, zcl_native_handle_fleet_steer_mailbox));
+        ASSERT(!fmx_ok(&c));
+        ASSERT_STR_EQ(c.reply.error.code, "STEER_MAILBOX_FOREIGN");
+        fmx_end(&c);
+        fmx_mbox_call(&c, other, "alice", NULL, 5);   /* no brief scope */
+        ASSERT(fmx_run(&c, zcl_native_handle_fleet_steer_mailbox));
+        ASSERT(!fmx_ok(&c));
+        fmx_end(&c);
+        fmx_restore();
+        PASS();
+    } _test_next:;
+    fmx_restore();
+    return failures;
+}
+
 static int fmx_t_candidate_reports(void)
 {
     int failures = 0;
@@ -5814,6 +6048,8 @@ int test_fleet_steer(void)
     failures += fmx_t_grant_records();
     failures += fmx_t_grant_list();
     failures += fmx_t_grant_list_full();
+    failures += fmx_t_grant_list_paged();
+    failures += fmx_t_mailbox();
     failures += fmx_t_peer_grants();
     failures += fmx_t_revoke_cancels_queued();
     failures += fmx_t_revoke_running();
