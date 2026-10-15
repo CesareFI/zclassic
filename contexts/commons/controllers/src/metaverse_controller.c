@@ -81,7 +81,7 @@ static void mv_fail_result(struct zcl_command_reply *reply,
     switch (r->code) {
     case MVS_ERR_NOT_A_DIR:
         mv_fail(reply, ZCL_COMMAND_EXIT_FAILED, "NOT_A_DIR",
-                "no such broker directory — run `zclassic23 "
+                "no such broker directory — run `z23 "
                 "--metaverse-broker --broker-dir=DIR` first, or point --dir at "
                 "the directory a broker already used",
                 r->message);

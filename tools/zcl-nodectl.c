@@ -566,7 +566,7 @@ static int cmd_start(struct rpc_target *c23)
 {
     systemctl_start();
     if (!rpc_ready(c23, 90)) die("zclassic23 RPC did not become ready");
-    printf("zclassic23 started and RPC is ready\n");
+    printf("z23 started and RPC is ready\n");
     return 0;
 }
 

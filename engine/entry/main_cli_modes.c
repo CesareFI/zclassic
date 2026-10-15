@@ -386,7 +386,7 @@ static void bench_maybe_live_readonly(struct bench_row rows[5])
     if (!bench_find_live_pid(&pid, source, sizeof(source)) ||
         !bench_read_proc_status(pid, &rss_mb, &uptime_s)) {
         snprintf(rows[3].notes, sizeof(rows[3].notes),
-                 "live read-only sample requested but no readable zclassic23 pid was found");
+                 "live read-only sample requested but no readable z23 pid was found");
         return;
     }
 

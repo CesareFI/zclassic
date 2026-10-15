@@ -1500,11 +1500,11 @@ static bool zr_prove_from_domain(struct node_db *ndb, const char *domain,
     }
     json_push_kv_str(&reply->data, "next",
                      dom.anchored
-                         ? "anyone can confirm inclusion with `zclassic23 "
+                         ? "anyone can confirm inclusion with `z23 "
                            "zcode release verify --doc=<hex> --proof=<proof> "
                            "--root=<domain_root>` — domain_root is already "
                            "anchored on-chain at anchored_txid"
-                         : "anyone can confirm inclusion with `zclassic23 "
+                         : "anyone can confirm inclusion with `z23 "
                            "zcode release verify --doc=<hex> --proof=<proof> "
                            "--root=<domain_root>` once domain_root is "
                            "anchored on-chain (`zcode release anchor`)");
@@ -1736,7 +1736,7 @@ void zcl_native_handle_zcode_domain_list(
     json_push_kv_int(&reply->data, "total", total);
     json_push_kv_int(&reply->data, "list_cap", ZR_DOMAIN_LIST_MAX);
     json_push_kv_str(&reply->data, "next",
-                     "inspect one domain's stored leaf set with `zclassic23 "
+                     "inspect one domain's stored leaf set with `z23 "
                      "zcode domain status --input='{\"domain\":\"zcode\"}'`");
     reply->status = ZCL_COMMAND_STATUS_PASSED;
     reply->exit_code = ZCL_COMMAND_EXIT_OK;
@@ -1827,7 +1827,7 @@ void zcl_native_handle_zcode_domain_status(
     json_push_kv_int(&reply->data, "leaf_preview_cap", ZR_DOMAIN_LEAF_PREVIEW);
     json_push_kv_str(&reply->data, "next",
                      d.anchored
-                         ? "prove one release's inclusion with `zclassic23 "
+                         ? "prove one release's inclusion with `z23 "
                            "zcode release prove --input='{\"name\":\"<n>\","
                            "\"version\":\"<v>\"}'`"
                          : "this domain's root is not on-chain yet — commit "

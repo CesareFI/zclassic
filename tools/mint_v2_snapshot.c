@@ -427,7 +427,7 @@ int main(int argc, char **argv)
     if (!load_block_index_flat(datadir, &ms).ok) {
         fprintf(stderr, "load_block_index_flat(%s) failed — the source datadir "
                 "has no readable block_index.bin. Point at a datadir from a "
-                "synced zclassic23 node, which writes block_index.bin itself "
+                "synced z23 node, which writes block_index.bin itself "
                 "(no zclassicd / --importblockindex step is involved).\n",
                 datadir);
         return 1;
@@ -825,7 +825,7 @@ int main(int argc, char **argv)
                 "\nFresh-node usage (zero flags — boot autodetects a dropped-in bundle):\n"
                 "  cp %s/block_index.bin   <DATADIR>/\n"
                 "  cp %s/%s   <DATADIR>/\n"
-                "  zclassic23 -datadir=<DATADIR>\n"
+                "  z23 -datadir=<DATADIR>\n"
                 "  (the explicit -load-snapshot-at-own-height=<DATADIR>/%s flag still\n"
                 "   works as a forced override, but is not required.)\n",
                 bundle_dir, seed_h, snap_name, (unsigned long long)got_count,

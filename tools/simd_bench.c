@@ -1309,7 +1309,7 @@ int main(int argc, char **argv)
 #else
         (void)snprintf(running_cpu, sizeof(running_cpu), "%s", "unknown");
 #endif
-        printf("zclassic23 simd_bench — per-ISA-tier crypto microbenchmark\n");
+        printf("z23 simd_bench — per-ISA-tier crypto microbenchmark\n");
         printf("=========================================================\n");
         printf("  pinned          : %s (requested cpu %d, running on cpu %s)\n",
                pinned ? "YES" : "NO -- NUMBERS ARE NOT COMPARABLE",
