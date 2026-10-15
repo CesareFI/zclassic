@@ -175,6 +175,11 @@ enum plugin_status plugin_copy_file(const char *src, const char *dst,
     FILE *in = fdopen(in_fd, "rb");
     int out_fd = open(dst, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
                       (mode_t)mode);
+    /* The mode must not depend on the process umask. */
+    if (out_fd >= 0 && fchmod(out_fd, (mode_t)mode) != 0) {
+        close(out_fd);
+        out_fd = -1;
+    }
     FILE *out = out_fd >= 0 ? fdopen(out_fd, "wb") : NULL;
     if (!in || !out) {
         if (in)

@@ -55,6 +55,7 @@ struct plugin_manifest {
     char version[PLUGIN_VERSION_MAX + 1];
     int64_t interface_version;
     char exe_sha3[PLUGIN_HEX_SHA3_512 + 1];
+    char generation[PLUGIN_HEX_SHA3_512 + 1]; /* signed manifest digest, set by plugin_verify_manifest */
     unsigned capabilities; /* bit i is the i-th entry of plugin_capability_name */
 };
 
@@ -81,8 +82,10 @@ enum plugin_status plugin_hash_file(const char *path,
 /* Install the plugin described by manifest_path (NAME.plugin.json). The
  * signature is NAME.plugin.sig and the executable is NAME, both in the same
  * directory. root is the plugin store, normally ~/.z23/plugins. Installing
- * does not change the current link. already_present is set when the
- * generation was stored earlier. */
+ * does not change the current link. A generation is named by the signed
+ * manifest digest (out->generation), so the same executable under different
+ * capabilities is a distinct generation. already_present is set when that
+ * exact manifest and executable were stored earlier. */
 enum plugin_status plugin_store_install(const char *root,
                                         const char *manifest_path,
                                         struct plugin_manifest *out,

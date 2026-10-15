@@ -122,7 +122,8 @@ static enum plugin_status pp_publish(const struct plugin_pack_request *r,
                                      struct plugin_pack_result *out)
 {
     char exe[PLUGIN_PATH_MAX], sig_path[PLUGIN_PATH_MAX], leaf[PLUGIN_NAME_MAX + 16];
-    char manifest[PP_MANIFEST_MAX], sig[PP_SIG_MAX];
+    char manifest[PP_MANIFEST_MAX], sig[PP_SIG_MAX], exe_sha[PLUGIN_HEX_SHA3_512 + 1];
+    uint8_t digest[PLUGIN_DIGEST_BYTES];
     struct plugin_manifest check;
     enum plugin_status st = pp_out_dir(dir);
     if (st != PLUGIN_OK)
@@ -134,12 +135,15 @@ static enum plugin_status pp_publish(const struct plugin_pack_request *r,
     paths = paths && plugin_join(sig_path, sizeof(sig_path), dir, leaf, NULL, NULL);
     if (!paths)
         return PLUGIN_ERR_ARGUMENT;
-    st = pp_store_exe(r->exe_path, exe, out->generation);
+    st = pp_store_exe(r->exe_path, exe, exe_sha);
     if (st != PLUGIN_OK)
         return st;
-    if (!pp_manifest_build(r, out->generation, manifest, sizeof(manifest)) ||
+    if (!pp_manifest_build(r, exe_sha, manifest, sizeof(manifest)) ||
         plugin_manifest_parse(manifest, strlen(manifest), &check) != PLUGIN_OK)
         return PLUGIN_ERR_MANIFEST_INVALID;
+    /* The generation id is the signed manifest digest, as plugin_store derives it. */
+    plugin_manifest_digest(manifest, strlen(manifest), digest);
+    zcl_hex_encode(digest, sizeof(digest), out->generation);
     st = pp_sign_doc(seed, manifest, strlen(manifest), sig, sizeof(sig), out->public_key);
     if (st == PLUGIN_OK && !(pp_write_atomic(out->manifest_path, manifest, strlen(manifest)) &&
                              pp_write_atomic(sig_path, sig, strlen(sig))))

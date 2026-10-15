@@ -38,6 +38,7 @@ struct pst_fx {
 struct pst_opts {
     int key;
     const char *extra;
+    const char *caps; /* JSON capability list body; default fs.read and clock */
     const char *sig_alg;
     bool tamper_exe;
     bool tamper_manifest;
@@ -119,17 +120,22 @@ static void pst_fx_close(struct pst_fx *fx)
         (void)test_rm_rf_recursive(fx->base);
 }
 
-static void pst_sign(const struct pst_fx *fx, int key, const char *manifest,
-                     char sig_hex[129])
+static void pst_digest(const char *manifest, unsigned char digest[64])
 {
     static const unsigned char domain[] = "z23.plugin.manifest.v1";
-    unsigned char digest[64];
-    uint8_t sig[64];
     struct sha3_512_ctx ctx;
     sha3_512_init(&ctx);
     sha3_512_write(&ctx, domain, sizeof(domain));
     sha3_512_write(&ctx, (const unsigned char *)manifest, strlen(manifest));
     sha3_512_finalize(&ctx, digest);
+}
+
+static void pst_sign(const struct pst_fx *fx, int key, const char *manifest,
+                     char sig_hex[129])
+{
+    unsigned char digest[64];
+    uint8_t sig[64];
+    pst_digest(manifest, digest);
     zcl_ed25519_sign(sig, digest, sizeof(digest), fx->sk[key], fx->pk[key]);
     pst_hex(sig, 64, sig_hex);
 }
@@ -155,12 +161,16 @@ static bool pst_publish(struct pst_fx *fx, const char *name, const char *exe,
     char manifest[1024], sigdoc[512];
     zcl_sha3_512((const unsigned char *)exe, strlen(exe), digest);
     pst_hex(digest, 64, sha);
-    memcpy(fx->generation, sha, sizeof(sha));
     snprintf(manifest, sizeof(manifest),
              "{\"schema\":\"z23.plugin.v1\",\"name\":\"%s\",\"version\":\"1.0.0\","
              "\"interface_version\":1,\"sha3_512\":\"%s\","
-             "\"capabilities\":[\"fs.read\",\"clock\"]%s}",
-             name, sha, o->extra ? o->extra : "");
+             "\"capabilities\":[%s]%s}",
+             name, sha, o->caps ? o->caps : "\"fs.read\",\"clock\"",
+             o->extra ? o->extra : "");
+    /* A generation is named by the signed manifest digest, which covers the
+     * capabilities as well as the executable hash. */
+    pst_digest(manifest, digest);
+    pst_hex(digest, 64, fx->generation);
     pst_sign(fx, o->key, manifest, sig_hex);
     pst_hex(fx->pk[o->key], 32, pub);
     snprintf(sigdoc, sizeof(sigdoc),
@@ -223,7 +233,7 @@ static int pst_case_install_valid(void)
         ASSERT(pst_publish(&fx, "hello", "#!/bin/sh\necho hi\n", &o));
         ASSERT_EQ(plugin_store_install(fx.root, fx.manifest, &m, &present), PLUGIN_OK);
         ASSERT_EQ(present, 0);
-        ASSERT_STR_EQ(m.exe_sha3, fx.generation);
+        ASSERT_STR_EQ(m.generation, fx.generation);
         ASSERT_EQ(m.capabilities, 1u | 32u);
         snprintf(dir, sizeof(dir), "%s/hello/generations/%s", fx.root, fx.generation);
         snprintf(exe, sizeof(exe), "%s/hello", dir);
@@ -617,6 +627,156 @@ static int pst_case_revoked_key(void)
     return failures;
 }
 
+/* True when generation GEN of NAME stores a manifest that grants capability CAP. */
+static bool pst_gen_grants(const struct pst_fx *fx, const char *name, const char *gen,
+                           const char *cap)
+{
+    char path[PATH_MAX], body[1024], needle[32];
+    snprintf(path, sizeof(path), "%s/%s/generations/%s/%s.plugin.json", fx->root, name, gen, name);
+    snprintf(needle, sizeof(needle), "\"%s\"", cap);
+    return pst_slurp(path, body, sizeof(body)) && strstr(body, needle) != NULL;
+}
+
+static enum plugin_status pst_install_present(struct pst_fx *fx, const char *name,
+                                              const char *exe, const struct pst_opts *o,
+                                              struct plugin_manifest *m, int *present)
+{
+    if (!pst_publish(fx, name, exe, o))
+        return PLUGIN_ERR_IO;
+    return plugin_store_install(fx->root, fx->manifest, m, present);
+}
+
+static int pst_case_permission_update(void)
+{
+    int failures = 0;
+    TEST_CASE("same executable with narrower capabilities is a new generation") {
+        struct pst_fx fx;
+        struct pst_opts wide = { .caps = "\"fs.write\",\"clock\"" };
+        struct pst_opts narrow = { .caps = "\"clock\"" };
+        struct plugin_manifest m1, m2, m3;
+        struct plugin_info *infos = NULL;
+        size_t count = 0;
+        int present = -1;
+        char g1[PST_HEX], g2[PST_HEX], cur[PST_HEX], back[PST_HEX];
+        ASSERT(pst_fx_open(&fx, true));
+        ASSERT_EQ(pst_install_present(&fx, "hello", "shared exe", &wide, &m1, &present), PLUGIN_OK);
+        ASSERT_EQ(present, 0);
+        memcpy(g1, fx.generation, PST_HEX);
+        ASSERT_EQ(plugin_store_switch(fx.root, "hello", g1), PLUGIN_OK);
+        ASSERT_EQ(pst_install_present(&fx, "hello", "shared exe", &narrow, &m2, &present),
+                  PLUGIN_OK);
+        ASSERT_EQ(present, 0);
+        memcpy(g2, fx.generation, PST_HEX);
+        ASSERT(strcmp(g1, g2) != 0);
+        ASSERT_STR_EQ(m1.exe_sha3, m2.exe_sha3);
+        ASSERT_STR_EQ(m2.generation, g2);
+        ASSERT_EQ(m1.capabilities & 2u, 2u);
+        ASSERT_EQ(m2.capabilities & 2u, 0u);
+        ASSERT(pst_gen_grants(&fx, "hello", g1, "fs.write"));
+        ASSERT(!pst_gen_grants(&fx, "hello", g2, "fs.write"));
+        /* installing never moves current: the wide grant is still live until switched */
+        pst_link(&fx, "hello", "current", cur);
+        ASSERT_STR_EQ(cur, g1);
+        ASSERT_EQ(plugin_store_list(fx.root, &infos, &count), PLUGIN_OK);
+        ASSERT_EQ(count, 1u);
+        ASSERT_EQ(infos[0].generation_count, 2u);
+        plugin_store_list_free(infos, count);
+        /* switch to the narrow grant, roll back to the wide one, switch forward again */
+        ASSERT_EQ(plugin_store_switch(fx.root, "hello", g2), PLUGIN_OK);
+        pst_link(&fx, "hello", "current", cur);
+        ASSERT_STR_EQ(cur, g2);
+        ASSERT(!pst_gen_grants(&fx, "hello", cur, "fs.write"));
+        ASSERT_EQ(plugin_store_rollback(fx.root, "hello", back), PLUGIN_OK);
+        pst_link(&fx, "hello", "current", cur);
+        ASSERT_STR_EQ(cur, g1);
+        ASSERT(pst_gen_grants(&fx, "hello", cur, "fs.write"));
+        ASSERT_EQ(plugin_store_switch(fx.root, "hello", g2), PLUGIN_OK);
+        pst_link(&fx, "hello", "current", cur);
+        ASSERT_STR_EQ(cur, g2);
+        ASSERT(!pst_gen_grants(&fx, "hello", cur, "fs.write"));
+        /* the identical manifest and executable is idempotent */
+        ASSERT_EQ(pst_install_present(&fx, "hello", "shared exe", &narrow, &m3, &present),
+                  PLUGIN_OK);
+        ASSERT_EQ(present, 1);
+        ASSERT_STR_EQ(m3.generation, g2);
+        ASSERT_EQ(pst_install_present(&fx, "hello", "shared exe", &wide, &m3, &present),
+                  PLUGIN_OK);
+        ASSERT_EQ(present, 1);
+        ASSERT_STR_EQ(m3.generation, g1);
+        ASSERT_EQ(plugin_store_list(fx.root, &infos, &count), PLUGIN_OK);
+        ASSERT_EQ(infos[0].generation_count, 2u);
+        plugin_store_list_free(infos, count);
+        pst_fx_close(&fx);
+    } TEST_END
+    return failures;
+}
+
+static int pst_case_permission_update_revoked(void)
+{
+    int failures = 0;
+    TEST_CASE("a permission update signed by a revoked key is refused") {
+        struct pst_fx fx;
+        struct pst_opts wide = { .caps = "\"fs.write\",\"clock\"" };
+        struct pst_opts narrow_revoked = { .key = 1, .caps = "\"clock\"" };
+        struct plugin_manifest m;
+        struct plugin_info *infos = NULL;
+        size_t count = 0;
+        int present = -1;
+        ASSERT(pst_fx_open(&fx, true));
+        ASSERT_EQ(pst_install_present(&fx, "hello", "shared exe", &wide, &m, &present), PLUGIN_OK);
+        ASSERT_EQ(pst_install_present(&fx, "hello", "shared exe", &narrow_revoked, &m, &present),
+                  PLUGIN_ERR_KEY_UNTRUSTED);
+        ASSERT_EQ(plugin_store_list(fx.root, &infos, &count), PLUGIN_OK);
+        ASSERT_EQ(infos[0].generation_count, 1u);
+        plugin_store_list_free(infos, count);
+        pst_fx_close(&fx);
+    } TEST_END
+    return failures;
+}
+
+static int pst_case_legacy_generation(void)
+{
+    int failures = 0;
+    TEST_CASE("generations named by the executable hash still verify, switch and roll back") {
+        struct pst_fx fx;
+        struct pst_opts o = {0};
+        unsigned char dg[64];
+        char exe_a[PST_HEX], exe_b[PST_HEX], from[PATH_MAX], to[PATH_MAX];
+        char cur[PST_HEX], back[PST_HEX], bogus[PST_HEX];
+        ASSERT(pst_fx_open(&fx, true));
+        /* version one, renamed to the pre-change layout: exe hash as the name */
+        ASSERT_EQ(pst_install(&fx, "hello", "version one", &o), PLUGIN_OK);
+        zcl_sha3_512((const unsigned char *)"version one", strlen("version one"), dg);
+        pst_hex(dg, 64, exe_a);
+        snprintf(from, sizeof(from), "%s/hello/generations/%s", fx.root, fx.generation);
+        snprintf(to, sizeof(to), "%s/hello/generations/%s", fx.root, exe_a);
+        ASSERT_EQ(rename(from, to), 0);
+        ASSERT_EQ(pst_install(&fx, "hello", "version two", &o), PLUGIN_OK);
+        zcl_sha3_512((const unsigned char *)"version two", strlen("version two"), dg);
+        pst_hex(dg, 64, exe_b);
+        snprintf(from, sizeof(from), "%s/hello/generations/%s", fx.root, fx.generation);
+        snprintf(to, sizeof(to), "%s/hello/generations/%s", fx.root, exe_b);
+        ASSERT_EQ(rename(from, to), 0);
+        ASSERT_EQ(plugin_store_switch(fx.root, "hello", exe_a), PLUGIN_OK);
+        ASSERT_EQ(plugin_store_switch(fx.root, "hello", exe_b), PLUGIN_OK);
+        ASSERT_EQ(plugin_store_rollback(fx.root, "hello", back), PLUGIN_OK);
+        pst_link(&fx, "hello", "current", cur);
+        ASSERT_STR_EQ(cur, exe_a);
+        ASSERT_STR_EQ(back, exe_a);
+        /* a directory whose name matches neither id of its stored manifest is refused */
+        memset(bogus, 'b', 128);
+        bogus[128] = '\0';
+        snprintf(from, sizeof(from), "%s/hello/generations/%s", fx.root, exe_b);
+        snprintf(to, sizeof(to), "%s/hello/generations/%s", fx.root, bogus);
+        ASSERT_EQ(rename(from, to), 0);
+        ASSERT_EQ(plugin_store_switch(fx.root, "hello", bogus), PLUGIN_ERR_MANIFEST_INVALID);
+        pst_link(&fx, "hello", "current", cur);
+        ASSERT_STR_EQ(cur, exe_a);
+        pst_fx_close(&fx);
+    } TEST_END
+    return failures;
+}
+
 static int pst_case_tampered_last_good(void)
 {
     int failures = 0;
@@ -791,7 +951,7 @@ static int pst_case_pack_roundtrip(void)
         ASSERT_EQ(plugin_store_install(pk.fx.root, pk.res.manifest_path, &m, &present),
                   PLUGIN_OK);
         ASSERT_EQ(present, 0);
-        ASSERT_STR_EQ(m.exe_sha3, pk.res.generation);
+        ASSERT_STR_EQ(m.generation, pk.res.generation);
         ASSERT_EQ(m.capabilities, 1u | 32u);
         pst_fx_close(&pk.fx);
     } TEST_END
@@ -924,6 +1084,8 @@ static int pst_case_pack_field_mutation(void)
         struct pst_pk pk;
         struct plugin_manifest m;
         char sha_cut[160];
+        unsigned char exe_digest[64];
+        char exe_hex[129];
         int present = 0;
         const char *cuts[6] = { "\"schema\":\"z23.plugin.v1\",", "\"name\":\"hello\",",
                                 "\"version\":\"1.0.0\",", "\"interface_version\":1,",
@@ -931,7 +1093,9 @@ static int pst_case_pack_field_mutation(void)
         for (int i = 0; i < 6; i++) {
             ASSERT(pst_pk_open(&pk, 0600));
             ASSERT_EQ(plugin_pack(&pk.rq, &pk.res), PLUGIN_OK);
-            snprintf(sha_cut, sizeof(sha_cut), "\"sha3_512\":\"%s\",", pk.res.generation);
+            zcl_sha3_512((const unsigned char *)pst_pk_body, strlen(pst_pk_body), exe_digest);
+            pst_hex(exe_digest, 64, exe_hex);
+            snprintf(sha_cut, sizeof(sha_cut), "\"sha3_512\":\"%s\",", exe_hex);
             ASSERT(pst_pk_resign_without(&pk, cuts[i] ? cuts[i] : sha_cut));
             ASSERT_EQ(plugin_store_install(pk.fx.root, pk.res.manifest_path, &m, &present),
                       PLUGIN_ERR_MANIFEST_INVALID);
@@ -1064,6 +1228,9 @@ int test_plugin_store(void)
     failures += pst_case_republish_broken();
     failures += pst_case_trust_file_forms();
     failures += pst_case_revoked_key();
+    failures += pst_case_permission_update();
+    failures += pst_case_permission_update_revoked();
+    failures += pst_case_legacy_generation();
     failures += pst_case_tampered_last_good();
     failures += pst_case_input_limits();
     failures += pst_case_commands();

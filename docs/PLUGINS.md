@@ -22,8 +22,10 @@ commands read and write files only.
     last-good  -> generations/<id>  symbolic link
 ```
 
-The generation id is the executable's SHA3-512 as 128 lowercase hex
-characters. Installing stores a generation and leaves `current` alone.
+The generation id is the SHA3-512 of the signed manifest (domain-tagged, as
+signed) as 128 lowercase hex characters. It covers the capabilities and the
+executable hash, so the same executable under new capabilities is a new
+generation. Generations stored under the executable hash still work. Installing stores a generation and leaves `current` alone.
 `switch` and `rollback` replace the links by creating a temporary symbolic link
 beside them and renaming it over the old one, so a reader sees the old or the
 new target and never a missing link. An interrupted swap leaves `current`
@@ -95,8 +97,8 @@ z23 plugin pack ./hello --name=hello --version=1.0.0 --key=./publisher.key \
 ```
 
 `pack` creates `./dist/hello`, `./dist/hello.plugin.json` and <!-- doc-path-ok: example output path -->
-`./dist/hello.plugin.sig` and reports `data` with `generation` (the
-executable's SHA3-512), `public_key`, `manifest` and `capabilities`. For the
+`./dist/hello.plugin.sig` and reports `data` with `generation` (the signed-manifest
+digest), `public_key`, `manifest` and `capabilities`. For the
 example above `hello.plugin.json` is:
 
 ```json

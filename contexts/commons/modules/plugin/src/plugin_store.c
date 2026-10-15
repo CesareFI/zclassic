@@ -127,7 +127,10 @@ enum plugin_status plugin_verify_generation_manifest(const char *root,
         return st == PLUGIN_ERR_NOT_INSTALLED ? PLUGIN_ERR_NO_GENERATION : st;
     st = ps_verify_set(&p, trust, PLUGIN_OPEN_NOFOLLOW, out);
     if (st == PLUGIN_OK &&
-        (strcmp(out->name, name) != 0 || strcmp(out->exe_sha3, generation) != 0))
+        (strcmp(out->name, name) != 0 ||
+         (strcmp(out->generation, generation) != 0 &&
+          /* generations stored before the id covered the manifest */
+          strcmp(out->exe_sha3, generation) != 0)))
         st = PLUGIN_ERR_MANIFEST_INVALID;
     return st;
 }
@@ -227,7 +230,7 @@ static enum plugin_status ps_publish(const char *plugdir, const char *name,
     snprintf(tag, sizeof(tag), "staging.%ld", (long)getpid());
     if (!plugin_join(gens, sizeof(gens), plugdir, "generations", NULL, NULL) ||
         !plugin_join(staging, sizeof(staging), plugdir, tag, NULL, NULL) ||
-        !plugin_join(final_dir, sizeof(final_dir), gens, m->exe_sha3, NULL, NULL))
+        !plugin_join(final_dir, sizeof(final_dir), gens, m->generation, NULL, NULL))
         return PLUGIN_ERR_ARGUMENT;
     if (!plugin_mkdirs(gens))
         return PLUGIN_ERR_IO;
@@ -272,7 +275,7 @@ enum plugin_status plugin_store_install(const char *root,
     st = plugin_check_dir(plugdir);
     if (st != PLUGIN_OK)
         return st;
-    if (plugin_verify_generation(root, stem, out->exe_sha3) == PLUGIN_OK) {
+    if (plugin_verify_generation(root, stem, out->generation) == PLUGIN_OK) {
         if (already_present)
             *already_present = 1;
         return PLUGIN_OK;

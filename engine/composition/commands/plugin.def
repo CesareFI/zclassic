@@ -58,7 +58,7 @@ ZCL_COMMAND_READY_COMMAND(
     "the domain tag, a NUL and the manifest bytes) against "
     "~/.z23/plugins/trusted_keys, and the executable's SHA3-512. Stages the "
     "files, verifies the staged copy again, then renames it to "
-    "~/.z23/plugins/NAME/generations/SHA3-512 with the executable at mode "
+    "~/.z23/plugins/NAME/generations/<signed-manifest SHA3-512> with the executable at mode "
     "0555. It does not change the current link. Unsigned, untrusted or "
     "altered plugins are refused with a PLUGIN_* code and the next action.",
     ZCL_COMMAND_RESULT_BUDGET,

@@ -158,16 +158,21 @@ static unsigned char *prt_image(const char *mode, const char *tag, size_t *len)
     return img;
 }
 
-static void prt_sign(const struct prt_env *e, const char *manifest, char sig_hex[129])
+static void prt_digest(const char *manifest, unsigned char digest[64])
 {
     static const unsigned char domain[] = "z23.plugin.manifest.v1";
-    unsigned char digest[64];
-    uint8_t sig[64];
     struct sha3_512_ctx ctx;
     sha3_512_init(&ctx);
     sha3_512_write(&ctx, domain, sizeof(domain));
     sha3_512_write(&ctx, (const unsigned char *)manifest, strlen(manifest));
     sha3_512_finalize(&ctx, digest);
+}
+
+static void prt_sign(const struct prt_env *e, const char *manifest, char sig_hex[129])
+{
+    unsigned char digest[64];
+    uint8_t sig[64];
+    prt_digest(manifest, digest);
     zcl_ed25519_sign(sig, digest, sizeof(digest), e->sk, e->pk);
     prt_hex(sig, 64, sig_hex);
 }
@@ -178,13 +183,16 @@ static bool prt_publish_bytes(struct prt_env *e, const char *name, const unsigne
                               size_t len, const char *caps, char gen[PRT_HEX])
 {
     unsigned char digest[64];
-    char sig_hex[129], pub[65], manifest[1024], doc[512], path[PATH_MAX], leaf[96];
+    char exe_hex[PRT_HEX], sig_hex[129], pub[65], manifest[1024], doc[512], path[PATH_MAX], leaf[96];
     zcl_sha3_512(img, len, digest);
-    prt_hex(digest, 64, gen);
+    prt_hex(digest, 64, exe_hex);
     snprintf(manifest, sizeof(manifest),
              "{\"schema\":\"z23.plugin.v1\",\"name\":\"%s\",\"version\":\"1.0.0\","
              "\"interface_version\":1,\"sha3_512\":\"%s\",\"capabilities\":[%s]}",
-             name, gen, caps);
+             name, exe_hex, caps);
+    /* the generation id is the signed manifest digest, covering the capabilities */
+    prt_digest(manifest, digest);
+    prt_hex(digest, 64, gen);
     prt_sign(e, manifest, sig_hex);
     prt_hex(e->pk, 32, pub);
     snprintf(doc, sizeof(doc),
@@ -300,6 +308,12 @@ static bool prt_new_pid(const struct plugin_run_info *i, const void *ctx)
 static bool prt_exit_code(const struct plugin_run_info *i, const void *ctx)
 {
     return i->last_exit_code == *(const int *)ctx;
+}
+
+static bool prt_file_exists(const struct plugin_run_info *i, const void *ctx)
+{
+    (void)i;
+    return access((const char *)ctx, F_OK) == 0;
 }
 
 static bool prt_waiting(const struct plugin_run_info *i, const void *ctx)
@@ -714,6 +728,43 @@ static int prt_case_fd_layout(void)
     return failures;
 }
 
+static int prt_case_permission_update(void)
+{
+    int failures = 0;
+    struct prt_env e;
+    struct plugin_run *wide = NULL, *narrow = NULL;
+    bool ready = prt_env_open(&e);
+    TEST_CASE("a narrowed manifest for the same executable no longer grants writes") {
+        char g1[PRT_HEX], g2[PRT_HEX], dir[PATH_MAX], w[PATH_MAX];
+        int granted = 0, eacces = EACCES;
+        struct plugin_run_info info;
+        ASSERT(ready);
+        ASSERT(prt_install(&e, "perm", "readonly", "p1", PRT_FS, g1));
+        ASSERT(prt_join(dir, sizeof(dir), e.root, "perm"));
+        ASSERT(prt_join(w, sizeof(w), dir, "data/w.txt"));
+        wide = prt_open(&e, "perm");
+        ASSERT(wide != NULL);
+        /* last_exit_code starts at 0, so wait for the write itself */
+        ASSERT(prt_wait(&wide, 1, 0, prt_file_exists, w, 5000));
+        ASSERT(prt_wait(&wide, 1, 0, prt_exit_code, &granted, 5000));
+        plugin_run_close(wide);
+        wide = NULL;
+        ASSERT_EQ(unlink(w), 0);
+        ASSERT(prt_install(&e, "perm", "readonly", "p1", "\"fs.read\",\"clock\"", g2));
+        ASSERT(strcmp(g1, g2) != 0);
+        narrow = prt_open(&e, "perm");
+        ASSERT(narrow != NULL);
+        ASSERT(prt_wait(&narrow, 1, 0, prt_exit_code, &eacces, 5000));
+        plugin_run_info_get(narrow, &info);
+        ASSERT_STR_EQ(info.generation, g2);
+        ASSERT(access(w, F_OK) != 0);
+    } TEST_END
+    plugin_run_close(wide);
+    plugin_run_close(narrow);
+    prt_env_close(&e);
+    return failures;
+}
+
 static int prt_case_swapped_executable(void)
 {
     int failures = 0;
@@ -1120,6 +1171,7 @@ int test_plugin_run(void)
     failures += prt_case_forbidden_calls();
     failures += prt_case_landlock_files();
     failures += prt_case_fd_layout();
+    failures += prt_case_permission_update();
     failures += prt_case_swapped_executable();
     failures += prt_case_fd_slots();
     failures += prt_case_kill_backoff();

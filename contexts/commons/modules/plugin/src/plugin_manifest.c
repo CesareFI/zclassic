@@ -323,6 +323,10 @@ enum plugin_status plugin_verify_manifest(const char *manifest, size_t manifest_
     if (st != PLUGIN_OK)
         return st;
     plugin_manifest_digest(manifest, manifest_len, digest);
-    return ed25519_verify(sg, digest, sizeof(digest), pk) ? PLUGIN_OK
-                                                          : PLUGIN_ERR_SIG_BAD;
+    if (!ed25519_verify(sg, digest, sizeof(digest), pk))
+        return PLUGIN_ERR_SIG_BAD;
+    /* The signed digest covers the capabilities and the executable hash, so it
+     * names the grant, not just the bytes. */
+    zcl_hex_encode(digest, sizeof(digest), out->generation);
+    return PLUGIN_OK;
 }

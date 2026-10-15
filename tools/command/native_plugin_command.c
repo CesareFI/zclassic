@@ -206,13 +206,13 @@ void zcl_native_handle_plugin_install(const struct zcl_command_request *request,
     (void)json_push_kv_str(&reply->data, "name", m.name);
     (void)json_push_kv_str(&reply->data, "version", m.version);
     (void)json_push_kv_int(&reply->data, "interface_version", m.interface_version);
-    (void)json_push_kv_str(&reply->data, "generation", m.exe_sha3);
+    (void)json_push_kv_str(&reply->data, "generation", m.generation);
     (void)json_push_kv_bool(&reply->data, "already_present", present != 0);
     plg_push_capabilities(&reply->data, m.capabilities);
     reply->error.mutated = present == 0;
     char input[256];
     (void)snprintf(input, sizeof(input), "{\"name\":\"%s\",\"generation\":\"%s\"}",
-                   m.name, m.exe_sha3);
+                   m.name, m.generation);
     (void)zcl_command_reply_add_next(reply, "plugin.switch", input,
                                      "make this generation current");
 }
