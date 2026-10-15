@@ -19,13 +19,6 @@ struct platform_private_file_identity {
   uint64_t file;
 };
 
-/* Metadata of one path or held file. Equal states taken under the caller's
- * serialization mean the same inode with unchanged size and timestamps. */
-struct platform_private_path_state {
-  uint64_t volume, file, size, mode, owner, links;
-  int64_t modified_ns, changed_ns;
-};
-
 void platform_private_file_init(struct platform_private_file *file);
 bool platform_private_file_create(const char *path,
                                   struct platform_private_file *file);
@@ -89,11 +82,6 @@ bool platform_private_file_retire_if_identity(
     const struct platform_private_file_identity *expected);
 bool platform_private_file_identity(struct platform_private_file *file,
                                     struct platform_private_file_identity *id);
-/* lstat / fstat metadata. POSIX only: Windows refuses so callers fall back. */
-bool platform_private_path_state(const char *path,
-                                 struct platform_private_path_state *state);
-bool platform_private_file_state(struct platform_private_file *file,
-                                 struct platform_private_path_state *state);
 
 /* Resolve an existing absolute parent and append the original leaf. */
 bool platform_private_path_resolve(const char *path, char *resolved,

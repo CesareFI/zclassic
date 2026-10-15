@@ -3,7 +3,7 @@
 #ifndef ZCL_MODELS_DEVICE_PAIRING_H
 #define ZCL_MODELS_DEVICE_PAIRING_H
 #include "models/activerecord.h"
-#include "platform/private_file.h"
+#include "platform/private_file_state.h"
 #include <stdbool.h>
 #include <stdint.h>
 

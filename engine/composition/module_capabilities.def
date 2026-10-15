@@ -865,6 +865,7 @@ ZCL_MODULE_CAPABILITY("platform/modules/platform/src/positioned_io.c", CAP_FS_RE
 ZCL_MODULE_CAPABILITY("platform/modules/platform/src/private_destination.c", CAP_FS_WRITE, "")
 ZCL_MODULE_CAPABILITY("platform/modules/platform/src/private_directory.c", CAP_FS_WRITE|CAP_FS_READ, "")
 ZCL_MODULE_CAPABILITY("platform/modules/platform/src/private_file.c", CAP_FS_WRITE|CAP_FS_READ|CAP_PRIVILEGE, "exclusive-create, lock, and durable-retire operations on a private file: reaches the kernel directly via syscall() for the no-clobber rename glibc does not expose under strict C23 flags")
+ZCL_MODULE_CAPABILITY("platform/modules/platform/src/private_file_state.c", CAP_FS_READ, "lstat()/fstat() metadata of a private path or held private file so callers can revalidate an earlier authority check without reopening it")
 ZCL_MODULE_CAPABILITY("platform/modules/platform/src/process_lifecycle.c", CAP_FS_WRITE|CAP_PROCESS|CAP_CLOCK|CAP_FS_READ, "shell-free hidden process lifecycle operations: launches and manages a child process and reads its /proc state")
 ZCL_MODULE_CAPABILITY("platform/modules/platform/src/ram_scratch.c", CAP_FS_READ|CAP_FS_WRITE|CAP_PROCESS, "lease_sum_live() probes a lease-holder pid with kill(pid, 0) to detect and reclaim a scratch lease whose process is gone")
 ZCL_MODULE_CAPABILITY("platform/modules/platform/src/read_mapping.c", CAP_FS_READ, "")
