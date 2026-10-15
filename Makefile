@@ -16314,8 +16314,8 @@ $(TUNNEL_EXPORT_BINDING): tools/native_tunnel_sources.def Makefile
 	@set -eu; descriptor_hash=$$(sha256sum tools/native_tunnel_sources.def | awk '{print $$1}'); \
 	test "$${#descriptor_hash}" -eq 64; \
 	tmp="$$(mktemp "$@.XXXXXX")"; trap 'rm -f "$$tmp"' EXIT HUP INT TERM; \
-	printf '%s\n' '/* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0 */' \
-	 '/* purpose: Generated exact tunnel descriptor binding; make native-tunnel-export-binding. */' \
+	printf '%s\n' '/* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0' \
+	 ' * purpose: Generated exact tunnel descriptor binding; make native-tunnel-export-binding. */' \
 	 '#ifndef ZCL_NATIVE_TUNNEL_EXPORT_BINDING_H' '#define ZCL_NATIVE_TUNNEL_EXPORT_BINDING_H' \
 	 "#define TUNNEL_DESCRIPTOR_SHA256 \"$$descriptor_hash\"" '#endif' > "$$tmp"; \
 	if cmp -s "$$tmp" "$@"; then rm -f "$$tmp"; else mv -f "$$tmp" "$@"; fi; \
@@ -16323,8 +16323,8 @@ $(TUNNEL_EXPORT_BINDING): tools/native_tunnel_sources.def Makefile
 check-native-tunnel-export-binding:
 	@set -eu; descriptor_hash=$$(sha256sum tools/native_tunnel_sources.def | awk '{print $$1}'); \
 	test "$${#descriptor_hash}" -eq 64; \
-	printf '%s\n' '/* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0 */' \
-	 '/* purpose: Generated exact tunnel descriptor binding; make native-tunnel-export-binding. */' \
+	printf '%s\n' '/* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0' \
+	 ' * purpose: Generated exact tunnel descriptor binding; make native-tunnel-export-binding. */' \
 	 '#ifndef ZCL_NATIVE_TUNNEL_EXPORT_BINDING_H' '#define ZCL_NATIVE_TUNNEL_EXPORT_BINDING_H' \
 	 "#define TUNNEL_DESCRIPTOR_SHA256 \"$$descriptor_hash\"" '#endif' | cmp - $(TUNNEL_EXPORT_BINDING)
 TUNNEL_EXPORT_HELPER_SRCS = tools/dev/native_tunnel_export.c \
