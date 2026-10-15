@@ -232,3 +232,7 @@ later lane flips it HARD.
 - 2026-10-14T22:47:31Z — REASON: Quarantine plaintext inbound links from bit-26 peers until the dialer upgrades
   old ROOT: 8320d67a5ccc0e220f0177df882b7573505a921b545295ee076aadb731a61bac
   by: owner unseal ritual (make core-unseal)
+
+- 2026-10-15T05:17:49Z — REASON: Metadata-only tunnel SHA3 dependency integration on published plugin/network base bb0a6f6; existing owner grant claude-laptop20534 and checkpoint order20813; dependency root1b3367c246712769a812464153dacfda27eb03ed3705e73370a03805524d025d unchanged from reported grant; no core implementation edit
+  old ROOT: 1288a6fed3f3bac8627269f4f6ca089e92a104445e331874296af53a1067af90
+  by: owner unseal ritual (make core-unseal)
