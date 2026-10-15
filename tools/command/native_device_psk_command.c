@@ -35,7 +35,14 @@ static void psk_refuse(struct zcl_command_reply *reply, enum zcl_command_exit ex
         message, "absent key path inside an existing owner-private (0700) directory");
 }
 
-enum psk_write { PSK_WRITTEN, PSK_EXISTS, PSK_IO, PSK_UNSUPPORTED };
+enum psk_write { PSK_WRITTEN, PSK_EXISTS, PSK_IO, PSK_UNCERTAIN, PSK_UNSUPPORTED };
+
+/* Test-only failure injection after the file exists: bit 0 fails the write,
+ * bit 1 fails the cleanup unlink. */
+static unsigned psk_fault_for_test;
+#if defined(ZCL_TESTING)
+void zcl_native_device_psk_fault_for_test(unsigned mask) { psk_fault_for_test = mask; }
+#endif
 
 #if !defined(_WIN32)
 #include <errno.h>
@@ -53,11 +60,13 @@ static enum psk_write psk_write_new(uintptr_t parent_handle, const char *leaf, c
     int parent = (int)parent_handle;
     int fd = openat(parent, leaf, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_NOCTTY | O_CLOEXEC, 0600);
     if (fd < 0) return errno == EEXIST || errno == ELOOP ? PSK_EXISTS : PSK_IO;
-    bool ok = write(fd, key, 32) == 32 && fchmod(fd, 0600) == 0 && fsync(fd) == 0;
+    bool ok = !(psk_fault_for_test & 1u) && write(fd, key, 32) == 32 && fchmod(fd, 0600) == 0 && fsync(fd) == 0;
     ok = close(fd) == 0 && ok;
     ok = ok && fsync(parent) == 0;
-    if (!ok) (void)unlinkat(parent, leaf, 0);
-    return ok ? PSK_WRITTEN : PSK_IO;
+    if (ok) return PSK_WRITTEN;
+    /* The file exists: only a confirmed unlink may claim "no key left". */
+    bool removed = !(psk_fault_for_test & 2u) && unlinkat(parent, leaf, 0) == 0;
+    return removed ? PSK_IO : PSK_UNCERTAIN;
 #else
     (void)parent_handle; (void)leaf; (void)key;
     return PSK_UNSUPPORTED;
@@ -99,6 +108,9 @@ static bool psk_written(struct zcl_command_reply *reply, enum psk_write written)
     else if (written == PSK_UNSUPPORTED)
         psk_refuse(reply, ZCL_COMMAND_EXIT_BLOCKED, "PSK_UNSUPPORTED", false,
             "durable private key creation is unsupported on Windows");
+    else if (written == PSK_UNCERTAIN)
+        psk_refuse(reply, ZCL_COMMAND_EXIT_FAILED, "PSK_KEY_CLEANUP_UNCERTAIN", true,
+            "key file was created but could not be made durable or removed; inspect and delete it before retry");
     else if (written != PSK_WRITTEN)
         psk_refuse(reply, ZCL_COMMAND_EXIT_FAILED, "PSK_KEY_IO", false,
             "entropy or durable write failed; no key file was left behind");

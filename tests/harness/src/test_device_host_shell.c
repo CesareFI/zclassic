@@ -188,6 +188,39 @@ static int shell_psk_new(void)
     return failures;
 }
 
+static int shell_psk_cleanup_honesty(void)
+{
+    int failures = 0;
+    char directory[1024] = {0};
+    struct zcl_command_reply reply = {0};
+    TEST_CASE("device_host_shell: psk.new never claims no key left when cleanup fails") {
+        ASSERT(test_mkdtemp(directory, sizeof(directory), "device-host-psk-io"));
+        char gone[1200], left[1200];
+        struct stat st;
+        snprintf(gone, sizeof(gone), "%s/gone.psk", directory);
+        snprintf(left, sizeof(left), "%s/left.psk", directory);
+        /* Write fails, unlink works: the file is really gone. */
+        zcl_native_device_psk_fault_for_test(1u);
+        ASSERT(psk_new_call(gone, &reply));
+        ASSERT_STR_EQ(reply.error.code, "PSK_KEY_IO");
+        ASSERT(!reply.error.mutated);
+        ASSERT(lstat(gone, &st) != 0);
+        zcl_command_reply_free(&reply); memset(&reply, 0, sizeof(reply));
+        /* Write and unlink both fail: a file remains, so the reply says so. */
+        zcl_native_device_psk_fault_for_test(3u);
+        ASSERT(psk_new_call(left, &reply));
+        zcl_native_device_psk_fault_for_test(0);
+        ASSERT_EQ(reply.status, ZCL_COMMAND_STATUS_FAILED);
+        ASSERT_STR_EQ(reply.error.code, "PSK_KEY_CLEANUP_UNCERTAIN");
+        ASSERT(reply.error.mutated);
+        ASSERT(lstat(left, &st) == 0);
+    } TEST_END
+    zcl_native_device_psk_fault_for_test(0);
+    zcl_command_reply_free(&reply);
+    if (directory[0]) test_rm_rf(directory);
+    return failures;
+}
+
 static bool shell_argv_equal(const struct zcl_native_host_shell_argv *plan, const char *const *want, size_t count)
 {
     if (plan->argc != count || plan->argv[count] != NULL) return false;
@@ -298,7 +331,7 @@ int test_device_host_shell(void)
 {
     int failures = shell_receiver_unit();
 #if defined(__linux__)
-    failures += shell_input_file() + shell_psk_fingerprint() + shell_psk_new();
+    failures += shell_input_file() + shell_psk_fingerprint() + shell_psk_new() + shell_psk_cleanup_honesty();
     failures += shell_dry_run_argv() + shell_injection_refused() + shell_package_hangup_race();
 #endif
     return failures;

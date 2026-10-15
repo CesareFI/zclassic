@@ -396,6 +396,11 @@ void zcl_native_handle_ops_mesh_device_host_runtime(const struct zcl_command_req
 void zcl_native_handle_ops_mesh_device_psk_new(const struct zcl_command_request *request,
     struct zcl_command_reply *reply);
 void zcl_native_device_psk_fingerprint(const uint8_t key[32], char out[17]);
+#if defined(ZCL_TESTING)
+/* Failure injection after the key file exists: bit 0 fails the write, bit 1
+ * fails the cleanup unlink. Zero restores normal behavior. */
+void zcl_native_device_psk_fault_for_test(unsigned mask);
+#endif
 /* ops.mesh.device.host.shell (tools/command/native_device_host_shell.c): a
  * raw pre-boot leaf that execvp()s a FIXED ssh argv whose ProxyCommand is
  * this binary's `ops mesh device host client --input-file=<route_input>`.
