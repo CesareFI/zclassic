@@ -584,6 +584,7 @@ ZCL_MODULE_CAPABILITY("engine/composition/src/boot_mesh_machines_rpc.c", CAP_FS_
 ZCL_MODULE_CAPABILITY("engine/composition/src/boot_mesh_pairing.c", CAP_FS_WRITE, "")
 ZCL_MODULE_CAPABILITY("engine/composition/src/boot_mesh_status.c", CAP_FS_WRITE, "")
 ZCL_MODULE_CAPABILITY("engine/composition/src/boot_mesh_status_refresh.c", CAP_FS_WRITE, "")
+ZCL_MODULE_CAPABILITY("engine/composition/src/boot_mesh_status_plugins.c", CAP_FS_READ, "stats the plugin store and lists installed generations on the refresh tick, off the P2P path")
 ZCL_MODULE_CAPABILITY("engine/composition/src/boot_mesh_status_requester.c", CAP_NONE, "")
 ZCL_MODULE_CAPABILITY("engine/composition/src/boot_mesh_terminal.c", CAP_FS_WRITE, "")
 ZCL_MODULE_CAPABILITY("engine/composition/src/boot_mesh_terminal_client.c", CAP_FS_WRITE, "")
