@@ -74,17 +74,17 @@ z23 discover schema <path> --side=input|output
 
 | Catalog fact | Count |
 |---|---|
-| Registry entries (branches + leaves) | 948 |
+| Registry entries (branches + leaves) | 951 |
 | Top-level roots | 15 |
-| Branches | 206 |
-| Leaves (dispatchable command paths) | 742 |
-| … `ready` (live handler in this build) | 649 |
+| Branches | 207 |
+| Leaves (dispatchable command paths) | 744 |
+| … `ready` (live handler in this build) | 651 |
 | … `compat` (metadata only, names a fallback) | 63 |
 | … `planned` (fail-closed BLOCKED, exit 3) | 30 |
 | … dev-gated 🔧 (`ready` only in `z23-dev`) | 62 |
-| Leaves with `effect=mutate` | 284 |
+| Leaves with `effect=mutate` | 286 |
 | Leaves with `effect=destructive` | 6 |
-| Leaves requiring **owner** authority | 148 |
+| Leaves requiring **owner** authority | 150 |
 
 Per source file:
 
@@ -95,7 +95,7 @@ Per source file:
 | `engine/composition/commands/apps.def` | 20 | 4 | 16 |
 | `engine/composition/commands/app_features.def` | 75 | 20 | 55 |
 | `engine/composition/commands/store.def` | 19 | 0 | 19 |
-| `engine/composition/commands/ops.def` | 72 | 14 | 58 |
+| `engine/composition/commands/ops.def` | 75 | 15 | 60 |
 | `engine/composition/commands/dev.def` | 128 | 23 | 105 |
 | `engine/composition/commands/code.def` | 34 | 4 | 30 |
 | `engine/composition/commands/accounts.def` | 11 | 2 | 9 |
@@ -1022,12 +1022,19 @@ represented by its children's sections.
 | `ops mesh device revoke` | ready | mutate / app-write / **owner**, plan-commit · foreground/low | **`directory`**, **`peer_key`**, `fingerprint`, `expected_root` | `zcl.device.grant.v1` | `z23 ops mesh device revoke --input=<explicit-json>` | Inspect or approve exact offline grant revocation |
 | `ops mesh device prepare-secret` | ready | mutate / app-write / **owner**, plan-commit · foreground/low | **`directory`**, **`peer_key`**, `capability`, `backend`, `destination`, `confirm` | `zcl.device.secret-source.v1` | `z23 ops mesh device prepare-secret --input=<explicit-json>` | Prepare one private pair-purpose import source |
 
+#### `ops.mesh.device.psk` — HOST hash-PSK secret files
+
+| Command | Avail | Policy | Input keys (**required**) | Output schema | Example | Summary |
+|---|---|---|---|---|---|---|
+| `ops mesh device psk new` | ready | mutate / app-write / **owner** · fast/low | **`key`** | `zcl.device.psk.new.v1` | `z23 ops mesh device psk new --key=<absent path in a private dir>` | Create a new 32-byte HOST PSK file and print its fingerprint |
+
 #### `ops.mesh.device.host` — Foreground owner-approved hash-PSK host transport
 
 | Command | Avail | Policy | Input keys (**required**) | Output schema | Example | Summary |
 |---|---|---|---|---|---|---|
 | `ops mesh device host client` | ready | mutate / app-write / **owner**, plan-commit · foreground/low | **`directory`**, **`peer_key`**, `expected_root`, `target_port`, `route_id`, `route_address`, `route_port`, `connect_ms`, `handshake_ms`, `session_ms`, `idle_ms`, `confirm` | `zcl.device.host.raw.v1` | `z23 ops mesh device host client --input=<explicit-json>` | Run one raw foreground selected-route HOST client |
 | `ops mesh device host receiver` | ready | mutate / app-write / **owner**, plan-commit · foreground/low | **`directory`**, **`peer_key`**, `expected_root`, `target_port`, `route_id`, `listen_address`, `listen_port`, `allow_external`, `lifetime_ms`, `handshake_ms`, `session_ms`, `idle_ms`, `max_active`, `max_sessions`, `confirm` | `zcl.device.host.raw.v1` | `z23 ops mesh device host receiver --input=<explicit-json>` | Run a finite foreground receiver for one exact HOST pair/root |
+| `ops mesh device host shell` | ready | mutate / app-write / **owner**, plan-commit · foreground/low | **`user`**, **`host`**, **`route_input`**, `dry_run` | `zcl.device.host.shell.v1` | `z23 ops mesh device host shell --input=<explicit-json>` | Open an ssh shell through the HOST tunnel in one command |
 
 #### `ops.mesh.device.host.package` — Exact installed HOST tunnel execution
 
