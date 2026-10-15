@@ -750,7 +750,7 @@ static int gw_t_handshake(void)
         const char *const obligations[] = {
             "cursor_token", "idempotency_key",
             "reconcile before retrying", "granted scope",
-            "publication authority"
+            "publication authority", "Omit grant", "Authorization", "caller.sender"
         };
         for (size_t i = 0; i < sizeof(obligations) / sizeof(obligations[0]); i++)
             ASSERT(strstr(instructions, obligations[i]) != NULL);
@@ -783,7 +783,15 @@ static int gw_t_handshake(void)
             const struct json_value *tool = json_at(tools, i);
             ASSERT_STR_EQ(json_get_str(json_get(tool, "name")), names[i]);
             ASSERT_STR_EQ(json_get_str(json_get(tool, "title")), titles[i]);
-            ASSERT(json_get(tool, "inputSchema") != NULL);
+            const struct json_value *schema = json_get(tool, "inputSchema");
+            ASSERT(schema != NULL);
+            const struct json_value *grant = json_get(json_get(schema, "properties"), "grant");
+            const char *credential = json_get_str(json_get(grant, "description"));
+            ASSERT(credential != NULL);
+            ASSERT(strstr(credential, "Omit when Authorization") != NULL);
+            ASSERT(strstr(credential, "credential token") != NULL);
+            ASSERT(strstr(credential, "caller.sender") != NULL);
+            ASSERT(strstr(credential, "agent label") != NULL);
         }
         const char *send_description =
             json_get_str(json_get(json_at(tools, 1), "description"));
@@ -3918,6 +3926,22 @@ static int gw_t_auth(void)
         ASSERT(b != NULL);
         ASSERT(gw_body_has(b, "\"code\":-32002"));
         ASSERT(gw_body_has(b, "conflicting grants"));
+        free(b);
+        /* A sender label is not the credential carried by Authorization. */
+        sn = snprintf(args, sizeof(args),
+                      "{\"jsonrpc\":\"2.0\",\"id\":25,\"method\":\"tools/"
+                      "call\",\"params\":{\"name\":\"steer_brief\","
+                      "\"arguments\":{\"grant\":\"%s\"}}}", GW_SENDER);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(args));
+        b = gw_post_auth("/steer", args, gid, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "\"code\":-32002"));
+        ASSERT(gw_body_has(b, "conflicting grants"));
+        ASSERT(gw_body_has(b, "GRANT_ARGUMENT_CONFLICT"));
+        ASSERT(gw_body_has(b, "omit grant when Authorization"));
+        ASSERT(gw_body_has(b, "caller.sender"));
+        ASSERT(!gw_body_has(b, gid));
+        ASSERT(!gw_body_has(b, GW_SENDER));
         free(b);
         /* Non-token bytes in the header: refused, never forwarded. */
         b = gw_post_auth("/steer",
