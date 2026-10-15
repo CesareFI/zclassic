@@ -903,6 +903,124 @@ _test_next:;
 #endif /* !defined(_WIN32) */
 
 #if !defined(_WIN32)
+/* Post (engine, model) as a leaf row, run next against the fake harness,
+ * wait for the run, and copy the argv the harness received (one argument
+ * per line, harness name excluded). False when anything on the way fails. */
+static bool dvx_engine_argv(const char *tag, const char *name,
+                            const char *engine, const char *model,
+                            int64_t attempt, char *argv, size_t cap)
+{
+    struct dvx_call c;
+    char bindir[512], wt[512], qd[1100], receipt[1300], argvlog[1300];
+    char path[9000], binTag[64], wtTag[64];
+    FILE *f;
+    size_t n;
+    bool ok = false;
+    (void)snprintf(binTag, sizeof(binTag), "%sbin", tag);
+    (void)snprintf(wtTag, sizeof(wtTag), "%swt", tag);
+    dvx_isolate(tag);
+    if (!dvx_fake_on_path(binTag, bindir, sizeof(bindir)) ||
+        !dvx_pool(wtTag, wt, sizeof(wt)))
+        goto out;
+    (void)snprintf(path, sizeof(path), "%s:%s", bindir, g_dvx_saved_path);
+    setenv("PATH", path, 1);
+    dvx_post(&c, "leaf", name, NULL, NULL, NULL, model, attempt);
+    if (engine)
+        (void)json_push_kv_str(&c.input, "engine", engine);
+    if (!dvx_run(&c) || !dvx_ok(&c)) {
+        dvx_end(&c);
+        goto out;
+    }
+    dvx_end(&c);
+    dvx_verb(&c, "next", false);
+    if (!dvx_run(&c) || !dvx_ok(&c)) {
+        dvx_end(&c);
+        goto out;
+    }
+    dvx_end(&c);
+    dvx_queuedir(qd, sizeof(qd));
+    (void)snprintf(receipt, sizeof(receipt), "%s/../engine/%s/a%lld/receipt.json",
+                   qd, name, (long long)(attempt > 0 ? attempt : 1));
+    (void)snprintf(argvlog, sizeof(argvlog), "%s/../engine/%s/a%lld/argv.log",
+                   qd, name, (long long)(attempt > 0 ? attempt : 1));
+    if (!dvx_await_run(wt, receipt))
+        goto out;
+    f = fopen(argvlog, "r");
+    if (!f)
+        goto out;
+    n = fread(argv, 1, cap - 1, f);
+    argv[n] = '\0';
+    (void)fclose(f);
+    ok = true;
+out:
+    dvx_restore();
+    return ok;
+}
+
+/* One refused engine post: code is the reply's error code. */
+static bool dvx_engine_refused(const char *tag, const char *engine,
+                               const char *model, const char *code)
+{
+    struct dvx_call c;
+    bool ok;
+    dvx_isolate(tag);
+    dvx_post(&c, "leaf", "refused", NULL, NULL, NULL, model, -1);
+    (void)json_push_kv_str(&c.input, "engine", engine);
+    ok = dvx_run(&c) && !dvx_ok(&c) &&
+         strcmp(c.reply.error.code, code) == 0;
+    dvx_end(&c);
+    dvx_restore();
+    return ok;
+}
+
+static int dvx_engine_cases(void)
+{
+    int failures = 0;
+    char argv[4096];
+    TEST("queue: a claude-haiku row launches --engine claude-haiku, no glm model") {
+        ASSERT(dvx_engine_argv("engh", "claudeunit", "claude-haiku", NULL, -1,
+                               argv, sizeof(argv)));
+        ASSERT(strncmp(argv, "--engine\nclaude-haiku\n--task\n", 29) == 0);
+        ASSERT(strstr(argv, "glm") == NULL);
+        ASSERT(strstr(argv, "--model") == NULL);
+        PASS();
+    }
+    TEST("queue: a claude-sonnet row with its own model passes that model") {
+        ASSERT(dvx_engine_argv("engs", "sonunit", "claude-sonnet",
+                               "claude-sonnet-5-5", -1, argv, sizeof(argv)));
+        ASSERT(strncmp(argv, "--engine\nclaude-sonnet\n--model\n"
+                             "claude-sonnet-5-5\n--task\n", 53) == 0);
+        PASS();
+    }
+    TEST("queue: a row without engine keeps the glm argv byte for byte") {
+        ASSERT(dvx_engine_argv("engo", "oldunit", NULL, NULL, -1, argv,
+                               sizeof(argv)));
+        ASSERT(strncmp(argv, "--engine\nglm\n--model\nglm-5.3-flash\n--task\n",
+                       41) == 0);
+        ASSERT(dvx_engine_argv("engo3", "oldunit3", NULL, NULL, 3, argv,
+                               sizeof(argv)));
+        ASSERT(strncmp(argv, "--engine\nglm\n--model\nglm-5.3\n--task\n",
+                       36) == 0);
+        PASS();
+    }
+    TEST("queue: an unknown engine is refused at post") {
+        ASSERT(dvx_engine_refused("engu", "no-such-engine", NULL,
+                                  "UNKNOWN_ENGINE"));
+        PASS();
+    }
+    TEST("queue: a model from another engine's family is refused at post") {
+        ASSERT(dvx_engine_refused("engm", "claude-haiku", "glm-5.3-flash",
+                                  "ENGINE_MODEL_MISMATCH"));
+        ASSERT(dvx_engine_refused("engm2", "claude-haiku", "claude-sonnet-5-5",
+                                  "ENGINE_MODEL_MISMATCH"));
+        ASSERT(dvx_engine_refused("engm3", "glm", "claude-haiku-5-5",
+                                  "ENGINE_MODEL_MISMATCH"));
+        PASS();
+    }
+_test_next:;
+    return failures;
+}
+
 static int dvx_encoding_cases(void);
 static int dvx_receipt_cost_cases(void)
 {
@@ -1806,6 +1924,7 @@ int test_devagent_queue(void)
 
 #if !defined(_WIN32)
     failures += dvx_receipt_cost_cases();
+    failures += dvx_engine_cases();
 
     failures += dvx_receipt_root_cases();
     failures += dvx_unresolved_candidate_root_case();

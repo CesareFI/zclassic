@@ -28,6 +28,10 @@
  *            the repo or the state dir; stored as its absolute path.
  *   model    post only, optional model id, default picks flash until
  *            attempt 3, then the stronger model.
+ *   engine   post only, optional registered engine id (glm, glm-cli,
+ *            claude-haiku, claude-sonnet, ...). Absent means glm. With an
+ *            engine, next passes --engine and --model only if model is set;
+ *            a model outside the engine's family is refused at post.
  *   attempt  post only, optional integer >= 1, default 1.
  *   priority post only, optional integer 0..3 (P0 correctness/custody,
  *            P1 node, P2 apps, P3 infrastructure), default 3.
@@ -120,6 +124,7 @@
 #include "base/safe_alloc.h"
 #include "base/hex.h"
 #include "crypto/sha256.h"
+#include "engine/engine.h"
 #include "json/json.h"
 #include "platform/os_proc.h"
 #include "platform/positioned_file.h"
@@ -573,6 +578,7 @@ struct dvq_row {
     char path[512];
     char brief[4096];
     char model[160];
+    char engine[40]; /* registry id, "" for a pre-engine row (glm) */
     long long attempt;
     char state[24]; /* WAITING_EXTERNAL is 17 characters */
     char worktree[4096];
@@ -625,6 +631,7 @@ static bool dvq_encode_row(const struct dvq_row *r, char *out, size_t cap,
 {
     char esc_kind[32], esc_name[160], esc_group[160], esc_path[1024];
     char esc_brief[8192], esc_model[320], esc_ts[128], esc_state[32];
+    char esc_engine[96];
     char esc_wt[8192], esc_unit[256], esc_dep[512];
     int w;
     if (!r || !out || cap == 0)
@@ -640,6 +647,7 @@ static bool dvq_encode_row(const struct dvq_row *r, char *out, size_t cap,
         {r->path, esc_path, sizeof(esc_path)},
         {r->brief, esc_brief, sizeof(esc_brief)},
         {r->model, esc_model, sizeof(esc_model)},
+        {r->engine, esc_engine, sizeof(esc_engine)},
         {r->ts, esc_ts, sizeof(esc_ts)},
         {r->state, esc_state, sizeof(esc_state)},
         {r->worktree, esc_wt, sizeof(esc_wt)},
@@ -654,12 +662,13 @@ static bool dvq_encode_row(const struct dvq_row *r, char *out, size_t cap,
     w = snprintf(out, cap,
                  "{\"seq\":%lld,\"ts\":\"%s\",\"kind\":\"%s\",\"name\":\"%s\","
                  "\"group\":\"%s\",\"path\":\"%s\",\"brief\":\"%s\","
-                 "\"model\":\"%s\",\"attempt\":%lld,\"state\":\"%s\","
+                 "\"model\":\"%s\",\"engine\":\"%s\",\"attempt\":%lld,"
+                 "\"state\":\"%s\","
                  "\"worktree\":\"%s\",\"pid_or_unit\":\"%s\","
                  "\"started\":%lld,\"priority\":%lld,\"depends_on\":\"%s\","
                  "\"owner_pid\":%lld,\"owner_start\":%lld}\n",
                  r->seq, esc_ts, esc_kind, esc_name, esc_group, esc_path,
-                 esc_brief, esc_model, r->attempt, esc_state, esc_wt,
+                 esc_brief, esc_model, esc_engine, r->attempt, esc_state, esc_wt,
                  esc_unit, r->started, r->priority, esc_dep, r->owner_pid,
                  r->owner_start);
     if (w <= 0 || (size_t)w >= cap)
@@ -685,7 +694,8 @@ static bool dvq_snapshot_strings(const struct json_value *doc, struct dvq_row *r
     const struct { const char *key; size_t offset, cap; } strings[] = {
 #define DVQ_STRING(field) {#field, offsetof(struct dvq_row, field), sizeof(r->field)}
         DVQ_STRING(ts), DVQ_STRING(kind), DVQ_STRING(name), DVQ_STRING(group),
-        DVQ_STRING(path), DVQ_STRING(brief), DVQ_STRING(model), DVQ_STRING(state),
+        DVQ_STRING(path), DVQ_STRING(brief), DVQ_STRING(model), DVQ_STRING(engine),
+        DVQ_STRING(state),
         DVQ_STRING(worktree), DVQ_STRING(pid_or_unit), DVQ_STRING(depends_on)
 #undef DVQ_STRING
     };
@@ -925,12 +935,89 @@ static bool dvq_post_order(const struct zcl_command_request *req,
     return true;
 }
 
+/* A row with no engine is a pre-engine row: glm plus the row model or the
+ * attempt-tiered default, byte-for-byte as before. A row naming an engine
+ * passes a model only when it sets one. */
+static void dvq_select_model(const struct dvq_row *pick, char *model,
+                             size_t cap)
+{
+    const char *m = pick->model;
+    if (!m[0] && !pick->engine[0])
+        m = pick->attempt >= 3 ? "glm-5.3" : "glm-5.3-flash";
+    (void)snprintf(model, cap, "%s", m);
+}
+
+/* Harness --engine [--model] arguments; returns the new argv length. */
+static int dvq_engine_args(const struct dvq_row *pick, const char *model,
+                           const char **hargv, int n)
+{
+    hargv[n++] = "--engine";
+    hargv[n++] = pick->engine[0] ? pick->engine : "glm";
+    if (model[0]) {
+        hargv[n++] = "--model";
+        hargv[n++] = model;
+    }
+    return n;
+}
+
+static bool dvq_engine_ok(const char *s)
+{
+    size_t n = s ? strlen(s) : 0;
+    if (n == 0 || n > 32)
+        return false;
+    for (const char *p = s; *p; p++)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') ||
+              *p == '-'))
+            return false;
+    return true;
+}
+
+/* A posted engine must be a registered vendor id; a posted model must be one
+ * of that vendor's family (its default model up to the first "-<digit>"), so
+ * a claude engine can never be handed a glm model id. Rows without an engine
+ * keep the legacy glm dispatch and are not checked. */
+static bool dvq_engine_model_ok(const char *engine, const char *model,
+                                const char **msg, const char **why,
+                                const char **code)
+{
+    const struct engine_vendor *v;
+    char family[64];
+    size_t n = 0;
+    if (!engine)
+        return true;
+    v = dvq_engine_ok(engine) ? engine_by_id(engine) : NULL;
+    if (!v) {
+        *code = "UNKNOWN_ENGINE";
+        *msg = "engine is a registered engine id (glm, glm-cli, claude-haiku, "
+               "claude-sonnet, ...)";
+        *why = "input.engine not in the engine registry";
+        return false;
+    }
+    if (!model || !model[0] || !v->default_model)
+        return true;
+    while (v->default_model[n] && n + 1 < sizeof(family) &&
+           !(v->default_model[n] == '-' && v->default_model[n + 1] >= '0' &&
+             v->default_model[n + 1] <= '9')) {
+        family[n] = v->default_model[n];
+        n++;
+    }
+    family[n] = '\0';
+    if (strncmp(model, family, n) == 0 &&
+        (model[n] == '\0' || model[n] == '-'))
+        return true;
+    *code = "ENGINE_MODEL_MISMATCH";
+    *msg = "model does not belong to the named engine";
+    *why = "input.model is another engine's model family";
+    return false;
+}
+
 /* attempt, model and the READY-order inputs: each wrong shape refuses with
  * its own message, and nothing is stored. */
 static bool dvq_post_scalars(const struct zcl_command_request *req,
                              const char *name, const char *model,
-                             long long *attempt, struct dvq_row *r,
-                             const char **msg, const char **why)
+                             const char *engine, long long *attempt,
+                             struct dvq_row *r, const char **msg,
+                             const char **why, const char **code)
 {
     if (json_get(req->input, "attempt") && !dvq_attempt(req, attempt)) {
         *msg = "attempt is an integer attempt number, 1 or more";
@@ -942,6 +1029,16 @@ static bool dvq_post_scalars(const struct zcl_command_request *req,
         *why = "input.model misspelled";
         return false;
     }
+    if (json_get(req->input, "engine") && !engine) {
+        *code = "UNKNOWN_ENGINE";
+        *msg = "engine is a registered engine id";
+        *why = "input.engine is not a string";
+        return false;
+    }
+    if (!dvq_engine_model_ok(engine, model, msg, why, code))
+        return false;
+    if (engine)
+        (void)snprintf(r->engine, sizeof(r->engine), "%s", engine);
     *msg = "priority is 0..3 and depends_on names another queue row";
     return dvq_post_order(req, name, r, why);
 }
@@ -1010,7 +1107,7 @@ static void dvq_post(const struct zcl_command_request *req,
     char line[DVQ_LINE_CAP];
     char brief_abs[4096];
     char ts[64];
-    const char *kind, *name, *group, *path, *brief, *model;
+    const char *kind, *name, *group, *path, *brief, *model, *engine;
     long long attempt = 1;
     size_t len = 0;
     int lock = -1;
@@ -1045,11 +1142,13 @@ static void dvq_post(const struct zcl_command_request *req,
     path = dvq_str(req, "path");
     brief = dvq_str(req, "brief");
     model = dvq_str(req, "model");
+    engine = dvq_str(req, "engine");
     memset(&r, 0, sizeof(r));
     {
-        const char *msg = NULL, *why = NULL;
-        if (!dvq_post_scalars(req, name, model, &attempt, &r, &msg, &why)) {
-            dvq_fail(reply, "BAD_INPUT", "post", msg, why);
+        const char *msg = NULL, *why = NULL, *code = "BAD_INPUT";
+        if (!dvq_post_scalars(req, name, model, engine, &attempt, &r, &msg,
+                              &why, &code)) {
+            dvq_fail(reply, code, "post", msg, why);
             return;
         }
     }
@@ -2611,11 +2710,7 @@ static void dvq_next(const struct zcl_command_request *req,
     }
     /* Mark running before releasing the lock; the worktree fd stays open
      * across the spawn so the child inherits the lock. */
-    if (pick.model[0])
-        (void)snprintf(model, sizeof(model), "%s", pick.model);
-    else
-        (void)snprintf(model, sizeof(model), "%s",
-                       pick.attempt >= 3 ? "glm-5.3" : "glm-5.3-flash");
+    dvq_select_model(&pick, model, sizeof(model));
     doc = strcmp(pick.kind, "doc") == 0;
     if (!doc && strcmp(pick.kind, "file") != 0) {
         tmo = "1200";
@@ -2715,10 +2810,7 @@ static void dvq_next(const struct zcl_command_request *req,
     {
         int n = 0;
         hargv[n++] = harness;
-        hargv[n++] = "--engine";
-        hargv[n++] = "glm";
-        hargv[n++] = "--model";
-        hargv[n++] = model;
+        n = dvq_engine_args(&pick, model, hargv, n);
         hargv[n++] = "--task";
         hargv[n++] = taskpath;
         if (doc) {
@@ -3772,25 +3864,34 @@ static bool dvq_landed_types_ok(const struct json_value *arr,
  * priority and depends_on ride along. An allocation failure on any
  * nonempty source refuses the row: present metadata is never reported
  * absent. */
+/* The engine a row dispatches on: a pre-engine row is a glm row. */
+static const char *dvq_engine_label(const struct dvq_row *r)
+{
+    return r->engine[0] ? r->engine : "glm";
+}
+
 static bool dvq_push_row_metadata(struct json_value *item,
                                   const struct dvq_row *r, bool full)
 {
-    struct json_value gv, pv, bv, mv, dv;
+    struct json_value gv, pv, bv, mv, dv, ev;
     bool ok;
     /* Every value prepares unconditionally so all four stay safe to free. */
     ok = dvq_str_or_null(&gv, r->group);
     ok = dvq_str_or_null(&pv, r->path) && ok;
     ok = dvq_str_or_null(&bv, r->brief) && ok;
     ok = dvq_str_or_null(&mv, r->model) && ok;
+    ok = dvq_str_or_null(&ev, dvq_engine_label(r)) && ok;
     if (ok)
         ok = dvq_push_checked(item, "group", &gv) &&
              dvq_push_checked(item, "path", &pv) &&
              dvq_push_checked(item, "brief", &bv) &&
-             dvq_push_checked(item, "model", &mv);
+             dvq_push_checked(item, "model", &mv) &&
+             dvq_push_checked(item, "engine", &ev);
     json_free(&gv);
     json_free(&pv);
     json_free(&bv);
     json_free(&mv);
+    json_free(&ev);
     if (!ok || !full)
         return ok;
     ok = dvq_str_or_null(&dv, r->depends_on);
@@ -3845,15 +3946,16 @@ static int dvq_screen_queued(char *out, size_t cap, const struct dvq_row *rows,
     const char *ref = NULL;
     bool pending;
     if (dvq_row_gate(rows, n, i, opath, &dep, &ref))
-        return snprintf(out, cap, "  #%lld queued  %-12s a%-3lld\n", r->seq,
-                        r->name, r->attempt);
+        return snprintf(out, cap, "  #%lld queued  %-12s %-13s a%-3lld\n", r->seq,
+                        r->name, dvq_engine_label(r), r->attempt);
     if (dep.attempt <= 0)
         return snprintf(out, cap,
-                        "  #%lld queued  %-12s a%-3lld blocked by %s "
-                        "(absent)\n", r->seq, r->name, r->attempt, ref);
+                        "  #%lld queued  %-12s %-13s a%-3lld blocked by %s "
+                        "(absent)\n", r->seq, r->name, dvq_engine_label(r), r->attempt,
+                        ref);
     pending = strcmp(dep.state, "terminal") != 0;
-    return snprintf(out, cap, "  #%lld queued  %-12s a%-3lld %s %s a%lld %s\n",
-                    r->seq, r->name, r->attempt,
+    return snprintf(out, cap, "  #%lld queued  %-12s %-13s a%-3lld %s %s a%lld %s\n",
+                    r->seq, r->name, dvq_engine_label(r), r->attempt,
                     pending ? "waiting on" : "blocked by", ref, dep.attempt,
                     pending ? dep.state : dep.verdict);
 }
@@ -3923,13 +4025,13 @@ static int dvq_screen_row(char *out, size_t cap, const struct dvq_row *rows,
         age = now - r->started;
         if (age < 0)
             age = 0;
-        return snprintf(out, cap, "  #%lld %-7s %-12s a%-3lld %s age %llds\n",
-                        r->seq, "running", r->name, r->attempt, r->worktree,
+        return snprintf(out, cap, "  #%lld %-7s %-12s %-13s a%-3lld %s age %llds\n",
+                        r->seq, "running", r->name, dvq_engine_label(r), r->attempt, r->worktree,
                         age);
     }
     if (strcmp(r->state, "WAITING_EXTERNAL") == 0)
-        return snprintf(out, cap, "  #%lld WAITING_EXTERNAL %-12s a%-3lld %s\n",
-                        r->seq, r->name, r->attempt, r->depends_on);
+        return snprintf(out, cap, "  #%lld WAITING_EXTERNAL %-12s %-13s a%-3lld %s\n",
+                        r->seq, r->name, dvq_engine_label(r), r->attempt, r->depends_on);
     if (strcmp(r->state, "queued") == 0)
         return dvq_screen_queued(out, cap, rows, nrows, i, opath);
     return 0;

@@ -112,16 +112,28 @@ shell scripts.
 
 | Verb | Effect |
 | --- | --- |
-| `dev agent queue post --kind=<leaf\|doc\|file\|fix-gate> --name=<n>` | Appends one durable row and returns its sequence number at once. |
+| `dev agent queue post --kind=<leaf\|doc\|file\|fix-gate> --name=<n> [--engine=<id>] [--model=<m>]` | Appends one durable row and returns its sequence number at once. `--engine` is a registered engine id; a model outside that engine's family is refused. |
 | `dev agent queue next` | Takes the oldest queued row, finds a free warm worktree in the pool, and launches the harness detached. Returns the run or `no_free_worktree` or `empty`. Never waits for the run. |
 | `dev agent queue reap` | Records every new receipt as an outcome and requeues a rate-limit refusal with the next attempt number. Returns what it recorded. |
-| `dev agent queue status [--json]` | One screen: queued rows, running rows with worktree and age, recent outcomes, pool occupancy. |
+| `dev agent queue status [--json]` | One screen: queued rows, running rows with engine, worktree and age, recent outcomes, pool occupancy. |
 
 Kinds: `leaf` fixes one dev-agent leaf judged by its own group;
 `fix-gate` is the same shape for a free-form fix; `doc` writes one document
 from a brief with no group; `file` writes one file judged by `--group`.
 Doc and file units need `--path` (a repo-relative path) and `--brief` (an
 existing file inside the repo or the state dir).
+
+### Claude engines
+
+A row may name `engine`: `claude-haiku` or `claude-sonnet` feed Claude units
+through the same harness (`--engine <id>`); `glm`, `glm-cli` and any other
+registered engine work the same way. `next` passes `--model` only when the row
+sets one, otherwise the engine's own default applies (the attempt-3 glm
+escalation does not apply to a named engine). A row without `engine` is a glm
+row and dispatches exactly as before. An unknown engine is refused
+`UNKNOWN_ENGINE` and a model from another engine's family is refused
+`ENGINE_MODEL_MISMATCH`, both at post time. Claude engines cost money, and
+`next` passes the harness its dispatch consent, so post a Claude row deliberately.
 
 ### State
 
