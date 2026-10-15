@@ -1010,6 +1010,20 @@ ZCL_COMMAND_READY_COMMAND(
     ZCL_COMMAND_LATENCY_FOREGROUND, ZCL_COMMAND_COST_LOW, ZCL_COMMAND_CONFIRM_PLAN_COMMIT,
     ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE, ZCL_COMMAND_CAP_NONE,
     ZCL_COMMAND_TRAIT_NONE, zcl_native_handle_ops_mesh_device)
+ZCL_COMMAND_BRANCH("ops.mesh.device.psk", "ops.mesh.device", "HOST hash-PSK secret files", ZCL_COMMAND_LAYER_OPS)
+ZCL_COMMAND_READY_COMMAND(
+    "ops.mesh.device.psk.new", "ops.mesh.device.psk", "",
+    "Create a new 32-byte HOST PSK file and print its fingerprint",
+    "Writes 32 host CSPRNG bytes to a NEW file (O_CREAT|O_EXCL|O_NOFOLLOW, mode 0600) beneath an existing owner-private 0700 parent, then fsyncs file and directory. An existing path or symlink refuses with PSK_KEY_EXISTS. The reply carries only psk_fingerprint, the first 16 hex of domain-separated SHA3-256 over the key, never key bytes or path; commit secret_file shows the same fingerprint for out-of-band comparison. No grant, import or service.",
+    ZCL_COMMAND_RESULT_BUDGET, "mesh,device,host,psk,secret,keygen,offline",
+    "zcl.device.psk.new.input.v1", "zcl.device.psk.new.v1",
+    "key", "key",
+    "z23 ops mesh device psk new --key=<absent path in a private dir>",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_APP_WRITE,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW, ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE, ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_NONE, zcl_native_handle_ops_mesh_device_psk_new)
 ZCL_COMMAND_BRANCH("ops.mesh.device.host", "ops.mesh.device", "Foreground owner-approved hash-PSK host transport",
                    ZCL_COMMAND_LAYER_OPS)
 ZCL_COMMAND_READY_COMMAND(

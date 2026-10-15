@@ -197,7 +197,9 @@ static bool host_publication(struct json_value *data, enum device_pairing_public
     return json_push_kv_str(data, "publication", name);
 }
 /* Trusted ancestors/private parent are caller requirements, not hostile-path
- * confinement. Never expose the source path or a secret-derived identifier. */
+ * confinement. Never expose the source path. The only secret-derived output is
+ * psk_fingerprint (zcl_native_device_psk_fingerprint: 64 bits of a
+ * domain-separated SHA3-256), printed so both ends compare out of band. */
 #if !defined(_WIN32)
 static bool host_secret_read(const struct json_value *input, uint8_t secret[32])
 {
@@ -260,6 +262,8 @@ static bool host_psk_commit(const struct json_value *input, struct host_proposal
 #else
     uint8_t secret[32] = {0};
     bool read = host_secret_read(input, secret);
+    char fingerprint[17] = {0};
+    if (read) zcl_native_device_psk_fingerprint(secret, fingerprint);
     /* Source filesystem IO may block. Recheck the proposed interval after
      * reading and pass this same fresh sample to the current-grant check. */
     uint64_t now = read ? host_now() : 0;
@@ -271,6 +275,7 @@ static bool host_psk_commit(const struct json_value *input, struct host_proposal
     memory_cleanse(secret, sizeof(secret));
     reply->error.mutated = report.mutation_attempted;
     bool emitted = host_psk_publication(&reply->data, &report);
+    if (read) emitted = json_push_kv_str(&reply->data, "psk_fingerprint", fingerprint) && emitted;
     if (!read) return host_psk_failure(reply, "private owner-bound exact32 stable regular source required", &report);
     if (!active) return host_psk_failure(reply, "approved interval expired during private source acquisition", &report);
     if (!ok) return host_psk_failure(reply,

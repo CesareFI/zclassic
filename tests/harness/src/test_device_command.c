@@ -746,6 +746,10 @@ static int psk_commit_flow(struct psk_command_fixture *psk)
         ASSERT(reply_field_count(&reply, "publication") == 0);
         ASSERT(reply_bool(&reply, "mutation_attempted", true)); ASSERT(reply_bool(&reply, "intent_retired", true));
         ASSERT(psk_reply_public(&reply, psk->source));
+        /* The same public fingerprint psk.new prints for this source. */
+        uint8_t source_key[32]; char expect[17];
+        memset(source_key, 0x5a, sizeof(source_key)); zcl_native_device_psk_fingerprint(source_key, expect);
+        ASSERT(reply_is(&reply, "psk_fingerprint", expect));
         ASSERT(grant_inspect(&psk->host.profile, &row, root));
         ASSERT_EQ(row.host_scope.binding.backend_profile, 2);
         ASSERT_EQ(row.host_scope.binding.psk.key_epoch, (uint64_t)psk->epoch);

@@ -384,6 +384,14 @@ bool zcl_native_device_host_package_terminal_for_test(int64_t deadline_ns);
 #endif
 void zcl_native_handle_ops_mesh_device_host_runtime(const struct zcl_command_request *request,
     struct zcl_command_reply *reply);
+/* ops.mesh.device.psk.new (tools/command/native_device_psk_command.c): 32
+ * CSPRNG bytes into a NEW 0600 file beneath an owner-private parent. The
+ * reply carries only the fingerprint: the first 16 hex of SHA3-256 over a
+ * domain label, a NUL and the key. ops.mesh.device.commit shows the same
+ * fingerprint for the imported secret_file. */
+void zcl_native_handle_ops_mesh_device_psk_new(const struct zcl_command_request *request,
+    struct zcl_command_reply *reply);
+void zcl_native_device_psk_fingerprint(const uint8_t key[32], char out[17]);
 
 /* ── app.service.* — declared services (tools/command/native_service_command.c).
  * `list` and `inspect` read the compile-time zcl.service_binding.v1 catalog

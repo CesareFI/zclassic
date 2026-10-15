@@ -1,8 +1,11 @@
 /* Copyright 2026 Rhett Creighton. SPDX-License-Identifier: Apache-2.0
  * Purpose: fleet usability of the hash-PSK HOST tunnel: the supervised
- * receiver example unit and the --input-file source it reads. */
+ * receiver example unit, the --input-file source it reads and psk.new. */
 #include "test/test_core.h"
 #include "command/native_command.h"
+#include "config/command_catalog.h"
+#include "json/json.h"
+#include "base/hex.h"
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -81,6 +84,108 @@ static int shell_input_file(void)
     if (directory[0]) test_rm_rf(directory);
     return failures;
 }
+
+/* Drive the registered leaf exactly as dispatch would: catalog spec plus one
+ * {"key": path} input object. */
+static bool psk_new_call(const char *path, struct zcl_command_reply *reply)
+{
+    const struct zcl_command_spec *spec = zcl_command_registry_find(zcl_command_catalog(), "ops.mesh.device.psk.new", NULL);
+    if (!spec || spec->handler != zcl_native_handle_ops_mesh_device_psk_new) return false;
+    struct json_value input = {0};
+    json_set_object(&input);
+    bool pushed = json_push_kv_str(&input, "key", path);
+    zcl_command_reply_init(reply, spec->output_schema);
+    struct zcl_command_request request = {.spec = spec, .input = &input};
+    if (pushed) zcl_native_handle_ops_mesh_device_psk_new(&request, reply);
+    json_free(&input);
+    return pushed;
+}
+
+static const char *psk_reply_str(const struct zcl_command_reply *reply, const char *key)
+{
+    return json_get_str(json_get(&reply->data, key));
+}
+
+static int shell_psk_fingerprint(void)
+{
+    int failures = 0;
+    TEST_CASE("device_host_shell: psk fingerprint is a stable domain-separated SHA3-256 prefix") {
+        uint8_t key[32];
+        for (size_t i = 0; i < sizeof(key); ++i) key[i] = (uint8_t)i;
+        char first[17], second[17], prefix[65];
+        zcl_native_device_psk_fingerprint(key, first);
+        zcl_native_device_psk_fingerprint(key, second);
+        /* openssl dgst -sha3-256 over "z23.device.host.psk.fingerprint.v1\0" || 00..1f */
+        ASSERT_STR_EQ(first, "fa5ecb987676c68b");
+        ASSERT_STR_EQ(first, second);
+        zcl_hex_encode(key, 32, prefix);
+        ASSERT(strncmp(first, prefix, 16) != 0);
+        key[31] ^= 1;
+        zcl_native_device_psk_fingerprint(key, second);
+        ASSERT(strcmp(first, second) != 0);
+    } TEST_END
+    return failures;
+}
+
+static int shell_psk_new(void)
+{
+    int failures = 0;
+    char directory[1024] = {0};
+    struct zcl_command_reply reply = {0};
+    TEST_CASE("device_host_shell: psk.new creates one 0600 32-byte key and refuses reuse or symlink") {
+        ASSERT(test_mkdtemp(directory, sizeof(directory), "device-host-psk"));
+        char path[1200], link[1200], target[1200], hex[65];
+        snprintf(path, sizeof(path), "%s/host.psk", directory);
+        ASSERT(psk_new_call(path, &reply));
+        ASSERT_EQ(reply.status, ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(reply.error.mutated);
+        struct stat st;
+        ASSERT(lstat(path, &st) == 0);
+        ASSERT(S_ISREG(st.st_mode)); ASSERT_EQ(st.st_mode & 0777, 0600u); ASSERT_EQ(st.st_size, 32);
+        uint8_t key[32]; char expect[17];
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        ASSERT(fd >= 0);
+        ASSERT_EQ(read(fd, key, sizeof(key)), 32); close(fd);
+        zcl_native_device_psk_fingerprint(key, expect);
+        const char *fingerprint = psk_reply_str(&reply, "psk_fingerprint");
+        ASSERT(fingerprint != NULL); ASSERT_STR_EQ(fingerprint, expect);
+        zcl_hex_encode(key, 32, hex);
+        ASSERT(strncmp(fingerprint, hex, 16) != 0);
+        /* The reply names no key bytes and no path. */
+        char wire[1024];
+        ASSERT(json_write(&reply.data, wire, sizeof(wire)) > 0);
+        bool leaked = strstr(wire, hex) != NULL || strstr(wire, "host.psk") != NULL;
+        ASSERT(!leaked);
+        memset(key, 0, sizeof(key));
+        zcl_command_reply_free(&reply); memset(&reply, 0, sizeof(reply));
+
+        ASSERT(psk_new_call(path, &reply));
+        ASSERT_EQ(reply.status, ZCL_COMMAND_STATUS_FAILED);
+        ASSERT_STR_EQ(reply.error.code, "PSK_KEY_EXISTS");
+        ASSERT(!reply.error.mutated);
+        ASSERT(lstat(path, &st) == 0); ASSERT_EQ(st.st_size, 32);
+        zcl_command_reply_free(&reply); memset(&reply, 0, sizeof(reply));
+
+        snprintf(target, sizeof(target), "%s/absent-target", directory);
+        snprintf(link, sizeof(link), "%s/link.psk", directory);
+        ASSERT(symlink(target, link) == 0);
+        ASSERT(psk_new_call(link, &reply));
+        ASSERT_EQ(reply.status, ZCL_COMMAND_STATUS_FAILED);
+        ASSERT_STR_EQ(reply.error.code, "PSK_KEY_EXISTS");
+        ASSERT(lstat(target, &st) != 0);
+        zcl_command_reply_free(&reply); memset(&reply, 0, sizeof(reply));
+
+        ASSERT(chmod(directory, 0755) == 0);
+        snprintf(path, sizeof(path), "%s/open.psk", directory);
+        ASSERT(psk_new_call(path, &reply));
+        ASSERT_STR_EQ(reply.error.code, "PSK_KEY_PARENT_NOT_PRIVATE");
+        ASSERT(lstat(path, &st) != 0);
+        ASSERT(chmod(directory, 0700) == 0);
+    } TEST_END
+    zcl_command_reply_free(&reply);
+    if (directory[0]) { (void)chmod(directory, 0700); test_rm_rf(directory); }
+    return failures;
+}
 #endif
 
 int test_device_host_shell(void);
@@ -88,7 +193,7 @@ int test_device_host_shell(void)
 {
     int failures = shell_receiver_unit();
 #if defined(__linux__)
-    failures += shell_input_file();
+    failures += shell_input_file() + shell_psk_fingerprint() + shell_psk_new();
 #endif
     return failures;
 }
