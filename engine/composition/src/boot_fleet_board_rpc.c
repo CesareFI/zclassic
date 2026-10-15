@@ -903,7 +903,9 @@ static enum fleet_wiki_visit_result fb_find_visit(void *context,
     if (parsed == FLEET_WIKI_PARSE_ALLOC_FAILED) return FLEET_WIKI_VISIT_FAILED;
     if (parsed != FLEET_WIKI_PARSE_ENTRY) return FLEET_WIKI_VISIT_CONTINUE;
     enum fleet_wiki_visit_result status = FLEET_WIKI_VISIT_CONTINUE;
-    if (fleet_wiki_entry_query_matches(&entry, &c->query.filters))
+    struct fleet_wiki_entry_query filters = c->query.filters;
+    filters.slug = row->post.slug;
+    if (fleet_wiki_entry_query_matches(&entry, &filters))
         status = fb_find_emit(c, row, &entry);
     json_free(&entry);
     return status;

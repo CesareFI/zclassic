@@ -227,5 +227,6 @@ bool fleet_wiki_entry_query_matches(const struct json_value *entry,
     if (query->topic && query->topic[0] &&
         strcmp(json_get_str(json_get(entry, "topic")), query->topic)) return false;
     return wiki_query_applies(entry, query->applies_to) &&
-        fleet_wiki_entry_matches(entry, query->q);
+        (fleet_wiki_entry_matches(entry, query->q) ||
+         (query->slug && query->slug[0] && contains_folded(query->slug, query->q)));
 }

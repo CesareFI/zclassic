@@ -342,7 +342,7 @@ is read-only, local, never contacts a peer and never waits. It scans the
 newest revision of each page this node holds, **whoever signed it** (the same
 revision `fleet wiki read` returns; the board's existing trust model applies
 to what it finds), up to a cap of 256 pages. It returns at most 8 valid
-entries whose `topic`, `applies_to` or `summary` contains `q`, each as
+entries whose `topic`, `applies_to`, `summary` or `slug` contains `q`, each as
 `topic`, `summary`, `slug`, `updated` and `rules` (the `rule` line of every
 lesson), within a 16 KiB answer. `q` is matched as a substring with ASCII
 letters compared case-insensitively and every other byte compared exactly;

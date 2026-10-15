@@ -2886,6 +2886,19 @@ static int test_fleet_wiki_entry_validation(void)
         ASSERT(fleet_wiki_entry_matches(&entry, "full lint"));
         ASSERT(fleet_wiki_entry_matches(&entry, "push-g"));
         ASSERT(!fleet_wiki_entry_matches(&entry, "nothing-here"));
+        {
+            struct fleet_wiki_entry_query sq = {.q = "rollback",
+                .slug = "rollback-drill"};
+            ASSERT(fleet_wiki_entry_query_matches(&entry, &sq));
+            sq.slug = NULL;
+            ASSERT(!fleet_wiki_entry_query_matches(&entry, &sq));
+            sq.slug = "rollback-drill";
+            sq.topic = "other";
+            ASSERT(!fleet_wiki_entry_query_matches(&entry, &sq));
+            sq.topic = NULL;
+            sq.q = "ROLLBACK";
+            ASSERT(fleet_wiki_entry_query_matches(&entry, &sq));
+        }
         json_free(&entry);
 
         const char *bad[] = {
@@ -3260,6 +3273,22 @@ static int test_fleet_wiki_find_and_read(void)
         ASSERT(fb_test_rpc(&table, &in, &result));
         ASSERT_EQ(json_get_int(json_get(&result, "returned")), 8);
         ASSERT(json_get_bool(json_get(&result, "truncated")));
+        json_free(&in); json_free(&result);
+
+        ASSERT(fb_test_ingest_page(&db, "rollback-drill",
+            "{\"schema\":\"zcl.fleet_wiki_entry.v1\",\"topic\":\"drills\","
+            "\"summary\":\"A drill note.\","
+            "\"lessons\":[{\"rule\":\"Practise the revert.\",\"why\":\"w\","
+            "\"evidence\":\"e\"}],\"applies_to\":[\"ops\"],"
+            "\"updated\":\"2026-10-12T09:00:00Z\"}", 12, now));
+        json_init(&in); json_init(&result);
+        json_set_object(&in);
+        ASSERT(json_push_kv_str(&in, "op", "wiki_find") &&
+               json_push_kv_str(&in, "q", "rollback"));
+        ASSERT(fb_test_rpc(&table, &in, &result));
+        ASSERT_EQ(json_get_int(json_get(&result, "returned")), 1);
+        ASSERT(strcmp(json_get_str(json_get(json_at(json_get(&result, "entries"), 0), "slug")),
+                      "rollback-drill") == 0);
         json_free(&in); json_free(&result);
 
         json_init(&in); json_init(&result);

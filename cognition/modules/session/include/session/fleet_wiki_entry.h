@@ -58,6 +58,8 @@ struct fleet_wiki_entry_query {
     const char *q;
     const char *topic;
     const char *applies_to;
+    /* page slug of the row being tested; q also matches it (NULL or empty: not searched) */
+    const char *slug;
 };
 bool fleet_wiki_entry_query_matches(const struct json_value *,
     const struct fleet_wiki_entry_query *);
