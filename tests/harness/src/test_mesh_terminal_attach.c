@@ -24,6 +24,7 @@
 #define PAIRING "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 #define TERMINAL "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 #define CAP 512
+#define FAKE_READS 160
 
 struct fake_node {
     /* script */
@@ -57,6 +58,13 @@ struct fake_term {
     int calls, raw_on_count, raw_off_count;
     bool raw_state;
     int min_timeout_ms;
+    bool clock_on_read;        /* a read with no input advances the clock */
+    struct {
+        int64_t at_ms;
+        int timeout_ms;
+        int calls;             /* RPC calls made before this read */
+    } reads[FAKE_READS];
+    int read_log;
     int64_t clock_ms;
     char out[CAP], err[CAP * 2];
     size_t out_len;
@@ -191,13 +199,23 @@ static long tty_read(void *ctx, uint8_t *buf, size_t cap, int timeout_ms)
     struct fake_term *t = ctx;
     if (t->min_timeout_ms == 0 || timeout_ms < t->min_timeout_ms)
         t->min_timeout_ms = timeout_ms;
+    if (t->read_log < FAKE_READS) {
+        t->reads[t->read_log].at_ms = t->clock_ms;
+        t->reads[t->read_log].timeout_ms = timeout_ms;
+        t->reads[t->read_log].calls = t->node->calls;
+    }
+    t->read_log++;
     if (t->input_next < t->input_count) {
         const char *chunk = t->inputs[t->input_next++];
         size_t len = strlen(chunk);
         memcpy(buf, chunk, len < cap ? len : cap);
         return (long)len;
     }
-    return t->eof_after_inputs ? -1 : 0;
+    if (t->eof_after_inputs)
+        return -1;
+    if (t->clock_on_read)
+        t->clock_ms += timeout_ms;
+    return 0;
 }
 
 static bool tty_write(void *ctx, const uint8_t *buf, size_t len)
@@ -620,6 +638,47 @@ static int test_bad_pairing(void)
     return failures;
 }
 
+static int test_active_hold(void)
+{
+    int failures = 0;
+    TEST("mesh terminal attach: polls stay at 20 ms for 500 ms after the "
+         "last input, then drop to 100 ms with a bounded RPC rate") {
+        struct fake_node n;
+        struct fake_term t;
+        fake_init(&n, &t);
+        t.clock_on_read = true;
+        t.inputs[0] = "x";
+        t.input_count = 1;
+        t.stop_at_call = 60;
+        (void)run(&n, &t, true, PAIRING);
+        ASSERT_EQ(t.input_next, (size_t)1);
+        ASSERT(t.read_log > 30 && t.read_log <= FAKE_READS);
+        const int64_t hold_end = t.reads[0].at_ms + 500;
+        int held = 0, idle = 0;
+        for (int i = 1; i < t.read_log; i++) {
+            if (t.reads[i].at_ms < hold_end) {
+                ASSERT_EQ(t.reads[i].timeout_ms, 20);
+                held++;
+            } else {
+                ASSERT_EQ(t.reads[i].timeout_ms, 100);
+                idle++;
+            }
+        }
+        ASSERT(held >= 20 && idle >= 20);
+        int from = -1, to = -1;
+        for (int i = 0; i < t.read_log; i++) {
+            if (from < 0 && t.reads[i].at_ms >= hold_end)
+                from = i;
+            if (to < 0 && t.reads[i].at_ms >= hold_end + 2000)
+                to = i;
+        }
+        ASSERT(from >= 0 && to > from);
+        ASSERT(t.reads[to].calls - t.reads[from].calls <= 21);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 int test_mesh_terminal_attach(void)
 {
     int failures = 0;
@@ -638,5 +697,6 @@ int test_mesh_terminal_attach(void)
     failures += test_stop();
     failures += test_timeout();
     failures += test_bad_pairing();
+    failures += test_active_hold();
     return failures;
 }

@@ -3,7 +3,8 @@
  * Purpose: the attach bridge for the mesh terminal lane; see
  * mesh_terminal_attach.h. One loop alternates a bounded output drain with a
  * bounded input wait, so the node RPC rate is set by the input timeout
- * (20 ms after activity, 100 ms idle) and never spins. Every RPC refusal is
+ * (20 ms while input or output occurred in the last 500 ms, 100 ms idle)
+ * and never spins. Every RPC refusal is
  * kept verbatim and printed once, after raw mode is off. */
 
 #include "command/mesh_terminal_attach.h"
@@ -24,6 +25,7 @@
 #define MTA_DRAIN_ROUNDS 8
 #define MTA_POLL_ACTIVE_MS 20
 #define MTA_POLL_IDLE_MS 100
+#define MTA_ACTIVE_HOLD_MS 500
 #define MTA_OPEN_POLL_MS 100
 #define MTA_EXIT_INTERRUPTED 130
 #define MTA_EOT 0x04u
@@ -68,7 +70,7 @@ struct mta {
     int64_t open_deadline_ms;
     enum mta_esc esc;
     bool stdin_open;
-    bool active;
+    int64_t active_until_ms;
     struct mta_refusal ref;
 };
 
@@ -328,6 +330,12 @@ static bool mta_read_once(struct mta *s, size_t *moved, bool *ended)
     return ok;
 }
 
+/* Input or output moved: keep the short poll for the hold window. */
+static void mta_mark_active(struct mta *s)
+{
+    s->active_until_ms = s->tty->now_ms(s->tty->ctx) + MTA_ACTIVE_HOLD_MS;
+}
+
 static enum mta_pump mta_pump_output(struct mta *s)
 {
     size_t total = 0, moved = 0;
@@ -340,7 +348,7 @@ static enum mta_pump mta_pump_output(struct mta *s)
             break;
     }
     if (total)
-        s->active = true;
+        mta_mark_active(s);
     if (ended && moved < MTA_READ_MAX)
         return MTA_PUMP_ENDED;
     return total ? MTA_PUMP_MORE : MTA_PUMP_IDLE;
@@ -437,8 +445,9 @@ static enum mta_in mta_input_end(struct mta *s)
 
 static enum mta_in mta_pump_input(struct mta *s)
 {
-    int wait = s->active ? MTA_POLL_ACTIVE_MS : MTA_POLL_IDLE_MS;
-    s->active = false;
+    int wait = s->tty->now_ms(s->tty->ctx) < s->active_until_ms
+                   ? MTA_POLL_ACTIVE_MS
+                   : MTA_POLL_IDLE_MS;
     if (!s->stdin_open) {
         s->tty->pause_ms(s->tty->ctx, wait);
         return MTA_IN_OK;
@@ -449,7 +458,7 @@ static enum mta_in mta_pump_input(struct mta *s)
         return MTA_IN_OK;
     if (n < 0)
         return mta_input_end(s);
-    s->active = true;
+    mta_mark_active(s);
     return mta_forward(s, buf, (size_t)n);
 }
 
