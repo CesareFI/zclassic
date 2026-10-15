@@ -6,6 +6,51 @@ ZCL_COMMAND_BRANCH("plugin", "", "Signed plugin store",
                    ZCL_COMMAND_LAYER_APP)
 
 ZCL_COMMAND_READY_COMMAND(
+    "plugin.keygen", "plugin", "",
+    "Create a plugin signing key file and print its public key",
+    "Creates the key file exclusively (O_EXCL, mode 0600) from the host "
+    "CSPRNG: exactly the 32-byte Ed25519 seed. An existing path is refused "
+    "with PLUGIN_KEY_EXISTS. The reply carries only the public key, the "
+    "line to add to ~/.z23/plugins/trusted_keys; the secret is never "
+    "printed.",
+    ZCL_COMMAND_RESULT_BUDGET,
+    "plugin,keygen,key,ed25519,publisher,trusted,sign",
+    "zcl.plugin_keygen.input.v1", "zcl.plugin_keygen.v1",
+    "key", "key",
+    "z23 plugin keygen ./publisher.key",
+    ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_NONE,
+    zcl_native_handle_plugin_keygen)
+
+ZCL_COMMAND_READY_COMMAND(
+    "plugin.pack", "plugin", "",
+    "Write the signed manifest and signature for a plugin executable",
+    "Copies the executable to dir (default the current directory) as NAME "
+    "and writes NAME.plugin.json (strict schema z23.plugin.v1, interface "
+    "version 1, the executable SHA3-512 and the capabilities in "
+    "vocabulary order) and NAME.plugin.sig (ed25519 over SHA3-512 of the "
+    "domain tag, a NUL and the manifest bytes) signed with the key file. "
+    "The key file must be a regular file you own with mode 0600 and exactly "
+    "32 bytes. Equal inputs give byte-identical output. cap is a "
+    "comma-separated list or a JSON array.",
+    ZCL_COMMAND_RESULT_BUDGET,
+    "plugin,pack,publish,sign,manifest,ed25519,sha3,capabilities",
+    "zcl.plugin_pack.input.v1", "zcl.plugin_pack.v1",
+    "exe,name,version,key,cap,dir", "exe",
+    "z23 plugin pack ./hello --name=hello --version=1.0.0 --key=./publisher.key --cap=fs.read,clock --dir=./dist",
+    ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    zcl_native_handle_plugin_pack)
+
+ZCL_COMMAND_READY_COMMAND(
     "plugin.install", "plugin", "",
     "Install a signed plugin executable as a new generation",
     "Verifies NAME.plugin.json (strict schema z23.plugin.v1, no unknown or "

@@ -71,7 +71,15 @@ static const struct {
     [PLUGIN_ERR_IO] = { "PLUGIN_IO",
         "check permissions and free space under ~/.z23/plugins and retry" },
     [PLUGIN_ERR_TRUST_INSECURE] = { "PLUGIN_TRUST_INSECURE",
-        "make trusted_keys and the plugin store regular files and real directories owned by you and not writable by group or others, with no symbolic links inside; then retry" }
+        "make trusted_keys and the plugin store regular files and real directories owned by you and not writable by group or others, with no symbolic links inside; then retry" },
+    [PLUGIN_ERR_KEY_MISSING] = { "PLUGIN_KEY_MISSING",
+        "create the signing key first: z23 plugin keygen <key file>" },
+    [PLUGIN_ERR_KEY_INSECURE] = { "PLUGIN_KEY_INSECURE",
+        "make the key file a regular file owned by you with mode 0600 (chmod 600 <key file>), not a symbolic link" },
+    [PLUGIN_ERR_KEY_MALFORMED] = { "PLUGIN_KEY_MALFORMED",
+        "use a key file of exactly 32 bytes, as written by: z23 plugin keygen <key file>" },
+    [PLUGIN_ERR_KEY_EXISTS] = { "PLUGIN_KEY_EXISTS",
+        "keygen never overwrites; choose a new key file path" }
 };
 
 const char *plugin_status_code(enum plugin_status status)
@@ -89,6 +97,20 @@ const char *plugin_status_next_action(enum plugin_status status)
 const char *plugin_capability_name(unsigned index)
 {
     return index < PM_CAPABILITY_COUNT ? pm_capabilities[index] : NULL;
+}
+
+bool plugin_capability_add(const char *name, size_t len, unsigned *mask)
+{
+    for (unsigned bit = 0; bit < PM_CAPABILITY_COUNT; bit++) {
+        if (strlen(pm_capabilities[bit]) != len ||
+            strncmp(pm_capabilities[bit], name, len) != 0)
+            continue;
+        if (*mask & (1u << bit))
+            return false;
+        *mask |= 1u << bit;
+        return true;
+    }
+    return false;
 }
 
 bool plugin_name_valid(const char *name)
@@ -140,7 +162,7 @@ static const char *pm_string(const struct json_value *obj, const char *key)
     return v && v->type == JSON_STR ? json_get_str(v) : NULL;
 }
 
-static bool pm_version_valid(const char *v)
+bool plugin_version_valid(const char *v)
 {
     size_t len = v ? strlen(v) : 0;
     if (len < 1 || len > PLUGIN_VERSION_MAX)
@@ -182,7 +204,7 @@ static bool pm_fields_read(const struct json_value *root,
     const char *sha = pm_string(root, "sha3_512");
     const struct json_value *iv = json_get(root, "interface_version");
     if (!schema || strcmp(schema, PM_SCHEMA) != 0 || !plugin_name_valid(name) ||
-        !pm_version_valid(version) ||
+        !plugin_version_valid(version) ||
         !plugin_hex_valid(sha, PLUGIN_HEX_SHA3_512) ||
         !iv || iv->type != JSON_INT || json_get_int(iv) < 1)
         return false;
@@ -271,7 +293,7 @@ static enum plugin_status pm_trust_open(const char *path, FILE **out)
     return PLUGIN_OK;
 }
 
-static void pm_manifest_digest(const char *manifest, size_t len,
+void plugin_manifest_digest(const char *manifest, size_t len,
                                uint8_t digest[PLUGIN_DIGEST_BYTES])
 {
     static const unsigned char domain[] = PM_SIG_DOMAIN;
@@ -300,7 +322,7 @@ enum plugin_status plugin_verify_manifest(const char *manifest, size_t manifest_
     fclose(trust);
     if (st != PLUGIN_OK)
         return st;
-    pm_manifest_digest(manifest, manifest_len, digest);
+    plugin_manifest_digest(manifest, manifest_len, digest);
     return ed25519_verify(sg, digest, sizeof(digest), pk) ? PLUGIN_OK
                                                           : PLUGIN_ERR_SIG_BAD;
 }

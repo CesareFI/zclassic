@@ -3,6 +3,7 @@
 #ifndef ZCL_PLUGIN_INTERNAL_H
 #define ZCL_PLUGIN_INTERNAL_H
 
+#include "plugin/plugin_pack.h"
 #include "plugin/plugin_store.h"
 
 #include <stdbool.h>
@@ -16,6 +17,19 @@ enum {
 };
 
 bool plugin_name_valid(const char *name);
+bool plugin_version_valid(const char *version);
+
+/* SHA3-512 of "z23.plugin.manifest.v1", one NUL and the manifest bytes: the
+ * message that is signed. */
+void plugin_manifest_digest(const char *manifest, size_t len,
+                            uint8_t digest[PLUGIN_DIGEST_BYTES]);
+
+/* Read a signing key file: a regular file owned by the effective user, no
+ * group or world access, exactly PLUGIN_KEY_FILE_BYTES long. */
+enum plugin_status plugin_key_load(const char *path,
+                                   uint8_t seed[PLUGIN_KEY_FILE_BYTES]);
+void plugin_key_public(const uint8_t seed[PLUGIN_KEY_FILE_BYTES],
+                       uint8_t pk[32]);
 /* True for exactly len lowercase hex characters (len even, at most 128). */
 bool plugin_hex_valid(const char *hex, size_t len);
 

@@ -11,6 +11,7 @@
 #include "crypto/ed25519.h"
 #include "json/json.h"
 #include "platform/atomic_link.h"
+#include "plugin/plugin_pack.h"
 #include "plugin/plugin_store.h"
 #include "sha3/sha3.h"
 
@@ -728,6 +729,297 @@ static int pst_case_commands(void)
     return failures;
 }
 
+struct pst_pk {
+    struct pst_fx fx;
+    char exe[PATH_MAX];
+    char key[PATH_MAX];
+    char dist[PATH_MAX];
+    struct plugin_pack_request rq;
+    struct plugin_pack_result res;
+};
+
+static const char pst_pk_body[] = "#!/bin/sh\necho packed\n";
+
+/* A publisher workspace: an executable, a key file holding the trusted seed
+ * with the given mode, and an output directory name. */
+static bool pst_pk_open(struct pst_pk *pk, mode_t key_mode)
+{
+    memset(pk, 0, sizeof(*pk));
+    if (!pst_fx_open(&pk->fx, true) ||
+        !pst_path(pk->exe, sizeof(pk->exe), pk->fx.src, "hello.bin") ||
+        !pst_path(pk->key, sizeof(pk->key), pk->fx.base, "publisher.key") ||
+        !pst_path(pk->dist, sizeof(pk->dist), pk->fx.base, "dist"))
+        return false;
+    bool ok = pst_write(pk->exe, pst_pk_body, strlen(pst_pk_body)) &&
+              pst_write(pk->key, (const char *)pk->fx.sk[0], 32) &&
+              chmod(pk->key, key_mode) == 0;
+    pk->rq = (struct plugin_pack_request){
+        .exe_path = pk->exe, .name = "hello", .version = "1.0.0",
+        .key_path = pk->key, .out_dir = pk->dist, .capabilities = 1u | 32u};
+    return ok;
+}
+
+static bool pst_pk_file(const struct pst_pk *pk, const char *leaf, char *out, size_t cap)
+{
+    char path[PATH_MAX];
+    return pst_path(path, sizeof(path), pk->dist, leaf) && pst_slurp(path, out, cap);
+}
+
+static int pst_case_pack_roundtrip(void)
+{
+    int failures = 0;
+    TEST_CASE("pack output installs and matches the documented bytes") {
+        struct pst_pk pk;
+        struct plugin_manifest m;
+        char want[512], got[512], sig[512], pub[65], sha[129];
+        unsigned char digest[64];
+        int present = -1;
+        ASSERT(pst_pk_open(&pk, 0600));
+        ASSERT_EQ(plugin_pack(&pk.rq, &pk.res), PLUGIN_OK);
+        zcl_sha3_512((const unsigned char *)pst_pk_body, strlen(pst_pk_body), digest);
+        pst_hex(digest, 64, sha);
+        snprintf(want, sizeof(want),
+                 "{\"schema\":\"z23.plugin.v1\",\"name\":\"hello\",\"version\":\"1.0.0\","
+                 "\"interface_version\":1,\"sha3_512\":\"%s\","
+                 "\"capabilities\":[\"fs.read\",\"clock\"]}\n", sha);
+        ASSERT(pst_pk_file(&pk, "hello.plugin.json", got, sizeof(got)));
+        ASSERT_STR_EQ(got, want);
+        ASSERT(pst_pk_file(&pk, "hello.plugin.sig", sig, sizeof(sig)));
+        pst_hex(pk.fx.pk[0], 32, pub);
+        ASSERT_STR_EQ(pk.res.public_key, pub);
+        ASSERT(strstr(sig, "\"sig_alg\":\"ed25519\"") && strstr(sig, pub));
+        ASSERT_EQ(plugin_store_install(pk.fx.root, pk.res.manifest_path, &m, &present),
+                  PLUGIN_OK);
+        ASSERT_EQ(present, 0);
+        ASSERT_STR_EQ(m.exe_sha3, pk.res.generation);
+        ASSERT_EQ(m.capabilities, 1u | 32u);
+        pst_fx_close(&pk.fx);
+    } TEST_END
+    return failures;
+}
+
+static int pst_case_pack_deterministic(void)
+{
+    int failures = 0;
+    TEST_CASE("two packs of the same inputs are byte-identical") {
+        struct pst_pk pk;
+        static const char *const leaves[] = { "hello", "hello.plugin.json", "hello.plugin.sig" };
+        char first[3][512], again[512];
+        ASSERT(pst_pk_open(&pk, 0600));
+        ASSERT_EQ(plugin_pack(&pk.rq, &pk.res), PLUGIN_OK);
+        for (int i = 0; i < 3; i++)
+            ASSERT(pst_pk_file(&pk, leaves[i], first[i], sizeof(first[i])));
+        ASSERT_EQ(plugin_pack(&pk.rq, &pk.res), PLUGIN_OK);
+        for (int i = 0; i < 3; i++) {
+            ASSERT(pst_pk_file(&pk, leaves[i], again, sizeof(again)));
+            ASSERT_STR_EQ(again, first[i]);
+        }
+        pst_fx_close(&pk.fx);
+    } TEST_END
+    return failures;
+}
+
+static int pst_case_pack_tampered_exe(void)
+{
+    int failures = 0;
+    TEST_CASE("an executable changed after pack is refused at install") {
+        struct pst_pk pk;
+        struct plugin_manifest m;
+        char path[PATH_MAX];
+        int present = 0;
+        ASSERT(pst_pk_open(&pk, 0600));
+        ASSERT_EQ(plugin_pack(&pk.rq, &pk.res), PLUGIN_OK);
+        ASSERT(pst_path(path, sizeof(path), pk.dist, "hello"));
+        ASSERT_EQ(chmod(path, 0700), 0);
+        ASSERT(pst_write(path, "tampered", 8));
+        ASSERT_EQ(plugin_store_install(pk.fx.root, pk.res.manifest_path, &m, &present),
+                  PLUGIN_ERR_EXE_HASH);
+        ASSERT(!pst_exists(pk.fx.root, "hello"));
+        pst_fx_close(&pk.fx);
+    } TEST_END
+    return failures;
+}
+
+static int pst_case_pack_key_refusals(void)
+{
+    int failures = 0;
+    TEST_CASE("pack refuses a readable, short, linked or missing key file") {
+        struct pst_pk pk;
+        char link[PATH_MAX];
+        ASSERT(pst_pk_open(&pk, 0644));
+        ASSERT_EQ(plugin_pack(&pk.rq, &pk.res), PLUGIN_ERR_KEY_INSECURE);
+        ASSERT(!pst_exists(pk.dist, "hello.plugin.json"));
+        ASSERT_EQ(chmod(pk.key, 0600), 0);
+        ASSERT(pst_write(pk.key, "short", 5) && chmod(pk.key, 0600) == 0);
+        ASSERT_EQ(plugin_pack(&pk.rq, &pk.res), PLUGIN_ERR_KEY_MALFORMED);
+        ASSERT(pst_path(link, sizeof(link), pk.fx.base, "linked.key"));
+        ASSERT_EQ(symlink(pk.key, link), 0);
+        pk.rq.key_path = link;
+        ASSERT_EQ(plugin_pack(&pk.rq, &pk.res), PLUGIN_ERR_KEY_INSECURE);
+        ASSERT_EQ(unlink(pk.key), 0);
+        pk.rq.key_path = pk.key;
+        ASSERT_EQ(plugin_pack(&pk.rq, &pk.res), PLUGIN_ERR_KEY_MISSING);
+        pst_fx_close(&pk.fx);
+    } TEST_END
+    return failures;
+}
+
+static int pst_case_keygen(void)
+{
+    int failures = 0;
+    TEST_CASE("keygen writes a private seed, prints the public key, never overwrites") {
+        struct pst_pk pk;
+        struct stat st;
+        char pub[PLUGIN_HEX_PUBLIC_KEY + 1], again[PLUGIN_HEX_PUBLIC_KEY + 1];
+        char before[64], after[64], trust[PATH_MAX], line[80];
+        ASSERT(pst_pk_open(&pk, 0600));
+        ASSERT_EQ(unlink(pk.key), 0);
+        ASSERT_EQ(plugin_keygen(pk.key, pub), PLUGIN_OK);
+        ASSERT_EQ(stat(pk.key, &st), 0);
+        ASSERT_EQ((unsigned)(st.st_mode & 0777), 0600u);
+        ASSERT_EQ((long)st.st_size, 32L);
+        ASSERT(strlen(pub) == 64);
+        ASSERT(pst_slurp(pk.key, before, sizeof(before)));
+        ASSERT_EQ(plugin_keygen(pk.key, again), PLUGIN_ERR_KEY_EXISTS);
+        ASSERT(pst_slurp(pk.key, after, sizeof(after)));
+        ASSERT_EQ(memcmp(before, after, 32), 0);
+        snprintf(line, sizeof(line), "%s\n", pub);
+        ASSERT(pst_path(trust, sizeof(trust), pk.fx.root, "trusted_keys"));
+        ASSERT(pst_write_private(trust, line, strlen(line)));
+        ASSERT_EQ(plugin_pack(&pk.rq, &pk.res), PLUGIN_OK);
+        ASSERT_STR_EQ(pk.res.public_key, pub);
+        ASSERT_EQ(plugin_store_install(pk.fx.root, pk.res.manifest_path,
+                                       &(struct plugin_manifest){0}, &(int){0}),
+                  PLUGIN_OK);
+        pst_fx_close(&pk.fx);
+    } TEST_END
+    return failures;
+}
+
+/* Removes the first occurrence of cut from the manifest, signs the result
+ * with the trusted key and writes both files, so only strictness can refuse. */
+static bool pst_pk_resign_without(const struct pst_pk *pk, const char *cut)
+{
+    char text[512], sig_hex[129], pub[65], doc[512], path[PATH_MAX];
+    char *p;
+    if (!pst_pk_file(pk, "hello.plugin.json", text, sizeof(text)) ||
+        !(p = strstr(text, cut)))
+        return false;
+    memmove(p, p + strlen(cut), strlen(p + strlen(cut)) + 1);
+    pst_sign(&pk->fx, 0, text, sig_hex);
+    pst_hex(pk->fx.pk[0], 32, pub);
+    snprintf(doc, sizeof(doc),
+             "{\"sig_alg\":\"ed25519\",\"public_key\":\"%s\",\"signature\":\"%s\"}\n",
+             pub, sig_hex);
+    return pst_path(path, sizeof(path), pk->dist, "hello.plugin.json") &&
+           pst_write(path, text, strlen(text)) &&
+           pst_path(path, sizeof(path), pk->dist, "hello.plugin.sig") &&
+           pst_write(path, doc, strlen(doc));
+}
+
+static int pst_case_pack_field_mutation(void)
+{
+    int failures = 0;
+    TEST_CASE("dropping any manifest field from pack output breaks install") {
+        struct pst_pk pk;
+        struct plugin_manifest m;
+        char sha_cut[160];
+        int present = 0;
+        const char *cuts[6] = { "\"schema\":\"z23.plugin.v1\",", "\"name\":\"hello\",",
+                                "\"version\":\"1.0.0\",", "\"interface_version\":1,",
+                                NULL, ",\"capabilities\":[\"fs.read\",\"clock\"]" };
+        for (int i = 0; i < 6; i++) {
+            ASSERT(pst_pk_open(&pk, 0600));
+            ASSERT_EQ(plugin_pack(&pk.rq, &pk.res), PLUGIN_OK);
+            snprintf(sha_cut, sizeof(sha_cut), "\"sha3_512\":\"%s\",", pk.res.generation);
+            ASSERT(pst_pk_resign_without(&pk, cuts[i] ? cuts[i] : sha_cut));
+            ASSERT_EQ(plugin_store_install(pk.fx.root, pk.res.manifest_path, &m, &present),
+                      PLUGIN_ERR_MANIFEST_INVALID);
+            pst_fx_close(&pk.fx);
+        }
+    } TEST_END
+    return failures;
+}
+
+static int pst_case_pack_commands(void)
+{
+    int failures = 0;
+    TEST_CASE("plugin.pack and plugin.keygen commands report public data only") {
+        struct pst_pk pk;
+        struct zcl_command_reply r;
+        char in[3 * PATH_MAX], seed_hex[65];
+        ASSERT(pst_pk_open(&pk, 0600));
+        pst_hex(pk.fx.sk[0], 32, seed_hex);
+        snprintf(in, sizeof(in),
+                 "{\"exe\":\"%s\",\"name\":\"hello\",\"version\":\"1.0.0\",\"key\":\"%s\","
+                 "\"cap\":\"fs.read,clock\",\"dir\":\"%s\"}", pk.exe, pk.key, pk.dist);
+        ASSERT(pst_call(zcl_native_handle_plugin_pack, in, &r));
+        ASSERT_EQ(r.exit_code, ZCL_COMMAND_EXIT_OK);
+        ASSERT(json_size(json_get(&r.data, "capabilities")) == 2);
+        ASSERT(strcmp(json_get_str(json_get(&r.data, "public_key")), seed_hex) != 0);
+        zcl_command_reply_free(&r);
+        snprintf(in, sizeof(in), "{\"exe\":\"%s\",\"name\":\"hello\",\"version\":\"1.0.0\","
+                 "\"key\":\"%s\",\"cap\":[\"clock\",\"clock\"]}", pk.exe, pk.key);
+        ASSERT(pst_call(zcl_native_handle_plugin_pack, in, &r));
+        ASSERT_STR_EQ(r.error.code, "PLUGIN_ARGUMENT");
+        zcl_command_reply_free(&r);
+        snprintf(in, sizeof(in), "{\"exe\":\"%s\",\"name\":\"hello\",\"version\":\"1.0.0\","
+                 "\"key\":\"%s\",\"cap\":\"clock,\"}", pk.exe, pk.key);
+        ASSERT(pst_call(zcl_native_handle_plugin_pack, in, &r));
+        ASSERT_STR_EQ(r.error.code, "PLUGIN_ARGUMENT");
+        zcl_command_reply_free(&r);
+        snprintf(in, sizeof(in), "{\"exe\":\"%s\",\"name\":\"hello\",\"version\":\"1.0.0\","
+                 "\"key\":\"%s\",\"cap\":\",\"}", pk.exe, pk.key);
+        ASSERT(pst_call(zcl_native_handle_plugin_pack, in, &r));
+        ASSERT_STR_EQ(r.error.code, "PLUGIN_ARGUMENT");
+        zcl_command_reply_free(&r);
+        snprintf(in, sizeof(in), "{\"key\":\"%s\"}", pk.key);
+        ASSERT(pst_call(zcl_native_handle_plugin_keygen, in, &r));
+        ASSERT_STR_EQ(r.error.code, "PLUGIN_KEY_EXISTS");
+        zcl_command_reply_free(&r);
+        snprintf(in, sizeof(in), "{\"key\":\"%s/second.key\"}", pk.fx.base);
+        ASSERT(pst_call(zcl_native_handle_plugin_keygen, in, &r));
+        ASSERT_EQ(r.exit_code, ZCL_COMMAND_EXIT_OK);
+        ASSERT(json_size(&r.data) == 3);
+        ASSERT(strlen(json_get_str(json_get(&r.data, "public_key"))) == 64);
+        zcl_command_reply_free(&r);
+        pst_fx_close(&pk.fx);
+    } TEST_END
+    return failures;
+}
+
+static int pst_case_pack_next_escaping(void)
+{
+    int failures = 0;
+    TEST_CASE("a quote and a backslash in dir stay one string in the next step") {
+        struct pst_pk pk;
+        struct zcl_command_reply r;
+        struct json_value next, d;
+        char in[3 * PATH_MAX], dir[PATH_MAX], esc[2 * PATH_MAX], want[PATH_MAX + 32];
+        ASSERT(pst_pk_open(&pk, 0600));
+        ASSERT(pst_path(dir, sizeof(dir), pk.fx.base, "d\"q\\x"));
+        json_init(&d);
+        json_set_str(&d, dir);
+        ASSERT(json_write(&d, esc, sizeof(esc)) < sizeof(esc));
+        json_free(&d);
+        snprintf(in, sizeof(in),
+                 "{\"exe\":\"%s\",\"name\":\"hello\",\"version\":\"1.0.0\","
+                 "\"key\":\"%s\",\"dir\":%s}", pk.exe, pk.key, esc);
+        ASSERT(pst_call(zcl_native_handle_plugin_pack, in, &r));
+        ASSERT_EQ(r.exit_code, ZCL_COMMAND_EXIT_OK);
+        ASSERT(r.next_count == 1);
+        snprintf(want, sizeof(want), "%s/hello.plugin.json", dir);
+        json_init(&next);
+        ASSERT(json_read(&next, r.next[0].input_json, strlen(r.next[0].input_json)));
+        ASSERT(json_size(&next) == 1);
+        ASSERT_STR_EQ(json_get_str(json_get(&next, "manifest")), want);
+        json_free(&next);
+        zcl_command_reply_free(&r);
+        pst_fx_close(&pk.fx);
+    } TEST_END
+    return failures;
+}
+
 static int pst_case_registered(void)
 {
     int failures = 0;
@@ -743,6 +1035,10 @@ static int pst_case_registered(void)
         ASSERT(s && s->handler == zcl_native_handle_plugin_switch);
         s = zcl_command_registry_find(reg, "plugin.rollback", NULL);
         ASSERT(s && s->handler == zcl_native_handle_plugin_rollback);
+        s = zcl_command_registry_find(reg, "plugin.pack", NULL);
+        ASSERT(s && s->handler == zcl_native_handle_plugin_pack);
+        s = zcl_command_registry_find(reg, "plugin.keygen", NULL);
+        ASSERT(s && s->handler == zcl_native_handle_plugin_keygen);
         ASSERT(zcl_native_command_is_root("plugin"));
     } TEST_END
     return failures;
@@ -771,6 +1067,14 @@ int test_plugin_store(void)
     failures += pst_case_tampered_last_good();
     failures += pst_case_input_limits();
     failures += pst_case_commands();
+    failures += pst_case_pack_roundtrip();
+    failures += pst_case_pack_deterministic();
+    failures += pst_case_pack_tampered_exe();
+    failures += pst_case_pack_key_refusals();
+    failures += pst_case_keygen();
+    failures += pst_case_pack_field_mutation();
+    failures += pst_case_pack_commands();
+    failures += pst_case_pack_next_escaping();
     failures += pst_case_registered();
     return failures;
 }

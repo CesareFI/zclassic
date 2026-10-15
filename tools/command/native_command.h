@@ -291,6 +291,12 @@ void zcl_native_handle_zses_invite_create(
 void zcl_native_handle_zses_invite_accept(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);
+void zcl_native_handle_plugin_pack(
+    const struct zcl_command_request *request,
+    struct zcl_command_reply *reply);
+void zcl_native_handle_plugin_keygen(
+    const struct zcl_command_request *request,
+    struct zcl_command_reply *reply);
 void zcl_native_handle_plugin_install(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);

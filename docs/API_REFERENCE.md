@@ -74,17 +74,17 @@ z23 discover schema <path> --side=input|output
 
 | Catalog fact | Count |
 |---|---|
-| Registry entries (branches + leaves) | 930 |
+| Registry entries (branches + leaves) | 932 |
 | Top-level roots | 15 |
 | Branches | 203 |
-| Leaves (dispatchable command paths) | 727 |
-| … `ready` (live handler in this build) | 634 |
+| Leaves (dispatchable command paths) | 729 |
+| … `ready` (live handler in this build) | 636 |
 | … `compat` (metadata only, names a fallback) | 63 |
 | … `planned` (fail-closed BLOCKED, exit 3) | 30 |
 | … dev-gated 🔧 (`ready` only in `z23-dev`) | 62 |
-| Leaves with `effect=mutate` | 273 |
+| Leaves with `effect=mutate` | 275 |
 | Leaves with `effect=destructive` | 6 |
-| Leaves requiring **owner** authority | 139 |
+| Leaves requiring **owner** authority | 141 |
 
 Per source file:
 
@@ -105,7 +105,7 @@ Per source file:
 | `engine/composition/commands/metaverse.def` | 30 | 7 | 23 |
 | `engine/composition/commands/yardsale.def` | 7 | 2 | 5 |
 | `engine/composition/commands/zses.def` | 4 | 2 | 2 |
-| `engine/composition/commands/plugin.def` | 6 | 1 | 5 |
+| `engine/composition/commands/plugin.def` | 8 | 1 | 7 |
 | `engine/composition/commands/story.def` | 5 | 1 | 4 |
 | `engine/composition/commands/fleet_board.def` | 12 | 3 | 9 |
 | `engine/composition/commands/mind.def` | 4 | 1 | 3 |
@@ -1810,6 +1810,8 @@ represented by its children's sections.
 
 | Command | Avail | Policy | Input keys (**required**) | Output schema | Example | Summary |
 |---|---|---|---|---|---|---|
+| `plugin keygen` | ready | mutate / app-write / **owner** · fast/low | **`key`** | `zcl.plugin_keygen.v1` | `z23 plugin keygen ./publisher.key` | Create a plugin signing key file and print its public key |
+| `plugin pack` | ready | mutate / app-write / **owner** · fast/low | **`exe`**, `name`, `version`, `key`, `cap`, `dir` | `zcl.plugin_pack.v1` | `z23 plugin pack ./hello --name=hello --version=1.0.0 --key=./publisher.key --cap=fs.read,clock --dir=./dist` | Write the signed manifest and signature for a plugin executable |
 | `plugin install` | ready | mutate / app-write / **owner** · foreground/low | **`manifest`** | `zcl.plugin_install.v1` | `z23 plugin install ./hello.plugin.json` | Install a signed plugin executable as a new generation |
 | `plugin list` | ready | read / read / operator · fast/low | none | `zcl.plugin_list.v1` | `z23 plugin list` | List installed plugins with current, last-good and all generations |
 | `plugin switch` | ready | mutate / app-write / **owner** · fast/low | **`name`**, **`generation`** | `zcl.plugin_switch.v1` | `z23 plugin switch hello <128-hex generation>` | Make an installed plugin generation current |

@@ -1,13 +1,15 @@
 /* Copyright 2026 Rhett Creighton - Apache License 2.0
- * purpose: plugin.install, plugin.list, plugin.switch, plugin.rollback and
+ * purpose: plugin.pack, plugin.keygen, plugin.install, plugin.list, plugin.switch, plugin.rollback and
  *          plugin.run — the signed plugin store under ~/.z23/plugins and the
  *          confined supervisor for one installed plugin. Every refusal
  *          carries a stable PLUGIN_* code and the command that resolves it.
  *          The daemon is not contacted. */
 
+#include "base/safe_alloc.h"
 #include "command/native_command.h"
 
 #include "json/json.h"
+#include "plugin/plugin_pack.h"
 #include "plugin/plugin_run.h"
 #include "plugin/plugin_store.h"
 
@@ -79,6 +81,110 @@ static void plg_push_capabilities(struct json_value *obj, unsigned mask)
     }
     (void)json_push_kv(obj, "capabilities", &caps);
     json_free(&caps);
+}
+
+/* Capabilities arrive as a JSON array of names or one comma-separated string. */
+static bool plg_cap_csv(const char *csv, unsigned *mask)
+{
+    while (*csv) {
+        size_t len = strcspn(csv, ",");
+        if (len == 0 || !plugin_capability_add(csv, len, mask))
+            return false;
+        if (csv[len] == ',' && csv[len + 1] == '\0')
+            return false;
+        csv += len + (csv[len] == ',');
+    }
+    return true;
+}
+
+static bool plg_capabilities(const struct zcl_command_request *request, unsigned *mask)
+{
+    const struct json_value *v = request->input ? json_get(request->input, "cap") : NULL;
+    *mask = 0;
+    if (!v || json_is_null(v))
+        return true;
+    if (v->type == JSON_STR)
+        return plg_cap_csv(json_get_str(v), mask);
+    if (v->type != JSON_ARR)
+        return false;
+    for (size_t i = 0; i < json_size(v); i++) {
+        const struct json_value *item = json_at(v, i);
+        const char *s = item && item->type == JSON_STR ? json_get_str(item) : NULL;
+        if (!s || !*s || !plugin_capability_add(s, strlen(s), mask))
+            return false;
+    }
+    return true;
+}
+
+/* The follow-up input is built as JSON so any path stays one string value. */
+static void plg_next_install(struct zcl_command_reply *reply, const char *manifest)
+{
+    struct json_value follow_up;
+    json_init(&follow_up);
+    json_set_object(&follow_up);
+    if (json_push_kv_str(&follow_up, "manifest", manifest)) {
+        size_t need = json_write(&follow_up, NULL, 0) + 1;
+        char *text = zcl_malloc(need, "plugin.pack.next");
+        if (text && json_write(&follow_up, text, need) < need)
+            (void)zcl_command_reply_add_next(reply, "plugin.install", text,
+                                             "install the packed plugin after trusting its key");
+        free(text);
+    }
+    json_free(&follow_up);
+}
+
+void zcl_native_handle_plugin_pack(const struct zcl_command_request *request,
+                                   struct zcl_command_reply *reply)
+{
+    struct plugin_pack_request pack = {0};
+    struct plugin_pack_result result;
+    if (!request || !reply)
+        return;
+    pack.exe_path = plg_str(request, "exe");
+    pack.name = plg_str(request, "name");
+    pack.version = plg_str(request, "version");
+    pack.key_path = plg_str(request, "key");
+    pack.out_dir = plg_str(request, "dir");
+    if (!plg_capabilities(request, &pack.capabilities)) {
+        plg_refuse(reply, PLUGIN_ERR_ARGUMENT, "pack",
+                   "cap must name distinct capabilities from the plugin vocabulary");
+        return;
+    }
+    enum plugin_status st = plugin_pack(&pack, &result);
+    if (st != PLUGIN_OK) {
+        bool key_fault = st >= PLUGIN_ERR_KEY_MISSING && st <= PLUGIN_ERR_KEY_MALFORMED;
+        plg_refuse(reply, st, "pack", key_fault ? pack.key_path : pack.exe_path);
+        return;
+    }
+    json_set_object(&reply->data);
+    (void)json_push_kv_str(&reply->data, "schema", "zcl.plugin_pack.v1");
+    (void)json_push_kv_str(&reply->data, "name", pack.name);
+    (void)json_push_kv_str(&reply->data, "version", pack.version);
+    (void)json_push_kv_str(&reply->data, "generation", result.generation);
+    (void)json_push_kv_str(&reply->data, "public_key", result.public_key);
+    (void)json_push_kv_str(&reply->data, "manifest", result.manifest_path);
+    plg_push_capabilities(&reply->data, pack.capabilities);
+    reply->error.mutated = true;
+    plg_next_install(reply, result.manifest_path);
+}
+
+void zcl_native_handle_plugin_keygen(const struct zcl_command_request *request,
+                                     struct zcl_command_reply *reply)
+{
+    char public_key[PLUGIN_HEX_PUBLIC_KEY + 1];
+    if (!request || !reply)
+        return;
+    const char *key = plg_str(request, "key");
+    enum plugin_status st = plugin_keygen(key, public_key);
+    if (st != PLUGIN_OK) {
+        plg_refuse(reply, st, "keygen", key);
+        return;
+    }
+    json_set_object(&reply->data);
+    (void)json_push_kv_str(&reply->data, "schema", "zcl.plugin_keygen.v1");
+    (void)json_push_kv_str(&reply->data, "public_key", public_key);
+    (void)json_push_kv_str(&reply->data, "key_file", key);
+    reply->error.mutated = true;
 }
 
 void zcl_native_handle_plugin_install(const struct zcl_command_request *request,
