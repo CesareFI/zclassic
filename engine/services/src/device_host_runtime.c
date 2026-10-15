@@ -445,7 +445,9 @@ static enum device_host_bridge_result runtime_listener(const struct device_host_
     struct sockaddr_in address = {.sin_family = AF_INET, .sin_port = htons(spec->listen_port),
         .sin_addr.s_addr = spec->listen_address_be};
     *listener = platform_socket_open(AF_INET, SOCK_STREAM, 0, true, true);
-    bool ok = *listener >= 0 && bind(*listener, (struct sockaddr *)&address, sizeof(address)) == 0 &&
+    /* SO_REUSEADDR only (never REUSEPORT): a supervised restart must rebind through TIME_WAIT. */
+    bool ok = *listener >= 0 && platform_socket_set_reuse_address(*listener, true) == 0 &&
+        bind(*listener, (struct sockaddr *)&address, sizeof(address)) == 0 &&
         listen(*listener, (int)spec->max_active) == 0;
     socklen_t size = sizeof(address);
     if (ok) ok = getsockname(*listener, (struct sockaddr *)&address, &size) == 0 && size == sizeof(address);

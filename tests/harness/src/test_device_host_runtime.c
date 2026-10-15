@@ -1499,6 +1499,32 @@ static int runtime_session_cap_before_target(void)
     for (int i = 0; i < CLIENTS; ++i) { device_host_psk_destroy(&session[i]); runtime_test_close(&carrier[i]); }
     json_free(&input); if (!runtime_fixture_close(&fixture)) ++failures; return failures;
 }
+static int runtime_restart_rebind(void)
+{
+    int failures = 0, silent = -1; struct runtime_fixture fixture; runtime_fixture_init(&fixture);
+    struct json_value input = {0};
+    TEST_CASE("HOST runtime: receiver rebinds its exact port at once after a busy run left TIME_WAIT") {
+        ASSERT(runtime_fixture_open(&fixture)); ASSERT(runtime_input_receiver(&input, &fixture, 1));
+        ASSERT(runtime_input_number(&input, "handshake_ms", 300));
+        ASSERT(runtime_process_start(&fixture.receiver, &fixture, &input, true, false));
+        ASSERT(runtime_wait_receiver(&fixture));
+        /* The receiver closes the silent carrier first, so its side holds TIME_WAIT on the listen port. */
+        silent = runtime_route_connect(fixture.receiver_port); ASSERT(silent >= 0);
+        ASSERT(runtime_socket_eof(silent)); runtime_test_close(&silent);
+        uint16_t port = fixture.receiver_port; ASSERT(fixture.receiver.pid > 0);
+        ASSERT_EQ(kill(fixture.receiver.pid, SIGTERM), 0);
+        ASSERT(runtime_process_wait(&fixture.receiver, clock_now_monotonic_ns() + INT64_C(3000000000)));
+        ASSERT(runtime_process_cleanup(&fixture.receiver)); runtime_process_init(&fixture.receiver);
+        json_free(&input); ASSERT(runtime_input_receiver(&input, &fixture, 1));
+        struct json_value *listen_port = (struct json_value *)json_get(&input, "listen_port");
+        ASSERT(listen_port != NULL); json_set_int(listen_port, port);
+        ASSERT(runtime_process_start(&fixture.receiver, &fixture, &input, true, false));
+        ASSERT(runtime_wait_receiver(&fixture)); ASSERT_EQ(fixture.receiver_port, port);
+    } TEST_END
+    runtime_test_close(&silent); json_free(&input);
+    if (!runtime_fixture_close(&fixture)) ++failures;
+    return failures;
+}
 int test_device_host_runtime(void);
 int test_device_host_runtime(void)
 {
@@ -1514,7 +1540,7 @@ int test_device_host_runtime(void)
         runtime_fresh_backup() + runtime_handshake_deadline() + runtime_idle_deadline() +
         runtime_during_traffic_revoke() + runtime_named_handshake_deadline(false) + runtime_named_handshake_deadline(true) + runtime_multi_active_deadline() + runtime_client_hup() +
         runtime_hup_kept_open() + runtime_hup_priority(false) + runtime_hup_priority(true) + runtime_hup_signal_restore() + runtime_hup_stdio_restore() + runtime_sparse_measurement() +
-        runtime_preauth_slots(1, 3, false) + runtime_preauth_slots(64, 70, false) + runtime_preauth_slots(1, 256, true) + runtime_session_cap_before_target();
+        runtime_preauth_slots(1, 3, false) + runtime_preauth_slots(64, 70, false) + runtime_preauth_slots(1, 256, true) + runtime_session_cap_before_target() + runtime_restart_rebind();
 }
 #else
 int test_device_host_runtime(void);
