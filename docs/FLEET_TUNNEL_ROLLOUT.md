@@ -20,9 +20,9 @@ Read-only probes on 2026-10-15 observed:
 
 | Host alias | System | SSH hybrid KEX | HOST rollout |
 | --- | --- | --- | --- |
-| z23-r1 | Linux x86_64, OpenSSH 9.6p1 | sntrup761x25519-sha512@openssh.com | First receiver; exact pair inputs pending |
-| z23-r2 (rhett2) | Linux x86_64, OpenSSH 9.6p1 | same | First client, then reciprocal receiver |
-| z23-r3 | Linux x86_64, OpenSSH 9.6p1 | same | After first pair acceptance |
+| z23-r1 | Linux x86_64, OpenSSH 9.6p1 | sntrup761x25519-sha512@openssh.com | First client (port 28022 receiver unit on z23-r2) |
+| z23-r2 | Linux x86_64, OpenSSH 9.6p1 | same | Persistent hub receiver (one supervised user unit per client) |
+| z23-r3 | Linux x86_64, OpenSSH 9.6p1 | same | Second client (port 28023) after r1 acceptance |
 | z23-r4 | Linux x86_64, OpenSSH 9.6p1 | same | After r3 acceptance |
 | z23-mac | Darwin arm64, OpenSSH 10.0p2 | sntrup and mlkem768x25519-sha256 | Blocked pending native HOST qualification |
 

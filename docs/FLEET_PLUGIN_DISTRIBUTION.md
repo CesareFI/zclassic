@@ -72,8 +72,8 @@ catalog before calling this a qualified publishing recipe.
 For already verified receiver-held ordinary package bytes, the local steps are:
 
 ```sh
-z23 zcode package checkout --input='{"root":"<64-hex-package-root>","destination":"./plugin-received"}'
-z23 plugin install --manifest=./plugin-received/NAME.plugin.json
+z23 zcode package checkout --datadir=<receiver-datadir> --input='{"root":"<64-hex-package-root>","destination":"./plugin-received"}'
+z23 plugin install --datadir=<receiver-datadir> --manifest=./plugin-received/NAME.plugin.json
 ```
 
 The destination must be absent and beneath an owner-private parent.
