@@ -292,7 +292,7 @@ test_groups: 1316
 port_interfaces: 13
 persistence_adapters: 14
 condition_registrations: 56
-command_bundles: 32
+command_bundles: 33
 command_roots: 14
 dumpstate_subsystems: 167
 app_shape_folders: 7
@@ -427,18 +427,20 @@ Use `docs/AGENT_ARCHITECTURE.md` as the full checklist. The short path:
 
 ### Add a native command
 1. Declare the command in the matching `engine/composition/commands/*.def` bundle.
-   There are 32 command bundles; `ls engine/composition/commands/*.def
-   engine/composition/commands/*/*.def` is the list — do not work from a remembered one,
-   and do not drop the nested half of that glob. Docs said "eight" for months
+   `engine/composition/commands/catalog.def` lists the command rooms in canonical
+   order, including nested telemetry rooms. The DOC-COUNTS `command_bundles`
+   field counts `.def` files, including that manifest; it is not a room count.
+   Use the manifest instead of a remembered list. Docs said "eight" for months
    after `vault` and `zcode` landed, and the flat glob alone silently stopped
    being the whole catalog once the telemetry bundles moved into
    `engine/composition/commands/telemetry/`.
 
-   Adding a bundle means adding it in **three** places — twice in
-   `engine/composition/src/command_catalog.c` (the spec table and the handler table) and
-   once in `tools/gen_api_reference.c`. Miss the third and the commands work
-   but never appear in `docs/API_REFERENCE.md`; `check-api-reference-generated`
-   now fails on that mismatch by name.
+   Adding a bundle means adding it in **two** places: once in
+   `engine/composition/commands/catalog.def`, which the spec table and the
+   handler table in `engine/composition/src/command_catalog.c` and the
+   describe-budget helper all expand, and once in `tools/gen_api_reference.c`.
+   Miss the second and the commands work but never appear in
+   `docs/API_REFERENCE.md`; `check-catalog-rooms` fails on that mismatch by name.
    Give it a name, transports (`ZCL_COMMAND_TRANSPORT_NATIVE`), and a handler
    symbol.
 2. Implement the handler in the matching

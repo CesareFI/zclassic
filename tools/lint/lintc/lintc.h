@@ -315,6 +315,8 @@ int check_tor_dial_prewarm_run(int argc, char **argv);
 int check_tor_dial_prewarm_selftest(void);
 int check_describe_budget_run(int argc, char **argv);
 int check_describe_budget_selftest(void);
+int check_catalog_rooms_run(int argc, char **argv);
+int check_catalog_rooms_selftest(void);
 int check_json_value_init_run(int argc, char **argv);
 int check_json_value_init_selftest(void);
 int check_one_write_path_run(int argc, char **argv);

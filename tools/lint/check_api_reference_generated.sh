@@ -168,26 +168,8 @@ done < <(def_rel_list)
 gate_require_scanned "$def_count" "$DEF_FLOOR" check_api_reference_generated \
     "no .def catalogs included by $GEN_SRC — the command catalog moved?"
 
-# The generator must include every .def the real catalog does, or a whole
-# bundle of live commands goes unpublished with nothing to notice: this gate
-# diffs the generator's output against a page the same generator wrote, so a
-# bundle absent from both sides matches perfectly. app.store.{catalog,order,
-# pay,purchases,collect} shipped ready-and-undocumented that way.
-CATALOG_SRC="engine/composition/src/command_catalog.c"
-if [ -f "$CATALOG_SRC" ]; then
-    unpublished=$(comm -23 \
-        <(sed -nE 's|^[[:space:]]*#include[[:space:]]+"\.\./(commands/[A-Za-z0-9_/]+\.def)".*|engine/composition/\1|p' \
-              "$CATALOG_SRC" | sort -u) \
-        <(def_rel_list) || true)
-    if [ -n "$unpublished" ]; then
-        echo "check_api_reference_generated: FAIL — $CATALOG_SRC compiles these" \
-             ".def bundles into the binary but $GEN_SRC does not include them," >&2
-        echo "  so every command they declare is missing from $DOC:" >&2
-        echo "$unpublished" | sed 's/^/    /' >&2
-        echo "  Add a matching ZCL_DEF_FILE block to $GEN_SRC." >&2
-        exit 1
-    fi
-fi
+# Runtime-room parity with this generator is enforced by the C23 gate
+# check-catalog-rooms (tools/lint/lintc/gate_catalog_rooms.c).
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/zcl-apiref.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM

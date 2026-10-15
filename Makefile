@@ -3097,7 +3097,7 @@ $(filter-out $(ZCL_VENDOR_LIB)/libsecp256k1.a,$(VENDOR_LIBS)):
         check-source-identity-authority \
         check-status-reason-single \
         check-operator-needed-sink check-systemd-memory-budget check-doc-accuracy check-doc-counts check-doc-claims check-no-stale-pinned-facts check-markdown-links check-doc-inline-paths \
-        check-api-reference-generated check-describe-budget \
+        check-api-reference-generated check-describe-budget check-catalog-rooms \
         check-no-new-repair-rung \
         check-no-new-coordination-shell \
         check-no-new-bash \
@@ -6371,6 +6371,7 @@ LINTC_SRCS = $(LINTC_LIVE_DATADIR_SRCS) tools/lint/lintc/lib.c tools/lint/lintc/
     tools/lint/lintc/gate_flag_registry_lex.c \
     tools/lint/lintc/gate_pattern_guard.c \
     tools/lint/lintc/gate_describe_budget.c \
+    tools/lint/lintc/gate_catalog_rooms.c \
     tools/lint/lintc/gate_state_hygiene_fences.c \
     tools/lint/lintc/gate_supervisor_domain.c \
     tools/lint/lintc/gate_supervisor_domain_scan.c \
@@ -6531,6 +6532,7 @@ LINT_FAST_GATES := \
     check-cyclomatic-complexity \
     check-file-size-ceiling \
     check-describe-budget \
+    check-catalog-rooms \
     check-flag-registry \
     check-raw-malloc \
     check-json-value-init \
@@ -14724,6 +14726,16 @@ check-describe-budget: $(LINTC_TOOL)
 	@./tools/lint/check_describe_budget.sh --selftest
 	@./tools/lint/check_describe_budget.sh
 
+# Gate — the native command rooms are declared once, in
+# engine/composition/commands/catalog.def. command_catalog.c and the
+# describe-budget helper must expand that list without naming a room, and
+# tools/gen_api_reference.c must include exactly the same rooms. Both
+# directions of the generator comparison refuse. Has --selftest.
+check-catalog-rooms: $(LINTC_TOOL)
+	@echo "══ LINT: command rooms agree across runtime, describe budget and API reference ══"
+	@./build/bin/z23-lint check-catalog-rooms --selftest
+	@./build/bin/z23-lint check-catalog-rooms
+
 # Regenerate the native command reference from the declarative catalog.
 API_REFERENCE_TOOL = $(BIN_DIR)/gen_api_reference
 
@@ -15492,6 +15504,7 @@ LINT_GATES := \
     check-capability-inventory-generated \
     check-generated-artifact-contradictions \
     check-describe-budget \
+    check-catalog-rooms \
     check-markdown-links \
     check-doc-inline-paths \
     check-hex-codec-single \

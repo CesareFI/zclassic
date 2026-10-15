@@ -298,19 +298,7 @@ void agent_spend_policy_release(const char *session_id,
  * relative path, so the gate's --selftest can compile this same file against a
  * padded copy of engine/composition/commands by putting that copy's parent first on -I. */
 static struct zcl_command_spec g_specs[] = {
-#include "commands/root.def"
-#include "commands/core.def"
-#include "commands/apps.def"
-#include "commands/app_features.def"
-#include "commands/store.def"
-#include "commands/ops.def"
-#include "commands/dev.def"
-#include "commands/code.def"
-#include "commands/accounts.def"
-#include "commands/vault.def"
-#include "commands/zcode.def"
-#include "commands/metaverse.def"
-#include "commands/zses.def"
+#include "commands/catalog.def"
 };
 
 #define SPEC_COUNT (sizeof(g_specs) / sizeof(g_specs[0]))
@@ -480,6 +468,24 @@ static size_t describe_needed_bytes(size_t idx)
     return base - 1 /* the placeholder 'x' */ + escaped;
 }
 
+static bool describe_catalog_ready(const char *baseline)
+{
+    const struct zcl_command_registry reg = { .commands = g_specs,
+                                              .count = SPEC_COUNT };
+    if (!zcl_command_registry_find(&reg, "fleet.steer.brief", NULL)) {
+        fputs("check-describe-budget: canonical fleet.steer.brief missing\n", stderr);
+        return false;
+    }
+    return load_baseline(baseline);
+}
+
+static void describe_brief_metric(const struct zcl_command_spec *spec, size_t i)
+{
+    if (strcmp(spec->path, "fleet.steer.brief") == 0)
+        printf("check-describe-budget: fleet.steer.brief needs %zu/%u bytes\n",
+               describe_needed_bytes(i), ZCL_COMMAND_SPEC_BUDGET);
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -487,7 +493,7 @@ int main(int argc, char **argv)
         return 2;
     }
     const bool verbose = argc > 2 && strcmp(argv[2], "-v") == 0;
-    if (!load_baseline(argv[1]))
+    if (!describe_catalog_ready(argv[1]))
         return 1;
 
     const struct zcl_command_registry reg = { .commands = g_specs,
@@ -501,6 +507,7 @@ int main(int argc, char **argv)
         if (spec->mode == ZCL_COMMAND_MODE_BRANCH)
             continue;   /* branches render a menu, gated below */
         leaves++;
+        describe_brief_metric(spec, i);
         size_t n = zcl_command_registry_describe_json(&reg, spec->path, out,
                                                       sizeof(out));
         if (n > 0) {

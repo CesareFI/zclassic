@@ -149,6 +149,7 @@ static const char *const k_db_incs[] = {
     "-Icontexts/commons/modules/vcs/include",
     "-Iengine/services/include",
     "-Icognition/services/include",
+    "-Icognition/modules/session/include",
 };
 
 /* Floors: refuse to report clean off a catalog that moved or emptied out.
@@ -571,47 +572,53 @@ static int db_copy_one(const char *src, const char *dst)
 
 /* One glob member of the selftest `cp`: skip non-.def/dot names, fail like
  * cp on a non-regular entry ("omitting directory" → exit 1), else copy. */
-static int db_copy_def(const char *nm, const char *dest, int *copied)
+static int db_copy_defs_from(const char *source, const char *dest, unsigned depth);
+
+static int db_copy_def(const char *source, const char *nm, const char *dest,
+                       unsigned depth, int *copied)
 {
-    size_t nl = strlen(nm);
-    if (nm[0] == '.' || nl < 4 || memcmp(nm + nl - 4, ".def", 4) != 0)
+    if (nm[0] == '.')
         return 0;
     char s[4096], d[4096];
-    int rc = ovf(snprintf(s, sizeof s, "%s/%s", k_db_def_dir, nm), sizeof s);
-    if (rc == 0)
-        rc = ovf(snprintf(d, sizeof d, "%s/%s", dest, nm), sizeof d);
+    int rc = ovf(snprintf(s, sizeof s, "%s/%s", source, nm), sizeof s);
+    rc |= ovf(snprintf(d, sizeof d, "%s/%s", dest, nm), sizeof d);
     struct stat st;
-    if (rc == 0 && (stat(s, &st) != 0 || !S_ISREG(st.st_mode)))
-        rc = 1;
-    if (rc == 0)
-        rc = db_copy_one(s, d);
+    if (rc != 0 || lstat(s, &st) != 0)
+        return 1;
+    if (S_ISDIR(st.st_mode))
+        return depth < 4 ? db_copy_defs_from(s, d, depth + 1) : 1;
+    size_t nl = strlen(nm);
+    if (nl < 4 || memcmp(nm + nl - 4, ".def", 4) != 0)
+        return 0;
+    if (!S_ISREG(st.st_mode))
+        return 1;
+    rc = db_copy_one(s, d);
     if (rc == 0)
         (*copied)++;
     return rc;
 }
 
-/* `mkdir -p` plus `cp` of the catalog's *.def files — the same non-dot
- * .def set. An empty or missing catalog is cp failing under set -e: a bare
- * exit 1. */
-static int db_copy_defs(const char *dest)
+/* Copy the canonical catalog and its bounded command subrooms. */
+static int db_copy_defs_from(const char *source, const char *dest, unsigned depth)
 {
     int rc = csr_mkdirs(dest);
     struct dirent **names = NULL;
-    int n = -1;
-    if (rc == 0) {
-        n = scandir(k_db_def_dir, &names, NULL, alphasort);
-        if (n < 0)
-            rc = 1;
-    }
+    int n = rc == 0 ? scandir(source, &names, NULL, alphasort) : -1;
+    if (n < 0)
+        return 1;
     int copied = 0;
-    for (int i = 0; i < n && rc == 0; i++) {
-        rc = db_copy_def(names[i]->d_name, dest, &copied);
+    for (int i = 0; i < n; i++) {
+        if (rc == 0)
+            rc = db_copy_def(source, names[i]->d_name, dest, depth, &copied);
         free(names[i]);
     }
     free(names);
-    if (rc == 0 && copied == 0)
-        rc = 1;
-    return rc;
+    return rc == 0 && copied == 0 ? 1 : rc;
+}
+
+static int db_copy_defs(const char *dest)
+{
+    return db_copy_defs_from(k_db_def_dir, dest, 0);
 }
 
 /* grep -Fxc "$anchor" — lines exactly equal to the anchor. An unreadable
@@ -810,6 +817,52 @@ static int db_st_missing(const struct db_srcs *srcs, const struct db_st *p)
     return rc == 1 ? 0 : rc;
 }
 
+static int db_drop_fleet_room(const char *defs)
+{
+    char path[4096], next[4096];
+    int rc = ovf(snprintf(path, sizeof path, "%s/catalog.def", defs), sizeof path);
+    rc |= ovf(snprintf(next, sizeof next, "%s/catalog-next.def", defs), sizeof next);
+    if (rc)
+        return rc;
+    FILE *in = fopen(path, "r"), *out = fopen(next, "w");
+    if (!in || !out) {
+        if (in) fclose(in);
+        if (out) fclose(out);
+        return 1;
+    }
+    char *line = NULL;
+    size_t cap = 0;
+    unsigned removed = 0;
+    while (getline(&line, &cap, in) >= 0) {
+        if (strcmp(line, "#include \"fleet.def\"\n") == 0)
+            removed++;
+        else if (fputs(line, out) == EOF)
+            rc = 1;
+    }
+    if (ferror(in)) rc = 1;
+    free(line);
+    fclose(in);
+    if (fclose(out) != 0 || removed != 1) rc = 1;
+    return rc == 0 && rename(next, path) == 0 ? 0 : 1;
+}
+
+static int db_st_omitted(const struct db_srcs *srcs, const struct db_st *p)
+{
+    int rc = db_drop_fleet_room(p->defs);
+    if (rc == 0)
+        rc = db_compile(srcs, p->gate2, p->defparent, p->cc2);
+    int code = 0;
+    if (rc == 0)
+        rc = db_run_gate(p->gate2, p->padded, &code);
+    if (rc != 0)
+        return rc;
+    if (code == 0 || !db_log_contains(p->padded,
+                        "canonical fleet.steer.brief missing"))
+        return db_st_fail("check_describe_budget selftest: FAIL — an omitted "
+                          "fleet room did not refuse:\n", NULL, p->padded);
+    return 0;
+}
+
 static int db_selftest_body(const struct db_srcs *srcs, const char *tmp)
 {
     struct db_st p;
@@ -821,10 +874,12 @@ static int db_selftest_body(const struct db_srcs *srcs, const char *tmp)
     if (rc == 0)
         rc = db_st_missing(srcs, &p);
     if (rc == 0)
+        rc = db_st_omitted(srcs, &p);
+    if (rc == 0)
         fputs("check_describe_budget selftest: PASS — clean tree passes; "
               "a leaf padded past ZCL_COMMAND_SPEC_BUDGET fails and is "
               "named; a dropped sibling command_registry*.c breaks the "
-              "link\n", stdout);
+              "link; an omitted fleet room refuses\n", stdout);
     return rc;
 }
 

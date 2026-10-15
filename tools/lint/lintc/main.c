@@ -123,6 +123,8 @@ static const struct lint_gate k_gates[] = {
       check_tor_dial_prewarm_selftest },
     { "check-describe-budget", check_describe_budget_run,
       check_describe_budget_selftest },
+    { "check-catalog-rooms", check_catalog_rooms_run,
+      check_catalog_rooms_selftest },
     { "check-json-value-init", check_json_value_init_run,
       check_json_value_init_selftest },
     { "check-one-write-path", check_one_write_path_run,

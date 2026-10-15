@@ -802,10 +802,12 @@ directly): partially landed.**
 
 - **Done:** the split `engine/composition/commands/*.def` registry exists —
   `root.def`, `core.def`, `apps.def`, `ops.def`, and `dev.def`.
-  `engine/composition/src/command_catalog.c` `#include`s `root.def` + `core.def` +
-  `apps.def` + `ops.def`, expands them via the `ZCL_COMMAND_*` X-macros into
-  one immutable `g_catalog_commands[]` table, and binds native handler
-  pointers. This is wired to real dispatch:
+  `engine/composition/commands/catalog.def` owns the ordered room includes.
+  `engine/composition/src/command_catalog.c` expands that same list into the
+  immutable metadata and handler tables. The lightweight describe-budget
+  helper also expands it, so fleet and nested telemetry rooms receive the
+  same fixed-size renderer check. Its selftests refuse an omitted fleet room
+  as well as oversized prose and a missing renderer object. This is wired to real dispatch:
   `tools/command/native_command.c` calls `zcl_command_catalog()`, and
   `engine/entry/main.c` reaches it through `zcl_native_command_main()` for any
   method `zcl_native_command_is_root()` recognizes. `status` and the
