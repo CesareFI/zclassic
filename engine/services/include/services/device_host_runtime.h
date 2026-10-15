@@ -7,6 +7,8 @@
 
 #define DEVICE_HOST_RUNTIME_ACTIVE_MAX 4u
 #define DEVICE_HOST_RUNTIME_ACCEPT_MAX 64u
+/* Receiver closes its listener after this many unauthenticated connections fail. */
+#define DEVICE_HOST_RUNTIME_PREAUTH_MAX 256u
 struct device_host_runtime_common {
     struct device_pairing_store *store;
     uint8_t peer[32], approved_root[32];
@@ -20,6 +22,7 @@ struct device_host_runtime_observation {
     uint16_t listen_port;
     bool io_taken, cleanup_complete;
     uint32_t accepted, completed, refused;
+    uint32_t preauth_refused; /* Subset of refused that never authenticated; accepted counts only authenticated sessions. */
     uint64_t plaintext_read_bytes, plaintext_written_bytes;
     uint64_t carrier_read_bytes, carrier_written_bytes;
 };

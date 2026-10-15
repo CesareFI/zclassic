@@ -470,12 +470,14 @@ static int runtime_truncated_handshake(void)
         ASSERT(carrier >= 0); uint8_t fragment = 1;
         ASSERT_EQ(send(carrier, &fragment, 1, MSG_NOSIGNAL), 1);
         ASSERT_EQ(shutdown(carrier, SHUT_WR), 0);
-        ASSERT(runtime_process_wait(&fixture.receiver, clock_now_monotonic_ns() + INT64_C(3000000000)));
-        ASSERT(WIFEXITED(fixture.receiver.status)); ASSERT(runtime_target_absent(&fixture));
-        ASSERT(runtime_terminal(&fixture.receiver, "eof"));
-        ASSERT(strstr(fixture.receiver.diagnostic_text, "accepted=1 completed=0 refused=1") != NULL);
         struct pollfd interest = {.fd = carrier, .events = POLLIN};
         ASSERT(poll(&interest, 1, 1000) > 0); ASSERT_EQ(recv(carrier, &fragment, 1, MSG_DONTWAIT), 0);
+        /* Unauthenticated failures no longer consume a session slot, so the receiver keeps listening. */
+        ASSERT_EQ(kill(fixture.receiver.pid, SIGTERM), 0);
+        ASSERT(runtime_process_wait(&fixture.receiver, clock_now_monotonic_ns() + INT64_C(3000000000)));
+        ASSERT(WIFEXITED(fixture.receiver.status)); ASSERT(runtime_target_absent(&fixture));
+        ASSERT(runtime_terminal(&fixture.receiver, "cancelled"));
+        ASSERT(strstr(fixture.receiver.diagnostic_text, "accepted=0 completed=0 refused=1") != NULL);
         ASSERT_EQ(read(fixture.receiver.output, &fragment, 1), 0);
     } TEST_END
     runtime_test_close(&carrier); json_free(&input);
@@ -529,11 +531,12 @@ static int runtime_wrong_secret(void)
         ASSERT(runtime_process_start(&fixture.client, &fixture, &input, false, false));
         ASSERT(runtime_process_wait(&fixture.client, clock_now_monotonic_ns() + INT64_C(3000000000)));
         ASSERT(WIFEXITED(fixture.client.status)); ASSERT(WEXITSTATUS(fixture.client.status) != 0);
+        ASSERT_EQ(kill(fixture.receiver.pid, SIGTERM), 0);
         ASSERT(runtime_process_wait(&fixture.receiver, clock_now_monotonic_ns() + INT64_C(3000000000)));
         uint8_t byte; ASSERT_EQ(read(fixture.client.output, &byte, 1), 0);
         ASSERT(runtime_terminal(&fixture.client, "refused"));
-        ASSERT(runtime_terminal(&fixture.receiver, "eof"));
-        ASSERT(strstr(fixture.receiver.diagnostic_text, "accepted=1 completed=0 refused=1") != NULL);
+        ASSERT(runtime_terminal(&fixture.receiver, "cancelled"));
+        ASSERT(strstr(fixture.receiver.diagnostic_text, "accepted=0 completed=0 refused=1") != NULL);
         ASSERT(runtime_target_absent(&fixture));
     } TEST_END
     json_free(&input); if (!runtime_fixture_close(&fixture)) ++failures; return failures;
@@ -586,6 +589,7 @@ static bool runtime_receive_hello(int carrier, struct device_host_psk_session *s
     }
     return false;
 }
+static bool runtime_socket_eof(int fd);
 static int runtime_unconfirmed_hello(void)
 {
     int failures = 0, carrier = -1; struct runtime_fixture fixture; runtime_fixture_init(&fixture);
@@ -598,6 +602,7 @@ static int runtime_unconfirmed_hello(void)
         ASSERT(runtime_receive_hello(carrier, &session));
         /* Verify the server flight, but deliberately withhold queued C_CONFIRM. */
         ASSERT(runtime_target_absent(&fixture)); ASSERT_EQ(shutdown(carrier, SHUT_WR), 0);
+        ASSERT(runtime_socket_eof(carrier)); ASSERT_EQ(kill(fixture.receiver.pid, SIGTERM), 0);
         ASSERT(runtime_process_wait(&fixture.receiver, clock_now_monotonic_ns() + INT64_C(3000000000)));
         ASSERT(runtime_target_absent(&fixture));
     } TEST_END
@@ -775,10 +780,11 @@ static int runtime_handshake_deadline(void)
         ASSERT(runtime_process_start(&fixture.receiver, &fixture, &input, true, false));
         ASSERT(runtime_wait_receiver(&fixture)); carrier = runtime_route_connect(fixture.receiver_port); ASSERT(carrier >= 0);
         /* Keep the peer open without sending EOF/FIN or protocol bytes. */
+        ASSERT(runtime_socket_eof(carrier));
+        ASSERT_EQ(kill(fixture.receiver.pid, SIGTERM), 0);
         ASSERT(runtime_process_wait(&fixture.receiver, clock_now_monotonic_ns() + INT64_C(3000000000)));
-        ASSERT(runtime_terminal(&fixture.receiver, "eof"));
-        ASSERT(strstr(fixture.receiver.diagnostic_text, "accepted=1 completed=0 refused=1") != NULL);
-        ASSERT(runtime_socket_eof(carrier)); ASSERT(runtime_target_absent(&fixture));
+        ASSERT(runtime_terminal(&fixture.receiver, "cancelled"));
+        ASSERT(strstr(fixture.receiver.diagnostic_text, "accepted=0 completed=0 refused=1") != NULL); ASSERT(runtime_target_absent(&fixture));
     } TEST_END
     runtime_test_close(&carrier); json_free(&input);
     if (!runtime_fixture_close(&fixture)) ++failures;
@@ -1014,7 +1020,7 @@ static int runtime_multi_active_deadline(void)
     int failures = 0, silent = -1; struct runtime_fixture fixture; runtime_fixture_init(&fixture);
     struct json_value input = {0};
     TEST_CASE("HOST readiness: earliest silent slot expires while later established slot continues exact echo and FIN drain") {
-        ASSERT(runtime_fixture_open(&fixture)); ASSERT(runtime_input_receiver(&input, &fixture, 2));
+        ASSERT(runtime_fixture_open(&fixture)); ASSERT(runtime_input_receiver(&input, &fixture, 1));
         ASSERT(runtime_input_number(&input, "handshake_ms", 3000));
         ASSERT(runtime_process_start(&fixture.receiver, &fixture, &input, true, false));
         ASSERT(runtime_wait_receiver(&fixture)); silent = runtime_route_connect(fixture.receiver_port); ASSERT(silent >= 0);
@@ -1029,7 +1035,7 @@ static int runtime_multi_active_deadline(void)
         ASSERT(runtime_process_wait(&fixture.client, clock_now_monotonic_ns() + INT64_C(3000000000)));
         ASSERT(runtime_process_wait(&fixture.receiver, clock_now_monotonic_ns() + INT64_C(3000000000)));
         ASSERT(runtime_terminal(&fixture.receiver, "eof"));
-        ASSERT(strstr(fixture.receiver.diagnostic_text, "accepted=2 completed=1 refused=1") != NULL);
+        ASSERT(strstr(fixture.receiver.diagnostic_text, "accepted=1 completed=1 refused=1") != NULL);
         ASSERT(WIFEXITED(fixture.client.status)); ASSERT_EQ(WEXITSTATUS(fixture.client.status), 0);
     } TEST_END
     runtime_test_close(&silent); json_free(&input);
@@ -1391,6 +1397,108 @@ static int runtime_typed_outputs(void)
     } TEST_END
     json_free(&input); return failures;
 }
+/* One unauthenticated carrier: connect, optionally send garbage, half-close, and wait for the
+ * receiver to close its side, so the flood is serialized without any wall-clock pacing. */
+static bool runtime_junk_connect(uint16_t port, unsigned kind)
+{
+    int fd = runtime_route_connect(port); if (fd < 0) return false;
+    static const uint8_t garbage[48] = {0xde, 0xad, 0xbe, 0xef, 1, 2, 3};
+    bool ok = kind % 3 == 0 || send(fd, garbage, kind % 3 == 1 ? 1 : sizeof(garbage), MSG_NOSIGNAL) > 0;
+    ok = ok && shutdown(fd, SHUT_WR) == 0 && runtime_socket_eof(fd);
+    close(fd); return ok;
+}
+static bool runtime_junk_flood(struct runtime_process *receiver, uint16_t port, unsigned count)
+{
+    for (unsigned i = 0; i < count; ++i) {
+        if (!runtime_junk_connect(port, i)) { fprintf(stderr, "junk connect %u failed errno=%d\n", i, errno); return false; }
+        /* Each refused carrier logs one line; discard so the bounded capture keeps the terminal line. */
+        if (!runtime_diagnostics(receiver)) return false;
+        receiver->diagnostic_used = 0;
+    }
+    return true;
+}
+static int runtime_preauth_slots(unsigned sessions, unsigned junk, bool flood)
+{
+    int failures = 0; struct runtime_fixture fixture; runtime_fixture_init(&fixture); struct json_value input = {0};
+    TEST_CASE("HOST runtime: unauthenticated connects never consume session slots; pre-auth flood ceiling closes listener") {
+        ASSERT(runtime_fixture_open(&fixture)); ASSERT(runtime_input_receiver(&input, &fixture, sessions));
+        ASSERT(runtime_process_start(&fixture.receiver, &fixture, &input, true, false)); ASSERT(runtime_wait_receiver(&fixture));
+        json_free(&input);
+        ASSERT(runtime_junk_flood(&fixture.receiver, fixture.receiver_port, junk));
+        if (flood) {
+            ASSERT(runtime_process_wait(&fixture.receiver, clock_now_monotonic_ns() + INT64_C(3000000000)));
+            ASSERT(WIFEXITED(fixture.receiver.status)); ASSERT(WEXITSTATUS(fixture.receiver.status) != 0);
+            ASSERT(runtime_terminal(&fixture.receiver, "refused"));
+            ASSERT(strstr(fixture.receiver.diagnostic_text, "accepted=0 completed=0") != NULL);
+            ASSERT(strstr(fixture.receiver.diagnostic_text, "preauth_refused=256") != NULL);
+            ASSERT(runtime_listener_closed(fixture.receiver_port)); ASSERT(runtime_target_absent(&fixture));
+        } else {
+            ASSERT(runtime_input_client(&input, &fixture));
+            ASSERT(runtime_process_start(&fixture.client, &fixture, &input, false, false));
+            ASSERT(runtime_roundtrip(&fixture, 7));
+            ASSERT(runtime_process_wait(&fixture.client, clock_now_monotonic_ns() + INT64_C(3000000000)));
+            ASSERT(WIFEXITED(fixture.client.status)); ASSERT_EQ(WEXITSTATUS(fixture.client.status), 0);
+            if (sessions == 1) {
+                ASSERT(runtime_process_wait(&fixture.receiver, clock_now_monotonic_ns() + INT64_C(3000000000)));
+                ASSERT(runtime_terminal(&fixture.receiver, "eof"));
+                char expected[64];
+                snprintf(expected, sizeof(expected), "accepted=1 completed=1 refused=%u", junk);
+                ASSERT(strstr(fixture.receiver.diagnostic_text, expected) != NULL);
+            } else {
+                ASSERT_EQ(kill(fixture.receiver.pid, SIGTERM), 0);
+                ASSERT(runtime_process_wait(&fixture.receiver, clock_now_monotonic_ns() + INT64_C(3000000000)));
+                ASSERT(runtime_terminal(&fixture.receiver, "cancelled"));
+                char expected[64];
+                snprintf(expected, sizeof(expected), "accepted=1 completed=");
+                ASSERT(strstr(fixture.receiver.diagnostic_text, expected) != NULL);
+                snprintf(expected, sizeof(expected), "preauth_refused=%u", junk);
+                ASSERT(strstr(fixture.receiver.diagnostic_text, expected) != NULL);
+            }
+        }
+    } TEST_END
+    json_free(&input); if (!runtime_fixture_close(&fixture)) ++failures; return failures;
+}
+static bool runtime_send_confirm(int carrier, struct device_host_psk_session *session)
+{
+    enum device_host_psk_result status; struct device_pairing_guard guard = {0}; const uint8_t *bytes; size_t length;
+    struct zcl_result acquired = device_host_psk_pending_acquire(session, &guard, &bytes, &length, &status);
+    if (!acquired.ok) return false;
+    ssize_t sent = send(carrier, bytes, length, MSG_DONTWAIT | MSG_NOSIGNAL);
+    struct zcl_result result = device_host_psk_pending_written(session, &guard, sent > 0 ? (size_t)sent : 0, &status);
+    return sent > 0 && (size_t)sent == length && result.ok;
+}
+static int runtime_session_cap_before_target(void)
+{
+    enum { CLIENTS = 3 };
+    int failures = 0, carrier[CLIENTS] = {-1, -1, -1}; struct runtime_fixture fixture; runtime_fixture_init(&fixture);
+    struct json_value input = {0}; struct device_host_psk_session session[CLIENTS];
+    for (int i = 0; i < CLIENTS; ++i) device_host_psk_init(&session[i]);
+    TEST_CASE("HOST runtime: sessions over max_sessions are refused at PSK success before any target connection") {
+        ASSERT(runtime_fixture_open(&fixture)); ASSERT(runtime_input_receiver(&input, &fixture, 1));
+        ASSERT(runtime_input_number(&input, "max_active", CLIENTS));
+        ASSERT(runtime_process_start(&fixture.receiver, &fixture, &input, true, false)); ASSERT(runtime_wait_receiver(&fixture));
+        for (int i = 0; i < CLIENTS; ++i) {
+            carrier[i] = runtime_route_connect(fixture.receiver_port); ASSERT(carrier[i] >= 0);
+            ASSERT(runtime_send_hello(&fixture, carrier[i], &session[i]));
+        }
+        for (int i = 0; i < CLIENTS; ++i) ASSERT(runtime_receive_hello(carrier[i], &session[i]));
+        /* All three are authenticated-capable and pending at once; confirm back to back. */
+        for (int i = 0; i < CLIENTS; ++i) ASSERT(runtime_send_confirm(carrier[i], &session[i]));
+        unsigned refused = 0;
+        for (int i = 0; i < CLIENTS; ++i) if (runtime_socket_eof(carrier[i])) ++refused;
+        ASSERT_EQ(refused, CLIENTS - 1u);
+        ASSERT(runtime_target_ready(&fixture)); /* exactly one session reached the target */
+        struct sockaddr_in address; size_t size = sizeof(address);
+        int extra = platform_socket_accept(fixture.target_listener, (struct sockaddr *)&address, &size);
+        ASSERT(extra < 0); if (extra >= 0) close(extra);
+        ASSERT_EQ(kill(fixture.receiver.pid, SIGTERM), 0);
+        ASSERT(runtime_process_wait(&fixture.receiver, clock_now_monotonic_ns() + INT64_C(3000000000)));
+        ASSERT(runtime_terminal(&fixture.receiver, "eof")); /* winner cancelled, listener already closed */
+        ASSERT(strstr(fixture.receiver.diagnostic_text, "accepted=1 ") != NULL);
+    } TEST_END
+    for (int i = 0; i < CLIENTS; ++i) { device_host_psk_destroy(&session[i]); runtime_test_close(&carrier[i]); }
+    json_free(&input); if (!runtime_fixture_close(&fixture)) ++failures; return failures;
+}
 int test_device_host_runtime(void);
 int test_device_host_runtime(void)
 {
@@ -1405,7 +1513,8 @@ int test_device_host_runtime(void)
         runtime_completed_revoke(false) + runtime_completed_revoke(true) + runtime_client_cancel() +
         runtime_fresh_backup() + runtime_handshake_deadline() + runtime_idle_deadline() +
         runtime_during_traffic_revoke() + runtime_named_handshake_deadline(false) + runtime_named_handshake_deadline(true) + runtime_multi_active_deadline() + runtime_client_hup() +
-        runtime_hup_kept_open() + runtime_hup_priority(false) + runtime_hup_priority(true) + runtime_hup_signal_restore() + runtime_hup_stdio_restore() + runtime_sparse_measurement();
+        runtime_hup_kept_open() + runtime_hup_priority(false) + runtime_hup_priority(true) + runtime_hup_signal_restore() + runtime_hup_stdio_restore() + runtime_sparse_measurement() +
+        runtime_preauth_slots(1, 3, false) + runtime_preauth_slots(64, 70, false) + runtime_preauth_slots(1, 256, true) + runtime_session_cap_before_target();
 }
 #else
 int test_device_host_runtime(void);

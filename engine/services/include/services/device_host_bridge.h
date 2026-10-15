@@ -79,6 +79,10 @@ struct device_host_psk_bridge_spec {
     struct device_host_psk_spec session;
     int carrier_input_fd, carrier_output_fd;
     int input_fd, output_fd;
+    /* Optional: called once after PSK authentication and BEFORE the target connect;
+     * returning false refuses the session with no target socket ever opened. */
+    bool (*reserve_target)(void *context);
+    void *reserve_context;
 };
 struct device_host_psk_bridge_observation {
     enum device_host_bridge_result result;

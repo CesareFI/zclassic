@@ -628,6 +628,8 @@ static enum device_host_bridge_result psk_io_target_step(struct device_host_psk_
     if (bridge->session.phase != DEVICE_HOST_PSK_NEED_TARGET) return DEVICE_HOST_BRIDGE_READY;
     if (bridge->connect_pending) return psk_io_connect_complete(bridge, progress);
     if (bridge->target_fd >= 0) return DEVICE_HOST_BRIDGE_REFUSED;
+    if (bridge->spec.reserve_target && !bridge->spec.reserve_target(bridge->spec.reserve_context))
+        return DEVICE_HOST_BRIDGE_REFUSED;
     return psk_io_connect_start(bridge, progress);
 }
 static ssize_t psk_io_write(int fd, bool socket, const uint8_t *bytes, size_t length)

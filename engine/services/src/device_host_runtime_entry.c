@@ -272,9 +272,9 @@ static enum device_host_runtime_entry_exit device_host_runtime_entry_run_state(c
     bool restored = raw_stdio_restore(&stdio, out.io_taken);
     restored = raw_signals_restore(&signals) && restored;
     device_identity_close(&runtime.identity);
-    fprintf(stderr, "event=HOST_RUNTIME_TERMINAL route=%s result=%s cleanup_complete=%u accepted=%u completed=%u refused=%u plaintext_read=%llu plaintext_written=%llu\n",
+    fprintf(stderr, "event=HOST_RUNTIME_TERMINAL route=%s result=%s cleanup_complete=%u accepted=%u completed=%u refused=%u plaintext_read=%llu plaintext_written=%llu preauth_refused=%u\n",
         runtime.route_id, raw_result_name(out.result), (unsigned)out.cleanup_complete, out.accepted, out.completed, out.refused,
-        (unsigned long long)out.plaintext_read_bytes, (unsigned long long)out.plaintext_written_bytes);
+        (unsigned long long)out.plaintext_read_bytes, (unsigned long long)out.plaintext_written_bytes, out.preauth_refused);
     return installed && stdio_ok && restored && out.result == DEVICE_HOST_BRIDGE_EOF ? DEVICE_HOST_ENTRY_OK : DEVICE_HOST_ENTRY_FAILED;
 }
 #else

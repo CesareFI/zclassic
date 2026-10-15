@@ -66,7 +66,8 @@ struct runtime_slot {
     struct device_host_psk_bridge bridge;
     int64_t deadline, handshake_deadline, idle_deadline, effective_deadline, grace_deadline;
     uint64_t activity;
-    bool active, authenticated;
+    bool active, authenticated, counted;
+    struct runtime_reserve { uint32_t *accepted; uint32_t max; bool *counted; } reserve;
 };
 static int64_t runtime_slot_deadline(const struct runtime_slot *slot);
 static int64_t runtime_deadline(int64_t now, uint32_t ms)
@@ -300,6 +301,13 @@ static bool runtime_running(enum device_host_bridge_result result)
 {
     return result == DEVICE_HOST_BRIDGE_READY || result == DEVICE_HOST_BRIDGE_WAIT || result == DEVICE_HOST_BRIDGE_PROGRESS;
 }
+/* Session-cap reservation at PSK success, before any target connect. */
+static bool runtime_reserve_target(void *context)
+{
+    struct runtime_reserve *reserve = context;
+    if (*reserve->accepted >= reserve->max) return false;
+    ++*reserve->accepted; *reserve->counted = true; return true;
+}
 static void runtime_slot_init(struct runtime_slot *slot, const struct device_host_runtime_common *common,
     int64_t ceiling)
 {
@@ -471,17 +479,19 @@ static enum device_host_bridge_result runtime_accept(int listener,
 static void runtime_admit(const struct device_host_runtime_receiver_spec *spec,
     struct runtime_slot *slot, int carrier, int64_t deadline, struct device_host_runtime_observation *out)
 {
-    ++out->accepted;
+    /* Only mutual PSK authentication consumes a session slot (see sessions_tick). */
     if (!platform_socket_set_nonblocking(carrier, true) || fcntl(carrier, F_SETFD, FD_CLOEXEC) != 0) {
-        out->error_number = errno; ++out->refused; platform_socket_close(carrier); return;
+        out->error_number = errno; ++out->refused; ++out->preauth_refused; platform_socket_close(carrier); return;
     }
     runtime_slot_init(slot, &spec->common, deadline);
     struct device_host_psk_bridge_spec bridge_spec = runtime_bridge_spec(&spec->common,
         DEVICE_PAIRING_HOST_INBOUND, carrier, slot->deadline);
+    slot->reserve = (struct runtime_reserve){&out->accepted, spec->max_sessions, &slot->counted};
+    bridge_spec.reserve_target = runtime_reserve_target; bridge_spec.reserve_context = &slot->reserve;
     enum device_host_bridge_result result = host_call_device_host_psk_bridge_open(&slot->bridge, &bridge_spec);
     if (!slot->bridge.observation.io_taken) platform_socket_close(carrier);
     slot->active = runtime_running(result);
-    if (!slot->active) { ++out->refused; runtime_collect(out, &slot->bridge.observation); }
+    if (!slot->active) { ++out->refused; ++out->preauth_refused; runtime_collect(out, &slot->bridge.observation); }
 }
 static enum device_host_bridge_result runtime_accept_tick(const struct device_host_runtime_receiver_spec *spec,
     const struct runtime_authority *authority, struct runtime_slot slots[], int listener,
@@ -509,6 +519,7 @@ static bool runtime_sessions_tick(const struct device_host_runtime_receiver_spec
         if (result == DEVICE_HOST_BRIDGE_PROGRESS) progress = true;
         if (runtime_running(result)) continue;
         if (result == DEVICE_HOST_BRIDGE_EOF) ++out->completed; else ++out->refused;
+        if (!slots[i].authenticated) ++out->preauth_refused;
         runtime_collect(out, &slots[i].bridge.observation); slots[i].active = false;
     }
     return progress;
@@ -546,15 +557,21 @@ static enum device_host_bridge_result runtime_receiver_loop(const struct device_
         if (*listener >= 0) {
             result = runtime_accept_tick(spec, authority, slots, *listener, deadline, out);
             if (result != DEVICE_HOST_BRIDGE_READY) return result;
-            if (out->accepted >= spec->max_sessions) { platform_socket_close(*listener); *listener = -1; }
+            if (out->accepted >= spec->max_sessions || out->preauth_refused >= DEVICE_HOST_RUNTIME_PREAUTH_MAX) {
+                platform_socket_close(*listener); *listener = -1;
+            }
         }
         bool progress = runtime_sessions_tick(spec, slots, out);
+        if (*listener >= 0 && out->preauth_refused >= DEVICE_HOST_RUNTIME_PREAUTH_MAX) {
+            platform_socket_close(*listener); *listener = -1;
+        }
         if (progress) continue;
         if (runtime_receiver_wait(spec, slots, *listener, deadline, out) < 0) {
             out->error_number = errno; return DEVICE_HOST_BRIDGE_IO_ERROR;
         }
     }
-    return DEVICE_HOST_BRIDGE_EOF;
+    /* Pre-auth flood ceiling reached: listener closed, distinct from a clean lifetime end. */
+    return out->preauth_refused >= DEVICE_HOST_RUNTIME_PREAUTH_MAX ? DEVICE_HOST_BRIDGE_REFUSED : DEVICE_HOST_BRIDGE_EOF;
 }
 static enum device_host_bridge_result device_host_runtime_receiver_run_state(
     const struct device_host_runtime_receiver_spec *spec, struct device_host_runtime_observation *out)
