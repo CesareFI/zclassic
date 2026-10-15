@@ -347,14 +347,30 @@ static bool input_file_read_exact(int fd, char *text, size_t size)
     char extra;
     return read(fd, &extra, 1) == 0;
 }
+/* Identity and content stamp: any difference means the file changed. */
+static bool input_file_same(const struct stat *a, const struct stat *b)
+{
+    return a->st_ino == b->st_ino && a->st_dev == b->st_dev && a->st_size == b->st_size &&
+        a->st_mtim.tv_sec == b->st_mtim.tv_sec && a->st_mtim.tv_nsec == b->st_mtim.tv_nsec &&
+        a->st_ctim.tv_sec == b->st_ctim.tv_sec && a->st_ctim.tv_nsec == b->st_ctim.tv_nsec &&
+        a->st_mode == b->st_mode && a->st_uid == b->st_uid;
+}
+static void (*input_file_read_hook_for_test)(const char *path);
+#if defined(ZCL_TESTING)
+void zcl_native_device_host_input_file_hook_for_test(void (*hook)(const char *path))
+{
+    input_file_read_hook_for_test = hook;
+}
+#endif
 static bool input_file_load(const char *path, char *text, size_t capacity, size_t *total)
 {
     int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) return false;
     struct stat before, after;
     bool ok = fstat(fd, &before) == 0 && input_file_admissible(&before, capacity) &&
-        input_file_read_exact(fd, text, (size_t)before.st_size) && fstat(fd, &after) == 0 &&
-        after.st_ino == before.st_ino && after.st_dev == before.st_dev && after.st_size == before.st_size;
+        input_file_read_exact(fd, text, (size_t)before.st_size);
+    if (ok && input_file_read_hook_for_test) input_file_read_hook_for_test(path);
+    ok = ok && fstat(fd, &after) == 0 && input_file_same(&before, &after);
     close(fd);
     *total = ok ? (size_t)before.st_size : 0;
     return ok;

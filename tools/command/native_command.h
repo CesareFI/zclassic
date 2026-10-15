@@ -379,6 +379,8 @@ void zcl_native_device_host_runtime_exit_if_requested(int argc, char **argv);
  * trailing newline is dropped. Linux only; elsewhere refuses. */
 bool zcl_native_device_host_input_file_read(const char *path, char *text, size_t capacity, size_t *length);
 #if defined(ZCL_TESTING) && defined(__linux__)
+/* Runs once between the --input-file read and its stability re-check. */
+void zcl_native_device_host_input_file_hook_for_test(void (*hook)(const char *path));
 bool zcl_native_device_host_package_input_for_test(const struct json_value *input);
 bool zcl_native_device_host_package_terminal_for_test(int64_t deadline_ns);
 /* Drives installed_wait with one pending SIGHUP whose forward fails; when

@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 extern int repo_path(char *out, size_t outsz, const char *rel);
@@ -82,6 +83,48 @@ static int shell_input_file(void)
         ASSERT(!zcl_native_device_host_input_file_read(big, text, sizeof(text), &length));
         ASSERT_STR_EQ(text, "");
     } TEST_END
+    if (directory[0]) test_rm_rf(directory);
+    return failures;
+}
+
+static void input_rewrite_same_length(const char *path)
+{
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd >= 0) { (void)!write(fd, "{\"a\":2}", 7); close(fd); }
+}
+
+static void input_chmod_group_read(const char *path)
+{
+    (void)chmod(path, 0640);
+}
+
+static int shell_input_file_rewrite(void)
+{
+    int failures = 0;
+    char directory[1024] = {0};
+    TEST_CASE("device_host_shell: --input-file refuses a same-length rewrite or mode change mid-read") {
+        ASSERT(test_mkdtemp(directory, sizeof(directory), "device-host-input-rw"));
+        char path[1200], text[64];
+        size_t length = 0;
+        snprintf(path, sizeof(path), "%s/route.json", directory);
+        const struct timespec past[2] = {{.tv_sec = 1000000000}, {.tv_sec = 1000000000}};
+        ASSERT(shell_write(path, "{\"a\":1}", 0600));
+        ASSERT(utimensat(AT_FDCWD, path, past, 0) == 0);
+        /* Control: the hook seam alone, doing nothing, changes no verdict. */
+        ASSERT(zcl_native_device_host_input_file_read(path, text, sizeof(text), &length));
+        zcl_native_device_host_input_file_hook_for_test(input_rewrite_same_length);
+        bool refused = !zcl_native_device_host_input_file_read(path, text, sizeof(text), &length);
+        zcl_native_device_host_input_file_hook_for_test(NULL);
+        ASSERT(refused);
+        ASSERT_EQ(length, 0u); ASSERT_STR_EQ(text, "");
+        ASSERT(shell_write(path, "{\"a\":1}", 0600));
+        ASSERT(utimensat(AT_FDCWD, path, past, 0) == 0);
+        zcl_native_device_host_input_file_hook_for_test(input_chmod_group_read);
+        refused = !zcl_native_device_host_input_file_read(path, text, sizeof(text), &length);
+        zcl_native_device_host_input_file_hook_for_test(NULL);
+        ASSERT(refused);
+    } TEST_END
+    zcl_native_device_host_input_file_hook_for_test(NULL);
     if (directory[0]) test_rm_rf(directory);
     return failures;
 }
@@ -331,7 +374,7 @@ int test_device_host_shell(void)
 {
     int failures = shell_receiver_unit();
 #if defined(__linux__)
-    failures += shell_input_file() + shell_psk_fingerprint() + shell_psk_new() + shell_psk_cleanup_honesty();
+    failures += shell_input_file() + shell_input_file_rewrite() + shell_psk_fingerprint() + shell_psk_new() + shell_psk_cleanup_honesty();
     failures += shell_dry_run_argv() + shell_injection_refused() + shell_package_hangup_race();
 #endif
     return failures;
