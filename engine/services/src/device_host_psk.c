@@ -1,4 +1,4 @@
-/* purpose: Implement the reviewed role-bound PSK handshake and verified-before-release records. */
+/* purpose: Implement the role-bound PSK handshake and verified-before-release records (project-specific protocol; not an independently proved protocol, see device_host_psk.h). */
 /* Copyright 2026 Rhett Creighton. SPDX-License-Identifier: Apache-2.0 */
 #include "services/device_host_psk.h"
 #include "crypto/hkdf_sha3.h"

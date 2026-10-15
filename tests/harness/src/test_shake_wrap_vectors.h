@@ -1,8 +1,11 @@
 /* Copyright 2026 Rhett Creighton. SPDX-License-Identifier: Apache-2.0 */
-/* Independent pinned XKCP 4affab454735d54e78156880b3b44e38dcbf765c oracle.
- * SHA256(reference-vectors.txt): 4f87d3630cdcfacb4e4dac6de39b3bcd1c1b3a19011d5c2e94e53931e7df3fb5
+/* Externally generated reference vectors: the generator and raw output are not
+ * committed, so provenance is not reproducible in this tree. The SHA256 below
+ * is of an external reference-vectors.txt that is NOT in the tree (it is not a
+ * hash of this file): 4f87d3630cdcfacb4e4dac6de39b3bcd1c1b3a19011d5c2e94e53931e7df3fb5
+ * Claimed source: XKCP 4affab454735d54e78156880b3b44e38dcbf765c plus system OpenSSL SHA256.
  * Key[j]=j; AD[j]=j*7+index+1; P[j]=j*13+index+3 (uint8).
- * Digest is system OpenSSL SHA256(ciphertext || tag), not this Wrap code. */
+ * Digest is SHA256(ciphertext || tag), not this Wrap code. */
 static const struct wrap_vector wrap_vectors[] = {
     {0, 0, 0, 0, "7ae1c31e7da4280076ccab711fe8f9c352e77ff00621adcbea65fabd9f6b49ad"},
     {0, 1, 0, 1, "2adb68a3e4c8a65e4c6b0817e5af2e7a941ee767a70f362b53958eaec29e656c"},

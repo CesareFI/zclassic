@@ -1,6 +1,10 @@
 /* Copyright 2026 Rhett Creighton. SPDX-License-Identifier: Apache-2.0 */
-/* Independent pinned XKCP/OpenSSL oracle, real model v5 roots.
- * oracle-handshake-vectors.txt SHA256399278bc3b0b4e2cac75aa402cc5266a7b29b7f7384399d09ba3f30f087ab2f8 */
+/* Externally generated vectors: the generator and raw output are not committed, so
+ * provenance is not reproducible in this tree. The SHA256 below is of an external
+ * oracle-handshake-vectors.txt that is NOT in the tree, not of this file:
+ * 399278bc3b0b4e2cac75aa402cc5266a7b29b7f7384399d09ba3f30f087ab2f8
+ * The handshake is a project-specific protocol, so these vectors show agreement with a
+ * second implementation, not conformance to any standard. */
 static const struct psk_vector psk_vectors[] = {
     {0, "PSK", "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"},
     {0, "ID", "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"},

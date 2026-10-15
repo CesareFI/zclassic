@@ -346,6 +346,31 @@ static int psk_confirmation_refusals(void)
     } TEST_END
     device_host_psk_destroy(&c); device_host_psk_destroy(&s); psk_fixture_close(&f); return failures;
 }
+static int psk_server_hello_refusals(void)
+{
+    int failures = 0; struct psk_fixture f = {0}; struct device_host_psk_session c = {0}, s = {0};
+    TEST_CASE("host PSK: server refuses a C_HELLO with any one bound field altered and emits no S_HELLO") {
+        /* version, epoch, credential id, client key, server key, port */
+        const size_t offsets[] = {27, 35, 36, 68, 100, 164};
+        for (unsigned defect = 0; defect <= 6; ++defect) {
+            ASSERT(psk_fixture_open(&f)); ASSERT(psk_fixture_start(&f, 0, &c, &s));
+            uint8_t wire[DEVICE_HOST_PSK_WIRE]; size_t length = 0;
+            ASSERT(psk_take_wire(&c, wire, &length)); ASSERT_EQ(length, 198);
+            if (defect < 6) wire[offsets[defect]] ^= 1;
+            enum device_host_psk_result result = psk_feed(&s, wire, length, 198);
+            if (defect == 6) {
+                ASSERT_EQ(result, DEVICE_HOST_PSK_PROGRESS); ASSERT(s.pending_used > 0);
+            } else {
+                ASSERT_EQ(result, DEVICE_HOST_PSK_REFUSED); ASSERT(psk_failed_erased(&s));
+                ASSERT_EQ(s.pending_used, 0);
+                uint8_t out[DEVICE_HOST_PSK_WIRE]; size_t out_length = 0;
+                ASSERT(!psk_take_wire(&s, out, &out_length));
+            }
+            device_host_psk_destroy(&c); device_host_psk_destroy(&s); psk_fixture_close(&f);
+        }
+    } TEST_END
+    device_host_psk_destroy(&c); device_host_psk_destroy(&s); psk_fixture_close(&f); return failures;
+}
 static int psk_record_refusals(void)
 {
     int failures = 0; struct psk_fixture f = {0}; struct device_host_psk_session c = {0}, s = {0};
@@ -654,7 +679,7 @@ int test_device_host_psk(void)
 {
     typed_state_failures = 0;
     int failures = psk_oracle_roundtrip();
-    failures += psk_confirmation_refusals(); failures += psk_record_refusals();
+    failures += psk_confirmation_refusals(); failures += psk_server_hello_refusals(); failures += psk_record_refusals();
     failures += psk_pending_and_target(); failures += psk_acquisition_boundary();
     failures += psk_guard_reuse_and_revoke(); failures += psk_fin_counter_and_truncation();
     failures += psk_wrong_states(); failures += psk_failure_reason();
