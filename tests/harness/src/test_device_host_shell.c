@@ -278,6 +278,19 @@ static int shell_injection_refused(void)
     if (directory[0]) test_rm_rf(directory);
     return failures;
 }
+
+static int shell_package_hangup_race(void)
+{
+    int failures = 0;
+    TEST_CASE("device_host_shell: a hangup that races the engine exit reports the observed exit") {
+        /* ssh HUPs its ProxyCommand as the session ends; an engine already
+         * exiting cannot take the forward, and that is not a failure. */
+        ASSERT_STR_EQ(zcl_native_device_host_package_hangup_for_test(true), "observed_exit");
+        /* A still-running engine that cannot be signalled stays named. */
+        ASSERT_STR_EQ(zcl_native_device_host_package_hangup_for_test(false), "signal_queue_failed");
+    } TEST_END
+    return failures;
+}
 #endif
 
 int test_device_host_shell(void);
@@ -286,7 +299,7 @@ int test_device_host_shell(void)
     int failures = shell_receiver_unit();
 #if defined(__linux__)
     failures += shell_input_file() + shell_psk_fingerprint() + shell_psk_new();
-    failures += shell_dry_run_argv() + shell_injection_refused();
+    failures += shell_dry_run_argv() + shell_injection_refused() + shell_package_hangup_race();
 #endif
     return failures;
 }

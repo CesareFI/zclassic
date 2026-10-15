@@ -159,17 +159,30 @@ static const char *installed_observation_result(const struct platform_supervised
     return "launch_failed";
 }
 
+#ifdef ZCL_TESTING
+static bool (*installed_hangup_for_test)(struct platform_supervised_process *process);
+#endif
+static bool installed_hangup(struct platform_supervised_process *process)
+{
+#ifdef ZCL_TESTING
+    if (installed_hangup_for_test) return installed_hangup_for_test(process);
+#endif
+    return platform_supervised_signal(process, PLATFORM_SUPERVISED_HANGUP);
+}
+
 static enum platform_supervised_state installed_wait(struct platform_supervised_process *process,
     const struct installed_signals *signals, int64_t deadline, uint32_t cleanup_ms, const char **owner_result)
 {
     enum platform_supervised_state state;
     int64_t grace = 0;
+    bool hangup_refused = false;
     for (;;) {
         struct timespec zero = {0}; int number = sigtimedwait(&signals->owned, NULL, &zero);
         state = platform_supervised_poll(process);
         int64_t now = clock_now_monotonic_ns();
         if (installed_stop_requested(number, now, deadline, grace)) {
-            *owner_result = number == SIGINT || number == SIGTERM ? "cancelled" : "deadline";
+            *owner_result = number == SIGINT || number == SIGTERM ? "cancelled" :
+                hangup_refused ? "signal_queue_failed" : "deadline";
             return platform_supervised_stop(process, installed_deadline(now, cleanup_ms));
         }
         if (state != PLATFORM_SUPERVISED_RUNNING) {
@@ -177,9 +190,17 @@ static enum platform_supervised_state installed_wait(struct platform_supervised_
         }
         if (number == SIGHUP) {
             if (!grace) { grace = installed_deadline(now, 1500); if (grace > deadline) grace = deadline; }
-            if (!platform_supervised_signal(process, PLATFORM_SUPERVISED_HANGUP)) {
-                *owner_result = "signal_queue_failed";
-                return platform_supervised_stop(process, installed_deadline(now, cleanup_ms));
+            /* ssh HUPs its ProxyCommand as the session ends, often while the
+             * engine is already exiting; then the forward fails only because
+             * there is no engine left to take it. Observe again before naming
+             * a failure, and keep observing through the HUP grace: only an
+             * engine still running at grace end was really unsignalable. */
+            if (!installed_hangup(process)) {
+                state = platform_supervised_poll(process);
+                if (state != PLATFORM_SUPERVISED_RUNNING) {
+                    *owner_result = installed_observation_result(process, state); return state;
+                }
+                hangup_refused = true;
             }
         }
         int64_t limit = grace ? grace : deadline;
@@ -258,6 +279,35 @@ static int installed_run(const struct json_value *input)
 bool zcl_native_device_host_package_input_for_test(const struct json_value *input)
 {
     struct installed_input selected; return installed_input_read(input, &selected);
+}
+/* The engine exits while its HUP is in flight: the forward fails and the
+ * very next observation is the engine's own exit. */
+static bool installed_hangup_exited_for_test(struct platform_supervised_process *process)
+{
+    process->observation = (struct platform_supervised_observation){.state = PLATFORM_SUPERVISED_CLEAN,
+        .no_children = true, .engine_exit_observed = true, .engine_wait_status = 0};
+    return false;
+}
+static bool installed_hangup_refused_for_test(struct platform_supervised_process *process)
+{
+    (void)process; return false;
+}
+const char *zcl_native_device_host_package_hangup_for_test(bool engine_exits)
+{
+    struct platform_supervised_process process; platform_supervised_init(&process);
+    process.observation = (struct platform_supervised_observation){.state = PLATFORM_SUPERVISED_RUNNING};
+    struct installed_signals signals = {0}; sigemptyset(&signals.owned); sigaddset(&signals.owned, SIGHUP);
+    sigset_t prior;
+    if (pthread_sigmask(SIG_BLOCK, &signals.owned, &prior) != 0) return "mask_failed";
+    const char *result = "setup_refused";
+    installed_hangup_for_test = engine_exits ? installed_hangup_exited_for_test : installed_hangup_refused_for_test;
+    if (raise(SIGHUP) == 0)
+        (void)installed_wait(&process, &signals, installed_deadline(clock_now_monotonic_ns(), 5000), 1000, &result);
+    installed_hangup_for_test = NULL;
+    struct timespec zero = {0};
+    while (sigtimedwait(&signals.owned, NULL, &zero) == SIGHUP) {}
+    (void)pthread_sigmask(SIG_SETMASK, &prior, NULL);
+    return result;
 }
 bool zcl_native_device_host_package_terminal_for_test(int64_t deadline_ns)
 {
