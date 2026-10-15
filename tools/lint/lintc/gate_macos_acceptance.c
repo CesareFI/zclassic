@@ -389,7 +389,7 @@ static int mac_make_target_reachable(const char *makefile_path)
     regex_t re_start, re_recipe, re_next;
     int bad = reg_fail(&re_start, regcomp(&re_start,
         "^macos-acceptance:[[:space:]]+z23[[:space:]]+"
-        "zclassic23-package-verify[[:space:]]+zclassic23-acme[[:space:]]+"
+        "z23-package-verify[[:space:]]+z23-acme[[:space:]]+"
         "zcl-rpc[[:space:]]+process-group-exec[[:space:]]*$",
         REG_EXTENDED | REG_NOSUB));
     bad |= reg_fail(&re_recipe, regcomp(&re_recipe,
@@ -517,7 +517,7 @@ static int mac_check_root(void)
               "  The native (Darwin) leg is then unreachable from any "
               "command a\n"
               "  person would type. Restore the exact 'macos-acceptance: z23\n"
-              "  zclassic23-package-verify zclassic23-acme zcl-rpc "
+              "  z23-package-verify z23-acme zcl-rpc "
               "process-group-exec' target and its "
               "tabbed\n  acceptance recipe.\n", stderr);
         return 1;

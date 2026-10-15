@@ -93,7 +93,7 @@ zcl_is_sha256 "$SOURCE_BEFORE" || {
     exit 1
 }
 
-products=(zclassic23 zcl-rpc zcl-nodectl zclassic23-package-sign zclassic23-package-verify zclassic23-acme)
+products=(zclassic23 zcl-rpc zcl-nodectl z23-package-sign z23-package-verify z23-acme)
 # The two tiny stable-name helpers are FORCE-built by their canonical rules;
 # changing this compiler also changes vendor provenance, which invalidates the
 # two whole-program products without making every source prerequisite phony.

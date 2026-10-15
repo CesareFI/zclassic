@@ -8,8 +8,9 @@
 #
 # Artifact source is taken from the first argument or Z23_RELEASE_SOURCE
 # (a node URL or a local directory). Never hardcoded: any node that serves
-# z23, zclassic23, zclassic23-package-verify, zclassic23-acme, and
-# SHA256SUMS is a valid source. There is no registry.
+# z23, z23-package-verify, z23-acme (and their zclassic23-* twins), and
+# SHA256SUMS is a valid source; a release cut before the rename, with only
+# the zclassic23-* helper names, is accepted too. There is no registry.
 #
 # Checksum mismatch is a loud refusal. Nothing is copied to the destination
 # until SHA256SUMS --strict passes.
@@ -77,7 +78,7 @@ sha256_check_manifest() {
     fi
 }
 
-# Public fetch ceilings. The manifest has exactly five short checksum rows;
+# Public fetch ceilings. The manifest has at most seven short checksum rows;
 # 1 KiB leaves ample format headroom. Node aliases are currently below 32 MiB,
 # the confined verifier below 96 MiB, and the certificate worker (a small
 # static-ish TLS client, currently ~5 MB) below 32 MiB; these limits allow
@@ -262,56 +263,94 @@ cleanup_install_stage() {
     INSTALL_STAGE=""
 }
 
-# The release is an EXACT CLOSED SET of five names. AGENT_CARD.md is in it
+# The release is an EXACT CLOSED SET. The current set is seven names: the
+# node, the confined package verifier and the certificate worker each under
+# their z23 name AND under the legacy zclassic23 name (byte-identical, the
+# same two-name rule the node has always had), plus AGENT_CARD.md. A release
+# cut before the rename carries the five-name legacy set (no z23-<helper>
+# rows); a new installer still takes it, and an old installer still takes a
+# new release because every legacy name it requires is present.
+# AGENT_CARD.md is in it
 # and is not "just documentation": its whole job is to tell a coding agent
 # which commands to run, so a tampered card is instruction injection into
-# whatever assistant installs the node. zclassic23-acme is in it because a
+# whatever assistant installs the node. The certificate worker is in it because a
 # node that can obtain a certificate but never installs the one binary that
 # can renew it is a node that goes dark the day the certificate expires —
 # see write_cert_renew_units below. A release that claims everything is
 # verified does not get to ship one unverified file. The set stays exact —
 # never a wildcard — because "any file the manifest names" is how an
-# attacker adds a sixth.
-RELEASE_MEMBERS="AGENT_CARD.md z23 zclassic23 zclassic23-package-verify zclassic23-acme"
+# attacker adds an extra.
+RELEASE_MEMBERS_LEGACY="AGENT_CARD.md z23 zclassic23 zclassic23-package-verify zclassic23-acme"
+RELEASE_MEMBERS="AGENT_CARD.md z23 zclassic23 z23-package-verify zclassic23-package-verify z23-acme zclassic23-acme"
 REMOTE_CARD_MAX_BYTES=$((64 * 1024))
 
 payload_max_bytes() {
     case "$1" in
         z23|zclassic23) printf '%s\n' "$REMOTE_NODE_MAX_BYTES" ;;
-        zclassic23-package-verify) printf '%s\n' "$REMOTE_VERIFIER_MAX_BYTES" ;;
-        zclassic23-acme) printf '%s\n' "$REMOTE_ACME_MAX_BYTES" ;;
+        z23-package-verify|zclassic23-package-verify)
+            printf '%s\n' "$REMOTE_VERIFIER_MAX_BYTES" ;;
+        z23-acme|zclassic23-acme) printf '%s\n' "$REMOTE_ACME_MAX_BYTES" ;;
         AGENT_CARD.md) printf '%s\n' "$REMOTE_CARD_MAX_BYTES" ;;
         *) return 1 ;;
     esac
 }
 
+# The names a manifest lists, one per line, in file order.
+manifest_members() {
+    awk '{print $2}' "$1/SHA256SUMS"
+}
+
+# For a zclassic23-<helper> row of a CURRENT manifest, the z23-<helper> row it
+# duplicates; prints nothing for every other name (including the helper rows
+# of a legacy manifest, which have no z23- twin and must be fetched).
+manifest_alias_source() {
+    local dir="$1" name="$2" source_name
+    case "$name" in
+        zclassic23) source_name=z23 ;;
+        zclassic23-package-verify) source_name=z23-package-verify ;;
+        zclassic23-acme) source_name=z23-acme ;;
+        *) return 0 ;;
+    esac
+    if [ -n "$(manifest_digest_of "$dir" "$source_name")" ]; then
+        printf '%s\n' "$source_name"
+    fi
+}
+
+# Sorted (LC_ALL=C) names of the two accepted shapes, compared literally.
+RELEASE_NAMES_CURRENT=$'AGENT_CARD.md\nz23\nz23-acme\nz23-package-verify\nzclassic23\nzclassic23-acme\nzclassic23-package-verify'
+RELEASE_NAMES_LEGACY=$'AGENT_CARD.md\nz23\nzclassic23\nzclassic23-acme\nzclassic23-package-verify'
+
 validate_manifest_contract() {
-    local manifest="$1" bytes lines matching names z23_digest alias_digest
+    local manifest="$1" bytes lines matching names dir name twin
     [ -f "$manifest" ] || die "SHA256SUMS missing after fetch"
     bytes="$(wc -c <"$manifest" | tr -d ' ')"
     [ "$bytes" -le "$REMOTE_MANIFEST_MAX_BYTES" ] \
         || die "SHA256SUMS exceeds $REMOTE_MANIFEST_MAX_BYTES bytes"
     lines="$(wc -l <"$manifest" | tr -d ' ')"
     matching="$(LC_ALL=C grep -Ec \
-        '^[0-9a-f]{64}  (AGENT_CARD\.md|z23|zclassic23|zclassic23-package-verify|zclassic23-acme)$' \
+        '^[0-9a-f]{64}  (AGENT_CARD\.md|z23|zclassic23|z23-package-verify|zclassic23-package-verify|z23-acme|zclassic23-acme)$' \
         "$manifest" || true)"
-    [ "$lines" -eq 5 ] && [ "$matching" -eq 5 ] \
-        || die "SHA256SUMS must contain exactly five strict lowercase SHA-256 rows"
+    { [ "$lines" -eq 7 ] || [ "$lines" -eq 5 ]; } && [ "$matching" -eq "$lines" ] \
+        || die "SHA256SUMS must contain exactly seven (current) or exactly five (legacy) strict lowercase SHA-256 rows"
     names="$(awk '{print $2}' "$manifest" | LC_ALL=C sort)"
-    [ "$names" = $'AGENT_CARD.md\nz23\nzclassic23\nzclassic23-acme\nzclassic23-package-verify' ] \
+    [ "$names" = "$RELEASE_NAMES_CURRENT" ] || [ "$names" = "$RELEASE_NAMES_LEGACY" ] \
         || die "SHA256SUMS must name each required release member exactly once"
     # z23 and zclassic23 are one program under two names, and the release
-    # says so with one digest in two rows. If they ever differ this is not a
-    # release we understand: refuse rather than guess which name is the node.
-    z23_digest="$(manifest_digest_of "$(dirname "$manifest")" z23)"
-    alias_digest="$(manifest_digest_of "$(dirname "$manifest")" zclassic23)"
-    [ "$z23_digest" = "$alias_digest" ] \
-        || die "SHA256SUMS gives z23 and zclassic23 different digests — refusing to guess which one is the node"
+    # says so with one digest in two rows. The same holds for each helper
+    # that ships under both names. If a pair ever differs this is not a
+    # release we understand: refuse rather than guess which name is real.
+    dir="$(dirname "$manifest")"
+    for name in zclassic23 zclassic23-package-verify zclassic23-acme; do
+        twin="$(manifest_alias_source "$dir" "$name")"
+        [ -n "$twin" ] || continue
+        [ "$(manifest_digest_of "$dir" "$twin")" = "$(manifest_digest_of "$dir" "$name")" ] \
+            || die "SHA256SUMS gives $twin and $name different digests — refusing to guess which one is real"
+    done
 }
 
 validate_payload_sizes() {
     local dir="$1" name bytes maximum
-    for name in $RELEASE_MEMBERS; do
+    for name in $(manifest_members "$dir"); do
         [ -f "$dir/$name" ] || die "verified payload missing $name"
         maximum="$(payload_max_bytes "$name")"
         bytes="$(wc -c <"$dir/$name" | tr -d ' ')"
@@ -345,6 +384,19 @@ materialize_alias() {
         || cp -f -- "$dir/$source_name" "$dir/$name" \
         || die "could not materialize $name from the identical $source_name"
 }
+
+# Second pass over a verified manifest: every name that duplicates another
+# row (zclassic23, and in a current release the zclassic23-<helper> rows) is
+# materialised from the already-fetched primary. Run after ALL primaries are
+# present so the manifest's row order never matters.
+materialize_aliases() {
+    local dir="$1" name source_name
+    while read -r _ name; do
+        source_name="$(manifest_alias_source "$dir" "$name")"
+        [ -z "$source_name" ] || materialize_alias "$dir" "$name" "$source_name"
+    done <"$dir/SHA256SUMS"
+}
+
 
 curl_bounded() {
     local url="$1" dest="$2" maximum_bytes="$3" maximum_seconds="$4"
@@ -391,15 +443,13 @@ fetch_into() {
             validate_manifest_contract "$dest/SHA256SUMS"
 
             while read -r _ name; do
-                if [ "$name" = zclassic23 ]; then
-                    materialize_alias "$dest" zclassic23 z23
-                    continue
-                fi
+                [ -z "$(manifest_alias_source "$dest" "$name")" ] || continue
                 curl_bounded "$src/$name" "$dest/$name" \
                     "$(payload_max_bytes "$name")" \
                     "$REMOTE_PAYLOAD_MAX_TIME_SECONDS" \
                     || die "could not fetch $src/$name"
             done <"$dest/SHA256SUMS"
+            materialize_aliases "$dest"
             ;;
         *)
             [ -d "$src" ] || die "source is not a directory or http(s) URL: $src"
@@ -419,13 +469,11 @@ fetch_into() {
             fi
             local name
             while read -r _ name; do
-                if [ "$name" = zclassic23 ]; then
-                    materialize_alias "$dest" zclassic23 z23
-                    continue
-                fi
+                [ -z "$(manifest_alias_source "$dest" "$name")" ] || continue
                 [ -f "$src/$name" ] || die "listed file missing: $src/$name"
                 cp -f -- "$src/$name" "$dest/$name"
             done <"$dest/SHA256SUMS"
+            materialize_aliases "$dest"
             # Sidecar is extra evidence, not a SHA256SUMS member. Copy it when
             # the source carries one so a foreign-arch payload can still be
             # refused or accepted without executing it.
@@ -627,12 +675,31 @@ atomic_relative_link() {
 
 macos_generation_matches() {
     local stage="$1" generation="$2" name
-    for name in z23 zclassic23-package-verify zclassic23-acme AGENT_CARD.md \
-        SHA256SUMS; do
+    # Every name the verified manifest lists (cmp reads through the helper
+    # alias symlinks, so a release with only the legacy helper names matches
+    # a generation this installer laid down from it), plus the manifest.
+    for name in $(manifest_members "$stage") SHA256SUMS; do
         cmp -s "$stage/$name" "$generation/$name" || return 1
     done
     [ -L "$generation/zclassic23" ] \
         && [ "$(readlink "$generation/zclassic23")" = z23 ]
+}
+
+# Place one helper under both names: the z23-<helper> primary as a real file
+# and zclassic23-<helper> as a relative symlink to it (the node's own
+# z23 / zclassic23 shape). A current release supplies z23-<helper>; a release
+# cut before the rename supplies only zclassic23-<helper>, whose bytes become
+# the primary here, so the installed tree is the same either way.
+install_helper() {
+    local stage="$1" dest="$2" helper="$3" mode="$4" src
+    src="$stage/z23-$helper"
+    [ -f "$src" ] || src="$stage/zclassic23-$helper"
+    [ -f "$src" ] || die "verified payload missing z23-$helper"
+    install -m "$mode" "$src" "$dest/z23-$helper" \
+        || die "could not install z23-$helper"
+    rm -f -- "$dest/zclassic23-$helper"
+    ln -s "z23-$helper" "$dest/zclassic23-$helper" \
+        || die "could not link zclassic23-$helper to z23-$helper"
 }
 
 # ── Post-install provenance ─────────────────────────────────────────────────
@@ -676,7 +743,7 @@ MACOS_ACTIVE_PREFIX=""
 MACOS_ACTIVATION_PENDING=0
 
 install_payload_macos_generation() {
-    local stage="$1" prefix="$2" root generations name
+    local stage="$1" prefix="$2" root generations name helper target
     root="$prefix/lib/z23"
     generations="$root/generations"
     MACOS_GENERATIONS="$generations"
@@ -700,9 +767,9 @@ install_payload_macos_generation() {
     else
         MACOS_INCOMING="$(mktemp -d "$generations/.incoming.XXXXXX")" \
             || die "could not stage macOS release generation"
-        for name in z23 zclassic23-package-verify zclassic23-acme; do
-            install -m 555 "$stage/$name" "$MACOS_INCOMING/$name"
-        done
+        install -m 555 "$stage/z23" "$MACOS_INCOMING/z23"
+        install_helper "$stage" "$MACOS_INCOMING" package-verify 555
+        install_helper "$stage" "$MACOS_INCOMING" acme 555
         install -m 444 "$stage/AGENT_CARD.md" "$MACOS_INCOMING/AGENT_CARD.md"
         # Retained beside the binary it names the generation after, so a
         # later provenance check (generation_provenance) or fleet audit reads
@@ -725,12 +792,17 @@ install_payload_macos_generation() {
         || die "could not link the current macOS z23 generation"
     atomic_relative_link z23 "$prefix/bin/zclassic23" \
         || die "could not link the current macOS node alias"
-    atomic_relative_link ../lib/z23/current/zclassic23-package-verify \
-        "$prefix/bin/zclassic23-package-verify" \
-        || die "could not link the current macOS package verifier"
-    atomic_relative_link ../lib/z23/current/zclassic23-acme \
-        "$prefix/bin/zclassic23-acme" \
-        || die "could not link the current macOS certificate worker"
+    for helper in package-verify acme; do
+        # A generation laid down before the rename holds the helper only
+        # under its zclassic23- name; point the primary at whichever exists.
+        target="z23-$helper"
+        [ -e "$MACOS_GENERATION/$target" ] || target="zclassic23-$helper"
+        atomic_relative_link "../lib/z23/current/$target" \
+            "$prefix/bin/z23-$helper" \
+            || die "could not link the current macOS z23-$helper"
+        atomic_relative_link "z23-$helper" "$prefix/bin/zclassic23-$helper" \
+            || die "could not link the macOS zclassic23-$helper alias"
+    done
     atomic_relative_link ../../lib/z23/current/AGENT_CARD.md \
         "$prefix/share/z23/AGENT_CARD.md" \
         || die "could not link the current verified agent card"
@@ -740,7 +812,7 @@ install_payload() {
     local stage="$1" prefix="$2" name
     local bindir="$prefix/bin" carddir="$prefix/share/z23"
     mkdir -p "$bindir" "$carddir"
-    for name in $RELEASE_MEMBERS; do
+    for name in $(manifest_members "$stage"); do
         [ -f "$stage/$name" ] || die "verified payload missing $name"
     done
     install -m 755 "$stage/z23" "$bindir/z23"
@@ -752,12 +824,11 @@ install_payload() {
     # so the running-binary digest and self-respawn are unchanged.
     rm -f -- "$bindir/zclassic23"
     ln -s z23 "$bindir/zclassic23" || die "could not link zclassic23 to z23"
-    install -m 755 "$stage/zclassic23-package-verify" \
-        "$bindir/zclassic23-package-verify"
-    # zclassic23-acme is the ONLY binary that can renew a certificate this
+    install_helper "$stage" "$bindir" package-verify 755
+    # z23-acme is the ONLY binary that can renew a certificate this
     # node obtains (see write_cert_renew_units). Installing it beside the
     # verifier is what closes the "certificate obtained, never renewed" bug.
-    install -m 755 "$stage/zclassic23-acme" "$bindir/zclassic23-acme"
+    install_helper "$stage" "$bindir" acme 755
     # The agent card is verified payload, so it is installed like payload:
     # an assistant reading it is reading bytes SHA256SUMS covered.
     install -m 644 "$stage/AGENT_CARD.md" "$carddir/AGENT_CARD.md"
@@ -1106,7 +1177,7 @@ selftest_prepare() {
     # A separate lifecycle proof exercises Darwin generations and launchd.
     export Z23_INSTALL_TEST_PLATFORM=Linux
 
-    # A release is five names, and z23/zclassic23 are the same bytes.
+    # A legacy release is five names, and z23/zclassic23 are the same bytes.
     # The node is a tiny executable that stamps tor: full so the fail-closed
     # installer check has a positive control that is not the real binary.
     printf '#!/bin/sh\nprintf "z23 v0.1.0 (source 000000000000)\\ntor: full\\n"\n' \
@@ -1116,7 +1187,7 @@ selftest_prepare() {
     printf 'confined-verifier\n' >"$tmp/good/zclassic23-package-verify"
     printf 'cert-worker\n' >"$tmp/good/zclassic23-acme"
     printf '# Z23 agent card\n\nRun `z23 status`.\n' >"$tmp/good/AGENT_CARD.md"
-    (cd "$tmp/good" && sha256sum $RELEASE_MEMBERS >SHA256SUMS)
+    (cd "$tmp/good" && sha256sum $RELEASE_MEMBERS_LEGACY >SHA256SUMS)
 
     # Shell-only curl fixture: map https://mirror.invalid/<path> into the
     # selftest tree and record every requested object. This proves a bad
@@ -1134,7 +1205,7 @@ selftest_prepare() {
     printf 'payload-b-different\n' >"$tmp/http/split-names/zclassic23"
     cp -f -- "$tmp/good/zclassic23-package-verify" "$tmp/good/zclassic23-acme" \
         "$tmp/good/AGENT_CARD.md" "$tmp/http/split-names/"
-    (cd "$tmp/http/split-names" && sha256sum $RELEASE_MEMBERS >SHA256SUMS)
+    (cd "$tmp/http/split-names" && sha256sum $RELEASE_MEMBERS_LEGACY >SHA256SUMS)
 
     # A release whose agent card was edited after the manifest was written.
     # The card tells an assistant what to run, so this must refuse.
@@ -1153,7 +1224,7 @@ selftest_prepare() {
         >"$tmp/http/replaced/zclassic23-package-verify"
     printf 'replacement-acme\n' >"$tmp/http/replaced/zclassic23-acme"
     printf '# replacement card\n' >"$tmp/http/replaced/AGENT_CARD.md"
-    (cd "$tmp/http/replaced" && sha256sum $RELEASE_MEMBERS >SHA256SUMS)
+    (cd "$tmp/http/replaced" && sha256sum $RELEASE_MEMBERS_LEGACY >SHA256SUMS)
     dd if=/dev/zero bs=1025 count=1 2>/dev/null | tr '\0' x \
         >"$tmp/http/oversized/SHA256SUMS"
     truncate -s $((REMOTE_NODE_MAX_BYTES + 1)) \
@@ -1162,7 +1233,7 @@ selftest_prepare() {
         "$tmp/http/oversized-payload/zclassic23"
     cp -f -- "$tmp/good/zclassic23-package-verify" "$tmp/good/zclassic23-acme" \
         "$tmp/good/AGENT_CARD.md" "$tmp/http/oversized-payload/"
-    (cd "$tmp/http/oversized-payload" && sha256sum $RELEASE_MEMBERS >SHA256SUMS)
+    (cd "$tmp/http/oversized-payload" && sha256sum $RELEASE_MEMBERS_LEGACY >SHA256SUMS)
     {
         sed -n '1p' "$tmp/good/SHA256SUMS"
         sed -n '1p' "$tmp/good/SHA256SUMS"
@@ -1198,11 +1269,11 @@ case "$rel" in
         [ "$maximum_seconds" = 300 ] && \
             [ "$maximum_bytes" = 67108864 ] || exit 4
         ;;
-    */zclassic23-package-verify)
+    */z23-package-verify|*/zclassic23-package-verify)
         [ "$maximum_seconds" = 300 ] && \
             [ "$maximum_bytes" = 134217728 ] || exit 4
         ;;
-    */zclassic23-acme)
+    */z23-acme|*/zclassic23-acme)
         [ "$maximum_seconds" = 300 ] && \
             [ "$maximum_bytes" = 33554432 ] || exit 4
         ;;
@@ -1270,7 +1341,7 @@ selftest_local_refusals() {
         cp -f -- "$tmp/good/zclassic23-package-verify" \
             "$tmp/good/zclassic23-acme" "$tmp/good/AGENT_CARD.md" \
             "$dest/"
-        (cd "$dest" && sha256sum $RELEASE_MEMBERS >SHA256SUMS)
+        (cd "$dest" && sha256sum $RELEASE_MEMBERS_LEGACY >SHA256SUMS)
     }
 
     selftest_expect_stamp_refuse() {
@@ -1337,7 +1408,7 @@ EOF
     cp -f -- "$tmp/good/zclassic23-package-verify" \
         "$tmp/good/zclassic23-acme" "$tmp/good/AGENT_CARD.md" \
         "$tmp/sidecar-missing/"
-    (cd "$tmp/sidecar-missing" && sha256sum $RELEASE_MEMBERS >SHA256SUMS)
+    (cd "$tmp/sidecar-missing" && sha256sum $RELEASE_MEMBERS_LEGACY >SHA256SUMS)
     selftest_expect_stamp_refuse \
         "$tmp/sidecar-missing" "$tmp/sidecar-missing-dest" \
         "$tmp/sidecar-missing.err" \
@@ -1357,7 +1428,7 @@ EOF
         "$tmp/good/zclassic23-acme" "$tmp/good/AGENT_CARD.md" \
         "$tmp/sidecar-full/"
     printf 'tor: full\n' >"$tmp/sidecar-full/z23.tor-stamp"
-    (cd "$tmp/sidecar-full" && sha256sum $RELEASE_MEMBERS >SHA256SUMS)
+    (cd "$tmp/sidecar-full" && sha256sum $RELEASE_MEMBERS_LEGACY >SHA256SUMS)
     selftest_expect_stamp_refuse \
         "$tmp/sidecar-full" "$tmp/sidecar-full-dest" "$tmp/sidecar-full.err" \
         tor_stamp_unbound "a non-executable release whose sidecar has no binary_sha256"
@@ -1376,7 +1447,7 @@ EOF
         "$tmp/sidecar-wrong-hash/"
     printf 'tor: full\nbinary_sha256: %s\n' \
         "$(printf 'a%.0s' {1..64})" >"$tmp/sidecar-wrong-hash/z23.tor-stamp"
-    (cd "$tmp/sidecar-wrong-hash" && sha256sum $RELEASE_MEMBERS >SHA256SUMS)
+    (cd "$tmp/sidecar-wrong-hash" && sha256sum $RELEASE_MEMBERS_LEGACY >SHA256SUMS)
     selftest_expect_stamp_refuse \
         "$tmp/sidecar-wrong-hash" "$tmp/sidecar-wrong-hash-dest" "$tmp/sidecar-wrong-hash.err" \
         tor_stamp_unbound "a non-executable release whose sidecar binary_sha256 does not match"
@@ -1391,7 +1462,7 @@ EOF
     cp -f -- "$tmp/good/zclassic23-package-verify" \
         "$tmp/good/zclassic23-acme" "$tmp/good/AGENT_CARD.md" \
         "$tmp/sidecar-bound/"
-    (cd "$tmp/sidecar-bound" && sha256sum $RELEASE_MEMBERS >SHA256SUMS)
+    (cd "$tmp/sidecar-bound" && sha256sum $RELEASE_MEMBERS_LEGACY >SHA256SUMS)
     printf 'tor: full\nbinary_sha256: %s\n' \
         "$(manifest_digest_of "$tmp/sidecar-bound" z23)" \
         >"$tmp/sidecar-bound/z23.tor-stamp"
@@ -1957,11 +2028,14 @@ EOF
     local version
     for version in v1 v2; do
         ln -f -- "$mac/$version/z23" "$mac/$version/zclassic23"
-        printf '%s verifier\n' "$version" >"$mac/$version/zclassic23-package-verify"
-        printf '%s acme\n' "$version" >"$mac/$version/zclassic23-acme"
+        printf '%s verifier\n' "$version" >"$mac/$version/z23-package-verify"
+        printf '%s acme\n' "$version" >"$mac/$version/z23-acme"
         printf '# %s agent card\n' "$version" >"$mac/$version/AGENT_CARD.md"
-        chmod 755 "$mac/$version/zclassic23-package-verify" \
-            "$mac/$version/zclassic23-acme"
+        chmod 755 "$mac/$version/z23-package-verify" \
+            "$mac/$version/z23-acme"
+        ln -f -- "$mac/$version/z23-package-verify" \
+            "$mac/$version/zclassic23-package-verify"
+        ln -f -- "$mac/$version/z23-acme" "$mac/$version/zclassic23-acme"
         (cd "$mac/$version" && sha256sum $RELEASE_MEMBERS >SHA256SUMS)
     done
     # The generation ID is the sha256 SHA256SUMS records for z23 -- the same
@@ -2081,6 +2155,17 @@ EOF
         || die "selftest: first macOS generation is not last-good"
     [ -L "$prefix/bin/z23" ] && [ -x "$prefix/bin/z23" ] \
         || die "selftest: stable macOS z23 name does not resolve to its generation"
+    # Both helper names resolve through the generation: z23-<helper> is the
+    # primary, zclassic23-<helper> a relative alias to it, and the bytes read
+    # back as the release.
+    for helper in package-verify acme; do
+        [ -L "$prefix/bin/z23-$helper" ] && [ -x "$prefix/bin/z23-$helper" ] \
+            || die "selftest: macOS z23-$helper does not resolve to its generation"
+        [ "$(readlink "$prefix/bin/zclassic23-$helper")" = "z23-$helper" ] \
+            || die "selftest: macOS zclassic23-$helper must alias z23-$helper"
+        cmp -s "$mac/v1/z23-$helper" "$prefix/bin/zclassic23-$helper" \
+            || die "selftest: macOS zclassic23-$helper bytes differ from the release"
+    done
 
     # The defect this proves fixed: the directory name is the sha256
     # SHA256SUMS records for z23, not the sha256 of the SHA256SUMS file.
@@ -2303,7 +2388,7 @@ selftest_macos_tampered_manifest() {
     printf '# agent card\n' >"$mac/release/AGENT_CARD.md"
     chmod 755 "$mac/release/zclassic23-package-verify" \
         "$mac/release/zclassic23-acme"
-    (cd "$mac/release" && sha256sum $RELEASE_MEMBERS >SHA256SUMS)
+    (cd "$mac/release" && sha256sum $RELEASE_MEMBERS_LEGACY >SHA256SUMS)
 
     # Tamper: rewrite the z23 and zclassic23 rows' digests (they are the same
     # hard-linked bytes, so both rows must move together or the EARLIER
@@ -2348,6 +2433,113 @@ selftest_macos_tampered_manifest() {
         || die "selftest: a tampered manifest still produced a generation directory"
 }
 
+# A CURRENT release names seven members: every helper under its z23- name AND
+# its legacy zclassic23- name. This proves the new shape installs, that every
+# member is individually required, that each twin pair must agree, that a
+# remote fetch transfers each pair once, and that an install over a prefix
+# holding the legacy layout converts it. (The legacy five-name release is the
+# `good` fixture everywhere above: a new installer must keep taking it.)
+selftest_current_release() {
+    local tmp="$SELFTEST_TMP" rc out name helper sha
+    local cur="$tmp/good-new"
+
+    mkdir -p "$cur" "$tmp/http/good-new"
+    cp -f -- "$tmp/good/z23" "$cur/z23"
+    ln -f -- "$cur/z23" "$cur/zclassic23"
+    printf 'confined-verifier\n' >"$cur/z23-package-verify"
+    ln -f -- "$cur/z23-package-verify" "$cur/zclassic23-package-verify"
+    printf 'cert-worker\n' >"$cur/z23-acme"
+    ln -f -- "$cur/z23-acme" "$cur/zclassic23-acme"
+    cp -f -- "$tmp/good/AGENT_CARD.md" "$cur/"
+    (cd "$cur" && sha256sum $RELEASE_MEMBERS >SHA256SUMS)
+    [ "$(wc -l <"$cur/SHA256SUMS")" -eq 7 ] \
+        || die "selftest: the current release fixture is not seven rows"
+
+    # Upgrade: a prefix holding the legacy layout (real zclassic23-<helper>
+    # files) takes the current release and ends with z23-<helper> real and
+    # zclassic23-<helper> relative links to it.
+    out="$(run_install "$tmp/cur-prefix" "$tmp/units" "$tmp/good" 2>"$tmp/cur-legacy.err")" \
+        || die "selftest: legacy release failed to install under the new installer"
+    for helper in package-verify acme; do
+        [ -L "$tmp/cur-prefix/bin/zclassic23-$helper" ] \
+            || die "selftest: a legacy release must still install zclassic23-$helper as a link"
+        cmp -s "$tmp/good/zclassic23-$helper" "$tmp/cur-prefix/bin/z23-$helper" \
+            || die "selftest: a legacy release must supply z23-$helper's bytes"
+    done
+    out="$(run_install "$tmp/cur-prefix" "$tmp/units" "$cur" 2>"$tmp/cur.err")" \
+        || die "selftest: current release failed to install"
+    [ "$out" = "$NEXT_COMMAND" ] \
+        || die "selftest: current release stdout must be exactly '$NEXT_COMMAND', got '$out'"
+    for helper in package-verify acme; do
+        [ -f "$tmp/cur-prefix/bin/z23-$helper" ] && [ ! -L "$tmp/cur-prefix/bin/z23-$helper" ] \
+            || die "selftest: z23-$helper must install as a real file"
+        cmp -s "$cur/z23-$helper" "$tmp/cur-prefix/bin/z23-$helper" \
+            || die "selftest: installed z23-$helper bytes differ"
+        [ "$(readlink "$tmp/cur-prefix/bin/zclassic23-$helper")" = "z23-$helper" ] \
+            || die "selftest: zclassic23-$helper must link to the relative name z23-$helper"
+        cmp -s "$cur/zclassic23-$helper" "$tmp/cur-prefix/bin/zclassic23-$helper" \
+            || die "selftest: zclassic23-$helper does not read as the release bytes"
+    done
+
+    # Each of the six non-card members is individually required: a manifest
+    # (and directory) missing any ONE of them is not a release.
+    for name in z23 zclassic23 z23-package-verify zclassic23-package-verify \
+        z23-acme zclassic23-acme; do
+        mkdir -p "$tmp/cur-missing-$name"
+        cp -f -- "$cur/"* "$tmp/cur-missing-$name/"
+        rm -f "$tmp/cur-missing-$name/$name"
+        (cd "$tmp/cur-missing-$name" && grep -v "  $name\$" "$cur/SHA256SUMS" >SHA256SUMS)
+        rc=0
+        run_install "$tmp/cur-missing-$name-dest" "$tmp/units" \
+            "$tmp/cur-missing-$name" >/dev/null 2>"$tmp/cur-missing-$name.err" || rc=$?
+        [ "$rc" -eq 1 ] || die "selftest: a current release missing $name must exit 1"
+        grep -Eq 'exactly five|exactly once' "$tmp/cur-missing-$name.err" \
+            || die "selftest: a current release missing $name must name the strict manifest refusal"
+        if [ -e "$tmp/cur-missing-$name-dest/bin/z23" ]; then
+            die "selftest: a current release missing $name installed z23 anyway"
+        fi
+    done
+
+    # A twin pair that disagrees is refused: there is no honest way to pick.
+    mkdir -p "$tmp/cur-split"
+    cp -f -- "$cur/"* "$tmp/cur-split/"
+    rm -f "$tmp/cur-split/zclassic23-acme"
+    printf 'a-different-acme\n' >"$tmp/cur-split/zclassic23-acme"
+    (cd "$tmp/cur-split" && sha256sum $RELEASE_MEMBERS >SHA256SUMS)
+    rc=0
+    run_install "$tmp/cur-split-dest" "$tmp/units" "$tmp/cur-split" \
+        >/dev/null 2>"$tmp/cur-split.err" || rc=$?
+    [ "$rc" -eq 1 ] || die "selftest: split z23-acme/zclassic23-acme digests must exit 1"
+    grep -q 'different digests' "$tmp/cur-split.err" \
+        || die "selftest: split helper twins must name the digest disagreement"
+
+    # Remote: each twin pair is transferred once. Manifest rows in REVERSE
+    # order put every alias ahead of its primary, which must not matter.
+    cp -f -- "$cur/"* "$tmp/http/good-new/"
+    sort -r -k2 "$cur/SHA256SUMS" >"$tmp/http/good-new/SHA256SUMS"
+    sha="$(sha256sum "$tmp/http/good-new/SHA256SUMS" | awk '{print $1}')"
+    : >"$tmp/curl.log"
+    PATH="$tmp/mockbin:$PATH" \
+    Z23_INSTALL_TEST_HTTP_ROOT="$tmp/http" \
+    Z23_INSTALL_TEST_CURL_LOG="$tmp/curl.log" \
+    Z23_SKIP_SYSTEMD=1 Z23_INSTALL_PREFIX="$tmp/cur-remote" \
+    Z23_UNIT_DIR="$tmp/units" \
+        "$SCRIPT_DIR/install_z23.sh" \
+        --source=https://mirror.invalid/good-new --manifest-sha256="$sha" \
+        >/dev/null 2>"$tmp/cur-remote.err" \
+        || die "selftest: pinned current release failed to install remotely"
+    [ "$(sort "$tmp/curl.log" | wc -l | tr -d ' ')" -eq 5 ] \
+        || die "selftest: a current release must fetch manifest, card and three primaries only"
+    for name in zclassic23 zclassic23-package-verify zclassic23-acme; do
+        ! grep -q "good-new/$name " "$tmp/curl.log" \
+            || die "selftest: remote fetch requested duplicate $name"
+    done
+    for helper in package-verify acme; do
+        cmp -s "$cur/z23-$helper" "$tmp/cur-remote/bin/zclassic23-$helper" \
+            || die "selftest: remote zclassic23-$helper does not read as the release bytes"
+    done
+}
+
 selftest() {
     # Ordinary fixtures use the production deadline, including cold launches
     # under parallel lint load. Only the timeout fixture shortens it to 1 s.
@@ -2362,6 +2554,7 @@ selftest() {
     selftest_remote_bounds
     selftest_remote_manifest_and_signal
     selftest_local_success
+    selftest_current_release
     selftest_local_manifest_refusals
     selftest_release_pin
     selftest_macos_transaction

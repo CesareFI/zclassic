@@ -4,7 +4,8 @@
 # ship.sh — build ONE production binary and put those exact bytes on every node
 # in the fleet, verifying each one by the source identity it reports back.
 # The two package-verify workers the daemon spawns at reproduce time
-# (zclassic23-package-verify{,-dev}, resolved beside its executable) ship as
+# (z23-package-verify{,-dev}, resolved beside its executable; the old
+# zclassic23-package-verify{,-dev} names ship beside them for older daemons) ship as
 # part of the same frozen artifact set: a host with a fresh daemon beside a
 # stale worker fails reproduces with a bare "rebuild worker exit 2".
 #
@@ -169,7 +170,11 @@ SHIP_RPC_BUDGETS="${ZCL_SHIP_RPC_BUDGETS:-5 20 60}"
 # Spawnable companions of the daemon, resolved BESIDE its executable at
 # reproduce time (pkgl_worker_path). Both ship with every candidate; the
 # index order here is the order the remote swap stages them.
-WORKER_NAMES=(zclassic23-package-verify zclassic23-package-verify-dev)
+# Indices 0 and 1 are the primary z23-* names; 2 and 3 are the same bytes
+# under the legacy names an already-installed daemon or installer still
+# resolves (same two-names precedent as z23 / zclassic23 in a release).
+WORKER_NAMES=(z23-package-verify z23-package-verify-dev
+              zclassic23-package-verify zclassic23-package-verify-dev)
 TARGETS="local remote"
 TARGETS_EXPLICIT=0
 DRY_RUN=0
@@ -1330,9 +1335,10 @@ if [ "$DRY_RUN" -eq 1 ]; then
     CANDIDATE=""; ARTIFACT_SHA=""; CAND_SOURCE_ID="$SOURCE_ID"
 else
     rm -f build/bin/z23 build/bin/zclassic23 \
+        build/bin/z23-package-verify build/bin/z23-package-verify-dev \
         build/bin/zclassic23-package-verify \
         build/bin/zclassic23-package-verify-dev
-    make -j"$(nproc)" zclassic23 zclassic23-package-verify dev-package-verifier >/dev/null || \
+    make -j"$(nproc)" zclassic23 z23-package-verify dev-package-verifier >/dev/null || \
         die "production build failed"
     CANDIDATE="$(mktemp "$(ship_scratch_root)/zclassic23.ship.XXXXXX")"
     WORKER_FILES=(); WORKER_SHAS=()
@@ -1375,7 +1381,7 @@ else
     # zcl_spawn_capture swallowed the stderr, so reproduce failed with a bare
     # "rebuild worker exit 2". Freeze the workers from the SAME gated checkout
     # so all three spawnables travel as one artifact set.
-    for w in zclassic23-package-verify zclassic23-package-verify-dev; do
+    for w in "${WORKER_NAMES[@]}"; do
         [ -x "build/bin/$w" ] || die "gated build did not produce worker $w"
         f="$(mktemp "$(ship_scratch_root)/zclassic23.ship.XXXXXX")"
         install -m 755 "build/bin/$w" "$f"
@@ -1384,7 +1390,7 @@ else
         zcl_is_sha256 "$s" || die "could not hash frozen worker $w"
         WORKER_SHAS+=("$s")
     done
-    say "workers    zclassic23-package-verify ${WORKER_SHAS[0]:0:16}…  zclassic23-package-verify-dev ${WORKER_SHAS[1]:0:16}…  $(du -ch "${WORKER_FILES[@]}" | tail -1 | cut -f1)"
+    say "workers    ${WORKER_NAMES[0]} ${WORKER_SHAS[0]:0:16}…  ${WORKER_NAMES[1]} ${WORKER_SHAS[1]:0:16}…  (plus legacy ${WORKER_NAMES[2]}, ${WORKER_NAMES[3]})  $(du -ch "${WORKER_FILES[@]}" | tail -1 | cut -f1)"
 
     # Not redundant with the archive preflight: only the built binary proves
     # the link consumed real Tor rather than -ltor_stub.
@@ -1403,8 +1409,9 @@ else
     trap 'rm -f "$CANDIDATE" "$CANDIDATE.tor-stamp" "$RELEASE_MANIFEST" "${WORKER_FILES[@]}"' EXIT HUP INT TERM
     {
         printf '%s  z23\n' "$ARTIFACT_SHA"
-        printf '%s  %s\n' "${WORKER_SHAS[0]}" "${WORKER_NAMES[0]}"
-        printf '%s  %s\n' "${WORKER_SHAS[1]}" "${WORKER_NAMES[1]}"
+        for i in "${!WORKER_NAMES[@]}"; do
+            printf '%s  %s\n' "${WORKER_SHAS[$i]}" "${WORKER_NAMES[$i]}"
+        done
     } > "$RELEASE_MANIFEST"
     RELEASE_ID="$(sha256sum < "$RELEASE_MANIFEST" | awk '{print $1}')"
     zcl_is_sha256 "$RELEASE_ID" || die "could not hash the release manifest"
@@ -1630,7 +1637,9 @@ if [ -e "$root" ]; then
     chmod 555 "$root" &&
     [ "$(sha256sum < "$root/MANIFEST.sha256" | awk '{print $1}')" = "$manifest_sha" ] &&
     [ "$(sha256sum < "$root/z23" | awk '{print $1}')" = "$daemon_sha" ] &&
+    [ "$(sha256sum < "$root/z23-package-verify" | awk '{print $1}')" = "$worker_v_sha" ] &&
     [ "$(sha256sum < "$root/zclassic23-package-verify" | awk '{print $1}')" = "$worker_v_sha" ] &&
+    [ "$(sha256sum < "$root/z23-package-verify-dev" | awk '{print $1}')" = "$worker_d_sha" ] &&
     [ "$(sha256sum < "$root/zclassic23-package-verify-dev" | awk '{print $1}')" = "$worker_d_sha" ] || {
         rmdir "$lock"
         echo "remote: immutable release root content mismatch: $root" >&2
@@ -1662,7 +1671,7 @@ REMOTE_STAGE_PREPARE
     fi
 
     if ! tar -C "$STAGE_BUNDLE_DIR" -cf - \
-        z23 "${WORKER_NAMES[0]}" "${WORKER_NAMES[1]}" MANIFEST.sha256 |
+        z23 "${WORKER_NAMES[@]}" MANIFEST.sha256 |
         ssh "${SSH_OPTS[@]}" "$host" tar -C "$incoming" -xf -; then
         rc=1
     elif ! ssh "${SSH_OPTS[@]}" "$host" bash -s -- \
@@ -1677,11 +1686,14 @@ trap 'rmdir "$lock" 2>/dev/null || true' EXIT HUP INT TERM
 }
 [ "$(sha256sum < "$incoming/MANIFEST.sha256" | awk '{print $1}')" = "$manifest_sha" ] &&
 [ "$(sha256sum < "$incoming/z23" | awk '{print $1}')" = "$daemon_sha" ] &&
+[ "$(sha256sum < "$incoming/z23-package-verify" | awk '{print $1}')" = "$worker_v_sha" ] &&
 [ "$(sha256sum < "$incoming/zclassic23-package-verify" | awk '{print $1}')" = "$worker_v_sha" ] &&
+[ "$(sha256sum < "$incoming/z23-package-verify-dev" | awk '{print $1}')" = "$worker_d_sha" ] &&
 [ "$(sha256sum < "$incoming/zclassic23-package-verify-dev" | awk '{print $1}')" = "$worker_d_sha" ] || {
     echo "remote: staged release bytes differ from manifest" >&2; exit 1;
 }
-chmod 555 "$incoming/z23" "$incoming/zclassic23-package-verify" \
+chmod 555 "$incoming/z23" "$incoming/z23-package-verify" \
+    "$incoming/z23-package-verify-dev" "$incoming/zclassic23-package-verify" \
     "$incoming/zclassic23-package-verify-dev"
 chmod 444 "$incoming/MANIFEST.sha256"
 # Rename while the directory is still writable — macOS refuses to move a
@@ -1821,7 +1833,9 @@ root="$1"; manifest_sha="$2"; daemon_sha="$3"; worker_v_sha="$4"; worker_d_sha="
 [ -d "$root" ] || { echo "remote: immutable release root is not a directory: $root" >&2; exit 1; }
 [ "$(sha256sum < "$root/MANIFEST.sha256" | awk '{print $1}')" = "$manifest_sha" ] &&
 [ "$(sha256sum < "$root/z23" | awk '{print $1}')" = "$daemon_sha" ] &&
+[ "$(sha256sum < "$root/z23-package-verify" | awk '{print $1}')" = "$worker_v_sha" ] &&
 [ "$(sha256sum < "$root/zclassic23-package-verify" | awk '{print $1}')" = "$worker_v_sha" ] &&
+[ "$(sha256sum < "$root/z23-package-verify-dev" | awk '{print $1}')" = "$worker_d_sha" ] &&
 [ "$(sha256sum < "$root/zclassic23-package-verify-dev" | awk '{print $1}')" = "$worker_d_sha" ] || {
     echo "remote: immutable release root content mismatch: $root" >&2
     exit 1
@@ -1900,8 +1914,10 @@ one_way_schema="${17:-0}"
 # the local side uses.
 observe_candidate() { ship_observe zclassic23 "$want_sha" "$want_src" "$want_commit" "$1"; }
 observe_restore()   { ship_observe zclassic23 "$prior_sha" "" "" "$1"; }
-worker_v="$release_root/zclassic23-package-verify"
-worker_d="$release_root/zclassic23-package-verify-dev"
+worker_v="$release_root/z23-package-verify"
+worker_v_legacy="$release_root/zclassic23-package-verify"
+worker_d="$release_root/z23-package-verify-dev"
+worker_d_legacy="$release_root/zclassic23-package-verify-dev"
 dropin_dir="$HOME/.config/systemd/user/zclassic23.service.d"
 dropin="$dropin_dir/zzzzz-z23-ship-release.conf"
 rollback_dropin="${dropin}.ship.rollback.${run_id}"
@@ -1982,11 +1998,14 @@ lock_held=1
 if [ -d "$node_incoming" ]; then
     [ "$(sha256sum < "$node_incoming/MANIFEST.sha256" | awk '{print $1}')" = "$manifest_sha" ] &&
     [ "$(sha256sum < "$node_incoming/z23" | awk '{print $1}')" = "$want_sha" ] &&
+    [ "$(sha256sum < "$node_incoming/z23-package-verify" | awk '{print $1}')" = "$want_worker_v" ] &&
     [ "$(sha256sum < "$node_incoming/zclassic23-package-verify" | awk '{print $1}')" = "$want_worker_v" ] &&
+    [ "$(sha256sum < "$node_incoming/z23-package-verify-dev" | awk '{print $1}')" = "$want_worker_d" ] &&
     [ "$(sha256sum < "$node_incoming/zclassic23-package-verify-dev" | awk '{print $1}')" = "$want_worker_d" ] || {
         echo "remote: transferred release bytes differ from manifest" >&2; exit 1;
     }
-    chmod 555 "$node_incoming/z23" "$node_incoming/zclassic23-package-verify" \
+    chmod 555 "$node_incoming/z23" "$node_incoming/z23-package-verify" \
+        "$node_incoming/z23-package-verify-dev" "$node_incoming/zclassic23-package-verify" \
         "$node_incoming/zclassic23-package-verify-dev"
     chmod 444 "$node_incoming/MANIFEST.sha256"
     # Rename while writable, then publish the read-only mode (same macOS
@@ -2001,6 +2020,8 @@ chmod 555 "$release_root"
 [ "$(sha256sum < "$release_root/MANIFEST.sha256" | awk '{print $1}')" = "$manifest_sha" ] &&
 [ "$(sha256sum < "$release_root/z23" | awk '{print $1}')" = "$want_sha" ] &&
 [ "$(sha256sum < "$worker_v" | awk '{print $1}')" = "$want_worker_v" ] &&
+[ "$(sha256sum < "$worker_v_legacy" | awk '{print $1}')" = "$want_worker_v" ] &&
+[ "$(sha256sum < "$worker_d_legacy" | awk '{print $1}')" = "$want_worker_d" ] &&
 [ "$(sha256sum < "$worker_d" | awk '{print $1}')" = "$want_worker_d" ] || {
     echo "remote: immutable release verification failed" >&2; exit 1;
 }

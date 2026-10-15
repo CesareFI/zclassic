@@ -8,18 +8,18 @@
 # can later serve. It never invokes docker.
 #
 # Platforms, and the build that produces each:
-#   linux-x86_64     make -j z23 zclassic23-package-verify zclassic23-acme
+#   linux-x86_64     make -j z23 z23-package-verify z23-acme
 #                    make tor-full
 #   darwin-arm64     make vendor && make tor-full
-#                    make -j z23 zclassic23-package-verify zclassic23-acme
+#                    make -j z23 z23-package-verify z23-acme
 #                    (built natively on Apple Silicon with the macOS SDK;
 #                     every shipped Mach-O has a macOS 14.0 floor.)
 #   windows-x86_64   VENDOR_TARGET=x86_64-w64-mingw32 \
 #                        tools/scripts/build_vendor.sh
-#                    make ZCL_TARGET=windows-x86_64 -j z23 zclassic23-acme
+#                    make ZCL_TARGET=windows-x86_64 -j z23 z23-acme
 #                    (cross-linked on Linux with clang + the mingw-w64
 #                     sysroot; see the Makefile's release-target block. There
-#                     is no Windows zclassic23-package-verify on purpose --
+#                     is no Windows z23-package-verify on purpose --
 #                     see release_binaries below.)
 # Darwin cannot be cross-built on Linux because its SDK is not redistributable;
 # the native Apple worker path is documented in docs/work/BOOTSTRAP_PLAN.md.
@@ -180,8 +180,12 @@ assert_platform_minimum_os() {
 # written-out list per platform and NEVER a glob or a filter over what happens
 # to be on disk. AGENT_CARD.md is added to every set by write_sha256sums.
 #
-# The sets differ by exactly one member, and for a stated reason:
-# zclassic23-package-verify is the confined worker that compiles and executes
+# Every helper ships under two names, exactly like the node: the z23-<name>
+# primary and a byte-identical zclassic23-<name> alias, so an installer or
+# daemon written before the rename still finds every name it requires.
+#
+# The sets differ by exactly one helper (two names), and for a stated reason:
+# z23-package-verify is the confined worker that compiles and executes
 # downloaded package code. It is safe only because it confines each child with
 # seccomp, Landlock and POSIX rlimits, and Windows has none of those in this
 # tree. Shipping an unconfined binary under that name would be a false safety
@@ -191,10 +195,13 @@ assert_platform_minimum_os() {
 release_binaries() {
     case "$1" in
         linux-x86_64|darwin-arm64)
-            printf '%s\n' z23 zclassic23 zclassic23-package-verify zclassic23-acme
+            printf '%s\n' z23 zclassic23 \
+                z23-package-verify zclassic23-package-verify \
+                z23-acme zclassic23-acme
             ;;
         windows-x86_64)
-            printf '%s\n' z23.exe zclassic23.exe zclassic23-acme.exe
+            printf '%s\n' z23.exe zclassic23.exe \
+                z23-acme.exe zclassic23-acme.exe
             ;;
         *) return 1 ;;
     esac
@@ -262,7 +269,7 @@ write_sha256sums() {
     # AGENT_CARD.md is a manifest member, not an optional extra: the card
     # tells a coding assistant which commands to run against the node, so
     # a tampered copy is an instruction-injection path into whatever agent
-    # installs it, not merely stale prose. zclassic23-acme is a manifest
+    # installs it, not merely stale prose. z23-acme is a manifest
     # member because it is the ONLY binary that can renew a certificate a
     # node obtains -- shipping a release that can get a certificate but
     # never installs the tool that renews it is exactly the silent-failure
@@ -292,9 +299,11 @@ write_sha256sums() {
 # an unchecked one.
 #
 # tools/scripts/install_z23.sh and tools/scripts/deploy_z23_release.sh
-# hard-require SHA256SUMS to name exactly z23, zclassic23,
-# zclassic23-package-verify, zclassic23-acme, and AGENT_CARD.md (five
-# names, in independent checks in each file). Keep all three in agreement:
+# hard-require SHA256SUMS to name exactly either this set (z23, zclassic23,
+# z23-package-verify, zclassic23-package-verify, z23-acme, zclassic23-acme,
+# and AGENT_CARD.md: seven names) or the previous five-name set that carries
+# only the zclassic23-<helper> names (so a new installer still takes an old
+# release). Both are independent checks in each file. Keep all three in agreement:
 # a name added or dropped here without the same change in both of those
 # files reopens the exact "release member silently missing" bug class this
 # script's own selftest below is built to catch.
@@ -337,6 +346,12 @@ link_or_copy() {
     local src="$1" dst="$2"
     rm -f -- "$dst"
     ln -f -- "$src" "$dst" 2>/dev/null || cp -f -- "$src" "$dst"
+}
+
+# z23-acme -> zclassic23-acme (and z23-acme.exe -> zclassic23-acme.exe): the
+# legacy name an already-installed daemon, installer or service unit uses.
+helper_alias_of() {
+    printf 'zclassic23-%s\n' "${1#z23-}"
 }
 
 package_from_bin() {
@@ -390,14 +405,17 @@ package_from_bin() {
 
     members="$(release_binaries "$platform")" \
         || die "no release member set for platform $platform"
-    # Every member except the z23/zclassic23 pair must already exist as a
-    # built binary: this script strips and checksums, it never builds.
+    # Every member except the z23/zclassic23 pair and the zclassic23-<helper>
+    # aliases must already exist as a built binary: this script strips and
+    # checksums, it never builds. A build directory that predates the
+    # z23-<helper> rename holds the helper only under its zclassic23- name,
+    # which is accepted as the source of the primary.
     for member in $members; do
         case "$member" in
-            "z23$exe"|"zclassic23$exe") continue ;;
+            "z23$exe"|"zclassic23$exe"|zclassic23-*) continue ;;
         esac
         source_name="${member%$exe}"
-        [ -f "$bin_dir/$member" ] \
+        [ -f "$bin_dir/$member" ] || [ -f "$bin_dir/$(helper_alias_of "$member")" ] \
             || die "no $member in $bin_dir — build first: make $source_name"
     done
 
@@ -415,11 +433,17 @@ package_from_bin() {
     chmod 755 "$out_dir/zclassic23$exe"
     for member in $members; do
         case "$member" in
-            "z23$exe"|"zclassic23$exe") continue ;;
+            "z23$exe"|"zclassic23$exe"|zclassic23-*) continue ;;
         esac
-        strip_binary "$platform" "$bin_dir/$member" "$out_dir/$member" \
+        candidate="$bin_dir/$member"
+        [ -f "$candidate" ] || candidate="$bin_dir/$(helper_alias_of "$member")"
+        strip_binary "$platform" "$candidate" "$out_dir/$member" \
             || die "strip failed for $member"
         chmod 755 "$out_dir/$member"
+        # Same two-name rule as the node: one stripped file, a second name
+        # for the identical bytes, two independent SHA256SUMS rows.
+        link_or_copy "$out_dir/$member" "$out_dir/$(helper_alias_of "$member")"
+        chmod 755 "$out_dir/$(helper_alias_of "$member")"
     done
     for member in $members; do
         assert_platform_minimum_os "$platform" "$out_dir/$member"
@@ -440,10 +464,10 @@ package_from_bin() {
                 || die "stripped z23 exceeds documented glibc/GLIBCXX symbol floor"
             ZCL_C23_MAX_GLIBC=GLIBC_2.38 bash "$NODE_AUDIT" "$out_dir/z23" \
                 || die "stripped z23 failed the C23 node ABI audit"
-            ZCL_SYMBOL_FLOOR_BIN="$out_dir/zclassic23-acme" bash "$FLOOR_GATE" \
+            ZCL_SYMBOL_FLOOR_BIN="$out_dir/z23-acme" bash "$FLOOR_GATE" \
                 || die "certificate worker exceeds documented glibc/GLIBCXX symbol floor"
             ZCL_C23_MAX_GLIBC=GLIBC_2.38 bash "$NODE_AUDIT" \
-                "$out_dir/zclassic23-acme" \
+                "$out_dir/z23-acme" \
                 || die "certificate worker failed the C23 binary ABI audit"
             ;;
         darwin-arm64)
@@ -455,7 +479,7 @@ package_from_bin() {
         *)
             bash "$NODE_AUDIT" "$out_dir/z23$exe" \
                 || die "stripped z23$exe failed the C23 node ABI audit"
-            bash "$NODE_AUDIT" "$out_dir/zclassic23-acme$exe" \
+            bash "$NODE_AUDIT" "$out_dir/z23-acme$exe" \
                 || die "certificate worker$exe failed the C23 binary ABI audit"
             ;;
     esac
@@ -664,7 +688,7 @@ selftest() {
     (package_from_bin "$tmp/no-verifier" "$tmp/out") \
         >/dev/null 2>"$tmp/verifier.err" || rc=$?
     [ "$rc" -eq 1 ] || die "selftest: missing verifier must exit 1, got $rc"
-    grep -q 'no zclassic23-package-verify' "$tmp/verifier.err" \
+    grep -q 'no z23-package-verify' "$tmp/verifier.err" \
         || die "selftest: missing verifier must name the refusal"
 
     # A release without the certificate renewal worker is the exact bug this
@@ -678,9 +702,9 @@ selftest() {
     rc=0
     (package_from_bin "$tmp/no-acme" "$tmp/out") \
         >/dev/null 2>"$tmp/acme.err" || rc=$?
-    [ "$rc" -eq 1 ] || die "selftest: missing zclassic23-acme must exit 1, got $rc"
-    grep -q 'no zclassic23-acme' "$tmp/acme.err" \
-        || die "selftest: missing zclassic23-acme must name the refusal"
+    [ "$rc" -eq 1 ] || die "selftest: missing z23-acme must exit 1, got $rc"
+    grep -q 'no z23-acme' "$tmp/acme.err" \
+        || die "selftest: missing z23-acme must name the refusal"
 
     # Apple Silicon is a measured runtime target. Intel Darwin remains an
     # explicit refusal until native hardware earns the same contract.
@@ -733,13 +757,13 @@ selftest() {
     # a set that silently grew or shrank is a SHA256SUMS that stopped being a
     # complete statement about the release directory.
     [ "$(release_binaries linux-x86_64 | tr '\n' ' ')" \
-        = "z23 zclassic23 zclassic23-package-verify zclassic23-acme " ] \
+        = "z23 zclassic23 z23-package-verify zclassic23-package-verify z23-acme zclassic23-acme " ] \
         || die "selftest: the linux-x86_64 member set changed"
     [ "$(release_binaries windows-x86_64 | tr '\n' ' ')" \
-        = "z23.exe zclassic23.exe zclassic23-acme.exe " ] \
+        = "z23.exe zclassic23.exe z23-acme.exe zclassic23-acme.exe " ] \
         || die "selftest: the windows-x86_64 member set changed"
     [ "$(release_binaries darwin-arm64 | tr '\n' ' ')" \
-        = "z23 zclassic23 zclassic23-package-verify zclassic23-acme " ] \
+        = "z23 zclassic23 z23-package-verify zclassic23-package-verify z23-acme zclassic23-acme " ] \
         || die "selftest: the darwin-arm64 member set changed"
     # Every member name must carry the platform's suffix, or SHA256SUMS names
     # files the platform cannot run.
@@ -753,8 +777,9 @@ selftest() {
         case "$name" in *.exe) die "selftest: Darwin member $name carries .exe" ;; esac
     done
 
-    # SHA256SUMS writer: the complete five-file manifest -- z23, zclassic23,
-    # zclassic23-package-verify, zclassic23-acme, AGENT_CARD.md -- then
+    # SHA256SUMS writer: the complete seven-file manifest -- z23, zclassic23,
+    # z23-package-verify, zclassic23-package-verify, z23-acme,
+    # zclassic23-acme, AGENT_CARD.md -- then
     # strict verification. AGENT_CARD.md sits on the same footing as the
     # binaries here: it is the file a coding assistant reads to learn which
     # commands to run against the node, so it must fail exactly like a
@@ -762,22 +787,34 @@ selftest() {
     mkdir -p "$tmp/sums"
     printf 'alpha\n' >"$tmp/sums/z23"
     printf 'alpha\n' >"$tmp/sums/zclassic23"
+    printf 'verifier\n' >"$tmp/sums/z23-package-verify"
     printf 'verifier\n' >"$tmp/sums/zclassic23-package-verify"
+    printf 'acme\n' >"$tmp/sums/z23-acme"
     printf 'acme\n' >"$tmp/sums/zclassic23-acme"
     printf 'card\n' >"$tmp/sums/AGENT_CARD.md"
     write_sha256sums "$tmp/sums"
     [ -s "$tmp/sums/SHA256SUMS" ] || die "selftest: SHA256SUMS empty"
-    [ "$(wc -l <"$tmp/sums/SHA256SUMS")" -eq 5 ] \
-        || die "selftest: SHA256SUMS must name exactly five files, not more or fewer"
+    [ "$(wc -l <"$tmp/sums/SHA256SUMS")" -eq 7 ] \
+        || die "selftest: SHA256SUMS must name exactly seven files, not more or fewer"
     grep -q '  z23$' "$tmp/sums/SHA256SUMS" || die "selftest: SHA256SUMS missing z23"
     grep -q '  zclassic23$' "$tmp/sums/SHA256SUMS" \
         || die "selftest: SHA256SUMS missing zclassic23"
-    grep -q '  zclassic23-package-verify$' "$tmp/sums/SHA256SUMS" \
-        || die "selftest: SHA256SUMS missing zclassic23-package-verify"
-    grep -q '  zclassic23-acme$' "$tmp/sums/SHA256SUMS" \
-        || die "selftest: SHA256SUMS missing zclassic23-acme"
+    for name in z23-package-verify zclassic23-package-verify z23-acme zclassic23-acme; do
+        grep -q "  $name\$" "$tmp/sums/SHA256SUMS" \
+            || die "selftest: SHA256SUMS missing $name"
+    done
     grep -q '  AGENT_CARD.md$' "$tmp/sums/SHA256SUMS" \
         || die "selftest: SHA256SUMS missing AGENT_CARD.md"
+    # A new-name member that is absent must refuse the manifest outright:
+    # the closed set is a complete statement or it is not written.
+    for name in z23-package-verify z23-acme; do
+        mv -- "$tmp/sums/$name" "$tmp/sums/$name.held"
+        rc=0
+        (write_sha256sums "$tmp/sums") >/dev/null 2>&1 || rc=$?
+        [ "$rc" -ne 0 ] || die "selftest: SHA256SUMS written despite missing $name"
+        mv -- "$tmp/sums/$name.held" "$tmp/sums/$name"
+    done
+    write_sha256sums "$tmp/sums"
     (cd "$tmp/sums" && sha256_check SHA256SUMS >/dev/null) \
         || die "selftest: SHA256SUMS must verify the files it names"
     printf 'tamper\n' >"$tmp/sums/z23"
@@ -829,14 +866,16 @@ selftest() {
         say "selftest: link_or_copy fell back to a copy on this filesystem (still correct)"
     fi
     # Re-running write_sha256sums over a hardlinked pair must still record
-    # independent, individually-verifiable lines for every one of the five
+    # independent, individually-verifiable lines for every one of the seven
     # names — not a shortcut just because two of them share storage.
-    printf 'verifier\n' >"$tmp/link/zclassic23-package-verify"
-    printf 'acme\n' >"$tmp/link/zclassic23-acme"
+    printf 'verifier\n' >"$tmp/link/z23-package-verify"
+    link_or_copy "$tmp/link/z23-package-verify" "$tmp/link/zclassic23-package-verify"
+    printf 'acme\n' >"$tmp/link/z23-acme"
+    link_or_copy "$tmp/link/z23-acme" "$tmp/link/zclassic23-acme"
     printf 'card\n' >"$tmp/link/AGENT_CARD.md"
     write_sha256sums "$tmp/link"
-    [ "$(wc -l <"$tmp/link/SHA256SUMS")" -eq 5 ] \
-        || die "selftest: hardlinked pair did not still produce a five-line SHA256SUMS"
+    [ "$(wc -l <"$tmp/link/SHA256SUMS")" -eq 7 ] \
+        || die "selftest: hardlinked pair did not still produce a seven-line SHA256SUMS"
     (cd "$tmp/link" && sha256_check SHA256SUMS >/dev/null) \
         || die "selftest: SHA256SUMS must verify a hardlinked pair too"
 

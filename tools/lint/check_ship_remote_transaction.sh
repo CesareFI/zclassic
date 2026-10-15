@@ -46,8 +46,8 @@ old_sha="$(sha256sum < "$tmp/old" | awk '{print $1}')"
 new_sha="$(sha256sum < "$tmp/new" | awk '{print $1}')"
 source_id="$(printf 'a%.0s' {1..64})"
 manifest="$tmp/MANIFEST.sha256"
-printf '%s  z23\n%s  zclassic23-package-verify\n%s  zclassic23-package-verify-dev\n' \
-    "$new_sha" "$new_sha" "$new_sha" > "$manifest"
+printf '%s  z23\n%s  z23-package-verify\n%s  z23-package-verify-dev\n%s  zclassic23-package-verify\n%s  zclassic23-package-verify-dev\n' \
+    "$new_sha" "$new_sha" "$new_sha" "$new_sha" "$new_sha" > "$manifest"
 manifest_sha="$(sha256sum < "$manifest" | awk '{print $1}')"
 
 home="$tmp/home"
@@ -153,8 +153,10 @@ stage_release() {
     [ ! -e "$incoming" ] || find "$incoming" -depth -delete
     mkdir -p "$incoming"
     install -m 755 "$tmp/new" "$incoming/z23"
-    install -m 755 "$tmp/new" "$incoming/zclassic23-package-verify"
-    install -m 755 "$tmp/new" "$incoming/zclassic23-package-verify-dev"
+    for w in z23-package-verify z23-package-verify-dev \
+             zclassic23-package-verify zclassic23-package-verify-dev; do
+        install -m 755 "$tmp/new" "$incoming/$w"
+    done
     install -m 644 "$manifest" "$incoming/MANIFEST.sha256"
 }
 invoke_activate() {
@@ -187,17 +189,33 @@ assert_old_selected() {
     [ "$(live_exe_sha "$live_pid")" = "$old_sha" ]
 }
 
-# An existing immutable identity with corrupt content must be refused in place.
+# An existing immutable identity must verify exactly when ALL four worker
+# names (the z23-* primaries and the legacy zclassic23-* copies an older daemon
+# resolves) are present with the frozen bytes, and must be refused in place
+# when any one of them is corrupt or missing.
+ship_workers="z23-package-verify z23-package-verify-dev zclassic23-package-verify zclassic23-package-verify-dev"
 mkdir -p "$release"
 install -m 644 "$manifest" "$release/MANIFEST.sha256"
 install -m 755 "$tmp/new" "$release/z23"
-install -m 755 "$tmp/new" "$release/zclassic23-package-verify"
-printf corrupt > "$release/zclassic23-package-verify-dev"
-if bash "$tmp/release-check.sh" "$release" "$manifest_sha" "$new_sha" "$new_sha" "$new_sha" >/dev/null 2>&1; then
-    echo "check_ship_remote_transaction: mismatched immutable root passed" >&2
+for w in $ship_workers; do install -m 755 "$tmp/new" "$release/$w"; done
+bash "$tmp/release-check.sh" "$release" "$manifest_sha" "$new_sha" "$new_sha" "$new_sha" >/dev/null 2>&1 || {
+    echo "check_ship_remote_transaction: complete immutable root was refused" >&2
     exit 1
-fi
-[ "$(cat "$release/zclassic23-package-verify-dev")" = corrupt ]
+}
+for w in $ship_workers; do
+    printf corrupt > "$release/$w"
+    if bash "$tmp/release-check.sh" "$release" "$manifest_sha" "$new_sha" "$new_sha" "$new_sha" >/dev/null 2>&1; then
+        echo "check_ship_remote_transaction: immutable root with corrupt $w passed" >&2
+        exit 1
+    fi
+    [ "$(cat "$release/$w")" = corrupt ]
+    rm -f "$release/$w"
+    if bash "$tmp/release-check.sh" "$release" "$manifest_sha" "$new_sha" "$new_sha" "$new_sha" >/dev/null 2>&1; then
+        echo "check_ship_remote_transaction: immutable root missing $w passed" >&2
+        exit 1
+    fi
+    install -m 755 "$tmp/new" "$release/$w"
+done
 
 # A foreign activation lock must refuse without mutating the running process or
 # removing the lock owned by the other transaction.
@@ -216,9 +234,18 @@ rmdir "$home/.cache/z23/ship-activation.lock"
 # the partial-stage fault that originally motivated shipping all three files
 # as one release set.
 reset_fixture
-printf corrupt > "$incoming/zclassic23-package-verify-dev"
+printf corrupt > "$incoming/z23-package-verify-dev"
 if invoke_activate >/dev/null 2>&1; then
     echo "check_ship_remote_transaction: corrupt worker passed" >&2
+    exit 1
+fi
+assert_old_selected
+
+# The legacy-name copy an older daemon resolves is held to the same standard.
+reset_fixture
+printf corrupt > "$incoming/zclassic23-package-verify"
+if invoke_activate >/dev/null 2>&1; then
+    echo "check_ship_remote_transaction: corrupt legacy-name worker passed" >&2
     exit 1
 fi
 assert_old_selected
@@ -268,6 +295,7 @@ reset_fixture
 invoke_activate >/dev/null
 live_pid="$(cat "$pidfile")"
 [ "$(live_exe_sha "$live_pid")" = "$new_sha" ]
+[ "$(sha256sum < "$release/z23-package-verify" | awk '{print $1}')" = "$new_sha" ]
 [ "$(sha256sum < "$release/zclassic23-package-verify" | awk '{print $1}')" = "$new_sha" ]
 grep -Fq "ExecStart=\"$release/z23\"" "$dropin"
 

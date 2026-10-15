@@ -2588,7 +2588,7 @@ endif
 # Tier-1 darwin-arm64 aggregate.  Its exact registered-test set is derived
 # from the closed capability matrix; unavailable rows run their refusal proof
 # rather than disappearing as hand-maintained skips.
-macos-acceptance: z23 zclassic23-package-verify zclassic23-acme zcl-rpc process-group-exec
+macos-acceptance: z23 z23-package-verify z23-acme zcl-rpc process-group-exec
 	@./tools/scripts/macos_acceptance.sh --run
 
 .PHONY: windows-service-install windows-service-status windows-service-remove

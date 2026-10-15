@@ -385,7 +385,7 @@ static int mac_st_group_wiring(int *rc, const char *sandbox,
     char no_z23_path[512];
     snprintf(no_z23_path, sizeof no_z23_path, "%s/make_no_z23", sandbox);
     if (mac_replace1_buf(makefile,
-        "macos-acceptance: z23 zclassic23-package-verify zclassic23-acme zcl-rpc process-group-exec",
+        "macos-acceptance: z23 z23-package-verify z23-acme zcl-rpc process-group-exec",
         "macos-acceptance: z23", t, sizeof t))
         return die("z23-lint: derived buffer overflow\n", "");
     (void)csr_write(no_z23_path, t);

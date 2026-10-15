@@ -33,13 +33,20 @@ usage() {
     sed -n '2,17p' "$0"
 }
 
+# The two accepted closed sets, sorted. The current release carries every
+# helper under its z23- name and its legacy zclassic23- name; a release cut
+# before the rename carries only the legacy names. Anything else (a missing
+# member, an extra one) is refused, never repaired.
+RELEASE_NAMES_CURRENT=$'AGENT_CARD.md\nz23\nz23-acme\nz23-package-verify\nzclassic23\nzclassic23-acme\nzclassic23-package-verify'
+RELEASE_NAMES_LEGACY=$'AGENT_CARD.md\nz23\nzclassic23\nzclassic23-acme\nzclassic23-package-verify'
+
 verify_release() {
     local dir="$1" names
     [ -d "$dir" ] || die "release directory missing: $dir"
     [ -f "$dir/SHA256SUMS" ] || die "SHA256SUMS missing in $dir"
     names="$(awk '{print $2}' "$dir/SHA256SUMS" | LC_ALL=C sort)"
-    [ "$names" = $'AGENT_CARD.md\nz23\nzclassic23\nzclassic23-acme\nzclassic23-package-verify' ] \
-        || die "SHA256SUMS must name exactly AGENT_CARD.md, z23, zclassic23, zclassic23-acme, and zclassic23-package-verify"
+    [ "$names" = "$RELEASE_NAMES_CURRENT" ] || [ "$names" = "$RELEASE_NAMES_LEGACY" ] \
+        || die "SHA256SUMS must name exactly AGENT_CARD.md, z23, zclassic23, z23-acme, zclassic23-acme, z23-package-verify, and zclassic23-package-verify (or the legacy five without the z23-<helper> names)"
     (cd "$dir" && sha256sum -c --strict SHA256SUMS >/dev/null) \
         || die "release SHA256SUMS mismatch"
     [ -x "$INSTALLER" ] || die "installer missing or not executable: $INSTALLER"
@@ -62,7 +69,9 @@ if systemctl --user cat z23.service >/dev/null 2>&1 ||
     exit 4
 fi
 for path in "$HOME/.local/bin/z23" "$HOME/.local/bin/zclassic23" \
+            "$HOME/.local/bin/z23-package-verify" \
             "$HOME/.local/bin/zclassic23-package-verify" \
+            "$HOME/.local/bin/z23-acme" \
             "$HOME/.local/bin/zclassic23-acme"; do
     [ ! -e "$path" ] || {
         echo "fresh bootstrap target already exists: $path" >&2
@@ -84,12 +93,13 @@ REMOTE_PREPARE
 copy_release() {
     local host="$1" incoming="$2" release_dir="$3"
     command -v tar >/dev/null 2>&1 || die "tar is required for release transfer"
-    # Exact, fixed member names only. The receiving directory was minted and
+    # Exact member names only: the verified manifest names, which
+    # verify_release has already pinned to one of the two closed sets. The
+    # receiving directory was minted and
     # path-checked by prepare_host; activate_host independently re-hashes the
     # manifest, installer, and every extracted payload before installation.
     tar -C "$release_dir" -cf - \
-        SHA256SUMS AGENT_CARD.md z23 zclassic23 zclassic23-package-verify \
-        zclassic23-acme \
+        SHA256SUMS $(awk '{print $2}' "$release_dir/SHA256SUMS" | LC_ALL=C sort) \
         -C "$SCRIPT_DIR" install_z23.sh \
         | "$SSH_BIN" "${SSH_OPTS[@]}" "$host" \
             tar -C "$incoming" -xf -
@@ -146,6 +156,7 @@ cleanup() {
         # plain -type f rollback left it behind dangling, pointing at bytes
         # this cleanup had just deleted.
         find "$prefix/bin/z23" "$prefix/bin/zclassic23" \
+             "$prefix/bin/z23-package-verify" "$prefix/bin/z23-acme" \
              "$prefix/bin/zclassic23-package-verify" \
              "$prefix/bin/zclassic23-acme" "$unit" \
              -maxdepth 0 \( -type f -o -type l \) -delete 2>/dev/null || true
@@ -182,8 +193,12 @@ systemctl --user start --no-block z23.service
 
 want_node="$(sha256sum "$stage/zclassic23" | awk '{print $1}')"
 want_z23="$(sha256sum "$stage/z23" | awk '{print $1}')"
-want_verifier="$(sha256sum "$stage/zclassic23-package-verify" | awk '{print $1}')"
-want_acme="$(sha256sum "$stage/zclassic23-acme" | awk '{print $1}')"
+verifier_src="$stage/z23-package-verify"
+[ -f "$verifier_src" ] || verifier_src="$stage/zclassic23-package-verify"
+acme_src="$stage/z23-acme"
+[ -f "$acme_src" ] || acme_src="$stage/zclassic23-acme"
+want_verifier="$(sha256sum "$verifier_src" | awk '{print $1}')"
+want_acme="$(sha256sum "$acme_src" | awk '{print $1}')"
 deadline=$(( $(date +%s) + health_seconds ))
 qualified=0
 while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -195,8 +210,10 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
             running_path="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
             installed_z23_path="$(readlink -f "$prefix/bin/z23" 2>/dev/null || true)"
             installed_z23="$(sha256sum "$prefix/bin/z23" 2>/dev/null | awk '{print $1}' || true)"
-            installed_verifier="$(sha256sum "$prefix/bin/zclassic23-package-verify" 2>/dev/null | awk '{print $1}' || true)"
-            installed_acme="$(sha256sum "$prefix/bin/zclassic23-acme" 2>/dev/null | awk '{print $1}' || true)"
+            installed_verifier="$(sha256sum "$prefix/bin/z23-package-verify" 2>/dev/null | awk '{print $1}' || true)"
+            installed_verifier_legacy="$(sha256sum "$prefix/bin/zclassic23-package-verify" 2>/dev/null | awk '{print $1}' || true)"
+            installed_acme="$(sha256sum "$prefix/bin/z23-acme" 2>/dev/null | awk '{print $1}' || true)"
+            installed_acme_legacy="$(sha256sum "$prefix/bin/zclassic23-acme" 2>/dev/null | awk '{print $1}' || true)"
             # The unit execs $prefix/bin/zclassic23, which install_z23.sh now
             # creates as a SYMLINK to z23 rather than a second 27.8 MB copy.
             # So /proc/<pid>/exe resolves to z23, and the old assertion that it
@@ -213,8 +230,12 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
                  = "$installed_z23_path" ] && \
                [ "$installed_z23" = "$want_z23" ] && \
                [ "$installed_verifier" = "$want_verifier" ] && \
+               [ "$installed_verifier_legacy" = "$want_verifier" ] && \
+               [ -x "$prefix/bin/z23-package-verify" ] && \
                [ -x "$prefix/bin/zclassic23-package-verify" ] && \
                [ "$installed_acme" = "$want_acme" ] && \
+               [ "$installed_acme_legacy" = "$want_acme" ] && \
+               [ -x "$prefix/bin/z23-acme" ] && \
                [ -x "$prefix/bin/zclassic23-acme" ] && \
                timeout 20 "/proc/$pid/exe" status >/dev/null 2>&1; then
                 pid_after="$(systemctl --user show z23.service -p MainPID --value 2>/dev/null || true)"
@@ -268,6 +289,9 @@ deploy_all() {
     say "PASS hosts=$hosts manifest=$manifest"
 }
 
+SELFTEST_CURRENT_MEMBERS="AGENT_CARD.md z23 zclassic23 z23-package-verify zclassic23-package-verify z23-acme zclassic23-acme"
+SELFTEST_LEGACY_MEMBERS="AGENT_CARD.md z23 zclassic23 zclassic23-package-verify zclassic23-acme"
+
 selftest_make_release() {
     local tmp="$1"
     cat >"$tmp/node.c" <<'EOF'
@@ -286,13 +310,18 @@ EOF
     cc -std=c23 -O0 "$tmp/node.c" -o "$tmp/release/z23"
     cp "$tmp/release/z23" "$tmp/release/zclassic23"
     printf '# card\n' >"$tmp/release/AGENT_CARD.md"
-    printf '#!/bin/sh\nexit 0\n' >"$tmp/release/zclassic23-package-verify"
-    chmod 755 "$tmp/release/zclassic23-package-verify"
-    printf '#!/bin/sh\nexit 0\n' >"$tmp/release/zclassic23-acme"
-    chmod 755 "$tmp/release/zclassic23-acme"
-    (cd "$tmp/release" && \
-        sha256sum AGENT_CARD.md z23 zclassic23 zclassic23-package-verify \
-            zclassic23-acme >SHA256SUMS)
+    printf '#!/bin/sh\nexit 0\n' >"$tmp/release/z23-package-verify"
+    printf '#!/bin/sh\nexit 0\n' >"$tmp/release/z23-acme"
+    chmod 755 "$tmp/release/z23-package-verify" "$tmp/release/z23-acme"
+    cp "$tmp/release/z23-package-verify" "$tmp/release/zclassic23-package-verify"
+    cp "$tmp/release/z23-acme" "$tmp/release/zclassic23-acme"
+    (cd "$tmp/release" && sha256sum $SELFTEST_CURRENT_MEMBERS >SHA256SUMS)
+    # The same release as cut before the rename: only the legacy helper names.
+    mkdir -p "$tmp/release-legacy"
+    cp "$tmp/release/z23" "$tmp/release/zclassic23" "$tmp/release/AGENT_CARD.md" \
+        "$tmp/release/zclassic23-package-verify" "$tmp/release/zclassic23-acme" \
+        "$tmp/release-legacy/"
+    (cd "$tmp/release-legacy" && sha256sum $SELFTEST_LEGACY_MEMBERS >SHA256SUMS)
 }
 
 selftest_make_ssh_mock() {
@@ -368,7 +397,7 @@ selftest_run_deploy() {
     Z23_DEPLOY_TEST_FAIL_HOST="${Z23_DEPLOY_TEST_FAIL_HOST:-}" \
     Z23_DEPLOY_SSH="$SELFTEST_TMP/mockbin/ssh" \
     Z23_RELEASE_HEALTH_SECONDS=5 \
-        "$0" --release-dir="$SELFTEST_TMP/release" --hosts="$1"
+        "$0" --release-dir="${SELFTEST_RELEASE_DIR:-$SELFTEST_TMP/release}" --hosts="$1"
 }
 
 selftest_assert_success() {
@@ -380,6 +409,9 @@ selftest_assert_success() {
         stage="$tmp/hosts/$host/.cache/z23/releases/$manifest"
         (cd "$stage" && sha256sum -c --strict SHA256SUMS >/dev/null)
         cmp -s "$stage/zclassic23" "$tmp/hosts/$host/.local/bin/zclassic23"
+        cmp -s "$stage/z23-package-verify" \
+            "$tmp/hosts/$host/.local/bin/z23-package-verify"
+        cmp -s "$stage/z23-acme" "$tmp/hosts/$host/.local/bin/z23-acme"
         cmp -s "$stage/zclassic23-package-verify" \
             "$tmp/hosts/$host/.local/bin/zclassic23-package-verify"
         cmp -s "$stage/zclassic23-acme" \
@@ -419,6 +451,45 @@ selftest_assert_failures() {
     : >"$tmp/hosts/existing/.config/systemd/user/z23.service"
     ! selftest_run_deploy existing >/dev/null 2>&1 \
         || die "selftest: pre-existing z23.service was not refused"
+}
+
+# Both accepted release shapes deploy, and every other shape is refused before
+# a single byte is transferred: a new-name member removed from a current
+# release is exactly the "release member silently missing" regression.
+selftest_assert_release_shapes() {
+    local tmp="$1" manifest name host=legacy
+    : >"$tmp/transport.log"; : >"$tmp/systemctl.log"
+    # A release cut before the rename (only zclassic23-<helper> names) is
+    # still deployable, and the host ends with BOTH names for each helper.
+    SELFTEST_RELEASE_DIR="$tmp/release-legacy" selftest_run_deploy "$host" >/dev/null \
+        || die "selftest: a legacy five-name release was refused"
+    manifest="$(sha256sum "$tmp/release-legacy/SHA256SUMS" | awk '{print $1}')"
+    for name in package-verify acme; do
+        cmp -s "$tmp/release-legacy/zclassic23-$name" \
+            "$tmp/hosts/$host/.local/bin/zclassic23-$name" \
+            || die "selftest: legacy release did not install zclassic23-$name"
+        cmp -s "$tmp/release-legacy/zclassic23-$name" \
+            "$tmp/hosts/$host/.local/bin/z23-$name" \
+            || die "selftest: legacy release did not supply z23-$name"
+    done
+    [ -n "$manifest" ] || die "selftest: legacy manifest is empty"
+    kill "$(cat "$tmp/hosts/$host/z23.pid")" 2>/dev/null || true
+    # Every current-release member is individually required.
+    for name in z23 zclassic23 z23-package-verify zclassic23-package-verify \
+        z23-acme zclassic23-acme AGENT_CARD.md; do
+        rm -rf "$tmp/release-missing"; mkdir -p "$tmp/release-missing"
+        cp "$tmp/release/"* "$tmp/release-missing/"
+        rm -f "$tmp/release-missing/$name"
+        grep -v "  $name\$" "$tmp/release/SHA256SUMS" >"$tmp/release-missing/SHA256SUMS"
+        : >"$tmp/transport.log"
+        if SELFTEST_RELEASE_DIR="$tmp/release-missing" \
+            selftest_run_deploy "never-$name" >/dev/null 2>&1; then
+            die "selftest: a release missing $name was deployed"
+        fi
+        [ ! -s "$tmp/transport.log" ] \
+            || die "selftest: a release missing $name reached the transport"
+    done
+    rm -rf "$tmp/release-missing"
 }
 
 selftest_assert_cleanup_guard() {
@@ -480,6 +551,7 @@ selftest() {
     fi
     selftest_assert_success "$tmp"
     selftest_assert_failures "$tmp"
+    selftest_assert_release_shapes "$tmp"
     selftest_assert_cleanup_guard "$tmp"
     selftest_stop_nodes "$tmp"
     say "selftest PASS"
