@@ -292,7 +292,8 @@ static int shell_dry_run_argv(void)
             "-o", "StrictHostKeyChecking=yes", "-o", "ControlPath=none", "-o", proxy, "--", "rhett@r2.lan"};
         ASSERT(shell_argv_equal(&plan, both, sizeof(both) / sizeof(both[0])));
         struct json_value out = {0};
-        ASSERT(zcl_native_device_host_shell_json(&plan, &out));
+        ASSERT(zcl_native_device_host_shell_json(&plan, NULL, "/usr/bin/ssh", &out));
+        ASSERT_STR_EQ(json_get_str(json_get(&out, "executable")), "/usr/bin/ssh");
         ASSERT_STR_EQ(json_get_str(json_get(&out, "schema")), "zcl.device.host.shell.v1");
         const struct json_value *list = json_get(&out, "argv");
         bool same = list && list->type == JSON_ARR && list->num_children == plan.argc;
@@ -300,6 +301,138 @@ static int shell_dry_run_argv(void)
         json_free(&out);
         ASSERT(same);
     } TEST_END
+    if (directory[0]) test_rm_rf(directory);
+    return failures;
+}
+
+static bool shell_script(const char *path, const char *body)
+{
+    return shell_write(path, body, 0700);
+}
+
+static bool shell_route_file(const char *path)
+{
+    char peer[65], root[65];
+    memset(peer, 'a', 64); peer[64] = '\0';
+    memset(root, 'b', 64); root[64] = '\0';
+    char text[1024];
+    snprintf(text, sizeof(text),
+        "{\"directory\":\"/var/lib/z23x\",\"peer_key\":\"%s\",\"expected_root\":\"%s\",\"target_port\":22,"
+        "\"route_id\":\"PUBLIC-local-loopback\",\"handshake_ms\":5000,\"session_ms\":15000,\"idle_ms\":5000,"
+        "\"confirm\":true,\"route_address\":\"127.0.0.1\",\"route_port\":4000,\"connect_ms\":3000}", peer, root);
+    return shell_write(path, text, 0600);
+}
+
+/* Run the leaf with stdout captured to a file. Returns its exit code. */
+static int shell_run_captured(const struct json_value *input, const char *capture)
+{
+    fflush(stdout);
+    int saved = dup(1), file = open(capture, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (saved < 0 || file < 0 || dup2(file, 1) < 0) return -1;
+    close(file);
+    int code = zcl_native_device_host_shell_run(input);
+    fflush(stdout);
+    (void)dup2(saved, 1); close(saved);
+    return code;
+}
+
+static bool shell_run_input(struct json_value *input, const char *route, bool dry)
+{
+    json_set_object(input);
+    return json_push_kv_str(input, "user", "rhett") && json_push_kv_str(input, "host", "r2.lan") &&
+        json_push_kv_str(input, "route_input", route) && json_push_kv_bool(input, "dry_run", dry);
+}
+
+static int shell_dry_run_executes_nothing(void)
+{
+    int failures = 0;
+    char directory[1024] = {0};
+    char *prior = getenv("PATH") ? strdup(getenv("PATH")) : NULL;
+    TEST_CASE("device_host_shell: dry_run runs no ssh and reports the once-resolved path and both shapes") {
+        ASSERT(test_mkdtemp(directory, sizeof(directory), "device-host-dry"));
+        char bin[1200], ssh[1200], marker[1200], route[1200], capture[1200], script[1400];
+        snprintf(bin, sizeof(bin), "%s/bin", directory);
+        ASSERT(mkdir(bin, 0700) == 0);
+        snprintf(ssh, sizeof(ssh), "%s/ssh", bin);
+        snprintf(marker, sizeof(marker), "%s/marker", directory);
+        snprintf(script, sizeof(script), "#!/bin/sh\n: > %s\nexit 1\n", marker);
+        ASSERT(shell_script(ssh, script));
+        snprintf(route, sizeof(route), "%s/route.json", directory);
+        ASSERT(shell_route_file(route));
+        snprintf(capture, sizeof(capture), "%s/out.json", directory);
+        ASSERT(setenv("PATH", bin, 1) == 0);
+        struct json_value input = {0};
+        ASSERT(shell_run_input(&input, route, true));
+        int code = shell_run_captured(&input, capture);
+        json_free(&input);
+        struct stat st;
+        bool spawned = lstat(marker, &st) == 0;
+        char *out = NULL;
+        ASSERT(read_entire_file(capture, &out) == 0);
+        ASSERT(!spawned);
+        ASSERT_EQ(code, 0);
+        ASSERT(strstr(out, "\"kex_probe\":\"skipped\"") != NULL);
+        ASSERT(strstr(out, ssh) != NULL);
+        ASSERT(strstr(out, "\"argv_mlkem\"") != NULL);
+        ASSERT(strstr(out, "KexAlgorithms=sntrup761x25519-sha512@openssh.com\"") != NULL);
+        ASSERT(strstr(out, "KexAlgorithms=mlkem768x25519-sha256,sntrup761x25519-sha512@openssh.com\"") != NULL);
+        free(out);
+    } TEST_END
+    if (prior) { (void)setenv("PATH", prior, 1); free(prior); }
+    if (directory[0]) test_rm_rf(directory);
+    return failures;
+}
+
+static int shell_ssh_resolution(void)
+{
+    int failures = 0;
+    char directory[1024] = {0};
+    char *prior = getenv("PATH") ? strdup(getenv("PATH")) : NULL;
+    TEST_CASE("device_host_shell: ssh resolves once from absolute PATH entries and relative ones refuse") {
+        ASSERT(test_mkdtemp(directory, sizeof(directory), "device-host-resolve"));
+        char bin[1200], plain[1200], ssh[1200], want[1300], list[2600], out[1200], marker[1200], route[1200], script[1400];
+        snprintf(bin, sizeof(bin), "%s/bin", directory);
+        snprintf(plain, sizeof(plain), "%s/plain", directory);
+        ASSERT(mkdir(bin, 0700) == 0); ASSERT(mkdir(plain, 0700) == 0);
+        snprintf(ssh, sizeof(ssh), "%s/ssh", bin);
+        snprintf(want, sizeof(want), "%s", ssh);
+        snprintf(marker, sizeof(marker), "%s/marker", directory);
+        snprintf(script, sizeof(script), "#!/bin/sh\n: > %s\nexit 1\n", marker);
+        ASSERT(shell_script(ssh, script));
+        /* A non-executable ssh earlier on PATH is skipped. */
+        char skipped[1200];
+        snprintf(skipped, sizeof(skipped), "%s/ssh", plain);
+        ASSERT(shell_write(skipped, "x", 0600));
+        snprintf(list, sizeof(list), "%s:%s", plain, bin);
+        ASSERT(zcl_native_device_host_shell_resolve(list, out, sizeof(out)));
+        ASSERT_STR_EQ(out, want);
+        ASSERT(!zcl_native_device_host_shell_resolve(plain, out, sizeof(out)));
+        /* Relative and empty components refuse the whole PATH, even with a hit. */
+        const char *bad[] = {"bin", "./bin", "..", "", ":", NULL};
+        for (size_t i = 0; bad[i]; ++i) {
+            snprintf(list, sizeof(list), "%s:%s", bad[i], bin);
+            ASSERT(!zcl_native_device_host_shell_resolve(list, out, sizeof(out)));
+            ASSERT_STR_EQ(out, "");
+            snprintf(list, sizeof(list), "%s:%s", bin, bad[i]);
+            ASSERT(!zcl_native_device_host_shell_resolve(list, out, sizeof(out)));
+        }
+        ASSERT(!zcl_native_device_host_shell_resolve(NULL, out, sizeof(out)));
+        /* The leaf itself refuses a relative PATH and spawns nothing. */
+        snprintf(route, sizeof(route), "%s/route.json", directory);
+        ASSERT(shell_route_file(route));
+        snprintf(list, sizeof(list), "%s:%s", "relative-bin", bin);
+        ASSERT(setenv("PATH", list, 1) == 0);
+        struct json_value input = {0};
+        ASSERT(shell_run_input(&input, route, true));
+        char capture[1200];
+        snprintf(capture, sizeof(capture), "%s/out.json", directory);
+        int code = shell_run_captured(&input, capture);
+        json_free(&input);
+        struct stat st;
+        ASSERT_EQ(code, ZCL_COMMAND_EXIT_BLOCKED);
+        ASSERT(lstat(marker, &st) != 0);
+    } TEST_END
+    if (prior) { (void)setenv("PATH", prior, 1); free(prior); }
     if (directory[0]) test_rm_rf(directory);
     return failures;
 }
@@ -375,7 +508,7 @@ int test_device_host_shell(void)
     int failures = shell_receiver_unit();
 #if defined(__linux__)
     failures += shell_input_file() + shell_input_file_rewrite() + shell_psk_fingerprint() + shell_psk_new() + shell_psk_cleanup_honesty();
-    failures += shell_dry_run_argv() + shell_injection_refused() + shell_package_hangup_race();
+    failures += shell_dry_run_argv() + shell_dry_run_executes_nothing() + shell_ssh_resolution() + shell_injection_refused() + shell_package_hangup_race();
 #endif
     return failures;
 }

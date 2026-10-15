@@ -404,7 +404,7 @@ void zcl_native_device_psk_fingerprint(const uint8_t key[32], char out[17]);
 void zcl_native_device_psk_fault_for_test(unsigned mask);
 #endif
 /* ops.mesh.device.host.shell (tools/command/native_device_host_shell.c): a
- * raw pre-boot leaf that execvp()s a FIXED ssh argv whose ProxyCommand is
+ * raw pre-boot leaf that execv()s a once-resolved absolute ssh with a FIXED argv whose ProxyCommand is
  * this binary's `ops mesh device host client --input-file=<route_input>`.
  * Every interpolated value is charset-checked first because ssh runs
  * ProxyCommand through a shell; dry_run prints the argv as JSON instead. */
@@ -417,8 +417,15 @@ struct zcl_native_host_shell_argv {
 /* Pure: no probe, no exec. *refusal names the refused field on false. */
 bool zcl_native_device_host_shell_argv(const char *self, const char *user, const char *host,
     const char *route_input, bool mlkem_offered, struct zcl_native_host_shell_argv *out, const char **refusal);
-bool zcl_native_device_host_shell_json(const struct zcl_native_host_shell_argv *plan, struct json_value *out);
-/* Raw entry: validates, probes `ssh -Q kex`, then dry-runs or execs. Returns
+/* dry_run report: argv for the sntrup-only shape, argv_mlkem for the shape
+ * used when ssh offers mlkem (may be NULL), the resolved executable, and
+ * kex_probe:"skipped" because dry_run executes nothing. */
+bool zcl_native_device_host_shell_json(const struct zcl_native_host_shell_argv *plan,
+    const struct zcl_native_host_shell_argv *mlkem_plan, const char *executable, struct json_value *out);
+/* Resolve ssh once from a PATH string: the first regular executable file
+ * named ssh. Any empty or relative component refuses the whole PATH. */
+bool zcl_native_device_host_shell_resolve(const char *path_env, char *out, size_t capacity);
+/* Raw entry: validates, resolves ssh, probes `ssh -Q kex` (not on dry_run), then execs. Returns
  * a process exit code only when it does not exec. */
 int zcl_native_device_host_shell_run(const struct json_value *input);
 

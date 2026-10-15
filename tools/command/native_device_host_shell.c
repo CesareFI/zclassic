@@ -115,9 +115,8 @@ bool zcl_native_device_host_shell_argv(const char *self, const char *user, const
     return true;
 }
 
-bool zcl_native_device_host_shell_json(const struct zcl_native_host_shell_argv *plan, struct json_value *out)
+static bool shell_json_argv(struct json_value *out, const char *key, const struct zcl_native_host_shell_argv *plan)
 {
-    if (!plan || !out || !plan->argc) return false;
     struct json_value list = {0};
     json_set_array(&list);
     bool ok = true;
@@ -127,22 +126,75 @@ bool zcl_native_device_host_shell_json(const struct zcl_native_host_shell_argv *
         ok = json_push_back(&list, &item);
         json_free(&item);
     }
-    json_set_object(out);
-    ok = ok && json_push_kv_str(out, "schema", "zcl.device.host.shell.v1") &&
-        json_push_kv_bool(out, "dry_run", true) && json_push_kv_str(out, "executable", "ssh") &&
-        json_push_kv(out, "argv", &list);
+    ok = ok && json_push_kv(out, key, &list);
     json_free(&list);
     return ok;
 }
 
+bool zcl_native_device_host_shell_json(const struct zcl_native_host_shell_argv *plan,
+    const struct zcl_native_host_shell_argv *mlkem_plan, const char *executable, struct json_value *out)
+{
+    if (!plan || !out || !plan->argc || !executable) return false;
+    json_set_object(out);
+    return json_push_kv_str(out, "schema", "zcl.device.host.shell.v1") &&
+        json_push_kv_bool(out, "dry_run", true) && json_push_kv_str(out, "executable", executable) &&
+        json_push_kv_str(out, "kex_probe", "skipped") && shell_json_argv(out, "argv", plan) &&
+        (!mlkem_plan || shell_json_argv(out, "argv_mlkem", mlkem_plan));
+}
+
+/* A usable PATH entry is an absolute directory: an empty or relative
+ * component would resolve against the caller's working directory. */
+static bool shell_path_components_absolute(const char *path_env)
+{
+    for (const char *component = path_env;;) {
+        const char *end = strchr(component, ':');
+        size_t size = end ? (size_t)(end - component) : strlen(component);
+        if (!size || component[0] != '/') return false;
+        if (!end) return true;
+        component = end + 1;
+    }
+}
+
+#if !defined(_WIN32)
+static bool shell_executable_file(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISREG(st.st_mode) && access(path, X_OK) == 0;
+}
+#endif
+
+bool zcl_native_device_host_shell_resolve(const char *path_env, char *out, size_t capacity)
+{
+    if (out && capacity) out[0] = '\0';
+#if !defined(_WIN32)
+    if (!path_env || !out || capacity < 2 || !shell_path_components_absolute(path_env)) return false;
+    for (const char *component = path_env;;) {
+        const char *end = strchr(component, ':');
+        size_t size = end ? (size_t)(end - component) : strlen(component);
+        const char *slash = component[size - 1] == '/' ? "" : "/";
+        char candidate[1100];
+        if (shell_fits(snprintf(candidate, sizeof(candidate), "%.*s%sssh", (int)size, component, slash),
+                sizeof(candidate)) && shell_executable_file(candidate) && strlen(candidate) < capacity) {
+            memcpy(out, candidate, strlen(candidate) + 1);
+            return true;
+        }
+        if (!end) return false;
+        component = end + 1;
+    }
+#else
+    (void)path_env;
+    return false;
+#endif
+}
+
 #if defined(__linux__)
 /* Child half of the probe: fixed argv, stdout to the pipe, stdin/stderr null. */
-[[noreturn]] static void shell_kex_probe_child(int output)
+[[noreturn]] static void shell_kex_probe_child(int output, const char *ssh)
 {
     int null = open("/dev/null", O_RDWR | O_CLOEXEC);
     if (null < 0 || dup2(null, 0) < 0 || dup2(output, 1) < 0 || dup2(null, 2) < 0) _exit(127);
     char *const argv[] = {(char *)"ssh", (char *)"-Q", (char *)"kex", NULL};
-    execvp("ssh", argv);
+    execv(ssh, argv);
     _exit(127);
 }
 
@@ -181,14 +233,14 @@ static bool shell_cloexec_pipe(int pipefd[2])
 #endif
 
 /* `ssh -Q kex`: which of the two pinned algorithms this ssh offers. */
-static bool shell_kex_probe(bool *mlkem, bool *sntrup)
+static bool shell_kex_probe(const char *ssh, bool *mlkem, bool *sntrup)
 {
     *mlkem = *sntrup = false;
 #if defined(__linux__)
     int pipefd[2];
     if (!shell_cloexec_pipe(pipefd)) return false;
     pid_t child = fork();
-    if (child == 0) shell_kex_probe_child(pipefd[1]);
+    if (child == 0) shell_kex_probe_child(pipefd[1], ssh);
     close(pipefd[1]);
     char text[16384] = {0};
     if (child > 0) (void)shell_read_all(pipefd[0], text, sizeof(text));
@@ -200,6 +252,7 @@ static bool shell_kex_probe(bool *mlkem, bool *sntrup)
     shell_kex_lines(text, mlkem, sntrup);
     return true;
 #else
+    (void)ssh;
     return false;
 #endif
 }
@@ -244,29 +297,36 @@ static bool shell_route_valid(const char *route)
     return ok;
 }
 
-static int shell_dry_run(const struct zcl_native_host_shell_argv *plan)
+static int shell_dry_run(const struct zcl_native_host_shell_argv *sntrup, const struct zcl_native_host_shell_argv *both,
+    const char *ssh)
 {
     struct json_value out = {0};
-    char text[8192];
-    bool ok = zcl_native_device_host_shell_json(plan, &out);
+    char text[16384];
+    bool ok = zcl_native_device_host_shell_json(sntrup, both, ssh, &out);
     size_t length = ok ? json_write(&out, text, sizeof(text)) : 0;
     json_free(&out);
     ok = ok && length > 0 && length < sizeof(text) && printf("%s\n", text) > 0 && fflush(stdout) == 0;
     return ok ? ZCL_COMMAND_EXIT_OK : ZCL_COMMAND_EXIT_INTERNAL;
 }
 
-static int shell_exec(const struct zcl_native_host_shell_argv *plan)
+static int shell_exec(const struct zcl_native_host_shell_argv *plan, const char *ssh)
 {
 #if defined(__linux__)
     fflush(NULL);
-    execvp("ssh", (char *const *)plan->argv);
+    execv(ssh, (char *const *)plan->argv);
     fprintf(stderr, "error=HOST_SHELL_EXEC_FAILED errno=%d\n", errno);
     return ZCL_COMMAND_EXIT_FAILED;
 #else
-    (void)plan;
+    (void)plan; (void)ssh;
     fprintf(stderr, "error=HOST_SHELL_UNSUPPORTED platform=unqualified\n");
     return ZCL_COMMAND_EXIT_BLOCKED;
 #endif
+}
+
+static int shell_refused(const char *refusal)
+{
+    fprintf(stderr, "error=HOST_SHELL_INPUT_REFUSED detail=%s\n", refusal);
+    return ZCL_COMMAND_EXIT_INVALID;
 }
 
 int zcl_native_device_host_shell_run(const struct json_value *input)
@@ -276,23 +336,28 @@ int zcl_native_device_host_shell_run(const struct json_value *input)
         fprintf(stderr, "error=HOST_SHELL_INPUT_REFUSED detail=user_host_route_input_and_optional_dry_run\n");
         return ZCL_COMMAND_EXIT_INVALID;
     }
-    char self[1024];
+    char self[1024], ssh[1100];
     if (!os_proc_exe_path(self, sizeof(self))) {
         fprintf(stderr, "error=HOST_SHELL_SELF_UNRESOLVED\n"); return ZCL_COMMAND_EXIT_BLOCKED;
     }
+    /* One resolution feeds both the probe and the exec, so they cannot
+     * disagree about which ssh is meant. */
+    if (!zcl_native_device_host_shell_resolve(getenv("PATH"), ssh, sizeof(ssh))) {
+        fprintf(stderr, "error=HOST_SHELL_SSH_UNRESOLVED detail=absolute_path_entries_only\n");
+        return ZCL_COMMAND_EXIT_BLOCKED;
+    }
+    struct zcl_native_host_shell_argv plan, both; const char *refusal = NULL;
     bool mlkem = false, sntrup = false;
-    if (!shell_kex_probe(&mlkem, &sntrup) || !sntrup) {
+    /* dry_run executes nothing, so it cannot probe: it reports both shapes. */
+    if (!request.dry_run && (!shell_kex_probe(ssh, &mlkem, &sntrup) || !sntrup)) {
         fprintf(stderr, "error=HOST_SHELL_SSH_KEX_UNAVAILABLE required=%s\n", shell_kex_sntrup);
         return ZCL_COMMAND_EXIT_BLOCKED;
     }
-    struct zcl_native_host_shell_argv plan; const char *refusal = NULL;
-    if (!zcl_native_device_host_shell_argv(self, request.user, request.host, request.route, mlkem, &plan, &refusal)) {
-        fprintf(stderr, "error=HOST_SHELL_INPUT_REFUSED detail=%s\n", refusal);
-        return ZCL_COMMAND_EXIT_INVALID;
-    }
-    if (!shell_route_valid(request.route)) {
-        fprintf(stderr, "error=HOST_SHELL_INPUT_REFUSED detail=route_input_not_a_client_input\n");
-        return ZCL_COMMAND_EXIT_INVALID;
-    }
-    return request.dry_run ? shell_dry_run(&plan) : shell_exec(&plan);
+    if (!zcl_native_device_host_shell_argv(self, request.user, request.host, request.route, mlkem, &plan, &refusal))
+        return shell_refused(refusal);
+    if (request.dry_run &&
+        !zcl_native_device_host_shell_argv(self, request.user, request.host, request.route, true, &both, &refusal))
+        return shell_refused(refusal);
+    if (!shell_route_valid(request.route)) return shell_refused("route_input_not_a_client_input");
+    return request.dry_run ? shell_dry_run(&plan, &both, ssh) : shell_exec(&plan, ssh);
 }
