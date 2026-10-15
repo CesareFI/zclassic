@@ -308,7 +308,7 @@ bool rpc_agent_interface(const struct json_value *params, bool help,
     agent_interface_push_str(
         &avoid,
         "do not add external operator wrappers; use typed native "
-        "zclassic23 commands");
+        "z23 commands");
     agent_interface_push_str(&avoid,
                              "do not require Python to parse agent API JSON");
     agent_interface_push_str(&avoid,

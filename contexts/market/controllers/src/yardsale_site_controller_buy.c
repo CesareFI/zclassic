@@ -458,7 +458,7 @@ size_t yardsale_site_handle_buy_post(const uint8_t *body, size_t body_len,
         "<p>Your <code>zswap_accept.v1</code> (%zu bytes) is gossiping "
         "toward the seller. When his <code>zswap_partial.v1</code> "
         "returns, this node verifies every term of the sign, signs your "
-        "inputs, and broadcasts the swap — check <code>zclassic23 "
+        "inputs, and broadcasts the swap — check <code>z23 "
         "status</code> or the logs for the settlement. If the sign "
         "expires first, the ceremony dies with it and nothing was "
         "lost.</p><p><a href='/yardsale'>Back to the yard</a></p>"

@@ -319,7 +319,7 @@ bool rpc_agent_map(const struct json_value *params, bool help,
     json_push_kv_str(result, "status", "ok");
     json_push_kv_str(
         result, "summary",
-        "Use typed native zclassic23 commands; discover them with "
+        "Use typed native z23 commands; discover them with "
         "z23 discover help.");
 
     json_init(&commands);
