@@ -484,5 +484,7 @@ int check_sqlite_cursor_lifetime_run(int argc, char **argv);
 int check_sqlite_cursor_lifetime_selftest(void);
 int check_cookbook_run(int argc, char **argv);
 int check_cookbook_selftest(void);
+int check_promotion_receipt_chain_run(int argc, char **argv);
+int check_promotion_receipt_chain_selftest(void);
 
 #endif

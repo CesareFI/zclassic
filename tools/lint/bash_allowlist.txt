@@ -196,7 +196,6 @@ tools/lint/check_outparam_init_before_return.sh
 tools/lint/check_package_anatomy.sh
 tools/lint/check_pipefail_status_pipe.sh
 tools/lint/check_platform_header_guards.sh
-tools/lint/check_promotion_receipt_chain.sh
 tools/lint/check_published_platforms.sh
 tools/lint/check_read_leaf_no_boot_ceremony.sh
 tools/lint/check_release_no_dev_symbols.sh

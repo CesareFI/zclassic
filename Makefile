@@ -6492,6 +6492,10 @@ LINTC_SRCS = $(LINTC_LIVE_DATADIR_SRCS) tools/lint/lintc/lib.c tools/lint/lintc/
     tools/lint/lintc/gate_cookbook.c \
     tools/lint/lintc/gate_cookbook_parse.c \
     tools/lint/lintc/gate_cookbook_selftest.c \
+    tools/lint/lintc/gate_promotion_receipt_chain.c \
+    tools/lint/lintc/gate_promotion_receipt_chain_checks.c \
+    tools/lint/lintc/gate_promotion_receipt_chain_git.c \
+    tools/lint/lintc/gate_promotion_receipt_chain_selftest.c \
     tools/lint/lintc/gate_orient_facts.c \
     tools/lint/lintc/gate_orient_facts_selftest.c \
     tools/lint/lintc/gate_tor_provenance.c \
@@ -14461,8 +14465,9 @@ check-proof-server-pin: $(LINTC_TOOL)
 # party verifies authorship offline with no private key). This runs the
 # tamper-detection self-test, verifies the in-tree chain, enforces append-only
 # against HEAD, and asserts ship.sh still appends a receipt on promotion.
-check-promotion-receipt-chain:
+check-promotion-receipt-chain: $(LINTC_TOOL)
 	@echo "══ LINT: promotion receipt chain ══"
+	@./tools/lint/check_promotion_receipt_chain.sh --selftest
 	@./tools/lint/check_promotion_receipt_chain.sh
 
 # Gate — hosted CI's green must not overstate what it checked. build.yml puts

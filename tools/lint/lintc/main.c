@@ -218,6 +218,8 @@ static const struct lint_gate k_gates[] = {
     { "check-tor-provenance", check_tor_provenance_run,
       check_tor_provenance_selftest },
     { "check-cookbook", check_cookbook_run, check_cookbook_selftest },
+    { "check-promotion-receipt-chain", check_promotion_receipt_chain_run,
+      check_promotion_receipt_chain_selftest },
     { "check-object-reproducible", check_object_reproducible_run,
       check_object_reproducible_selftest },
     { "riscv64-universal", riscv64_universal_run, riscv64_universal_selftest },

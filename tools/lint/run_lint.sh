@@ -217,7 +217,7 @@ gate_command() {
         check-supervisor-progress-declared) echo './tools/lint/check_supervisor_progress_declared.sh' ;;
         check-stopwatch-skip-detector)     echo './build/bin/z23-lint check-stopwatch-skip-detector' ;;
         check-proof-server-pin)            echo './build/bin/z23-lint check-proof-server-pin' ;;
-        check-promotion-receipt-chain)     echo './tools/lint/check_promotion_receipt_chain.sh' ;;
+        check-promotion-receipt-chain)     echo './tools/lint/check_promotion_receipt_chain.sh --selftest && ./tools/lint/check_promotion_receipt_chain.sh' ;;
         check-verification-coverage)       echo './tools/lint/check_verification_coverage.sh --selftest && ./tools/lint/check_verification_coverage.sh' ;;
         check-ship-remote-transaction)     echo './tools/ship.sh --selftest && ./tools/ship_selftest.sh && ./tools/lint/check_ship_remote_transaction.sh' ;;
         check-z23-release-install)         echo 'make --no-print-directory -s z23-bootstrap install-selftest && "$ZCL_LINT_BIN_DIR/install_selftest" --selftest && bash platform/packaging/release/build_release.sh --selftest && bash tools/scripts/install_z23.sh --selftest && bash tools/scripts/deploy_z23_release.sh --selftest' ;;
