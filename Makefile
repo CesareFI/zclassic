@@ -3209,10 +3209,14 @@ RESIDENT_CONTRACT_FIXTURE_BINS = \
 	$(BUILD_DIR)/fixtures/rlc_child_v1$(ZCL_HOST_EXEEXT) \
 	$(BUILD_DIR)/fixtures/rlc_child_broken$(ZCL_HOST_EXEEXT) \
 	$(BUILD_DIR)/fixtures/rcc_child$(ZCL_HOST_EXEEXT) \
-	$(BUILD_DIR)/fixtures/rcc_child_dyn$(ZCL_HOST_EXEEXT) \
-	$(BUILD_DIR)/fixtures/plugin_run_child$(ZCL_HOST_EXEEXT)
+	$(BUILD_DIR)/fixtures/rcc_child_dyn$(ZCL_HOST_EXEEXT)
 else
 RESIDENT_CONTRACT_FIXTURE_BINS =
+endif
+# plugin_run_child is Linux-only (its source includes sys/prctl.h). Off Linux the
+# plugin_run group asserts the platform refusal and never reads the fixture.
+ifneq ($(filter Linux,$(ZCL_HOST_OS)),)
+RESIDENT_CONTRACT_FIXTURE_BINS += $(BUILD_DIR)/fixtures/plugin_run_child$(ZCL_HOST_EXEEXT)
 endif
 
 $(BUILD_DIR)/fixtures/rlc_child_v1$(ZCL_HOST_EXEEXT): $(RESIDENT_CONTRACT_FIXTURE_SRC)
@@ -3241,6 +3245,8 @@ $(BUILD_DIR)/fixtures/rcc_child_dyn$(ZCL_HOST_EXEEXT): $(RESIDENT_CONFINED_FIXTU
 
 # Fixture plugin for the plugin_run group: a static image whose behaviour field
 # the test patches to derive distinct generations (see the fixture header).
+# Built on Linux only: the source includes sys/prctl.h. Elsewhere the group
+# asserts the platform refusal and never builds or reads this image.
 PLUGIN_RUN_FIXTURE_SRC = tests/harness/fixtures/plugin_run_child.c
 $(BUILD_DIR)/fixtures/plugin_run_child$(ZCL_HOST_EXEEXT): $(PLUGIN_RUN_FIXTURE_SRC)
 	@mkdir -p $(dir $@)
