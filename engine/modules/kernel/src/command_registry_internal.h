@@ -90,7 +90,8 @@ bool command_registry_reply_add_describe_next(
     const char *reason);
 bool command_registry_push_error(struct json_value *root,
                                  const struct zcl_command_spec *spec,
-                                 const struct zcl_command_error *error);
+                                 const struct zcl_command_error *error,
+                                 const struct json_value *facts);
 const char *command_registry_wiki_effect(const struct zcl_command_spec *spec,
                                          const struct zcl_command_error *error);
 bool command_registry_effect_possible(const char *effect,

@@ -113,8 +113,12 @@ static bool error_effect_complete(const struct json_value *object,
 
 bool command_registry_push_error(struct json_value *root,
                                  const struct zcl_command_spec *spec,
-                                 const struct zcl_command_error *error)
+                                 const struct zcl_command_error *error,
+                                 const struct json_value *facts)
 {
+    /* Only explicit sanitized facts are exported. Ordinary partial handler
+     * data remains private; malformed opt-in metadata refuses serialization. */
+    if (facts && facts->type != JSON_OBJ) return false;
     struct json_value object, blockers;
     json_init(&object);
     json_init(&blockers);
@@ -125,6 +129,7 @@ bool command_registry_push_error(struct json_value *root,
               push_error_optional(&object, error) &&
               json_push_kv(&object, "blockers", &blockers);
     if (ok && effect) ok = json_push_kv_str(&object, "effect_outcome", effect);
+    if (ok && facts) ok = json_push_kv(&object, "facts", facts);
     ok = ok && error_effect_complete(&object, error, effect) &&
         json_push_kv(root, "error", &object) &&
         error_effect_complete(json_get(root, "error"), error, effect);
@@ -290,7 +295,8 @@ static bool serialize_body(struct json_value *root,
                                                  : spec->output_schema) &&
              json_push_kv(root, "data", &reply->data);
     } else {
-        ok = ok && command_registry_push_error(root, spec, &reply->error);
+        ok = ok && command_registry_push_error(root, spec, &reply->error,
+                                               json_get(&reply->data, "failure_facts"));
         if (reply->next_count == 0) {
             ok = ok && command_registry_reply_add_describe_next(
                 reply, spec,
