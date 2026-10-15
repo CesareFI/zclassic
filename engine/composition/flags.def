@@ -424,13 +424,13 @@ Z23_FLAG("ZCL_CONTROLLER_PRIVATE_HEADER_ROOT", "env_build", "-", "-",
 Z23_FLAG("ZCL_CONTROLLER_PRIVATE_SCAN_ROOT", "env_build", ".", "-",
           "undocumented; first use tools/lint/lintc/gate_controller_private_headers.c:auto")
 Z23_FLAG("ZCL_COOKBOOK_DEF", "env_build", "-", "-",
-          "undocumented; first use tools/lint/check_cookbook.sh:auto")
+          "undocumented; first use tools/lint/lintc/gate_cookbook.c:auto")
 Z23_FLAG("ZCL_COOKBOOK_DOC", "env_build", "docs/COOKBOOK.md", "-",
-          "undocumented; first use tools/lint/check_cookbook.sh:auto")
+          "undocumented; first use tools/lint/lintc/gate_cookbook.c:auto")
 Z23_FLAG("ZCL_COOKBOOK_ROW_FLOOR", "env_build", "10", "-",
-          "undocumented; first use tools/lint/check_cookbook.sh:auto")
+          "undocumented; first use tools/lint/lintc/gate_cookbook.c:auto")
 Z23_FLAG("ZCL_COOKBOOK_TIMEOUT", "env_build", "120", "-",
-          "undocumented; first use tools/lint/check_cookbook.sh:auto")
+          "undocumented; first use tools/lint/lintc/gate_cookbook.c:auto")
 Z23_FLAG("ZCL_COPY_PROVE_CONTINUITY_RETRIES", "env_build", "15", "-",
           "undocumented; first use tools/scripts/import-copy-prove.sh:auto")
 Z23_FLAG("ZCL_COPY_PROVE_STATUS_DIR", "env_runtime", "-", "-",
@@ -1458,7 +1458,7 @@ Z23_FLAG("ZCL_LIB_MODULES", "env_build", "-", "-",
 Z23_FLAG("ZCL_LINKGRAPH_OBJ_DIR", "env_build", "-", "-",
           "undocumented; first use tools/dev/module-linkgraph.sh:auto")
 Z23_FLAG("ZCL_LINT_BIN_DIR", "env_build", "build/bin", "-",
-          "undocumented; first use tools/lint/check_cookbook.sh:auto")
+          "undocumented; first use tools/lint/lintc/gate_cookbook.c:auto")
 Z23_FLAG("ZCL_LINT_BUDGET_SEC", "env_build", "75", "-",
           "undocumented; first use tools/lint/run_lint.sh:auto")
 Z23_FLAG("ZCL_LINT_CACHE", "env_build", "0", "-",

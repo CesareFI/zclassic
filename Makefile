@@ -6488,6 +6488,10 @@ LINTC_SRCS = $(LINTC_LIVE_DATADIR_SRCS) tools/lint/lintc/lib.c tools/lint/lintc/
     tools/lint/lintc/gate_macos_acceptance_selftest.c \
     tools/lint/lintc/gate_sqlite_cursor_lifetime.c \
     tools/lint/lintc/lintc_sig.c \
+    tools/lint/lintc/lintc_proc.c \
+    tools/lint/lintc/gate_cookbook.c \
+    tools/lint/lintc/gate_cookbook_parse.c \
+    tools/lint/lintc/gate_cookbook_selftest.c \
     tools/lint/lintc/gate_orient_facts.c \
     tools/lint/lintc/gate_orient_facts_selftest.c \
     tools/lint/lintc/gate_tor_provenance.c \
@@ -13433,7 +13437,7 @@ check-model-sql-literals:
 # still be tracked. There is no baseline — a row that stopped being true is
 # not a debt, it is a false statement.
 .PHONY: check-cookbook
-check-cookbook: $(ZCLASSIC23_DEV_BIN)
+check-cookbook: $(ZCLASSIC23_DEV_BIN) $(LINTC_TOOL)
 	@echo "══ LINT: every cookbook recipe still works ══"
 	@./tools/lint/check_cookbook.sh --selftest
 	@./tools/lint/check_cookbook.sh

@@ -482,5 +482,7 @@ int check_macos_acceptance_run(int argc, char **argv);
 int check_macos_acceptance_selftest(void);
 int check_sqlite_cursor_lifetime_run(int argc, char **argv);
 int check_sqlite_cursor_lifetime_selftest(void);
+int check_cookbook_run(int argc, char **argv);
+int check_cookbook_selftest(void);
 
 #endif
