@@ -374,6 +374,10 @@ void zcl_native_device_prepare_test_interrupt(unsigned stage);
 #endif
 /* Exact registered raw CLI dispatch before config/node initialization. */
 void zcl_native_device_host_runtime_exit_if_requested(int argc, char **argv);
+/* --input-file=<absolute> source: a non-symlink regular file owned by the
+ * caller, not group/other writable, 1..capacity-1 bytes with no NUL; one
+ * trailing newline is dropped. Linux only; elsewhere refuses. */
+bool zcl_native_device_host_input_file_read(const char *path, char *text, size_t capacity, size_t *length);
 #if defined(ZCL_TESTING) && defined(__linux__)
 bool zcl_native_device_host_package_input_for_test(const struct json_value *input);
 bool zcl_native_device_host_package_terminal_for_test(int64_t deadline_ns);

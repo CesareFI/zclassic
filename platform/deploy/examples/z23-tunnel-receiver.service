@@ -1,0 +1,64 @@
+# Example supervised hash-PSK tunnel receiver (systemd USER unit).
+#
+# Install as ~/.config/systemd/user/z23-tunnel-receiver.service and copy
+# z23-tunnel-receiver.env.example to ~/.config/z23/tunnel-receiver.env.
+# The env file names ONE receiver input file; that JSON names the trusted
+# profile directory, the selected peer/root/target_port and the literal
+# listen address. The PSK itself lives in the profile (imported at
+# `ops mesh device commit` time); neither this unit nor the input file holds
+# secret bytes.
+#
+# Each run is bounded: the input file must carry lifetime_ms <= 600000,
+# max_sessions <= 64 and max_active <= 4 (the leaf refuses larger values).
+# When the lifetime ends the leaf closes its listener and exits; systemd then
+# relaunches it after RestartSec, which re-reads the grant, so a revoked or
+# re-rooted grant stops being served at the next run at the latest.
+#
+# Exit codes of `ops mesh device host receiver`
+# (engine/services/src/device_host_runtime_entry.c):
+#   0  every one of max_sessions was accepted and drained (EOF)
+#   1  lifetime expiry (DEADLINE), SIGTERM from `systemctl stop` (CANCELLED),
+#      and also genuine IO or refusal failures -- the leaf does not tell them
+#      apart by exit code, read the HOST_RUNTIME_TERMINAL stderr line
+#   2  input refused (malformed JSON, out-of-range caps, profile/grant refused)
+#   3  unsupported platform
+# Lifetime expiry is the normal end of a run, so exit 1 is listed as success
+# and restarts; 2 and 3 cannot heal by retrying, so they stop the unit rather
+# than looping every RestartSec.
+
+[Unit]
+Description=Z23 hash-PSK tunnel receiver (bounded runs, supervised relaunch)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+# No leading '-': a missing env file must fail closed, never start a
+# receiver without its named input.
+EnvironmentFile=%h/.config/z23/tunnel-receiver.env
+ExecStart=%h/.local/bin/z23 ops mesh device host receiver --input-file=${Z23_TUNNEL_RECEIVER_INPUT}
+Restart=always
+RestartSec=2
+SuccessExitStatus=1
+RestartPreventExitStatus=2 3
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# The profile directory and the input file live here; the leaf takes the
+# pairing-store lock inside the profile, so it needs write access to it.
+ReadWritePaths=%h/.local/state/z23-tunnel
+UMask=0077
+
+MemoryHigh=256M
+TasksMax=64
+CPUWeight=50
+IOWeight=50
+
+[Install]
+WantedBy=default.target

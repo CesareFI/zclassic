@@ -85,6 +85,29 @@ operator-specific peers. Copy and adapt before installing:
   script's own trap), even on a hard failure.
 - `zcl-stopwatch-onfailure.service` — shared `OnFailure=` arm for both
   stopwatch run units; logs to the journal (`journalctl -t stopwatch-gate`).
+- `z23-tunnel-receiver.service` / `z23-tunnel-receiver.env.example` — a
+  supervised hash-PSK tunnel receiver. Each run is one bounded
+  `z23 ops mesh device host receiver --input-file=<json>` (lifetime_ms
+  ≤ 600000, max_sessions ≤ 64, max_active ≤ 4); `Restart=always` with
+  `RestartSec=2` relaunches it, and every relaunch re-reads the grant. The
+  leaf exits 1 on lifetime expiry, so the unit lists 1 in
+  `SuccessExitStatus=`; exit 2 (input refused) and 3 (unsupported) stop it.
+  **PSK path:** the receiver reads no secret file. Create the key with
+  `z23 ops mesh device psk new --key=<absent path in a private dir>`, carry
+  it to the peer out of band, then on each end run `ops mesh device plan`
+  and `commit` with `backend=2`, `secret_file=<that file>` and the same
+  64-hex `credential_id` and `key_epoch` on both ends (`psk new` mints only
+  the secret; `prepare-secret` is the variant that also mints a random
+  `credential_id`). Compare the `psk_fingerprint` that `psk new` and each
+  `commit` print; the profile directory then holds the key.
+  **Enable:** copy the unit to `~/.config/systemd/user/`, the env example
+  to `~/.config/z23/tunnel-receiver.env` (edit the input path), keep the
+  profile and input under `~/.local/state/z23-tunnel`, then
+  `systemctl --user daemon-reload && systemctl --user enable --now
+  z23-tunnel-receiver`. **Disable:** `systemctl --user disable --now
+  z23-tunnel-receiver`. **Rollback:** disable it, remove the unit file and
+  `daemon-reload`; revoke the grant with `ops mesh device revoke` if the
+  peer must lose access, which the next bounded run honours.
 
 ## Replay-canary operational notes
 

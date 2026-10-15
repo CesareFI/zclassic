@@ -277,6 +277,62 @@ static int installed_run(const struct json_value *input)
     fprintf(stderr, "error=HOST_PACKAGE_UNSUPPORTED\n"); return ZCL_COMMAND_EXIT_BLOCKED;
 }
 #endif
+#if defined(__linux__)
+#include <sys/stat.h>
+/* A named input binds a route, so it must be an owner-written regular file
+ * that does not change while it is read. */
+static bool input_file_admissible(const struct stat *st, size_t capacity)
+{
+    return S_ISREG(st->st_mode) && st->st_uid == geteuid() && !(st->st_mode & (S_IWGRP | S_IWOTH)) &&
+        st->st_size > 0 && (uint64_t)st->st_size < capacity;
+}
+static bool input_file_read_exact(int fd, char *text, size_t size)
+{
+    size_t total = 0;
+    while (total < size) {
+        ssize_t got = read(fd, text + total, size - total);
+        if (got <= 0) return false;
+        total += (size_t)got;
+    }
+    char extra;
+    return read(fd, &extra, 1) == 0;
+}
+static bool input_file_load(const char *path, char *text, size_t capacity, size_t *total)
+{
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return false;
+    struct stat before, after;
+    bool ok = fstat(fd, &before) == 0 && input_file_admissible(&before, capacity) &&
+        input_file_read_exact(fd, text, (size_t)before.st_size) && fstat(fd, &after) == 0 &&
+        after.st_ino == before.st_ino && after.st_dev == before.st_dev && after.st_size == before.st_size;
+    close(fd);
+    *total = ok ? (size_t)before.st_size : 0;
+    return ok;
+}
+#endif
+static bool input_file_arguments(const char *path, const char *text, size_t capacity, const size_t *length)
+{
+    return path && path[0] == '/' && strnlen(path, 1024) < 1024 && text && capacity >= 2 && length;
+}
+/* The bound on each read is the caller's capacity minus the terminator. */
+bool zcl_native_device_host_input_file_read(const char *path, char *text, size_t capacity, size_t *length)
+{
+    if (length) *length = 0;
+    if (text && capacity) text[0] = '\0';
+    if (!input_file_arguments(path, text, capacity, length)) return false;
+#if defined(__linux__)
+    size_t total = 0;
+    if (!input_file_load(path, text, capacity, &total)) { text[0] = '\0'; return false; }
+    /* One trailing newline is an editor artifact, not part of the object. */
+    if (text[total - 1] == '\n') --total;
+    text[total] = '\0';
+    if (!total || strnlen(text, total + 1) != total) { text[0] = '\0'; return false; }
+    *length = total;
+    return true;
+#else
+    return false;
+#endif
+}
 static bool raw_is_host_path(int argc, char **argv)
 {
     return argc >= 6 && !strcmp(argv[1], "ops") && !strcmp(argv[2], "mesh") &&
@@ -304,8 +360,15 @@ static bool raw_input_read(int argc, char **argv, size_t consumed,
     const struct zcl_command_spec *spec, bool package, struct json_value *input)
 {
     size_t maximum = package ? 8192 : 4096;
-    if (!spec || (size_t)argc != consumed + 2 || strncmp(argv[consumed + 1], "--input=", 8)) return false;
-    const char *text = argv[consumed + 1] + 8; size_t length = strnlen(text, maximum + 1);
+    if (!spec || (size_t)argc != consumed + 2) return false;
+    const char *argument = argv[consumed + 1], *text = NULL; size_t length = 0;
+    char named[8193];
+    if (!strncmp(argument, "--input=", 8)) {
+        text = argument + 8; length = strnlen(text, maximum + 1);
+    } else if (!strncmp(argument, "--input-file=", 13)) {
+        if (!zcl_native_device_host_input_file_read(argument + 13, named, maximum + 1, &length)) return false;
+        text = named;
+    } else return false;
     if (length > maximum) return false;
     bool valid = package ? !strstr(text, "\\u0000") && json_read(input, text, length) && installed_keys(input)
         : device_host_runtime_entry_parse(input, text, length, !strcmp(spec->path, "ops.mesh.device.host.receiver")).ok;
