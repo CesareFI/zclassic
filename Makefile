@@ -16328,7 +16328,12 @@ lint lint-fast: check-native-tunnel-export-binding
 $(TUNNEL_EXPORT_BINDING): tools/native_tunnel_sources.def Makefile
 	@set -eu; descriptor_hash=$$(sha256sum tools/native_tunnel_sources.def | awk '{print $$1}'); \
 	test "$${#descriptor_hash}" -eq 64; \
-	tmp="$$(mktemp "$@.XXXXXX")"; trap 'rm -f "$$tmp"' EXIT HUP INT TERM; \
+	mkdir -p "$(BUILD_DIR)"; \
+	tmp="$$(mktemp "$(BUILD_DIR)/native-tunnel-binding.XXXXXX")"; trap 'rm -f "$$tmp"' EXIT HUP INT TERM; \
+	device_id() { stat -c '%d' "$$1" 2>/dev/null || stat -f '%d' "$$1"; }; \
+	stage_device=$$(device_id "$$tmp"); target_device=$$(device_id "$(@D)"); \
+	case "$$stage_device:$$target_device" in *[!0-9:]*|:*|*:) echo 'tunnel binding: invalid filesystem identity' >&2; exit 1;; esac; \
+	test "$$stage_device" = "$$target_device" || { echo 'tunnel binding: staging and destination must share a filesystem' >&2; exit 1; }; \
 	printf '%s\n' '/* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0' \
 	 ' * purpose: Generated exact tunnel descriptor binding; make native-tunnel-export-binding. */' \
 	 '#ifndef ZCL_NATIVE_TUNNEL_EXPORT_BINDING_H' '#define ZCL_NATIVE_TUNNEL_EXPORT_BINDING_H' \
