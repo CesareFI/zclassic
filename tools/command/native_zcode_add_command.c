@@ -20,6 +20,7 @@
 #include "base/hex.h"
 #include "base/safe_alloc.h"
 #include "command/native_command.h"
+#include "command/native_package_artifact.h"
 
 #include "json/json.h"
 #include "platform/time_compat.h"
@@ -251,6 +252,15 @@ static uint8_t *za_local_wire(const struct json_value *input, const char *key,
     return wire;
 }
 
+static uint8_t *za_artifact_wire(const struct json_value *input, const char *hex_key,
+    const char *file_key, const char *digest_key, size_t maximum, size_t *size)
+{
+    if (!json_get(input, file_key) && !json_get(input, digest_key))
+        return za_local_wire(input, hex_key, maximum, size);
+    uint8_t *bytes = NULL;
+    if (!zcl_native_package_artifact_read(input, hex_key, file_key, digest_key, maximum, &bytes, size)) return NULL;
+    return bytes;
+}
 static struct zcl_result za_local_plan(const struct zcl_command_request *request,
     const char *target, struct package_local_plan *out)
 {
@@ -260,8 +270,10 @@ static struct zcl_result za_local_plan(const struct zcl_command_request *request
         !zcl_hex_decode_lower(target, source.expected_root, 32))
         return ZCL_ERR(-1, "local-source-input: dir and exact 64-hex source root required");
     uint8_t *release = za_local_wire(request->input, "release_hex", VCS_PACKAGE_RELEASE_MAX_WIRE_BYTES, &source.release_size);
-    uint8_t *manifest = za_local_wire(request->input, "manifest_hex", VCS_PACKAGE_MANIFEST_MAX_WIRE_BYTES, &source.manifest_size);
-    uint8_t *recipe = za_local_wire(request->input, "recipe_hex", VCS_PACKAGE_RECIPE_MAX_WIRE_BYTES, &source.recipe_size);
+    uint8_t *manifest = za_artifact_wire(request->input, "manifest_hex", "manifest_file", "manifest_sha3",
+        VCS_PACKAGE_MANIFEST_MAX_WIRE_BYTES, &source.manifest_size);
+    uint8_t *recipe = za_artifact_wire(request->input, "recipe_hex", "recipe_file", "recipe_sha3",
+        VCS_PACKAGE_RECIPE_MAX_WIRE_BYTES, &source.recipe_size);
     source.release_wire = release; source.manifest_wire = manifest; source.recipe_wire = recipe;
     struct zcl_result result = release && manifest && recipe ?
         package_local_plan(za_input_str(request->input, "datadir"), &source, za_now(request), out) :
@@ -275,7 +287,9 @@ static bool za_local_inputs_valid(const struct json_value *input, bool local)
     const struct json_value *flag = json_get(input, "local_only");
     if (flag && flag->type != JSON_BOOL) return false;
     return local || (!json_get(input, "dir") && !json_get(input, "release_hex") &&
-        !json_get(input, "manifest_hex") && !json_get(input, "recipe_hex"));
+        !json_get(input, "manifest_hex") && !json_get(input, "recipe_hex") &&
+        !json_get(input, "manifest_file") && !json_get(input, "manifest_sha3") &&
+        !json_get(input, "recipe_file") && !json_get(input, "recipe_sha3"));
 }
 
 void zcl_native_handle_zcode_package_add_plan(

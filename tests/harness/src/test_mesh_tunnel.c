@@ -713,6 +713,65 @@ _test_next:
     return failures;
 }
 
+/* Missing authority during a periodic check must end the admitted acceptor,
+ * while local listener lifetime and the initiator remain separately owned. */
+static int tunnel_missing_db_live_case(struct tunnel_test_wire *wire,
+                                       const char *peer_b,
+                                       struct db_service *dbsvc)
+{
+    int failures = 0;
+    struct tunnel_live_conn c;
+    tunnel_live_init(&c);
+    uint64_t idle_id = 0;
+    uint16_t idle_port = 0;
+    struct node_db *saved = dbsvc->node_db;
+    const char *paired = wire->f->term_peer.pairing.pairing_id;
+    TEST("mesh tunnel: missing pairing database ends an admitted acceptor "
+         "by name without closing local listeners") {
+        mesh_stream_test_reset();
+        ASSERT(tunnel_live_open(paired, peer_b, "missing-db-live", &c));
+        tunnel_beat(wire, 2);
+        ASSERT(tunnel_live_accept(&c));
+        tunnel_beat(wire, 2);
+        ASSERT(tunnel_roundtrip(wire, c.client, c.served));
+        ASSERT_EQ(mesh_stream_test_live_count(MESH_TUNNEL_SERVICE_NAME),
+                  (size_t)2);
+        ASSERT_EQ(mesh_tunnel_listen(peer_b, c.port, 0, &idle_id, &idle_port),
+                  MESH_TUNNEL_OK);
+        dbsvc->node_db = NULL;
+        mesh_tunnel_test_tick(TUNNEL_TEST_PAIRED_AT + 1000);
+        dbsvc->node_db = saved;
+        ASSERT_EQ(mesh_stream_test_live_count(MESH_TUNNEL_SERVICE_NAME),
+                  (size_t)1);
+        char tail[2];
+        ASSERT(platform_socket_wait_readable(c.served,
+                                             TUNNEL_TEST_IO_WAIT_MS) > 0);
+        ASSERT_EQ(platform_socket_receive_nonblocking(c.served, tail, 1), 0);
+        uint8_t answer[TUNNEL_TEST_WIRE_MAX];
+        size_t answer_len = 0;
+        ASSERT(tunnel_take_close(wire, "tunnel_peer_unpaired", answer,
+                                 sizeof(answer), &answer_len));
+        struct mesh_tunnel_row rows[MESH_TUNNEL_LISTENERS_MAX];
+        size_t total = 0;
+        ASSERT_EQ(mesh_tunnel_list(rows, MESH_TUNNEL_LISTENERS_MAX, &total),
+                  (size_t)2);
+        ASSERT_EQ(total, (size_t)2);
+        ASSERT(mesh_stream_frame(wire->mp, wire->a, answer, answer_len, NULL));
+        tunnel_beat(wire, 4);
+        ASSERT_EQ(mesh_stream_test_live_count(MESH_TUNNEL_SERVICE_NAME),
+                  (size_t)0);
+        PASS();
+    }
+_test_next:
+    dbsvc->node_db = saved;
+    tunnel_live_drop(&c);
+    (void)mesh_tunnel_close(c.id);
+    (void)mesh_tunnel_close(idle_id);
+    (void)mesh_tunnel_deny(paired, c.port);
+    tunnel_beat(wire, 4);
+    return failures;
+}
+
 /* A pairing revoked while a stream is live: the acceptor's next check
  * reads the row, finds it gone, and ends the stream by name. */
 static int tunnel_revoke_live_case(struct tunnel_test_wire *wire,
@@ -1515,6 +1574,7 @@ int test_mesh_tunnel(void)
     failures += tunnel_health_peer_case(&wire, peer_b);
     failures += tunnel_health_scan_case(&wire, peer_b);
     failures += tunnel_health_rpc_case(&wire, peer_b);
+    failures += tunnel_missing_db_live_case(&wire, peer_b, &dbsvc);
     failures += tunnel_revoke_live_case(&wire, peer_b);
 
 _test_next:

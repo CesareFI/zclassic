@@ -38,6 +38,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #if !defined(_WIN32)
+#include "devloop.h"
 #include <sys/wait.h>
 #endif
 #include <unistd.h>
@@ -141,60 +142,76 @@ static void car_rm_shallow_dir(const char *dir)
     rmdir(dir);
 }
 
-/* Fork/exec CAR_BIN with a caller-built argv and envp, capture combined
- * stdout+stderr (truncated, non-blocking drain — same shape as
- * test_importblockindex_cli_dispatch.c's icd_run). Returns the exit code,
- * or a negative sentinel on spawn/wait failure or signal death. */
-static int car_run(char *const argv[], char *const envp[], char *out,
-                   size_t cap)
+#if !defined(_WIN32)
+static int car_capture_result(const struct zcl_devloop_process_result *result,
+                               bool ran, bool restored, char *out, size_t cap,
+                               bool *timed_out)
 {
+    bool complete = ran && restored && !result->cancelled &&
+        !result->output_truncated && result->output_len < cap;
+    if (timed_out) *timed_out = complete && result->timed_out;
+    if (!complete || result->timed_out) {
+        fprintf(stderr, "car_run_bounded: incomplete CLI observation "
+                "ran=%d restored=%d timeout=%d cancelled=%d truncated=%d "
+                "bytes=%zu cap=%zu exit=%d signal=%d\n",
+                ran, restored, result->timed_out, result->cancelled,
+                result->output_truncated, result->output_len, cap,
+                result->exit_code, result->term_signal);
+        return -1;
+    }
+    if (result->term_signal) {
+        fprintf(stderr, "car_run_bounded: CLI terminated by signal %d\n",
+                result->term_signal);
+        return -100 - result->term_signal;
+    }
+    memcpy(out, result->output, result->output_len);
+    out[result->output_len] = 0;
+    return result->exit_code;
+}
+#endif
+
+/* Capture the real CLI with an exact isolated environment. POSIX reuses the
+ * bounded devloop process implementation; Windows retains its capture helper.
+ * Incomplete output and harness failures must never satisfy absence checks. */
+static int car_run_bounded(char *const argv[], char *const envp[], char *out,
+                           size_t cap, int timeout_ms, bool *timed_out)
+{
+    if (timed_out) *timed_out = false;
+    if (!argv || !argv[0] || !envp || !out || cap == 0 || timeout_ms <= 0) {
+        fprintf(stderr, "car_run_bounded: invalid capture arguments\n");
+        return -1;
+    }
+    out[0] = 0;
 #if defined(_WIN32)
+    (void)timeout_ms;
     /* No fork/execve: CreateProcess with a custom environment block and a
      * captured pipe (test_spawn_capture_env). */
     return test_spawn_capture_env(
         (const char *const *)argv, (const char *const *)envp, out, cap);
 #else
-    int pipefd[2];
-    if (pipe(pipefd) != 0) return -1;
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(pipefd[0]);
-        close(pipefd[1]);
+    const char *prior = getenv("ZCL_DEVLOOP_TEST_PROCESS");
+    char *saved = prior ? strdup(prior) : NULL;
+    if ((prior && !saved) || setenv("ZCL_DEVLOOP_TEST_PROCESS", "1", 1) != 0) {
+        fprintf(stderr, "car_run_bounded: cannot enable isolated process fixture\n");
+        free(saved);
         return -1;
     }
-
-    if (pid == 0) {
-        dup2(pipefd[1], STDOUT_FILENO);
-        dup2(pipefd[1], STDERR_FILENO);
-        close(pipefd[0]);
-        close(pipefd[1]);
-        execve(CAR_BIN, argv, envp);
-        _exit(127);
-    }
-
-    close(pipefd[1]);
-    size_t pos = 0;
-    char buf[4096];
-    ssize_t r;
-    while ((r = read(pipefd[0], buf, sizeof(buf))) > 0) {
-        size_t take = (size_t)r;
-        size_t room = (pos + 1 < cap) ? (cap - 1 - pos) : 0;
-        if (take > room) take = room;
-        if (take > 0) {
-            memcpy(out + pos, buf, take);
-            pos += take;
-        }
-    }
-    out[pos < cap ? pos : cap - 1] = 0;
-    close(pipefd[0]);
-
-    int status = 0;
-    if (waitpid(pid, &status, 0) != pid) return -1;
-    if (WIFEXITED(status)) return WEXITSTATUS(status);
-    if (WIFSIGNALED(status)) return -100 - WTERMSIG(status);
-    return -1;
+    struct zcl_devloop_process_result result = {0};
+    bool ran = zcl_devloop_process_run_env(".",
+        (const char *const *)argv, (const char *const *)envp,
+        timeout_ms, &result);
+    bool restored = (saved
+        ? setenv("ZCL_DEVLOOP_TEST_PROCESS", saved, 1)
+        : unsetenv("ZCL_DEVLOOP_TEST_PROCESS")) == 0;
+    free(saved);
+    return car_capture_result(&result, ran, restored, out, cap, timed_out);
 #endif
+}
+
+static int car_run(char *const argv[], char *const envp[], char *out,
+                   size_t cap)
+{
+    return car_run_bounded(argv, envp, out, cap, 10000, NULL);
 }
 
 /* Build a minimal envp: HOME=<home>, PATH inherited from the real
@@ -225,10 +242,9 @@ static char *const *car_build_envp(const char *home, const char *extra_kv)
 
 /* ── fixture datadir builders ────────────────────────────────────── */
 
-/* A REAL live RPC listener (empty command table — every method reads back
- * as "method not found", which is exactly the signal this test group
- * needs: it proves auth succeeded without depending on any real RPC
- * handler). Returns the bound port, or 0 on failure. Caller must
+/* A REAL live RPC listener with an empty command table. An authenticated RPC
+ * error proves auth succeeded without depending on any real RPC handler.
+ * Returns the bound port, or 0 on failure. Caller must
  * rpc_http_stop() when done. */
 static uint16_t car_start_live_fixture(const char *datadir)
 {
@@ -286,15 +302,21 @@ static int car_test_autodiscover_picks_matching_fixture(const char *home)
             (char *)"zcl_test_no_such_method_xyz", NULL,
         };
         char out[16384] = {0};
+        char prior_status[256];
+        bool prior_warmup = rpc_is_in_warmup(prior_status, sizeof(prior_status));
+        set_rpc_warmup_started("cli auth fixture warmup");
         int rc = car_run(argv, car_build_envp(home, NULL), out, sizeof(out));
 
         rpc_http_stop();
+        set_rpc_warmup_started(prior_status);
+        if (!prior_warmup) set_rpc_warmup_finished();
 
         ASSERT(car_contains(out, "auto-discovered datadir"));
         ASSERT(car_contains(out, live_dir));
         ASSERT(!car_contains(out, decoy_dir));
         ASSERT(!car_contains(out, "AUTH_REJECTED"));
-        (void)rc;
+        ASSERT(car_contains(out, "Error: cli auth fixture warmup"));
+        ASSERT_EQ(rc, ZCL_COMMAND_EXIT_FAILED);
         PASS();
     } _test_next:;
     return failures;
@@ -459,17 +481,44 @@ static int car_test_auth_rejected_taxonomy(const char *home,
     return failures;
 }
 
-static int car_test_response_timeout_taxonomy(const char *home)
+#if !defined(_WIN32)
+/* Inspect only bytes already queued by the terminated CLI: neither accept nor
+ * receive may wait. This witnesses an RPC request reaching our own fixture. */
+static bool car_blackhole_received_rpc(platform_socket_t listener)
+{
+    if (!platform_socket_set_nonblocking(listener, true)) return false;
+    struct sockaddr_in address;
+    size_t address_len = sizeof(address);
+    platform_socket_t client = platform_socket_accept(listener,
+        (struct sockaddr *)&address, &address_len);
+    if (client == PLATFORM_SOCKET_INVALID) return false;
+    char request[4096] = {0};
+    size_t used = 0;
+    while (used < sizeof(request) - 1) {
+        int received = platform_socket_receive_nonblocking(client,
+            request + used, sizeof(request) - 1 - used);
+        if (received <= 0) break;
+        used += (size_t)received;
+    }
+    platform_socket_close(client);
+    return car_contains(request, "\"method\":\"zcl_test_no_such_method_xyz\"");
+}
+#endif
+
+static int car_test_response_timeout_case(const char *home, bool bounded)
 {
     int failures = 0;
-    TEST("cli auth: a peer that accepts the TCP connection but never "
+    platform_socket_t blackhole = PLATFORM_SOCKET_INVALID;
+    TEST(bounded
+         ? "cli auth: harness deadline stops a real CLI launch before its RPC timeout"
+         : "cli auth: a peer that accepts the TCP connection but never "
          "answers is reported as RESPONSE_TIMEOUT with exit code 5 (node "
          "busy), bounded by ZCL_CLI_RPC_TIMEOUT_SEC for test speed") {
         /* A bound+listening socket completes the client's connect() via
          * the kernel accept queue even with no accept() call — exactly
          * "TCP up, nobody home to answer" (see file header + engine/entry/main.c
          * cli_rpc_call_internal_ex's RESPONSE_TIMEOUT branch). */
-        platform_socket_t blackhole = platform_socket_open(
+        blackhole = platform_socket_open(
             AF_INET, SOCK_STREAM, 0, true, false);
         ASSERT(blackhole != PLATFORM_SOCKET_INVALID);
         uint16_t port = car_reserve_port();
@@ -498,15 +547,30 @@ static int car_test_response_timeout_taxonomy(const char *home)
             (char *)"zcl_test_no_such_method_xyz", NULL,
         };
         char out[16384] = {0};
-        int rc = car_run(argv,
-                         car_build_envp(home, "ZCL_CLI_RPC_TIMEOUT_SEC=1"),
-                         out, sizeof(out));
+        bool timed_out = false;
+        int rc = car_run_bounded(argv,
+                         car_build_envp(home, bounded
+                             ? "ZCL_CLI_RPC_TIMEOUT_SEC=2"
+                             : "ZCL_CLI_RPC_TIMEOUT_SEC=1"),
+                         out, sizeof(out), bounded ? 500 : 10000, &timed_out);
+        bool received_rpc = false;
+#if !defined(_WIN32)
+        if (bounded) received_rpc = car_blackhole_received_rpc(blackhole);
+#endif
         platform_socket_close(blackhole);
+        blackhole = PLATFORM_SOCKET_INVALID;
 
-        ASSERT(car_contains(out, "error=RESPONSE_TIMEOUT"));
-        ASSERT_EQ(rc, ZCL_COMMAND_EXIT_TRANSIENT);
+        if (bounded) {
+            ASSERT(received_rpc);
+            ASSERT(timed_out);
+            ASSERT(rc < 0);
+        } else {
+            ASSERT(car_contains(out, "error=RESPONSE_TIMEOUT"));
+            ASSERT_EQ(rc, ZCL_COMMAND_EXIT_TRANSIENT);
+        }
         PASS();
     } _test_next:;
+    if (blackhole != PLATFORM_SOCKET_INVALID) platform_socket_close(blackhole);
     return failures;
 }
 
@@ -587,7 +651,10 @@ int test_cli_auth_robust(void)
         rpc_http_stop();
     }
 
-    failures += car_test_response_timeout_taxonomy(home);
+    failures += car_test_response_timeout_case(home, false);
+#if !defined(_WIN32)
+    failures += car_test_response_timeout_case(home, true);
+#endif
 
     /* Best-effort cleanup of every fixture path this file creates. */
     static const char *const car_fixture_leaf_names[] = {

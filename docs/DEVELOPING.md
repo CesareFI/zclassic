@@ -587,6 +587,28 @@ C23 Commons acceptance requires it. Architecture and measured evidence live in
 
 ## 5. Build and focused proof
 
+For a small real-binary CLI test, specify the behavior, registered group, test
+file, isolated HOME/datadir, expected exit code and diagnostic output before
+editing. Follow `tests/harness/src/test_cli_auth_robust.c`: its POSIX
+`car_run_bounded` reuses `zcl_devloop_process_run_env` with an exact child
+environment and deadline. Windows retains its existing capture helper; this
+deadline regression is POSIX-only. Preserve binary freshness and identity
+checks. Missing observations, truncated output, cancellation and unexpected
+timeouts cannot count as success.
+
+Build the real binary once for the selected source, then run fresh focused
+acceptance through the scheduler and canonical runner:
+
+```sh
+devbuild --wait make t-fast-exact ONLY=cli_auth_robust T_FAST_EXACT_ARGS=--no-cache
+```
+
+This target builds its required binaries and runs the exact group without
+cached verdicts. Measure the complete command, including admission wait,
+build and execution; distinguish those costs when evidence permits. Keep
+unmeasured model, token and retry costs unknown. Require a failing regression
+before the fix and a fresh passing observation afterward.
+
 The build profiles keep iteration separate from release proof. LTO means
 link-time optimization. A translation unit (TU) is a source file compiled
 with its included headers; a build epoch identifies one input generation:
@@ -1179,6 +1201,25 @@ exits 0 without producing the path, fails the proof as
 `test_need_unbuildable_clang-manifest`; the group never self-skips. A BUILD
 need never gates a group out of a universal selection, and a proof that
 selects no such group runs no extra step.
+
+The optional tunnel source export uses the C23 build helper
+`build/bin/native-tunnel-export`, built only for `export-native-tunnel`.
+Run it through `devbuild --wait make export-native-tunnel` with
+`TUNNEL_EXPORT_DIR` naming an absent absolute directory in task scratch.
+The helper binds its compiled table to `tools/native_tunnel_sources.def`,
+checks bounded source and copied-byte hashes through retained handles, and
+preserves the canonical map, checksum manifests, package metadata and observed
+HEAD provenance. It neither executes exported code nor signs, publishes,
+installs or reads device secrets. HEAD is a caller observation; exported byte
+hashes establish the snapshot identity.
+
+The registered `native_tunnel_export` group imports the same helper body with
+a small fixed public fixture table. Stage faults model partial copy and
+completion-barrier failure; they do not qualify provider power-loss behavior.
+Failures preserve partial output. After marker removal, completion may be
+unconfirmed even when the marker is absent, so never infer acceptance or retry
+authority from marker absence. Actual platform/export equivalence needs its
+own receipts; Linux evidence does not qualify other platforms.
 
 On Linux x86_64, `make clang-manifest` recognizes root-controlled
 `/usr/include/clang-c`, `/usr/lib/libclang.so.22.1`, and

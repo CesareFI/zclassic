@@ -62,6 +62,7 @@
 #include "test/test_core.h"
 
 #include "command/native_command.h"
+#include "base/hex.h"
 
 #include "chain/chainparams.h"
 #include "config/command_catalog.h"
@@ -1267,6 +1268,112 @@ static int zp_commit_no_license_rule(const char *dd)
     return failures;
 }
 
+static int zp_local_reply_equal(const struct zcl_command_reply *left,
+                                const struct zcl_command_reply *right)
+{
+    int failures = 0;
+    const char *fields[] = {"result", "release_id", "package_root",
+        "transport_root", "name"};
+    ZP_CHECK("typed local: same successful effect",
+        left->status == right->status && left->error.mutated == right->error.mutated);
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
+        const char *a = json_get_str(json_get(&left->data, fields[i]));
+        const char *b = json_get_str(json_get(&right->data, fields[i]));
+        ZP_CHECK("typed local: exact publication identity", a && b && !strcmp(a, b));
+    }
+    ZP_CHECK("typed local: same stored chunk count",
+        json_get_int(json_get(&left->data, "chunks_stored")) ==
+        json_get_int(json_get(&right->data, "chunks_stored")));
+    ZP_CHECK("typed local: same explicit policy day",
+        json_get_int(json_get(json_get(&left->data, "policy"), "day")) ==
+        json_get_int(json_get(json_get(&right->data, "policy"), "day")));
+    return failures;
+}
+
+static int zp_local_duplicate(struct zcl_native_local_publication *p,
+                              const char *release_hex)
+{
+    int failures = 0;
+    char *manifest = zp_hex(p->manifest_wire, p->manifest_wire_len);
+    struct zp_cmd native, typed;
+    zp_publish_input(&native, p->datadir, release_hex, manifest, p->source_directory);
+    zp_cmd_init(&typed);
+    zcl_native_handle_zcode_package_publish_commit(&native.request, &native.reply);
+    zcl_native_zcode_local_publication_commit(p, &typed.reply);
+    failures += zp_local_reply_equal(&native.reply, &typed.reply);
+    const char *result = json_get_str(json_get(&typed.reply.data, "result"));
+    ZP_CHECK("typed local: replay remains duplicate without mutation",
+        result && !strcmp(result, "duplicate") && !typed.reply.error.mutated);
+    zp_cmd_free(&native);
+    zp_cmd_free(&typed);
+    free(manifest);
+    return failures;
+}
+
+static int zp_local_bad_signature(struct zcl_native_local_publication *p,
+                                  uint8_t *release_wire)
+{
+    int failures = 0;
+    release_wire[p->release_wire_len - 1] ^= 1;
+    char *hex = zp_hex(release_wire, p->release_wire_len);
+    char *manifest = zp_hex(p->manifest_wire, p->manifest_wire_len);
+    struct zp_cmd native, typed;
+    zp_publish_input(&native, p->datadir, hex, manifest, p->source_directory);
+    zp_cmd_init(&typed);
+    zcl_native_handle_zcode_package_publish_commit(&native.request, &native.reply);
+    zcl_native_zcode_local_publication_commit(p, &typed.reply);
+    ZP_CHECK("typed local: same signature refusal before effect",
+        native.reply.status == ZCL_COMMAND_STATUS_FAILED &&
+        typed.reply.status == ZCL_COMMAND_STATUS_FAILED &&
+        !native.reply.error.mutated && !typed.reply.error.mutated &&
+        !strcmp(native.reply.error.code, typed.reply.error.code));
+    release_wire[p->release_wire_len - 1] ^= 1;
+    free(hex);
+    free(manifest);
+    zp_cmd_free(&native);
+    zp_cmd_free(&typed);
+    return failures;
+}
+
+static int zp_local_equivalence(const char *dd, const char *pkgdir,
+    const struct zp_pkg *package, const struct vcs_package_release *release,
+    const struct zp_cmd *native)
+{
+    int failures = 0;
+    char local_dir[512];
+    snprintf(local_dir, sizeof(local_dir), "%s/typed-local", dd);
+    ZP_CHECK("typed local: separate store fixture", mkdir(local_dir, 0700) == 0);
+    uint8_t *wire = NULL;
+    size_t length = 0;
+    char *hex = zp_release_hex(release, &wire, &length);
+    size_t recipe_cap = strlen(g_zp_recipe_hex) / 2;
+    uint8_t *recipe = malloc(recipe_cap);
+    size_t recipe_length = 0;
+    bool ready = hex && recipe && zcl_hex_decode_n(g_zp_recipe_hex,
+        recipe, recipe_cap, &recipe_length);
+    ZP_CHECK("typed local: exact fixture wires", ready);
+    if (ready) {
+        struct zcl_native_local_publication p = {
+            .datadir = local_dir, .source_directory = pkgdir,
+            .release_wire = wire, .release_wire_len = length,
+            .manifest_wire = package->wire, .manifest_wire_len = package->wire_len,
+            .recipe_wire = recipe, .recipe_wire_len = recipe_length,
+            .has_day = true, .day = json_get_int(json_get(&native->input, "day"))};
+        struct zp_cmd typed;
+        zp_cmd_init(&typed);
+        zcl_native_zcode_local_publication_commit(&p, &typed.reply);
+        failures += zp_local_reply_equal(&native->reply, &typed.reply);
+        zp_cmd_free(&typed);
+        failures += zp_local_duplicate(&p, hex);
+        failures += zp_local_bad_signature(&p, wire);
+        failures += zp_commit_on_disk_truth(local_dir, package, release);
+    }
+    free(wire);
+    free(recipe);
+    free(hex);
+    return failures;
+}
+
 static int t_commit_roundtrip(void)
 {
     int failures = 0;
@@ -1289,6 +1396,7 @@ static int t_commit_roundtrip(void)
     zcl_native_handle_zcode_package_publish_commit(&c.request, &c.reply);
     failures += zp_commit_valid_and_chunks(&c);
     failures += zp_commit_pointer_plan(&c);
+    failures += zp_local_equivalence(dd, pkgdir, &p, &r, &c);
     zp_cmd_free(&c);
 
     failures += zp_commit_on_disk_truth(dd, &p, &r);

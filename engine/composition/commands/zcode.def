@@ -2189,17 +2189,40 @@ ZCL_COMMAND_READY_READ(
     ZCL_COMMAND_TRANSPORT_NATIVE,
     zcl_native_handle_zcode_package_dev_prepare)
 
+ZCL_COMMAND_READY_COMMAND(
+    "zcode.package.dev.prepare.export", "zcode.package.dev", "",
+    "Export bounded inert canonical package wires",
+    "Derives the existing unsigned package inputs once and exclusively creates "
+    "artifact_dir beneath trusted ancestors. Writes fixed raw manifest, recipe, "
+    "lock, capsule and release-body files; returns exact lengths and SHA3 digests "
+    "within a bounded reply. Existing destinations refuse. Interrupted/uncertain "
+    "publication preserves artifacts without automatic retry. This is neither "
+    "signing, package publication, installation nor execution.",
+    ZCL_COMMAND_LIST_BUDGET, "zcode,package,dev,prepare,export,artifact,offline",
+    "zcl.zcode_package_dev_prepare_export.input.v1", "zcl.zcode_package_dev_prepare_export.v1",
+    "dir,publisher_pubkey,publisher_sequence,reward_address,chain_id,artifact_dir,confirm",
+    "dir,publisher_pubkey,publisher_sequence,artifact_dir,confirm",
+    "z23 zcode package dev prepare export --input='{\"dir\":\"/tmp/source\",\"publisher_pubkey\":\"<66hex>\",\"publisher_sequence\":1,\"artifact_dir\":\"/tmp/new-artifacts\",\"confirm\":true}'",
+    ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_FOREGROUND, ZCL_COMMAND_COST_MODERATE,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_NONE,
+    zcl_native_handle_zcode_package_dev_prepare_export)
+
 ZCL_COMMAND_READY_READ(
     "zcode.package.dev.seal", "zcode.package.dev", "",
     "Verify and attach an offline development signature",
     "Combines the exact canonical release_body_hex returned by prepare with "
     "one detached compact low-S secp256k1 signature, verifies the embedded "
     "publisher key and signing digest, and returns the canonical "
-    "zcl.zcode_release.v1 wire. It creates no datadir and persists nothing.",
+    "zcl.zcode_release.v1 wire. release_body_file plus exact release_body_sha3 "
+    "may replace inline body hex; mixed representations refuse. It creates no "
+    "datadir and persists nothing.",
     0, "zcode,package,dev,seal,signature,offline,release",
     "zcl.zcode_package_dev_seal.input.v1",
     "zcl.zcode_package_dev_seal.v1",
-    "release_body_hex,signature_hex", "release_body_hex,signature_hex",
+    "release_body_hex,release_body_file,release_body_sha3,signature_hex", "signature_hex",
     "z23 zcode package dev seal --input='{\"release_body_hex\":\"<hex>\",\"signature_hex\":\"<128hex>\"}'",
     ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_SCOPE_LOCAL,
     ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FAST,
@@ -2274,13 +2297,13 @@ ZCL_COMMAND_READY_COMMAND(
     "zcode.package.dev.create", "zcode.package.dev", "zcode.create",
     "Create package",
     "Typed convenience adapter over zcode.package.publish.plan/commit. "
-    "mode=plan validates release_hex, manifest_hex, recipe_hex and optional "
+    "mode=plan validates release_hex, manifest/recipe hex or file+SHA3 and optional "
     "source dir without writes; mode=commit re-validates and publishes them "
     "through the same package CAS lifecycle. No second package format or "
     "store is created.", 0,
     "zcode,create,package,publish,plan,commit",
     "zcl.zcode_create.input.v1", "zcl.zcode_create.v1",
-    "mode,release_hex,manifest_hex,recipe_hex,dir,day,datadir", "mode",
+    "mode,release_hex,manifest_hex,manifest_file,manifest_sha3,recipe_hex,recipe_file,recipe_sha3,dir,day,datadir", "mode",
     "z23 zcode create --input='{\"mode\":\"plan\",\"release_hex\":\"..\",\"manifest_hex\":\"..\",\"recipe_hex\":\"..\",\"dir\":\"/tmp/pkg\"}'",
     ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_EFFECT_MUTATE,
     ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_NODE,
@@ -2302,7 +2325,7 @@ ZCL_COMMAND_READY_COMMAND(
     "resolver.", 0,
     "zcode,use,package,dependency,lock,install,using C23 packages",
     "zcl.zcode_use.input.v1", "zcl.zcode_use.v1",
-    "name_or_root,plan_id,now_unix,datadir,local_only,dir,release_hex,manifest_hex,recipe_hex", "",
+    "name_or_root,plan_id,now_unix,datadir,local_only,dir,release_hex,manifest_hex,manifest_file,manifest_sha3,recipe_hex,recipe_file,recipe_sha3", "",
     "z23 zcode use --input='{\"name_or_root\":\"<64hex>\"}'",
     ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_EFFECT_MUTATE,
     ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_NODE,
@@ -2543,7 +2566,7 @@ ZCL_COMMAND_READY_READ(
     ZCL_COMMAND_LIST_BUDGET,
     "zcode,package,publish,plan,validate,release,manifest,recipe,license",
     "zcl.zcode_publish_plan.input.v1", "zcl.zcode_publish_plan.v1",
-    "release_hex,manifest_hex,recipe_hex,dir,datadir", "",
+    "release_hex,manifest_hex,manifest_file,manifest_sha3,recipe_hex,recipe_file,recipe_sha3,dir,datadir", "",
     "z23 zcode package publish plan --input='{\"release_hex\":\"..\",\"manifest_hex\":\"..\",\"recipe_hex\":\"..\",\"dir\":\"/tmp/pkg\"}'",
     ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_SCOPE_NODE, ZCL_COMMAND_AUTH_OPERATOR,
     ZCL_COMMAND_LATENCY_FOREGROUND, ZCL_COMMAND_COST_MODERATE,
@@ -2556,7 +2579,8 @@ ZCL_COMMAND_READY_COMMAND(
     "zcode.package.publish.commit", "zcode.package.publish", "",
     "Re-validate and persist a candidate release into the local store",
     "Runs the full publish-plan validation over release_hex + manifest_hex + "
-    "recipe_hex (naming the exact failed rule on "
+    "recipe_hex (or each mutually exclusive file plus expected SHA3; copied "
+    "bytes retain canonical/signature/root checks), naming the exact failed rule on "
     "rejection), then persists: the manifest and every chunk from `dir` "
     "into the content-addressed store (verify-before-store, dedup, atomic "
     "rename — a crash mid-commit leaves resumable staging, never partial "
@@ -2581,7 +2605,7 @@ ZCL_COMMAND_READY_COMMAND(
     "one-shot path and must not name a hosting node's datadir.", 0,
     "zcode,package,publish,commit,persist,release,recipe,store",
     "zcl.zcode_publish_commit.input.v1", "zcl.zcode_publish_commit.v1",
-    "release_hex,manifest_hex,recipe_hex,dir,day,datadir", "",
+    "release_hex,manifest_hex,manifest_file,manifest_sha3,recipe_hex,recipe_file,recipe_sha3,dir,day,datadir", "",
     "z23 zcode package publish commit --input='{\"release_hex\":\"..\",\"manifest_hex\":\"..\",\"recipe_hex\":\"..\",\"dir\":\"/tmp/pkg\"}'",
     ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_EFFECT_MUTATE,
     ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_NODE,
@@ -4769,11 +4793,10 @@ ZCL_COMMAND_BRANCH("zcode.package.add", "zcode.package",
 ZCL_COMMAND_READY_COMMAND(
     "zcode.package.add.plan", "zcode.package.add", "",
     "Resolve, dependency-lock, and report what installing would do",
-    "Resolves `name_or_root` (a 64-hex package root is identity; a "
-    "publisher/package name only SELECTS the highest published semver), "
-    "walks the package's own zcode-package.json declarations into a "
-    "bounded acyclic dependency DAG locked to immutable package roots, and "
-    "reports every step in BUILD ORDER (dependencies first, target last) "
+    "`name_or_root` is a 64-hex byte identity or a publisher/package name "
+    "selecting the highest published semver. Locks the package's "
+    "zcode-package.json dependencies to immutable roots in a bounded acyclic "
+    "DAG; reports steps in dependency-first build order "
     "with the lifecycle state it has actually reached: `installed` (this "
     "exact root is already installed), `verified` (every manifest chunk "
     "re-hashed from the CAS, envelope and recipe root check out), "
@@ -4791,7 +4814,7 @@ ZCL_COMMAND_READY_COMMAND(
     "shared `cursor`/`max_items` controls: a shortened reply carries a "
     "`_page` descriptor naming where to resume, and the complete list is "
     "all pages in order. With local_only:true, explicit "
-    "datadir, dir, release_hex, manifest_hex and recipe_hex, verifies the signed "
+    "datadir, dir, release_hex, manifest/recipe hex or files with exact SHA3, verifies the signed "
     "exact source into a private nonhosting child store without Commons publication. "
     "Returns that store's datadir for a separate add commit; execution acceptance "
     "remains a separate exact-artifact grant. Local planning may retain verified "
@@ -4799,7 +4822,7 @@ ZCL_COMMAND_READY_COMMAND(
     0,
     "zcode,package,add,install,plan,dependency,lock,resolve",
     "zcl.zcode_add_plan.input.v1", "zcl.zcode_add_plan.v1",
-    "name_or_root,now_unix,datadir,cursor,max_items,local_only,dir,release_hex,manifest_hex,recipe_hex", "name_or_root",
+    "name_or_root,now_unix,datadir,cursor,max_items,local_only,dir,release_hex,manifest_hex,manifest_file,manifest_sha3,recipe_hex,recipe_file,recipe_sha3", "name_or_root",
     "z23 zcode package add plan --input='{\"name_or_root\":\"ringbuffer\"}'",
     ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_EFFECT_MUTATE,
     ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_NODE,

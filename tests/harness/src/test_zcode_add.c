@@ -167,11 +167,13 @@ static int64_t za_midcopy_read(const struct platform_positioned_file *file,
 #define pkgl_declared_open_bytes za_retained_twin_pkgl_declared_open_bytes
 #define pkgl_declared_copy za_retained_twin_pkgl_declared_copy
 #define pkgl_declared_copy_clear za_retained_twin_pkgl_declared_copy_clear
+#define pkgl_declared_host_executable za_retained_twin_pkgl_declared_host_executable
 #define pkgl_resolve_target za_retained_twin_pkgl_resolve_target
 #define package_lifecycle_receipt_read za_retained_twin_package_lifecycle_receipt_read
 #define package_lifecycle_plan za_retained_twin_package_lifecycle_plan
 #define package_lifecycle_declared_output_open za_retained_twin_package_lifecycle_declared_output_open
 #define package_lifecycle_declared_output_read_verified za_retained_twin_package_lifecycle_declared_output_read_verified
+#define package_lifecycle_declared_output_host_executable za_retained_twin_package_lifecycle_declared_output_host_executable
 #define package_lifecycle_installed_inspect za_retained_twin_package_lifecycle_installed_inspect
 #define package_lifecycle_commit za_retained_twin_package_lifecycle_commit
 #define package_lifecycle_last_activated za_retained_twin_package_lifecycle_last_activated
@@ -223,6 +225,8 @@ struct zcl_result pkgl_declared_copy(
     struct package_lifecycle_declared_output *handle, void *buffer,
     size_t capacity, size_t *produced);
 void pkgl_declared_copy_clear(void *buffer, size_t copied);
+struct zcl_result pkgl_declared_host_executable(
+    const struct package_lifecycle_declared_output *handle);
 struct zcl_result pkgl_resolve_target(const struct pkgl_ctx *ctx,
                                       const char *name_or_root,
                                       uint8_t out_root[32]);
@@ -239,6 +243,8 @@ struct zcl_result package_lifecycle_declared_output_open(
 struct zcl_result package_lifecycle_declared_output_read_verified(
     struct package_lifecycle_declared_output *handle, void *buffer,
     size_t capacity, size_t *produced);
+struct zcl_result package_lifecycle_declared_output_host_executable(
+    const struct package_lifecycle_declared_output *handle);
 struct zcl_result package_lifecycle_installed_inspect(
     const char *datadir, const uint8_t root[32],
     struct package_lifecycle_step *out, bool *installed_out);
@@ -276,11 +282,13 @@ struct zcl_result package_lifecycle_active(
 #undef pkgl_declared_open_bytes
 #undef pkgl_declared_copy
 #undef pkgl_declared_copy_clear
+#undef pkgl_declared_host_executable
 #undef pkgl_resolve_target
 #undef package_lifecycle_receipt_read
 #undef package_lifecycle_plan
 #undef package_lifecycle_declared_output_open
 #undef package_lifecycle_declared_output_read_verified
+#undef package_lifecycle_declared_output_host_executable
 #undef package_lifecycle_installed_inspect
 #undef package_lifecycle_commit
 #undef package_lifecycle_last_activated
@@ -1897,6 +1905,70 @@ static int t_receipt_parent_symlink(const char *base, const char *zcode,
     return failures;
 }
 
+static bool za_installed_plan_ready(const struct package_lifecycle_plan_report *plan)
+{
+    return plan->ready && plan->plan.step_count == 1 &&
+        plan->plan.steps[0].installed &&
+        plan->plan.steps[0].state == VCS_PACKAGE_LIFECYCLE_INSTALLED;
+}
+
+static int za_installed_plan_refusal(const char *label, bool changed,
+                                    struct zcl_result planned,
+                                    const struct package_lifecycle_plan_report *plan)
+{
+    int failures = 0;
+    ZA_CHECK(label, changed && planned.ok && !plan->ready &&
+             plan->plan.step_count == 1 && !plan->plan.steps[0].installed &&
+             plan->plan.steps[0].state == VCS_PACKAGE_LIFECYCLE_DISCOVERED &&
+             strcmp(plan->rule, "installed-receipt-invalid") == 0 && plan->detail[0]);
+    return failures;
+}
+
+static int za_installed_plan_evidence(const char *base, const uint8_t root[32],
+                                      const char *installed,
+                                      const uint8_t receipt_id[32], int64_t now)
+{
+    int failures = 0;
+    char root_hex[65], report[4600];
+    za_hex(root, 32, root_hex);
+    struct vcs_package_build_receipt receipt;
+    struct zcl_result read = package_lifecycle_receipt_read(base, receipt_id, &receipt);
+    ZA_CHECK("installed plan fixture reads its exact receipt", read.ok);
+    if (!read.ok) return failures;
+    struct package_lifecycle_plan_report plan;
+    struct zcl_result planned = package_lifecycle_plan(base, root_hex, now, &plan);
+    ZA_CHECK("a verified warm install remains ready without rebuilding",
+             planned.ok && za_installed_plan_ready(&plan));
+    int n = snprintf(report, sizeof(report), "%s/build-report", installed);
+    bool changed = n > 0 && (size_t)n < sizeof(report) &&
+        za_write_file(report, "invalid", 7, 0600);
+    planned = package_lifecycle_plan(base, root_hex, now + 1, &plan);
+    failures += za_installed_plan_refusal(
+        "planning refuses a tampered installed receipt before reuse",
+        changed, planned, &plan);
+    ZA_CHECK("installed plan receipt fixture restores exact evidence",
+             za_declared_receipt_write(base, installed, &receipt));
+    struct vcs_package_build_receipt stale = receipt;
+    stale.lock_root[0] ^= 1u;
+    changed = za_declared_receipt_write(base, installed, &stale);
+    struct package_lifecycle_step inspected;
+    bool present = false;
+    read = package_lifecycle_installed_inspect(base, root, &inspected, &present);
+    ZA_CHECK("stale lock fixture is valid evidence but cannot reuse current lock",
+             changed && read.ok && present && !inspected.receipt_reused);
+    planned = package_lifecycle_plan(base, root_hex, now + 2, &plan);
+    failures += za_installed_plan_refusal(
+        "planning refuses a filed receipt naming a stale dependency lock",
+        changed, planned, &plan);
+    ZA_CHECK("stale installed plan names its dependency lock mismatch",
+             strstr(plan.detail, "dependency lock") != NULL);
+    ZA_CHECK("installed plan stale receipt fixture removes synthetic evidence",
+             za_declared_receipt_remove(base, &stale));
+    ZA_CHECK("installed plan lock fixture restores exact evidence",
+             za_declared_receipt_write(base, installed, &receipt));
+    return failures;
+}
+
 // long-function-ok:one-lifecycle-transcript — this is a single ordered
 // transcript (publish, plan, commit, upgrade, roll back, then the three
 // refusals) against ONE fixture datadir; splitting it would either
@@ -2049,6 +2121,9 @@ static int t_e2e(void)
                  reuse_inspection.already_installed &&
                  reuse_inspection.has_receipt &&
                  memcmp(reuse_inspection.root, ring_root, 32) == 0);
+
+    failures += za_installed_plan_evidence(base, ring_root, installed_dir,
+                                           commit.steps[0].receipt_id, t0 + 1);
 
     failures += za_declared_reader_limits(base, ring_root);
     failures += za_declared_reader_replacement(base, ring_root, header);
@@ -2813,6 +2888,9 @@ static int t_e2e(void)
     struct package_lifecycle_plan_report damaged_plan;
     struct zcl_result damaged_planned =
         package_lifecycle_plan(base, root_hex, t0 + 11, &damaged_plan);
+    failures += za_installed_plan_refusal(
+        "planning refuses a tampered installed output before reuse",
+        damaged, damaged_planned, &damaged_plan);
     struct package_lifecycle_commit_report damaged_commit;
     struct zcl_result damaged_result = package_lifecycle_commit(
         base, damaged_plan.plan_id, t0 + 12, &damaged_commit);

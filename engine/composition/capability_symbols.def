@@ -283,6 +283,8 @@ ZCL_CAPABILITY_SYMBOL("chdir", CAP_FS_WRITE,
     "Writes no file, but it silently retargets every relative path the "
     "process later creates, renames or unlinks. Classed with the writes "
     "because that is the failure that re-running does not repair.")
+ZCL_CAPABILITY_SYMBOL("fchdir", CAP_FS_WRITE,
+    "Descriptor-bound CWD selection retargets subsequent relative filesystem operations, like chdir.")
 ZCL_CAPABILITY_SYMBOL("chmod", CAP_FS_WRITE, "")
 ZCL_CAPABILITY_SYMBOL("copy_file_range", CAP_FS_WRITE,
     "Copies bytes into an output descriptor; the destination mutation is the "
@@ -1140,6 +1142,10 @@ ZCL_CAPABILITY_SYMBOL("sigaddset", CAP_HARMLESS, "")
 ZCL_CAPABILITY_SYMBOL("sigaltstack", CAP_HARMLESS,
     "Points this process own signal handling at a different stack.")
 ZCL_CAPABILITY_SYMBOL("sigemptyset", CAP_HARMLESS, "")
+ZCL_CAPABILITY_SYMBOL("sigfillset", CAP_HARMLESS, "Initializes a caller-owned signal-set value.")
+ZCL_CAPABILITY_SYMBOL("sigismember", CAP_HARMLESS, "Inspects a caller-owned signal-set value.")
+ZCL_CAPABILITY_SYMBOL("sigpending", CAP_HARMLESS, "Observes this process pending signals without external reach.")
+ZCL_CAPABILITY_SYMBOL("sigprocmask", CAP_HARMLESS, "Changes only this process signal mask.")
 ZCL_CAPABILITY_SYMBOL("signal", CAP_HARMLESS,
     "Installs a handler in this process and reaches nothing outside it.")
 ZCL_CAPABILITY_SYMBOL("sigtimedwait", CAP_PROCESS,

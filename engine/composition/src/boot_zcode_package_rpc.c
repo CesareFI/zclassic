@@ -5,6 +5,7 @@
 #include "config/boot_zcode_dht.h"
 
 #include "command/native_command.h"
+#include "command/native_package_artifact.h"
 #include "base/hex.h"
 #include "json/json.h"
 #include "rpc/server.h"
@@ -186,11 +187,11 @@ static bool package_publish_commit(const struct json_value *params, bool help,
     if (help) {
         json_set_str(result,
                      "zcode_package_publish_commit "
-                     "{release_hex,manifest_hex,recipe_hex,dir,day?}");
+                     "{release_hex,manifest_hex|manifest_file+manifest_sha3,recipe_hex|recipe_file+recipe_sha3,dir,day?}; file paths must be canonical absolute");
         return true;
     }
     const struct json_value *input = package_rpc_input(params);
-    if (!input || json_get(input, "datadir")) {
+    if (!input || json_get(input, "datadir") || !zcl_native_package_artifact_paths_absolute(input)) {
         json_set_object(result);
         json_push_kv_bool(result, "ok", false);
         json_push_kv_str(result, "code", "INVALID_INPUT");
@@ -218,7 +219,15 @@ static bool package_publish_commit(const struct json_value *params, bool help,
     struct json_value forwarded;
     json_init(&forwarded);
     json_copy(&forwarded, input);
-    json_push_kv_str(&forwarded, "datadir", datadir);
+    bool copied = zcl_native_package_artifact_fields_equal(input, &forwarded) &&
+        json_push_kv_str(&forwarded, "datadir", datadir);
+    const char *copied_datadir = json_get_str(json_get(&forwarded, "datadir"));
+    if (!copied || !copied_datadir || strcmp(copied_datadir, datadir)) {
+        json_free(&forwarded); json_set_object(result);
+        json_push_kv_bool(result, "ok", false); json_push_kv_bool(result, "mutated", false);
+        json_push_kv_str(result, "code", "PUBLISH_INPUT_COPY_FAILED");
+        return true;
+    }
 
     struct zcl_command_request request = { .input = &forwarded };
     struct zcl_command_reply reply;

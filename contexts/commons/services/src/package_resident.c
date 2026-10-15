@@ -5,6 +5,10 @@
 #include "base/hex.h"
 #include "base/safe_alloc.h"
 #include "sha3/sha3.h"
+#include "platform/supervised_process.h"
+#if defined(__linux__)
+#include <unistd.h>
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -112,4 +116,72 @@ struct zcl_result package_resident_artifact_read(
     free(receipt);
     if (!result.ok) memset(out, 0, sizeof(*out));
     return result;
+}
+
+#if defined(__linux__)
+static bool pr_host_digest(const struct package_resident_artifact *artifact,
+    const uint8_t expected[32])
+{
+    uint8_t digest[32];
+    return zcl_hex_decode(artifact->accepted.image_sha3_hex, digest, sizeof(digest)) &&
+        !memcmp(digest, expected, sizeof(digest));
+}
+
+static bool pr_host_same(const struct package_resident_artifact *a,
+    const struct package_resident_artifact *b)
+{
+    const struct resident_launch_accepted *x = &a->accepted, *y = &b->accepted;
+    bool roots = !memcmp(a->package_root, b->package_root, 32) &&
+        !memcmp(a->receipt_id, b->receipt_id, 32) && !memcmp(a->recipe_root, b->recipe_root, 32);
+    bool image = x->image_volume == y->image_volume && x->image_low == y->image_low &&
+        x->image_high == y->image_high && x->image_size == y->image_size;
+    return roots && image && !strcmp(x->image_sha3_hex, y->image_sha3_hex);
+}
+
+static struct zcl_result pr_host_capture_bytes(const char *datadir,
+    const struct package_resident_artifact *before, const uint8_t digest[32], int *image_fd)
+{
+    struct package_lifecycle_declared_output *handle = NULL;
+    struct zcl_result result = package_lifecycle_declared_output_open(datadir,
+        before->package_root, "bin/tunnel", PLATFORM_SUPERVISED_IMAGE_MAX,
+        UINT64_C(512) * 1024 * 1024, &handle);
+    size_t length = (size_t)before->accepted.image_size, produced = 0;
+    uint8_t *bytes = NULL;
+    if (result.ok) result = package_lifecycle_declared_output_host_executable(handle);
+    if (result.ok) {
+        bytes = zcl_malloc(length, "package.resident.host.image");
+        if (!bytes) result = ZCL_ERR(-1, "cannot allocate bounded HOST image copy");
+    }
+    if (result.ok) result = package_lifecycle_declared_output_read_verified(handle, bytes, length, &produced);
+    if (result.ok) result = package_lifecycle_declared_output_host_executable(handle);
+    if (result.ok && produced != length) result = ZCL_ERR(-1, "HOST image size differs from approved receipt");
+    if (result.ok && platform_supervised_image_capture(bytes, length, digest, image_fd) != PLATFORM_SUPERVISED_IMAGE_OK)
+        result = ZCL_ERR(-1, "HOST image digest, ELF admission or sealed capture refused");
+    free(bytes); package_lifecycle_declared_output_close(&handle);
+    return result;
+}
+#endif
+
+struct zcl_result package_resident_host_image_capture(
+    const char *datadir, const uint8_t package_root[32], const uint8_t receipt_id[32],
+    const uint8_t artifact_sha3[32], int *image_fd)
+{
+#if defined(__linux__)
+    if (!artifact_sha3 || !image_fd || *image_fd != -1)
+        return ZCL_ERR(-1, "HOST image requires exact digest and fresh FD output");
+    struct package_resident_artifact before, after;
+    ZCL_CHECK(package_resident_artifact_read(datadir, package_root, receipt_id, "bin/tunnel", &before));
+    if (!pr_host_digest(&before, artifact_sha3) || !before.accepted.image_size ||
+        before.accepted.image_size > PLATFORM_SUPERVISED_IMAGE_MAX)
+        return ZCL_ERR(-1, "HOST image approval digest or bounded size differs");
+    struct zcl_result result = pr_host_capture_bytes(datadir, &before, artifact_sha3, image_fd);
+    if (result.ok) result = package_resident_artifact_read(datadir, package_root, receipt_id, "bin/tunnel", &after);
+    if (result.ok && !pr_host_same(&before, &after))
+        result = ZCL_ERR(-1, "HOST installed artifact changed during capture");
+    if (!result.ok && *image_fd >= 0) { close(*image_fd); *image_fd = -1; }
+    return result;
+#else
+    (void)datadir; (void)package_root; (void)receipt_id; (void)artifact_sha3; (void)image_fd;
+    return ZCL_ERR(-1, "HOST installed image admission is Linux-only");
+#endif
 }

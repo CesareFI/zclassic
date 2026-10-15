@@ -75,6 +75,7 @@
 
 #include "base/hex.h"
 #include "command/native_command.h"
+#include "command/native_package_artifact.h"
 
 #include "kernel/command_registry.h"
 
@@ -174,6 +175,32 @@ static void zc_candidate_free(struct zc_candidate *c)
  * rule. Returns false only on a hard error already reported via
  * reply_fail (missing/undecodable inputs, I/O failure); a true return can
  * still carry a non-empty failure list — that is the plan report. */
+/* All representations use these canonical parsers before shared admission. */
+static enum vcs_package_release_error zc_parse_release_wire(
+    const uint8_t *wire, size_t length, struct zc_candidate *cand)
+{
+    enum vcs_package_release_error error =
+        vcs_package_release_parse(wire, length, &cand->release);
+    cand->release_parsed = error == VCS_PACKAGE_RELEASE_OK;
+    return error;
+}
+
+static bool zc_parse_manifest_wire(struct zc_candidate *cand)
+{
+    cand->manifest_parsed = vcs_package_manifest_parse(
+        cand->manifest_wire, cand->manifest_wire_len, &cand->manifest);
+    return cand->manifest_parsed;
+}
+
+static enum vcs_package_recipe_error zc_parse_recipe_wire(
+    struct zc_candidate *cand)
+{
+    enum vcs_package_recipe_error error = vcs_package_recipe_parse(
+        cand->recipe_wire, cand->recipe_wire_len, &cand->recipe);
+    cand->recipe_parsed = error == VCS_PACKAGE_RECIPE_OK;
+    return error;
+}
+
 static bool zc_validate_release(const struct zcl_command_request *request,
                                 struct zcl_command_reply *reply,
                                 struct zc_candidate *cand,
@@ -203,8 +230,7 @@ static bool zc_validate_release(const struct zcl_command_request *request,
                                  &release_wire_len);
     enum vcs_package_release_error perr = VCS_PACKAGE_RELEASE_OK;
     if (decoded)
-        perr = vcs_package_release_parse(release_wire, release_wire_len,
-                                         &cand->release);
+        perr = zc_parse_release_wire(release_wire, release_wire_len, cand);
     free(release_wire);
     if (!decoded || perr != VCS_PACKAGE_RELEASE_OK) {
         vcs_package_publish_fail(
@@ -222,6 +248,19 @@ static bool zc_validate_manifest(const struct zcl_command_request *request,
                                  struct zc_candidate *cand,
                                  struct vcs_package_publish_report *report)
 {
+    if (json_get(request->input, "manifest_file") || json_get(request->input, "manifest_sha3")) {
+        if (!zcl_native_package_artifact_read(request->input, "manifest_hex", "manifest_file", "manifest_sha3",
+            VCS_PACKAGE_MANIFEST_MAX_WIRE_BYTES, &cand->manifest_wire, &cand->manifest_wire_len)) {
+            zcl_command_reply_fail(reply, ZCL_COMMAND_STATUS_FAILED, ZCL_COMMAND_EXIT_INVALID,
+                "INVALID_MANIFEST_ARTIFACT", "normalize", false, false,
+                "exactly one manifest representation and matching bounded file digest are required", "zcode.package.publish");
+            return false;
+        }
+        (void)zc_parse_manifest_wire(cand);
+        if (!cand->manifest_parsed) vcs_package_publish_fail(report, VCS_PACKAGE_PUBLISH_RULE_MANIFEST_PARSE,
+            "manifest file violates the existing content.v2 grammar");
+        return true;
+    }
     const char *manifest_hex = zc_input_str(request->input, "manifest_hex");
     if (!manifest_hex || !manifest_hex[0]) {
         zcl_command_reply_fail(reply, ZCL_COMMAND_STATUS_FAILED,
@@ -244,9 +283,7 @@ static bool zc_validate_manifest(const struct zcl_command_request *request,
     if (!zcl_hex_decode_n(manifest_hex, cand->manifest_wire,
                        VCS_PACKAGE_MANIFEST_MAX_WIRE_BYTES,
                        &cand->manifest_wire_len) ||
-        !vcs_package_manifest_parse(cand->manifest_wire,
-                                    cand->manifest_wire_len,
-                                    &cand->manifest)) {
+        !zc_parse_manifest_wire(cand)) {
         vcs_package_publish_fail(
             report, VCS_PACKAGE_PUBLISH_RULE_MANIFEST_PARSE,
             "manifest wire violates the content.v2 grammar (paths, modes, "
@@ -264,6 +301,20 @@ static bool zc_validate_recipe(const struct zcl_command_request *request,
                                struct zc_candidate *cand,
                                struct vcs_package_publish_report *report)
 {
+    if (json_get(request->input, "recipe_file") || json_get(request->input, "recipe_sha3")) {
+        if (!zcl_native_package_artifact_read(request->input, "recipe_hex", "recipe_file", "recipe_sha3",
+            VCS_PACKAGE_RECIPE_MAX_WIRE_BYTES, &cand->recipe_wire, &cand->recipe_wire_len)) {
+            zcl_command_reply_fail(reply, ZCL_COMMAND_STATUS_FAILED, ZCL_COMMAND_EXIT_INVALID,
+                "INVALID_RECIPE_ARTIFACT", "normalize", false, false,
+                "exactly one recipe representation and matching bounded file digest are required", "zcode.package.publish");
+            return false;
+        }
+        enum vcs_package_recipe_error error = zc_parse_recipe_wire(cand);
+        cand->recipe_parsed = error == VCS_PACKAGE_RECIPE_OK;
+        if (!cand->recipe_parsed) vcs_package_publish_fail(report, VCS_PACKAGE_PUBLISH_RULE_RECIPE_PARSE,
+            vcs_package_recipe_error_string(error));
+        return true;
+    }
     const char *recipe_hex = zc_input_str(request->input, "recipe_hex");
     if (!recipe_hex || !recipe_hex[0]) {
         vcs_package_publish_fail(
@@ -287,9 +338,7 @@ static bool zc_validate_recipe(const struct zcl_command_request *request,
                                     VCS_PACKAGE_RECIPE_MAX_WIRE_BYTES,
                                     &cand->recipe_wire_len);
     if (rc_decoded)
-        rcerr = vcs_package_recipe_parse(cand->recipe_wire,
-                                         cand->recipe_wire_len,
-                                         &cand->recipe);
+        rcerr = zc_parse_recipe_wire(cand);
     if (!rc_decoded || rcerr != VCS_PACKAGE_RECIPE_OK) {
         vcs_package_publish_fail(
             report, VCS_PACKAGE_PUBLISH_RULE_RECIPE_PARSE,
@@ -356,22 +405,12 @@ static bool zc_validate_accept(struct zcl_command_reply *reply,
     return true;
 }
 
-static bool zc_validate(const struct zcl_command_request *request,
-                        struct zcl_command_reply *reply,
-                        struct zc_candidate *cand,
-                        struct vcs_package_publish_report *report,
-                        const char *datadir, const char *dir,
-                        size_t *replayed_out)
+static bool zc_validate_parsed(struct zcl_command_reply *reply,
+                               struct zc_candidate *cand,
+                               struct vcs_package_publish_report *report,
+                               const char *datadir, const char *dir,
+                               size_t *replayed_out)
 {
-    memset(cand, 0, sizeof(*cand));
-    vcs_package_manifest_init(&cand->manifest);
-    vcs_package_recipe_init(&cand->recipe);
-
-    if (!zc_validate_release(request, reply, cand, report) ||
-        !zc_validate_manifest(request, reply, cand, report) ||
-        !zc_validate_recipe(request, reply, cand, report))
-        return false;
-
     if (!cand->release_parsed || !cand->manifest_parsed)
         return true; /* the report already names the failed rules */
 
@@ -393,6 +432,26 @@ static bool zc_validate(const struct zcl_command_request *request,
     if (dir && dir[0])
         vcs_package_publish_verify_chunks(&cand->manifest, dir, report);
     return true;
+}
+
+static bool zc_validate(const struct zcl_command_request *request,
+                        struct zcl_command_reply *reply,
+                        struct zc_candidate *cand,
+                        struct vcs_package_publish_report *report,
+                        const char *datadir, const char *dir,
+                        size_t *replayed_out)
+{
+    memset(cand, 0, sizeof(*cand));
+    vcs_package_manifest_init(&cand->manifest);
+    vcs_package_recipe_init(&cand->recipe);
+
+    if (!zc_validate_release(request, reply, cand, report) ||
+        !zc_validate_manifest(request, reply, cand, report) ||
+        !zc_validate_recipe(request, reply, cand, report))
+        return false;
+
+    return zc_validate_parsed(reply, cand, report, datadir, dir,
+                              replayed_out);
 }
 
 /* ── reply projection ───────────────────────────────────────────────── */
@@ -619,28 +678,56 @@ static bool zc_absolute_dir(const char *dir, char *absolute, size_t cap)
 }
 
 /* The forwarded publish-commit parameters as an RPC argument string. */
+static bool zc_commit_forward_string(struct json_value *out, const struct json_value *input,
+    const char *key, size_t maximum, bool file_path)
+{
+    if (!json_get(input, key)) return true;
+    const char *value = zc_input_str(input, key); char absolute[4096];
+    if (!value || strlen(value) > maximum) return false;
+    if (file_path) {
+        if (!zcl_native_package_artifact_absolute(value, absolute, sizeof(absolute))) return false;
+        value = absolute;
+    }
+    if (!json_push_kv_str(out, key, value)) return false;
+    const char *copied = json_get_str(json_get(out, key));
+    return copied && strcmp(value, copied) == 0;
+}
+static bool zc_commit_forward_wires(struct json_value *out, const struct json_value *input)
+{
+    static const struct { const char *key; size_t maximum; bool path; } fields[] = {
+        {"release_hex", VCS_PACKAGE_RELEASE_MAX_WIRE_BYTES * 2u, false},
+        {"manifest_hex", VCS_PACKAGE_MANIFEST_MAX_WIRE_BYTES * 2u, false},
+        {"recipe_hex", VCS_PACKAGE_RECIPE_MAX_WIRE_BYTES * 2u, false},
+        {"manifest_file", 4095, true}, {"manifest_sha3", 64, false},
+        {"recipe_file", 4095, true}, {"recipe_sha3", 64, false}
+    };
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i)
+        if (!zc_commit_forward_string(out, input, fields[i].key, fields[i].maximum, fields[i].path)) return false;
+    return true;
+}
+static char *zc_commit_params_json(const struct json_value *forwarded)
+{
+    struct json_value arguments; json_init(&arguments); json_set_array(&arguments);
+    bool ok = json_push_back(&arguments, forwarded) &&
+        zcl_native_package_artifact_fields_equal(forwarded, json_at(&arguments, 0));
+    size_t needed = ok ? json_write(&arguments, NULL, 0) : 0;
+    char *wire = needed && needed < SIZE_MAX ? zcl_malloc(needed + 1, "package.publish.rpc-input") : NULL;
+    if (wire && json_write(&arguments, wire, needed + 1) != needed) { free(wire); wire = NULL; }
+    json_free(&arguments); return wire;
+}
 static char *zc_commit_forward_params(const struct zcl_command_request *request,
                                       const char *absolute)
 {
     struct json_value forwarded;
     json_init(&forwarded);
     json_set_object(&forwarded);
-    (void)json_push_kv_str(&forwarded, "dir", absolute);
-    static const char *const carried[] = { "release_hex", "manifest_hex",
-                                           "recipe_hex" };
-    for (size_t i = 0; i < sizeof(carried) / sizeof(carried[0]); i++) {
-        const char *value = zc_input_str(request->input, carried[i]);
-        if (value)
-            (void)json_push_kv_str(&forwarded, carried[i], value);
-    }
+    bool ok = json_push_kv_str(&forwarded, "dir", absolute);
+    const char *copied = json_get_str(json_get(&forwarded, "dir"));
+    ok = ok && copied && strcmp(copied, absolute) == 0;
+    if (ok) ok = zc_commit_forward_wires(&forwarded, request->input);
     const struct json_value *day = json_get(request->input, "day");
-    if (day)
-        (void)json_push_kv_int(&forwarded, "day", json_get_int(day));
-
-    struct rpc_arg_builder args;
-    rpc_arg_builder_init(&args);
-    rpc_arg_builder_push_value(&args, &forwarded);
-    char *params = rpc_arg_builder_to_json(&args);
+    if (day) ok = ok && day->type == JSON_INT && json_push_kv_int(&forwarded, "day", json_get_int(day));
+    char *params = ok ? zc_commit_params_json(&forwarded) : NULL;
     json_free(&forwarded);
     return params;
 }
@@ -709,6 +796,13 @@ static bool zc_commit_via_resident(const struct zcl_command_request *request,
         return false;
 
     char *params = zc_commit_forward_params(request, absolute);
+    if (!params) {
+        zcl_command_reply_fail(reply, ZCL_COMMAND_STATUS_FAILED, ZCL_COMMAND_EXIT_INVALID,
+            "PUBLISH_FORWARD_INPUT", "forward", false, false,
+            "complete bounded publication fields could not be forwarded; no local fallback attempted",
+            "zcode.package.publish.commit");
+        return true;
+    }
     zcl_native_bridge_ensure_rpc();
     char *raw = params
         ? node_rpc_call("zcode_package_publish_commit", params) : NULL;
@@ -724,16 +818,15 @@ static bool zc_commit_via_resident(const struct zcl_command_request *request,
  * only within the publisher key's per-ISO-week tier allowance. On success
  * `*book_out` holds the service book the commit records into (caller frees);
  * on failure the reply is filled and nothing is left allocated. */
-static bool zc_policy_gate(const struct zcl_command_request *request,
+static bool zc_policy_gate(bool has_day, int64_t requested_day,
                            struct zcl_command_reply *reply,
                            const char *zcode_dir,
                            const struct zc_candidate *cand,
                            struct vcs_service_book **book_out,
                            enum vcs_policy_tier *tier_out, int64_t *day_out)
 {
-    const struct json_value *dv = json_get(request->input, "day");
-    int64_t policy_day = dv ? json_get_int(dv)
-                            : vcs_rank_day_from_unix(platform_time_wall_unix());
+    int64_t policy_day = has_day ? requested_day
+        : vcs_rank_day_from_unix(platform_time_wall_unix());
     struct vcs_service_book *book = vcs_service_book_load(zcode_dir);
     struct vcs_reward_ledger *ledger = vcs_reward_ledger_load(zcode_dir);
     if (!book || !ledger) {
@@ -970,6 +1063,8 @@ static void zc_push_commit_policy(struct zcl_command_reply *reply,
 struct zc_commit {
     const struct zcl_command_request *request;
     struct zcl_command_reply *reply;
+    bool has_day;
+    int64_t requested_day;
     const char *datadir;
     const char *dir;
     char zcode_dir[4400];
@@ -1002,6 +1097,9 @@ static void zc_commit_cleanup(struct zc_commit *c)
 
 static bool zc_commit_inputs(struct zc_commit *c)
 {
+    const struct json_value *day = json_get(c->request->input, "day");
+    c->has_day = day != NULL;
+    c->requested_day = day ? json_get_int(day) : 0;
     c->datadir = zc_datadir(c->request);
     if (!c->datadir) {
         zcl_command_reply_fail(c->reply, ZCL_COMMAND_STATUS_FAILED,
@@ -1026,10 +1124,6 @@ static bool zc_commit_inputs(struct zc_commit *c)
 /* Validates the candidate and resolves the store directory. */
 static bool zc_commit_check(struct zc_commit *c)
 {
-    vcs_package_publish_report_init(&c->report);
-    if (!zc_validate(c->request, c->reply, &c->cand, &c->report, c->datadir,
-                     c->dir, &c->replayed))
-        return false;
     if (c->report.failure_count > 0) {
         /* The exact failed rule leads; the rest fit the evidence budget. */
         const struct vcs_package_publish_failure *first =
@@ -1067,7 +1161,8 @@ static bool zc_commit_policy(struct zc_commit *c)
 {
     if (c->report.accept != VCS_PACKAGE_ACCEPT_OK)
         return true;
-    return zc_policy_gate(c->request, c->reply, c->zcode_dir, &c->cand,
+    return zc_policy_gate(c->has_day, c->requested_day, c->reply,
+                          c->zcode_dir, &c->cand,
                           &c->book, &c->tier, &c->day);
 }
 
@@ -1199,6 +1294,109 @@ static void zc_commit_reply(struct zc_commit *c)
     reply->error.mutated = c->committed;
 }
 
+static void zc_commit_local(struct zc_commit *c)
+{
+    if (zc_commit_check(c) && zc_commit_policy(c) &&
+        zc_commit_open_store(c) && zc_commit_persist(c))
+        zc_commit_reply(c);
+    zc_commit_cleanup(c);
+}
+
+static bool zc_local_wire_copy(const uint8_t *wire, size_t length,
+                               uint8_t **copy, size_t *copy_length)
+{
+    *copy = zcl_malloc(length, "zc_local_publication_wire");
+    if (!*copy)
+        return false;
+    memcpy(*copy, wire, length);
+    *copy_length = length;
+    return true;
+}
+
+static bool zc_local_candidate(struct zc_commit *c,
+                               const struct zcl_native_local_publication *p)
+{
+    vcs_package_manifest_init(&c->cand.manifest);
+    vcs_package_recipe_init(&c->cand.recipe);
+    if (!zc_local_wire_copy(p->manifest_wire, p->manifest_wire_len,
+                            &c->cand.manifest_wire,
+                            &c->cand.manifest_wire_len) ||
+        !zc_local_wire_copy(p->recipe_wire, p->recipe_wire_len,
+                            &c->cand.recipe_wire,
+                            &c->cand.recipe_wire_len))
+        return false;
+    enum vcs_package_release_error release_error = zc_parse_release_wire(
+        p->release_wire, p->release_wire_len, &c->cand);
+    c->cand.release_parsed = release_error == VCS_PACKAGE_RELEASE_OK;
+    if (!c->cand.release_parsed)
+        vcs_package_publish_fail(&c->report,
+            VCS_PACKAGE_PUBLISH_RULE_RELEASE_PARSE,
+            vcs_package_release_error_string(release_error));
+    (void)zc_parse_manifest_wire(&c->cand);
+    if (!c->cand.manifest_parsed)
+        vcs_package_publish_fail(&c->report,
+            VCS_PACKAGE_PUBLISH_RULE_MANIFEST_PARSE,
+            "manifest wire is not content.v2 wire grammar");
+    enum vcs_package_recipe_error recipe_error = zc_parse_recipe_wire(&c->cand);
+    c->cand.recipe_parsed = recipe_error == VCS_PACKAGE_RECIPE_OK;
+    if (!c->cand.recipe_parsed)
+        vcs_package_publish_fail(&c->report,
+            VCS_PACKAGE_PUBLISH_RULE_RECIPE_PARSE,
+            vcs_package_recipe_error_string(recipe_error));
+    return true;
+}
+
+static bool zc_local_wires_valid(const struct zcl_native_local_publication *p)
+{
+    return p->release_wire && p->release_wire_len &&
+        p->release_wire_len <= VCS_PACKAGE_RELEASE_MAX_WIRE_BYTES &&
+        p->manifest_wire && p->manifest_wire_len &&
+        p->manifest_wire_len <= VCS_PACKAGE_MANIFEST_MAX_WIRE_BYTES &&
+        p->recipe_wire && p->recipe_wire_len &&
+        p->recipe_wire_len <= VCS_PACKAGE_RECIPE_MAX_WIRE_BYTES;
+}
+
+void zcl_native_zcode_local_publication_commit(
+    const struct zcl_native_local_publication *p,
+    struct zcl_command_reply *reply)
+{
+    if (!reply)
+        return;
+    if (!p || !p->datadir || !p->datadir[0] ||
+        !p->source_directory || !p->source_directory[0]) {
+        zcl_command_reply_fail(reply, ZCL_COMMAND_STATUS_FAILED,
+            ZCL_COMMAND_EXIT_INVALID, "LOCAL_PUBLICATION_INPUT", "normalize",
+            false, false, "explicit local datadir and source directory required",
+            "zcode.package.publish.commit");
+        return;
+    }
+    struct zc_commit c = {.reply = reply, .datadir = p->datadir,
+        .dir = p->source_directory, .has_day = p->has_day,
+        .requested_day = p->day, .tier = VCS_POLICY_TIER_NEW_USER};
+    vcs_package_publish_report_init(&c.report);
+    if (!zc_local_wires_valid(p)) {
+        zcl_command_reply_fail(reply, ZCL_COMMAND_STATUS_FAILED,
+            ZCL_COMMAND_EXIT_INVALID, "LOCAL_PUBLICATION_WIRE", "normalize",
+            false, false, "bounded immutable publication wires required",
+            "zcode.package.publish.commit");
+        return;
+    }
+    if (!zc_local_candidate(&c, p)) {
+        zcl_command_reply_fail(reply, ZCL_COMMAND_STATUS_FAILED,
+            ZCL_COMMAND_EXIT_INTERNAL, "ALLOC", "normalize",
+            false, false, "local publication wire buffers",
+            "zcode.package.publish.commit");
+        zc_commit_cleanup(&c);
+        return;
+    }
+    if (!zc_validate_parsed(reply, &c.cand, &c.report, c.datadir, c.dir,
+                            &c.replayed)) {
+        zc_commit_cleanup(&c);
+        return;
+    }
+    zc_commit_local(&c);
+}
+
 void zcl_native_handle_zcode_package_publish_commit(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply)
@@ -1211,13 +1409,13 @@ void zcl_native_handle_zcode_package_publish_commit(
         return;
     if (zc_commit_via_resident(request, reply))
         return;
-    if (!zc_commit_check(&c) || !zc_commit_policy(&c) ||
-        !zc_commit_open_store(&c) || !zc_commit_persist(&c)) {
+    vcs_package_publish_report_init(&c.report);
+    if (!zc_validate(request, reply, &c.cand, &c.report, c.datadir,
+                     c.dir, &c.replayed)) {
         zc_commit_cleanup(&c);
         return;
     }
-    zc_commit_reply(&c);
-    zc_commit_cleanup(&c);
+    zc_commit_local(&c);
 }
 
 /* ── zcode package recipe ───────────────────────────────────────────── */

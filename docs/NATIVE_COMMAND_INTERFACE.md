@@ -1202,3 +1202,13 @@ which is the optional suggestion descriptor: codes absent from the table
 fall back to the envelope's own `next[0]` rendered as an executable shell
 line, then to no hint. `UNKNOWN_COMMAND` always prefers the envelope's
 `next[0]` because it carries the operator's real query.
+
+Package publication composition uses an explicit local wire entry for internally
+derived release, manifest and recipe bytes. It runs the same canonical parsers,
+signature, root, chunk, replay and policy checks as native publication commit;
+it does not forward to a resident node or confer install or execution authority.
+The optional policy day is passed explicitly. `dev.publish.commit` continues to
+accept its own signed bundle inputs, without artifact-file selectors. The
+forwarding create, use and presentation confirmation leaves accept the existing
+mutually exclusive manifest/recipe hex or file+SHA3 representations. Resident
+forwarding remains owned by the ordinary publication command adapter.

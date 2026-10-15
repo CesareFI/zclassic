@@ -205,6 +205,12 @@ struct zcl_result package_lifecycle_declared_output_read_verified(
     size_t capacity, size_t *produced);
 void package_lifecycle_declared_output_close(
     struct package_lifecycle_declared_output **handle);
+/* Linux-only read-only metadata admission on the retained exact descriptor:
+ * regular executable and no setuid/setgid mode. No descriptor escapes and no
+ * execution authority is conferred. Qualification holds at this observation;
+ * callers still use read_verified and separately approve host execution. */
+struct zcl_result package_lifecycle_declared_output_host_executable(
+    const struct package_lifecycle_declared_output *handle);
 
 /* Read-only projection of ONE installed root's receipt: the bin/ outputs it
  * committed, in the receipt's own canonical order. Nothing is built,

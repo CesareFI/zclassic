@@ -42,6 +42,9 @@ static int test_make_lint_gates_family(void)
 
 int main(int argc, char **argv)
 {
+    /* Narrow sealed-image process fixture dispatch, before global test init. */
+    extern void supervised_fixture_exit_if_requested(int argc, char **argv);
+    supervised_fixture_exit_if_requested(argc, argv);
     /* Clean-zygote reflex runner re-exec of this binary (exact argv shape),
      * dispatched before any global test init. */
     zcl_reflex_runner_exit_if_requested(argc, argv);
@@ -1264,6 +1267,30 @@ int main(int argc, char **argv)
       failures += test_zses(); }
     { extern int test_mesh_pairing(void);
       failures += test_mesh_pairing(); }
+    { extern int test_device_pairing(void);
+      failures += test_device_pairing(); }
+    { extern int test_device_host_key(void);
+      failures += test_device_host_key(); }
+    { extern int test_device_host_bridge(void);
+      failures += test_device_host_bridge(); }
+    { extern int test_shake_wrap(void);
+      failures += test_shake_wrap(); }
+    { extern int test_device_host_psk(void);
+      failures += test_device_host_psk(); }
+    { extern int test_device_host_runtime(void);
+      failures += test_device_host_runtime(); }
+    { extern int test_native_tunnel_export(void);
+      failures += test_native_tunnel_export(); }
+    { extern int test_supervised_process(void);
+      failures += test_supervised_process(); }
+    { extern int test_device_channel(void);
+      failures += test_device_channel(); }
+    { extern int test_device_connection(void);
+      failures += test_device_connection(); }
+    { extern int test_device_identity(void);
+      failures += test_device_identity(); }
+    { extern int test_device_command(void);
+      failures += test_device_command(); }
     { extern int test_mesh_pairing_list(void);
       failures += test_mesh_pairing_list(); }
     { extern int test_mesh_route(void);

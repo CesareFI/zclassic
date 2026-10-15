@@ -1200,6 +1200,23 @@ struct zcl_result package_lifecycle_installed_programs(
     }
     return ZCL_OK;
 }
+struct zcl_result pkgl_declared_host_executable(
+    const struct package_lifecycle_declared_output *handle)
+{
+#if defined(__linux__)
+    struct stat status;
+    int fd = (int)platform_positioned_file_native_fd(&handle->file);
+    if (fd < 0 || fstat(fd, &status) < 0 || !S_ISREG(status.st_mode) ||
+        !(status.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) ||
+        (status.st_mode & (S_ISUID | S_ISGID)))
+        return ZCL_ERR(-1, "host image requires a regular unprivileged executable descriptor");
+    return ZCL_OK;
+#else
+    (void)handle;
+    return ZCL_ERR(-1, "host executable metadata admission is Linux-only");
+#endif
+}
+
 void package_lifecycle_declared_output_close(
     struct package_lifecycle_declared_output **handle)
 {

@@ -622,68 +622,18 @@ static bool zpub_commit_verify_release(
 /* Stage the verified CAS source bytes into a fresh temporary directory. */
 static bool zpub_commit_stage(
     struct zpub_accepted_bundle *bundle, char staging[ZPUB_PATH_MAX],
-    uint8_t *release_wire, struct zcl_command_reply *reply)
+    struct zcl_command_reply *reply)
 {
     bool stage_created = zpub_stage_create(bundle->datadir, staging);
     bool staged = stage_created &&
         zpub_stage_transport(staging, &bundle->transport);
     if (!staged) {
         if (stage_created) zpub_stage_cleanup(staging, &bundle->transport);
-        free(release_wire);
-        zpub_bundle_free(bundle);
         zpub_fail(reply, "SOURCE_STAGE_FAILED",
                   "verified CAS source bytes could not be staged in the "
                   "explicit datadir");
         return false;
     }
-    return true;
-}
-
-/* Build the hex-encoded input for the existing package.publish commit
- * handler, which performs the actual store/index write. */
-static bool zpub_commit_build_input(
-    const struct zcl_command_request *request,
-    struct zpub_accepted_bundle *bundle, const char *staging,
-    const uint8_t *release_wire, size_t release_wire_len,
-    struct json_value *commit_input, struct zcl_command_reply *reply)
-{
-    char *release_hex =
-        zcl_malloc(release_wire_len * 2u + 1u, "zcode.publish.release_hex");
-    char *manifest_hex =
-        zcl_malloc(bundle->transport.manifest_wire_len * 2u + 1u,
-                   "zcode.publish.manifest_hex");
-    char *recipe_hex =
-        zcl_malloc(bundle->transport.recipe_wire_len * 2u + 1u,
-                   "zcode.publish.recipe_hex");
-    if (!release_hex || !manifest_hex || !recipe_hex) {
-        zpub_stage_cleanup(staging, &bundle->transport);
-        free(release_hex);
-        free(manifest_hex);
-        free(recipe_hex);
-        zcl_command_reply_fail(reply, ZCL_COMMAND_STATUS_FAILED,
-                               ZCL_COMMAND_EXIT_INTERNAL, "ALLOC", "publish",
-                               false, false, "hex wire buffers",
-                               "zcode.publish");
-        return false;
-    }
-    zcl_hex_encode(release_wire, release_wire_len, release_hex);
-    zcl_hex_encode(bundle->transport.manifest_wire,
-                   bundle->transport.manifest_wire_len, manifest_hex);
-    zcl_hex_encode(bundle->transport.recipe_wire,
-                   bundle->transport.recipe_wire_len, recipe_hex);
-    json_init(commit_input);
-    json_set_object(commit_input);
-    (void)json_push_kv_str(commit_input, "release_hex", release_hex);
-    (void)json_push_kv_str(commit_input, "manifest_hex", manifest_hex);
-    (void)json_push_kv_str(commit_input, "recipe_hex", recipe_hex);
-    (void)json_push_kv_str(commit_input, "dir", staging);
-    (void)json_push_kv_str(commit_input, "datadir", bundle->datadir);
-    const struct json_value *day = json_get(request->input, "day");
-    if (day)
-        (void)json_push_kv_int(commit_input, "day", json_get_int(day));
-    free(release_hex);
-    free(manifest_hex);
-    free(recipe_hex);
     return true;
 }
 
@@ -702,7 +652,7 @@ static void zpub_commit_map_failure(
                    commit_reply->error.evidence);
     zcl_command_reply_fail(reply, ZCL_COMMAND_STATUS_FAILED,
                            ZCL_COMMAND_EXIT_INVALID, code, "validate",
-                           false, false, message, evidence);
+                           false, commit_reply->error.mutated, message, evidence);
 }
 
 /* Bind the CAS release object into the exact publication job progress, if
@@ -758,22 +708,24 @@ static bool zpub_commit_run_inner(
      * whatever this function decides. */
     zcl_command_reply_init(commit_reply, "zcl.zcode_publish_commit.v1");
     char staging[ZPUB_PATH_MAX] = {0};
-    if (!zpub_commit_stage(bundle, staging, release_wire, reply)) {
+    if (!zpub_commit_stage(bundle, staging, reply)) {
+        zpub_bundle_free(bundle);
         free(release_wire);
         return false;
     }
 
-    struct json_value commit_input;
-    if (!zpub_commit_build_input(request, bundle, staging, release_wire,
-                                 release_wire_len, &commit_input, reply)) {
-        free(release_wire);
-        return false;
-    }
-    struct zcl_command_request commit_request = { .input = &commit_input };
-    zcl_native_handle_zcode_package_publish_commit(
-        &commit_request, commit_reply);
+    const struct json_value *day = json_get(request->input, "day");
+    const struct zcl_native_local_publication publication = {
+        .datadir = bundle->datadir, .source_directory = staging,
+        .release_wire = release_wire, .release_wire_len = release_wire_len,
+        .manifest_wire = bundle->transport.manifest_wire,
+        .manifest_wire_len = bundle->transport.manifest_wire_len,
+        .recipe_wire = bundle->transport.recipe_wire,
+        .recipe_wire_len = bundle->transport.recipe_wire_len,
+        .has_day = day != NULL, .day = day ? json_get_int(day) : 0
+    };
+    zcl_native_zcode_local_publication_commit(&publication, commit_reply);
     zpub_stage_cleanup(staging, &bundle->transport);
-    json_free(&commit_input);
 
     if (commit_reply->exit_code != ZCL_COMMAND_EXIT_OK) {
         zpub_commit_map_failure(reply, commit_reply);

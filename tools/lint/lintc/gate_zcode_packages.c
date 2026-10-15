@@ -182,16 +182,20 @@ static int zpr_group_hits(const char *group, char mono[][RS_PATH], int n,
     }
     return pc;
 }
-static int zpr_take_match(const char *text, regex_t *re, char v[][RS_PATH], int cap, int *n)
+/* Owned capture storage: delimit only for regex evaluation, restore before
+ * copying a matched path or taking any bounds-refusal exit. */
+static int zpr_take_match(char *text, regex_t *re, char v[][RS_PATH], int cap, int *n)
 {
-    for (const char *p = text; *p; ) {
-        const char *eol = strchr(p, '\n');
+    for (char *p = text; *p; ) {
+        char *eol = strchr(p, '\n');
         size_t len = eol ? (size_t)(eol - p) : strlen(p);
-        char line[RS_PATH];
-        if (zpkg_copy(line, sizeof line, p, len)) return 2;
-        if (regexec(re, line, 0, NULL, 0) == 0) {
+        if (eol) *eol = '\0';
+        int match = regexec(re, p, 0, NULL, 0);
+        if (eol) *eol = '\n';
+        if (match == 0) {
             if (*n >= cap) return ovf(*n + 1, (size_t)cap);
-            memcpy(v[*n], line, strlen(line) + 1); (*n)++;
+            if (zpkg_copy(v[*n], RS_PATH, p, len)) return 2;
+            (*n)++;
         }
         p = eol ? eol + 1 : p + len;
     }
@@ -423,6 +427,53 @@ static int zpr_st_excluded_hits(char mono[][RS_PATH], int *bad)
     *bad |= zpr_hits(mono, 1, "ok.c") != 1;
     return 0;
 }
+static int zpr_st_long_diagnostic(regex_t *re, int *bad)
+{
+    char text[RS_PATH * 3] = {0}, original[sizeof text], paths[2][RS_PATH];
+    static const char valid[] = "engine/models/src/device_pairing.c";
+    memset(text, 'x', RS_PATH * 2);
+    text[RS_PATH * 2] = '\n';
+    memcpy(text + RS_PATH * 2 + 1, valid, sizeof valid - 1);
+    text[RS_PATH * 2 + sizeof valid] = '\n';
+    memcpy(original, text, sizeof text);
+    int n = 0;
+    int rc = zpr_take_match(text, re, paths, 2, &n);
+    *bad |= rc != 0 || n != 1;
+    if (n == 1) *bad |= strcmp(paths[0], valid) != 0;
+    *bad |= memcmp(text, original, sizeof text) != 0;
+    return 0;
+}
+static int zpr_st_matching_bounds(regex_t *re, int *bad)
+{
+    char text[RS_PATH + 64] = {0}, original[sizeof text], paths[1][RS_PATH];
+    static const char prefix[] = "engine/example/src/";
+    memcpy(text, prefix, sizeof prefix - 1);
+    memset(text + sizeof prefix - 1, 'a', RS_PATH);
+    memcpy(text + sizeof prefix - 1 + RS_PATH, ".c\n", 4);
+    memcpy(original, text, sizeof text);
+    int n = 0;
+    *bad |= zpr_take_match(text, re, paths, 1, &n) != 2 || n != 0;
+    *bad |= memcmp(text, original, sizeof text) != 0;
+    static const char two[] = "engine/a/src/a.c\nengine/a/src/b.c\n";
+    memset(text, 0, sizeof text);
+    memcpy(text, two, sizeof two);
+    memcpy(original, text, sizeof text);
+    n = 0;
+    *bad |= zpr_take_match(text, re, paths, 1, &n) != 2 || n != 1;
+    *bad |= memcmp(text, original, sizeof text) != 0;
+    return 0;
+}
+static int zpr_st_captured_lines(int *bad)
+{
+    regex_t re;
+    int error = reg_fail(&re, regcomp(&re,
+        "^(core|engine|contexts|cognition|platform)/.*/src/.*\\.c$", REG_EXTENDED));
+    if (error) return error;
+    int rc = zpr_st_long_diagnostic(&re, bad);
+    if (!rc) rc = zpr_st_matching_bounds(&re, bad);
+    regfree(&re);
+    return rc;
+}
 int check_zcode_package_registry_selftest(void)
 {
     char msg[512], ok[512], chosen[RS_PATH], mono[4][RS_PATH];
@@ -432,6 +483,7 @@ int check_zcode_package_registry_selftest(void)
     if (zpr_st_host(msg, sizeof msg, ok, sizeof ok, &bad)) return 2;
     if (zpr_st_codec(msg, sizeof msg, &bad)) return 2;
     if (zpr_st_excluded_hits(mono, &bad)) return 2;
+    if (zpr_st_captured_lines(&bad)) return 2;
     return st_ok(bad, "check_zcode_package_registry selftest: OK\n");
 }
 

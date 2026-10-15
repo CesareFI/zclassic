@@ -334,7 +334,7 @@ ZCL_COMMAND_READY_COMMAND(
     "presentation,native,confirmation,publication,package,plan,human",
     "zcl.zcode_publish_plan.input.v1",
     "zcl.app_presentation_publication_confirm.v1",
-    "release_hex,manifest_hex,recipe_hex,dir,datadir,output,page", "",
+    "release_hex,manifest_hex,manifest_file,manifest_sha3,recipe_hex,recipe_file,recipe_sha3,dir,datadir,output,page", "",
     "z23 app presentation publication-confirm --input='"
     "{\"release_hex\":\"..\",\"manifest_hex\":\"..\","
     "\"recipe_hex\":\"..\",\"dir\":\"/tmp/pkg\"}'",

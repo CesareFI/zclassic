@@ -608,14 +608,14 @@ static void tunnel_service_data(struct mesh_stream *st,
 }
 
 /* Whether the pairing that admitted an acceptor stream still grants it.
- * No database handle is no verdict (skip this interval). A row that cannot
- * be read, or is gone, revoked, expired or stripped of the capability, ends
- * the stream: like the terminal service, a live stream fails closed. */
+ * Missing database authority, or a row that cannot be read, is gone, revoked,
+ * expired or stripped of the capability, ends the stream. A previous
+ * admission cannot replace the current check: a live stream fails closed. */
 static bool tunnel_pairing_lost(const struct mesh_tunnel_session *s)
 {
     struct node_db *ndb = app_runtime_node_db();
     if (!ndb)
-        return false;
+        return true;
     struct db_mesh_pairing row;
     if (!db_mesh_pairing_find(ndb, s->peer, &row))
         return true;

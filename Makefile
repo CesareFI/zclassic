@@ -390,7 +390,8 @@ endif
 # stale, so the authoritative capture always observes the bytes actually used.
 VIEW_GEN_HEADERS_EARLY := contexts/wallet/views/include/views/wallet_templates_gen.h \
 	contexts/explorer/views/include/views/site_css.h \
-	contexts/commons/views/include/views/install_script_gen.h
+	contexts/commons/views/include/views/install_script_gen.h \
+	tools/dev/native_tunnel_export_binding.h
 VIEW_BOOTSTRAP_MK := build/identity/view-inputs-ready.mk
 ifneq ($(ZCL_STANDALONE_CLEAN),1)
 ifeq ($(strip $(MAKE_RESTARTS)),)
@@ -943,6 +944,7 @@ DEVLOOP_INCLUDES = -Itools/dev
 # DEV_ONLY_SRCS split, because DEV_ONLY_SRCS is still linked (into the dev
 # binary) — filtering there would only move the duplicate-`main` link error.
 DEV_STANDALONE_SRCS = tools/dev/hotswap_verify_so.c \
+	tools/dev/native_tunnel_export.c \
 	tools/dev/mutation_campaign.c \
 	tools/dev/source_identity_batch.c \
 	tools/dev/windows_headless_run.c \
@@ -16290,3 +16292,60 @@ $(BIN_DIR)/z23kernel.identity: $(BIN_DIR)/z23kernel.bin
 	Z23KERNEL_CC="$(Z23KERNEL_CC)" Z23KERNEL_LD="$(Z23KERNEL_LD)" Z23KERNEL_OBJCOPY="$(Z23KERNEL_OBJCOPY)" apps/z23kernel/build.sh apps/z23kernel "$(Z23KERNEL_DIR)" "$(BIN_DIR)"
 .PHONY: z23kernel-identity
 z23kernel-identity: $(BIN_DIR)/z23kernel.identity
+
+# Optional foreground HOST program. Exact closure is an exported allowlist,
+# not the node archive; library policy and resident execution are unchanged.
+NATIVE_TUNNEL_SRCS := $(shell awk -F '"' '/^ZCL_TUNNEL_SOURCE/ {print $$2}' tools/native_tunnel_sources.def)
+NATIVE_TUNNEL_HEADERS := $(shell awk -F '"' '/^ZCL_TUNNEL_(HEADER|INTERNAL)/ {print $$2}' tools/native_tunnel_sources.def)
+NATIVE_TUNNEL_INCLUDES := $(sort $(shell awk -F '"' '/^ZCL_TUNNEL_HEADER/ {p=$$2; sub(/\/include\/.*/, "/include", p); print p}' tools/native_tunnel_sources.def))
+NATIVE_TUNNEL_FLAGS = -std=c23 -O1 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L $(addprefix -I,$(NATIVE_TUNNEL_INCLUDES))
+$(BIN_DIR)/tunnel: tools/native_tunnel.c tools/native_tunnel_sources.def $(NATIVE_TUNNEL_SRCS) $(NATIVE_TUNNEL_HEADERS) Makefile | $(BIN_DIR)
+	$(CC) $(NATIVE_TUNNEL_FLAGS) tools/native_tunnel.c $(NATIVE_TUNNEL_SRCS) -o $@
+$(BIN_DIR)/tunnel-static: tools/native_tunnel.c tools/native_tunnel_sources.def $(NATIVE_TUNNEL_SRCS) $(NATIVE_TUNNEL_HEADERS) Makefile | $(BIN_DIR)
+	$(CC) $(NATIVE_TUNNEL_FLAGS) -static-pie tools/native_tunnel.c $(NATIVE_TUNNEL_SRCS) -o $@
+.PHONY: native-tunnel native-tunnel-static export-native-tunnel
+native-tunnel: $(BIN_DIR)/tunnel
+native-tunnel-static: $(BIN_DIR)/tunnel-static
+TUNNEL_EXPORT_BINDING := tools/dev/native_tunnel_export_binding.h
+.PHONY: native-tunnel-export-binding check-native-tunnel-export-binding
+native-tunnel-export-binding: $(TUNNEL_EXPORT_BINDING)
+lint lint-fast: check-native-tunnel-export-binding
+$(TUNNEL_EXPORT_BINDING): tools/native_tunnel_sources.def Makefile
+	@set -eu; descriptor_hash=$$(sha256sum tools/native_tunnel_sources.def | awk '{print $$1}'); \
+	test "$${#descriptor_hash}" -eq 64; \
+	tmp="$$(mktemp "$@.XXXXXX")"; trap 'rm -f "$$tmp"' EXIT HUP INT TERM; \
+	printf '%s\n' '/* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0 */' \
+	 '/* purpose: Generated exact tunnel descriptor binding; make native-tunnel-export-binding. */' \
+	 '#ifndef ZCL_NATIVE_TUNNEL_EXPORT_BINDING_H' '#define ZCL_NATIVE_TUNNEL_EXPORT_BINDING_H' \
+	 "#define TUNNEL_DESCRIPTOR_SHA256 \"$$descriptor_hash\"" '#endif' > "$$tmp"; \
+	if cmp -s "$$tmp" "$@"; then rm -f "$$tmp"; else mv -f "$$tmp" "$@"; fi; \
+	trap - EXIT HUP INT TERM
+check-native-tunnel-export-binding:
+	@set -eu; descriptor_hash=$$(sha256sum tools/native_tunnel_sources.def | awk '{print $$1}'); \
+	test "$${#descriptor_hash}" -eq 64; \
+	printf '%s\n' '/* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0 */' \
+	 '/* purpose: Generated exact tunnel descriptor binding; make native-tunnel-export-binding. */' \
+	 '#ifndef ZCL_NATIVE_TUNNEL_EXPORT_BINDING_H' '#define ZCL_NATIVE_TUNNEL_EXPORT_BINDING_H' \
+	 "#define TUNNEL_DESCRIPTOR_SHA256 \"$$descriptor_hash\"" '#endif' | cmp - $(TUNNEL_EXPORT_BINDING)
+TUNNEL_EXPORT_HELPER_SRCS = tools/dev/native_tunnel_export.c \
+ platform/modules/platform/src/positioned_file.c \
+ platform/modules/platform/src/private_file.c \
+ platform/modules/platform/src/private_directory.c \
+ platform/modules/platform/src/directory_transaction.c \
+ platform/modules/base/src/safe_alloc.c \
+ contexts/commons/packages/zsha256/src/zsha256.c
+TUNNEL_EXPORT_HELPER_HEADERS = platform/modules/base/include/base/safe_alloc.h \
+ platform/modules/base/include/base/hex.h \
+ tools/dev/native_tunnel_export_binding.h \
+ platform/modules/platform/include/platform/positioned_file.h \
+ platform/modules/platform/include/platform/private_file.h \
+ platform/modules/platform/include/platform/private_directory.h \
+ platform/modules/platform/include/platform/directory_transaction.h \
+ contexts/commons/packages/zsha256/include/zsha256/zsha256.h
+$(BIN_DIR)/native-tunnel-export: $(TUNNEL_EXPORT_HELPER_SRCS) $(TUNNEL_EXPORT_HELPER_HEADERS) tools/native_tunnel_sources.def Makefile | $(BIN_DIR)
+	$(CC) -std=c23 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE \
+	 -Itools -Iplatform/modules/platform/include -Iplatform/modules/base/include \
+	 -Icontexts/commons/packages/zsha256/include $(TUNNEL_EXPORT_HELPER_SRCS) -o $@
+export-native-tunnel: $(BIN_DIR)/native-tunnel-export
+	$(BIN_DIR)/native-tunnel-export --root "$(CURDIR)" --out "$(TUNNEL_EXPORT_DIR)" \
+	 --source-head "$(shell git rev-parse HEAD)"

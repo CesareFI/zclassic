@@ -1,0 +1,4 @@
+/* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0 */
+ZCL_TUNNEL_PROGRAM("src/main.c","app/tunnel.c")
+ZCL_TUNNEL_HEADER("include/demo.h","include/demo.h")
+ZCL_TUNNEL_COPY("tools/native_tunnel_sources.def","SOURCE-DESCRIPTOR.def")

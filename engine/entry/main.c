@@ -35,6 +35,7 @@
 #include "config/boot_error.h"          /* pre-registry typed failure surface */
 #include "config/args.h"                /* flag ladder, -loglevel, usage text */
 #include "main_cli_modes.h"             /* bench/cli/import/gen run-and-exit modes */
+#include "command/native_command.h"
 #include "net/file_service.h"           /* -filesync fast path (fs_client_sync) */
 #include "controllers/agent_controller.h" /* rpc_agent_set_boot_context */
 #include "views/ui_present.h"           /* detached reviewed UI child */
@@ -826,6 +827,7 @@ static void main_run_service_loop(const struct app_context *ctx,
 
 int main(int argc, char **argv)
 {
+    zcl_native_device_host_runtime_exit_if_requested(argc, argv);
     int rc = 0;
     if (main_dispatch_dev_ui_modes(argc, argv, &rc))
         return rc;

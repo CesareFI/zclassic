@@ -26,6 +26,15 @@ struct zcl_result package_resident_artifact_read(
     const uint8_t receipt_id[32], const char *output,
     struct package_resident_artifact *out);
 
+/* Inert Linux HOST image admission for fixed bin/tunnel. Exact request binds
+ * installed root, receipt and digest; retained current-lock reads are copied
+ * into a sealed top-level image. Fresh image_fd=-1 output owns the returned FD.
+ * No child/socket is created. Caller separately approves host_os execution,
+ * trusts mutable system loader/libraries and retains exclusive FD custody. */
+struct zcl_result package_resident_host_image_capture(
+    const char *datadir, const uint8_t package_root[32], const uint8_t receipt_id[32],
+    const uint8_t artifact_sha3[32], int *image_fd);
+
 /* One caller-owned application process. Independent snapshot lifetime ends
  * only after the seam has cancelled/reaped its child. A failed candidate
  * never changes any other instance or a package's active generation. */

@@ -70,7 +70,7 @@ static bool cr_match_bool(const char *key, const struct json_value *value,
         "enabled",           "relink_generation", "wait_for_edit",
         "all",               "allow_high_fees",   "exact",
         "restore",           "release",           "once",
-        "dry_run",           "require_existing_watcher",
+        "dry_run",           "require_existing_watcher", "allow_external",
     };
     if (!cr_key_in(key, keys, sizeof(keys) / sizeof(keys[0])) &&
         !command_registry_devagent_input_extra_bool_key(key))
@@ -506,6 +506,48 @@ static bool cr_match_machine_boot(const char *path, const char *key,
     return true;
 }
 
+/* HOST integers are leaf-scoped: other commands may use string `backend`. */
+static const struct cr_int_bound *cr_device_package_bound(const char *path, const char *key)
+{
+    if (!path || strcmp(path, "ops.mesh.device.host.package.run")) return NULL;
+    static const struct cr_int_bound bounds[] = {
+        { "launch_ms", 1, 10000 }, { "execution_ms", 1, 600000 }, { "cleanup_ms", 1, 10000 }
+    };
+    for (size_t i = 0; i < sizeof(bounds) / sizeof(bounds[0]); ++i)
+        if (!strcmp(key, bounds[i].key)) return &bounds[i];
+    return NULL;
+}
+
+static const struct cr_int_bound *cr_device_host_bound(const char *path,
+                                                       const char *key)
+{
+    if (strcmp(path, "ops.mesh.device.plan") != 0 &&
+        strcmp(path, "ops.mesh.device.commit") != 0 &&
+        strcmp(path, "ops.mesh.device.prepare-secret") != 0 &&
+        strcmp(path, "ops.mesh.device.host.client") != 0 &&
+        strcmp(path, "ops.mesh.device.host.receiver") != 0)
+        return NULL;
+    static const struct cr_int_bound bounds[] = {
+        { "backend", 1, UINT32_MAX },
+        { "inbound_port", 0, UINT16_MAX },
+        { "outbound_port", 0, UINT16_MAX },
+        { "paired_at", 1, INT64_MAX },
+        { "key_epoch", 1, INT64_MAX },
+        { "target_port", 1, UINT16_MAX },
+        { "route_port", 1, UINT16_MAX },
+        { "listen_port", 0, UINT16_MAX },
+        { "connect_ms", 1, 10000 },
+        { "handshake_ms", 1, 10000 },
+        { "session_ms", 1, 600000 },
+        { "idle_ms", 1, 60000 },
+        { "lifetime_ms", 1, 600000 },
+        { "max_sessions", 1, 64 },
+        { "max_active", 1, 4 },
+    };
+    for (size_t i = 0; i < sizeof(bounds) / sizeof(bounds[0]); ++i)
+        if (strcmp(key, bounds[i].key) == 0) return &bounds[i];
+    return NULL;
+}
 static bool cr_match_path_special(const struct zcl_command_spec *spec,
                                   const char *key,
                                   const struct json_value *value,
@@ -661,7 +703,13 @@ bool zcl_command_registry_input_descriptor(
     memset(out, 0, sizeof(*out));
     if (!spec || !spec->path || !key || !cr_csv_has(spec->input_keys, key))
         return false;
-    if (cr_key_in(key, strings, sizeof(strings) / sizeof(strings[0]))) {
+    const struct cr_int_bound *host_bound = cr_device_host_bound(spec->path, key);
+    if (!host_bound) host_bound = cr_device_package_bound(spec->path, key);
+    if (host_bound) {
+        out->type = JSON_INT;
+        out->minimum = host_bound->lo;
+        out->maximum = host_bound->hi;
+    } else if (cr_key_in(key, strings, sizeof(strings) / sizeof(strings[0]))) {
         out->type = JSON_STR;
         out->max_bytes = zcl_command_registry_input_str_max(key);
     } else if (cr_key_in(key, integers, sizeof(integers) / sizeof(integers[0]))) {

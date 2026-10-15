@@ -932,3 +932,123 @@ ZCL_COMMAND_READY_COMMAND(
     ZCL_COMMAND_CAP_DEV_STATE_WRITE | ZCL_COMMAND_CAP_PROCESS_EXEC,
     ZCL_COMMAND_TRAIT_IDEMPOTENT,
     zcl_native_handle_ops_host_gc)
+
+ZCL_COMMAND_BRANCH("ops.mesh.device", "ops.mesh", "Offline owner device identity and grants",
+                   ZCL_COMMAND_LAYER_OPS)
+ZCL_COMMAND_READY_COMMAND(
+    "ops.mesh.device.init", "ops.mesh.device", "",
+    "Initialize an offline private device identity",
+    "Creates an absent trusted owner-private profile exclusively. Public identity and actual publication durability are reported; unknown initialization requires reconciliation, never automatic retry. Starts no service or network connection.",
+    ZCL_COMMAND_RESULT_BUDGET, "mesh,device,owner,identity,offline",
+    "zcl.device.init.input.v1", "zcl.device.profile.v1", "directory", "directory",
+    "z23 ops mesh device init --directory=<absent-private-profile>",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_APP_WRITE,
+    ZCL_COMMAND_SCOPE_NODE, ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FOREGROUND, ZCL_COMMAND_COST_LOW, ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE, ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_NONE, zcl_native_handle_ops_mesh_device)
+ZCL_COMMAND_READY_READ(
+    "ops.mesh.device.identity", "ops.mesh.device", "",
+    "Observe an existing offline device identity",
+    "Validates an existing trusted private profile and exact key binding; returns public key and fingerprint only. Reads never repair, create, infer owner consent or prove historical durability.",
+    ZCL_COMMAND_RESULT_BUDGET, "mesh,device,owner,identity,offline",
+    "zcl.device.identity.input.v1", "zcl.device.profile.v1", "directory", "directory",
+    "z23 ops mesh device identity --directory=<private-profile>",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_SCOPE_NODE, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE, ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT, ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_ops_mesh_device)
+ZCL_COMMAND_READY_READ(
+    "ops.mesh.device.plan", "ops.mesh.device", "",
+    "Preview an explicit offline device grant",
+    "Read-only HOST proposal: backend=1 uses canonical SSH public blobs; backend=2 uses opaque credential_id and key_epoch (1..INT64_MAX), with canonical endpoints derived locally. Both explicit ports (zero denies) and expiry are required. Plan never reads secret input. Insert proposes paired_at; exact-root upgrade preserves it. Proposal root is not approval or possession proof. Status/guest defaults remain proposals and grant no host authority.",
+    ZCL_COMMAND_LIST_BUDGET, "mesh,device,owner,pairing,offline",
+    "zcl.device.plan.input.v1", "zcl.device.grant.v1",
+    "directory,peer_key,capability,expires_at,backend,local_pq_blob,peer_pq_blob,inbound_port,outbound_port,paired_at,expected_root,credential_id,key_epoch", "directory,peer_key",
+    "z23 ops mesh device plan --input=<explicit-json>",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_SCOPE_NODE, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE, ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT, ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_ops_mesh_device)
+ZCL_COMMAND_READY_COMMAND(
+    "ops.mesh.device.commit", "ops.mesh.device", "",
+    "Approve a complete exact offline device grant",
+    "Status/guest insert requires fingerprint and expected_root=absent. HOST requires explicit backend binding/ports/paired_at/expiry; backend=2 imports owner-private exact32 secret_file using credential_id and key_epoch and independently confirmed_proposal_root; expected_root=absent inserts, exact inspected root upgrades. Commit never regenerates paired_at. Revoked grants stay revoked. Representation does not prove possession or backend qualification; no network or wallet authority.",
+    ZCL_COMMAND_LIST_BUDGET, "mesh,device,owner,pairing,offline",
+    "zcl.device.commit.input.v1", "zcl.device.grant.v1",
+    "directory,peer_key,capability,expires_at,fingerprint,expected_root,backend,local_pq_blob,peer_pq_blob,inbound_port,outbound_port,paired_at,confirmed_proposal_root,credential_id,key_epoch,secret_file",
+    "directory,peer_key,capability,expires_at,expected_root",
+    "z23 ops mesh device commit --input=<explicit-json>",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_APP_WRITE,
+    ZCL_COMMAND_SCOPE_NODE, ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FOREGROUND, ZCL_COMMAND_COST_LOW, ZCL_COMMAND_CONFIRM_PLAN_COMMIT,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE, ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_NONE, zcl_native_handle_ops_mesh_device)
+ZCL_COMMAND_READY_COMMAND(
+    "ops.mesh.device.revoke", "ops.mesh.device", "",
+    "Inspect or approve exact offline grant revocation",
+    "Without approval fields reads the current exact full-wire root. Mutation requires fingerprint and expected_root together and compares the root under the exclusive authority lock. Revocation is sticky; stale approvals refuse. Starts no service.",
+    ZCL_COMMAND_RESULT_BUDGET, "mesh,device,owner,pairing,revocation,offline",
+    "zcl.device.revoke.input.v1", "zcl.device.grant.v1",
+    "directory,peer_key,fingerprint,expected_root", "directory,peer_key",
+    "z23 ops mesh device revoke --input=<explicit-json>",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_APP_WRITE,
+    ZCL_COMMAND_SCOPE_NODE, ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FOREGROUND, ZCL_COMMAND_COST_LOW, ZCL_COMMAND_CONFIRM_PLAN_COMMIT,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE, ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_NONE, zcl_native_handle_ops_mesh_device)
+ZCL_COMMAND_READY_COMMAND(
+    "ops.mesh.device.prepare-secret", "ops.mesh.device", "",
+    "Prepare one private pair-purpose import source",
+    "Requires existing trusted profile, peer_key, capability=host-forward, backend=2, absent destination in an existing owner-private parent and confirm=true. Generates independent OS random secret32 and opaque credential ID; returns public ID and publication only, never secret/path/hash. Creates inert import input, no grant or service. Interrupted artifacts are preserved; no automatic retry/reconciliation. Trusted ancestors and no hostile same-UID swaps required; Windows durable preparation unsupported.",
+    ZCL_COMMAND_RESULT_BUDGET, "mesh,device,owner,pairing,secret,offline",
+    "zcl.device.prepare-secret.input.v1", "zcl.device.secret-source.v1",
+    "directory,peer_key,capability,backend,destination,confirm", "directory,peer_key",
+    "z23 ops mesh device prepare-secret --input=<explicit-json>",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_APP_WRITE,
+    ZCL_COMMAND_SCOPE_NODE, ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FOREGROUND, ZCL_COMMAND_COST_LOW, ZCL_COMMAND_CONFIRM_PLAN_COMMIT,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE, ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_NONE, zcl_native_handle_ops_mesh_device)
+ZCL_COMMAND_BRANCH("ops.mesh.device.host", "ops.mesh.device", "Foreground owner-approved hash-PSK host transport",
+                   ZCL_COMMAND_LAYER_OPS)
+ZCL_COMMAND_READY_COMMAND(
+    "ops.mesh.device.host.client", "ops.mesh.device.host", "",
+    "Run one raw foreground selected-route HOST client",
+    "Linux foreground raw CLI only, before node/config startup. Exactly one --input JSON; stdout contains only authenticated application bytes, stderr public tokens. Explicit trusted profile, peer/root/directional target_port, route_id/literal IPv4/route_port, confirm=true and finite connect/handshake/session/idle milliseconds required. No DNS, shell, automatic backup, RPC/JSON stream fallback or guest authority. Stdin/stdout exclusive pipe/connected-stream descriptions independent of stderr; original status flags restored. Fresh session after restart/restore; restore entropy qualification is separate.",
+    ZCL_COMMAND_RESULT_BUDGET, "mesh,device,host,psk,raw,foreground",
+    "zcl.device.host.client.input.v1", "zcl.device.host.raw.v1",
+    "directory,peer_key,expected_root,target_port,route_id,route_address,route_port,connect_ms,handshake_ms,session_ms,idle_ms,confirm", "directory,peer_key",
+    "z23 ops mesh device host client --input=<explicit-json>",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_APP_WRITE,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FOREGROUND, ZCL_COMMAND_COST_LOW, ZCL_COMMAND_CONFIRM_PLAN_COMMIT,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_NONE, zcl_native_handle_ops_mesh_device_host_runtime)
+ZCL_COMMAND_BRANCH("ops.mesh.device.host.package", "ops.mesh.device.host", "Exact installed HOST tunnel execution", ZCL_COMMAND_LAYER_OPS)
+ZCL_COMMAND_READY_COMMAND(
+    "ops.mesh.device.host.package.run", "ops.mesh.device.host.package", "",
+    "Run exact owner-accepted installed bin/tunnel in foreground",
+    "Linux raw CLI only, before node/config startup. Exact datadir/package_root/receipt_id/artifact_sha3, accept_execution=true and runtime_policy=host_os required. role is client or receiver; runtime_input is the existing bounded nonsecret HOST JSON with absolute profile directory. Fixed argv/env/CWD and bin/tunnel only; no shell or arbitrary executable. launch_ms/execution_ms/cleanup_ms bound process observation, excluding filesystem acquisition. Sealed top image is pinned; mutable system loader/libc are trusted, not pinned or confined. HUP forwards bounded engine drain; hard cancel/deadline wins. CLEAN requires engine exit and descendant/supervisor reap; incomplete cleanup exits nonzero with explicit owner-EOF custody handoff, not success. JSON/RPC stream execution refuses.",
+    ZCL_COMMAND_RESULT_BUDGET, "mesh,device,host,package,installed,raw",
+    "zcl.device.host.package.input.v1", "zcl.device.host.raw.v1",
+    "datadir,package_root,receipt_id,artifact_sha3,accept_execution,runtime_policy,role,runtime_input,launch_ms,execution_ms,cleanup_ms", "datadir,package_root,receipt_id,artifact_sha3",
+    "z23 ops mesh device host package run --input=<explicit-json>",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_APP_WRITE,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FOREGROUND, ZCL_COMMAND_COST_LOW, ZCL_COMMAND_CONFIRM_PLAN_COMMIT,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_NONE, zcl_native_handle_ops_mesh_device_host_runtime)
+ZCL_COMMAND_READY_COMMAND(
+    "ops.mesh.device.host.receiver", "ops.mesh.device.host", "",
+    "Run a finite foreground receiver for one exact HOST pair/root",
+    "Linux raw CLI only, no node/config startup or stdout JSON. Explicit trusted profile, selected peer/root/target_port and literal listen_address/listen_port (zero explicitly ephemeral); confirm=true and allow_external required for nonloopback. Finite lifetime/session/handshake/idle limits, max_active1..4 and max_sessions1..64; failed attempts count. Stderr listener token proves bind/listen only. Target is literal loopback, connected only after mutual confirmation by guarded PSK IO. Revoke/root change or signal closes owned listener/contexts. No supervision/autostart/private delivery/deployment or guest-restore qualification.",
+    ZCL_COMMAND_RESULT_BUDGET, "mesh,device,host,psk,receiver,foreground",
+    "zcl.device.host.receiver.input.v1", "zcl.device.host.raw.v1",
+    "directory,peer_key,expected_root,target_port,route_id,listen_address,listen_port,allow_external,lifetime_ms,handshake_ms,session_ms,idle_ms,max_active,max_sessions,confirm", "directory,peer_key",
+    "z23 ops mesh device host receiver --input=<explicit-json>",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_APP_WRITE,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FOREGROUND, ZCL_COMMAND_COST_LOW, ZCL_COMMAND_CONFIRM_PLAN_COMMIT,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_NONE, zcl_native_handle_ops_mesh_device_host_runtime)

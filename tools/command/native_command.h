@@ -358,6 +358,28 @@ void zcl_native_handle_ops_mesh_pair_list(
 void zcl_native_handle_ops_mesh_pair_revoke(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);
+void zcl_native_handle_ops_mesh_device(
+    const struct zcl_command_request *request,
+    struct zcl_command_reply *reply);
+struct device_identity;
+/* HOST-only full-proposal branch; representation does not prove possession. */
+bool zcl_native_device_host_requested(const struct json_value *input);
+bool zcl_native_device_host_pairing(const struct json_value *input,
+    const struct device_identity *identity, bool commit, struct zcl_command_reply *reply);
+bool zcl_native_device_prepare_secret(const struct json_value *input,
+    const struct device_identity *identity, struct zcl_command_reply *reply);
+#ifdef ZCL_TESTING
+/* One-shot fault checkpoints, never a production entropy/configuration input. */
+void zcl_native_device_prepare_test_interrupt(unsigned stage);
+#endif
+/* Exact registered raw CLI dispatch before config/node initialization. */
+void zcl_native_device_host_runtime_exit_if_requested(int argc, char **argv);
+#if defined(ZCL_TESTING) && defined(__linux__)
+bool zcl_native_device_host_package_input_for_test(const struct json_value *input);
+bool zcl_native_device_host_package_terminal_for_test(int64_t deadline_ns);
+#endif
+void zcl_native_handle_ops_mesh_device_host_runtime(const struct zcl_command_request *request,
+    struct zcl_command_reply *reply);
 
 /* ── app.service.* — declared services (tools/command/native_service_command.c).
  * `list` and `inspect` read the compile-time zcl.service_binding.v1 catalog
@@ -742,10 +764,32 @@ void zcl_native_handle_zcode_package_publish_plan(
 void zcl_native_handle_zcode_package_publish_commit(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);
+/* Local publication composition, with the same canonical parse, signature,
+ * roots, chunks, replay and policy admission as the native commit leaf.
+ * Explicit paths and immutable wire storage remain valid for the whole call.
+ * This never forwards to a resident node or bypasses publication validation. */
+struct zcl_native_local_publication {
+    const char *datadir;
+    const char *source_directory;
+    const uint8_t *release_wire;
+    size_t release_wire_len;
+    const uint8_t *manifest_wire;
+    size_t manifest_wire_len;
+    const uint8_t *recipe_wire;
+    size_t recipe_wire_len;
+    bool has_day;
+    int64_t day;
+};
+void zcl_native_zcode_local_publication_commit(
+    const struct zcl_native_local_publication *publication,
+    struct zcl_command_reply *reply);
 void zcl_native_handle_zcode_package_guide(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);
 void zcl_native_handle_zcode_package_dev_prepare(
+    const struct zcl_command_request *request,
+    struct zcl_command_reply *reply);
+void zcl_native_handle_zcode_package_dev_prepare_export(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);
 void zcl_native_handle_zcode_package_dev_seal(

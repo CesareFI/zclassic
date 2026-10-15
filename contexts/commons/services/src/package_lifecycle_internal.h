@@ -200,6 +200,8 @@ struct zcl_result pkgl_declared_copy(
     struct package_lifecycle_declared_output *handle, void *buffer,
     size_t capacity, size_t *produced);
 void pkgl_declared_copy_clear(void *buffer, size_t copied);
+struct zcl_result pkgl_declared_host_executable(
+    const struct package_lifecycle_declared_output *handle);
 
 struct zcl_result pkgl_installed_evidence(
     const struct pkgl_ctx *ctx, const uint8_t root[32],

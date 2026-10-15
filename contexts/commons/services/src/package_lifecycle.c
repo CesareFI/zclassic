@@ -205,6 +205,28 @@ struct zcl_result package_lifecycle_receipt_read(
 // DAG, surveying every node and stamping the expiry are one derivation; a
 // caller must never be able to obtain a plan whose steps were surveyed
 // against a different lock than the one it commits to.
+static void pkgl_plan_installed(const char *datadir,
+                               struct vcs_package_plan_step *step,
+                               struct package_lifecycle_plan_report *out)
+{
+    struct package_lifecycle_step inspected;
+    bool installed = false;
+    struct zcl_result result = package_lifecycle_installed_inspect(
+        datadir, step->root, &inspected, &installed);
+    if (result.ok && installed && inspected.receipt_reused) {
+        step->state = VCS_PACKAGE_LIFECYCLE_INSTALLED;
+        return;
+    }
+    step->installed = false;
+    step->state = VCS_PACKAGE_LIFECYCLE_DISCOVERED;
+    out->ready = false;
+    if (!out->rule[0])
+        pkgl_note(out->rule, sizeof(out->rule), out->detail,
+                  sizeof(out->detail), "installed-receipt-invalid",
+                  result.ok ? "installed evidence does not match the current dependency lock; inspect and reinstall the exact root"
+                            : result.message);
+}
+
 struct zcl_result package_lifecycle_plan(
     const char *datadir, const char *name_or_root, int64_t now_unix,
     struct package_lifecycle_plan_report *out)
@@ -270,7 +292,7 @@ struct zcl_result package_lifecycle_plan(
         }
 
         if (s->installed) {
-            s->state = VCS_PACKAGE_LIFECYCLE_INSTALLED;
+            pkgl_plan_installed(datadir, s, out);
         } else if (!s->complete) {
             /* Honest phase boundary: this layer does not fetch. */
             s->state = VCS_PACKAGE_LIFECYCLE_FETCHING;
@@ -503,6 +525,14 @@ struct zcl_result package_lifecycle_declared_output_read_verified(
     }
     *produced = copied;
     return ZCL_OK;
+}
+
+struct zcl_result package_lifecycle_declared_output_host_executable(
+    const struct package_lifecycle_declared_output *handle)
+{
+    if (!handle) return ZCL_ERR(-1, "host executable requires a retained declared output");
+    ZCL_CHECK(pkgl_declared_current(handle));
+    return pkgl_declared_host_executable(handle);
 }
 
 struct zcl_result package_lifecycle_installed_inspect(
