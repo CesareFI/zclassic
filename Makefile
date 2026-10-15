@@ -4114,16 +4114,31 @@ $(TEST_TSAN_LINK_RSP): $(TEST_TSAN_OBJS)
 # dev-bin already builds the confined verifier in its dev epoch. When both
 # are selected, join the producer before running the verifier freshness check:
 # two recursive writers cannot acquire the same unverified compile epoch.
+# z23 and zclassic23 are the same public producer. Dispatch that producer
+# once, concurrently with independent targets, then check every named output.
 ZCL_TEST_BUILD_NEEDS = $(if $(ZCL_MAKE_NO_EXEC),: test build needs not listed in a dry run,$(ZCL_TEST_BUILD_NEEDS_RUN))
 ZCL_TEST_BUILD_NEEDS_RUN = needs="$$($(1) --list-build-needs $(2))" || exit 2; \
 	dev_selected="$$(printf '%s\n' "$$needs" | awk '$$1 == "dev-bin" { print 1 }')" || exit 2; \
-	printf '%s\n' "$$needs" | { pids=; deferred_path=; \
+	node_needs="$$(printf '%s\n' "$$needs" | awk '$$1 == "z23" || $$1 == "zclassic23"')" || exit 2; \
+	printf '%s\n' "$$needs" | { pids=; deferred_path=; node_started=; \
 	build_target() { \
 	  $(MAKE) --no-print-directory "$$1" </dev/null && [ -e "$$2" ] || { \
 	    echo "FAIL test_need_unbuildable_$$1: make $$1 did not produce $$2" >&2; \
 	    return 1; }; \
+	}; build_node_aliases() { \
+	  node_failed=0; $(MAKE) --no-print-directory z23 </dev/null || node_failed=1; \
+	  printf '%s\n' "$$node_needs" | { failed="$$node_failed"; \
+	    while read -r alias alias_path; do \
+	      if [ "$$node_failed" != 0 ] || [ ! -e "$$alias_path" ]; then \
+	        echo "FAIL test_need_unbuildable_$$alias: make z23 did not produce $$alias_path" >&2; failed=1; \
+	      fi; \
+	    done; exit "$$failed"; }; \
 	}; while read -r target path; do \
 	  [ -n "$$target" ] || continue; \
+	  case "$$target" in z23|zclassic23) \
+	    if [ -z "$$node_started" ]; then \
+	      build_node_aliases & pids="$$pids $$!"; node_started=1; \
+	    fi; continue;; esac; \
 	  if [ "$$target" = dev-package-verifier-ensure ] && [ -n "$$dev_selected" ]; then \
 	    deferred_path="$$path"; continue; \
 	  fi; \
