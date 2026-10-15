@@ -167,7 +167,7 @@ tools/lint/lintc/gate_git_hooks_installed.c 1
 tools/lint/lintc/gate_git_scan_a.c 1
 tools/lint/lintc/gate_git_scan_a_selftests.c 1
 tools/lint/lintc/gate_git_scan_b.c 2
-tools/lint/lintc/gate_hosted_suite_verdict.c 1
+tools/lint/lintc/gate_hosted_suite_verdict_selftest.c 1
 tools/lint/lintc/gate_hotswap_candidates_ledger.c 1
 tools/lint/lintc/gate_installed_acceptance_tools.c 1
 tools/lint/lintc/gate_landing_proof.c 8

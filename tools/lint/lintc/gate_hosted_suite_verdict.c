@@ -13,18 +13,15 @@
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #endif
-#include <dirent.h>
 #include <errno.h>
-#include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
 #include "base/safe_alloc.h"
+#include "gate_hosted_suite_verdict_priv.h"
 #include "lintc.h"
 
 /* Every static name carries the hsv_ prefix: the code index links test
@@ -46,9 +43,9 @@ static const char k_hsv_failed_prefix[] = "SOME TESTS FAILED";
 
 /* fail() sink: stderr normally; the self-test redirects both streams for
  * its rejecting-mutation runs, exactly as the script's 2>&1 did. */
-static FILE *g_hsv_err = NULL;
+FILE *g_hsv_err = NULL;
 
-static void hsv_fail(const char *fmt, ...)
+void hsv_fail(const char *fmt, ...)
 {
     va_list ap;
     if (!g_hsv_err)
@@ -323,7 +320,7 @@ static void hsv_validate_counts(const struct hsv_values *vals, int *bad)
     }
 }
 
-static int hsv_check_log(const char *path, FILE *out)
+int hsv_check_log(const char *path, FILE *out)
 {
     size_t size;
     char *buf = hsv_read_file(path, &size);
@@ -368,256 +365,6 @@ static int hsv_check_log(const char *path, FILE *out)
             vals.v[HSV_SKIPS]);
     free(buf);
     return bad ? 1 : 0;
-}
-
-/* ── self-test ────────────────────────────────────────────────────────── */
-
-static volatile sig_atomic_t g_hsv_signal;
-static char g_hsv_fixture_dir[4096];
-
-static void hsv_on_signal(int sig)
-{
-    g_hsv_signal = sig;
-}
-
-static int hsv_rm_tree(const char *path)
-{
-    struct stat st;
-    DIR *d;
-    struct dirent *de;
-    int rc = 0;
-    if (lstat(path, &st) != 0)
-        return 0;
-    if (!S_ISDIR(st.st_mode))
-        return unlink(path) == 0 ? 0 : -1;
-    d = opendir(path);
-    if (!d)
-        return -1;
-    while ((de = readdir(d)) != NULL) {
-        char child[4096];
-        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
-            continue;
-        if (snprintf(child, sizeof child, "%s/%s", path, de->d_name)
-            >= (int)sizeof child) {
-            rc = -1;
-            continue;
-        }
-        if (hsv_rm_tree(child) != 0)
-            rc = -1;
-    }
-    closedir(d);
-    if (rmdir(path) != 0)
-        rc = -1;
-    return rc;
-}
-
-/* Remove the fixture tree with the recorded signal delivered afterwards:
- * the handler only records, cleanup runs with the signal blocked, then the
- * disposition is restored and the signal re-raised, as the EXIT trap's
- * cleanup-on-signal death did. */
-static void hsv_cleanup_and_raise(void)
-{
-    int sig = (int)g_hsv_signal;
-    sigset_t all, old;
-    sigfillset(&all);
-    sigprocmask(SIG_BLOCK, &all, &old);
-    if (g_hsv_fixture_dir[0]) {
-        hsv_rm_tree(g_hsv_fixture_dir);
-        g_hsv_fixture_dir[0] = '\0';
-    }
-    if (sig) {
-        signal(sig, SIG_DFL);
-        sigprocmask(SIG_SETMASK, &old, NULL);
-        raise(sig);
-        _exit(128 + sig);
-    }
-    sigprocmask(SIG_SETMASK, &old, NULL);
-}
-
-static int hsv_write_fixture(const char *dir, const char *name,
-                             const char *const *lines, size_t n)
-{
-    char path[4096];
-    FILE *f;
-    size_t i;
-    if (snprintf(path, sizeof path, "%s/%s", dir, name)
-        >= (int)sizeof path)
-        return -1;
-    f = fopen(path, "w");
-    if (!f)
-        return -1;
-    for (i = 0; i < n; i++)
-        if (fprintf(f, "%s\n", lines[i]) < 0) {
-            fclose(f);
-            return -1;
-        }
-    return fclose(f) == 0 ? 0 : -1;
-}
-
-/* The five fixtures, byte-for-byte the script's self-test logs. */
-static const char *const k_hsv_fx_good[] = {
-    "SUITE VERDICT mode=cold groups_total=1050 groups_ran=1041 "
-    "groups_cached=0 groups_gated=9 groups_failed=0 self_skips=20 "
-    "env_unobserved=0 toolkey=34e55dd75397",
-    "ALL TESTS PASSED \xE2\x80\x94 0/1041 groups failed, 20 skipped"
-};
-static const char *const k_hsv_fx_cached[] = {
-    "SUITE VERDICT mode=cached groups_total=1050 groups_ran=0 "
-    "groups_cached=1041 groups_gated=9 groups_failed=0 self_skips=0 "
-    "env_unobserved=0 toolkey=34e55dd75397",
-    "ALL TESTS PASSED (CACHED) \xE2\x80\x94 0/1041 groups failed, "
-    "0 skipped"
-};
-static const char *const k_hsv_fx_zero_run[] = {
-    "SUITE VERDICT mode=cold groups_total=9 groups_ran=0 "
-    "groups_cached=0 groups_gated=9 groups_failed=0 self_skips=0 "
-    "env_unobserved=0 toolkey=34e55dd75397",
-    "ALL TESTS PASSED \xE2\x80\x94 0/0 groups failed, 0 skipped"
-};
-static const char *const k_hsv_fx_duplicate[] = {
-    "SUITE VERDICT mode=cold groups_total=1050 groups_ran=1041 "
-    "groups_cached=0 groups_gated=9 groups_failed=0 groups_failed=0 "
-    "self_skips=20 env_unobserved=0 toolkey=34e55dd75397",
-    "ALL TESTS PASSED \xE2\x80\x94 0/1041 groups failed, 20 skipped"
-};
-static const char *const k_hsv_fx_unobserved[] = {
-    "SUITE VERDICT mode=cold groups_total=1050 groups_ran=1041 "
-    "groups_cached=0 groups_gated=9 groups_failed=0 self_skips=20 "
-    "env_unobserved=1 toolkey=34e55dd75397",
-    "ALL TESTS PASSED \xE2\x80\x94 0/1041 groups failed, 20 skipped"
-};
-
-static int hsv_selftest_dir(void)
-{
-    struct sigaction sa;
-    sigset_t block, old;
-    char template[4096];
-    char *dir;
-    const char *tmp;
-    memset(&sa, 0, sizeof sa);
-    sa.sa_handler = hsv_on_signal;
-    sigemptyset(&sa.sa_mask);
-    sigaddset(&sa.sa_mask, SIGINT);
-    sigaddset(&sa.sa_mask, SIGTERM);
-    sigaddset(&sa.sa_mask, SIGHUP);
-    sa.sa_flags = 0;              /* no SA_RESTART, no SA_RESETHAND */
-    if (sigaction(SIGINT, &sa, NULL) != 0
-        || sigaction(SIGTERM, &sa, NULL) != 0
-        || sigaction(SIGHUP, &sa, NULL) != 0) {
-        hsv_fail("self-test cannot install signal handlers");
-        return -1;
-    }
-    /* Keep the mkdtemp plus its registration atomic against signals. */
-    sigemptyset(&block);
-    sigaddset(&block, SIGINT);
-    sigaddset(&block, SIGTERM);
-    sigaddset(&block, SIGHUP);
-    sigprocmask(SIG_BLOCK, &block, &old);
-    tmp = env_or("TMPDIR", "/tmp");
-    if (snprintf(template, sizeof template,
-                  "%s/zcl-hosted-suite-verdict.XXXXXX", tmp)
-        >= (int)sizeof template) {
-        sigprocmask(SIG_SETMASK, &old, NULL);
-        hsv_fail("self-test cannot build the fixture template path");
-        return -1;
-    }
-    dir = mkdtemp(template);
-    if (!dir) {
-        sigprocmask(SIG_SETMASK, &old, NULL);
-        hsv_fail("self-test cannot create the fixture directory");
-        return -1;
-    }
-    snprintf(g_hsv_fixture_dir, sizeof g_hsv_fixture_dir, "%s", dir);
-    sigprocmask(SIG_SETMASK, &old, NULL);
-    return 0;
-}
-
-static int hsv_selftest_fixtures(void)
-{
-    static const struct {
-        const char *name;
-        const char *const *lines;
-    } fixtures[] = {
-        { "good.log", k_hsv_fx_good },
-        { "cached.log", k_hsv_fx_cached },
-        { "zero-run.log", k_hsv_fx_zero_run },
-        { "duplicate.log", k_hsv_fx_duplicate },
-        { "unobserved.log", k_hsv_fx_unobserved }
-    };
-    for (size_t i = 0; i < sizeof fixtures / sizeof fixtures[0]; i++)
-        if (hsv_write_fixture(g_hsv_fixture_dir, fixtures[i].name,
-                              fixtures[i].lines, 2) != 0) {
-            hsv_fail("self-test cannot write fixtures");
-            return -1;
-        }
-    return 0;
-}
-
-static bool hsv_fixture_rejects(const char *name)
-{
-    char path[4096];
-    FILE *saved_err = g_hsv_err;
-    int rc;
-    if (snprintf(path, sizeof path, "%s/%s", g_hsv_fixture_dir, name)
-        >= (int)sizeof path)
-        return true;
-    g_hsv_err = NULL;             /* the script's 2>&1 into the void */
-    rc = hsv_check_log(path, NULL);
-    g_hsv_err = saved_err;
-    return rc != 0;
-}
-
-/* Each rejecting mutation keeps the script's exact failure sentence. */
-static int hsv_selftest_rejections(void)
-{
-    static const struct {
-        const char *name, *msg;
-    } cases[] = {
-        { "cached.log", "cached zero-run log was admitted" },
-        { "zero-run.log", "cold zero-run log was admitted" },
-        { "duplicate.log", "duplicate verdict field was admitted" },
-        { "unobserved.log", "environment-unobserved run was admitted" }
-    };
-    char path[4096];
-    /* The valid fixture must pass with stdout discarded (stderr, which a
-     * passing run never writes, still flows). */
-    if (snprintf(path, sizeof path, "%s/good.log", g_hsv_fixture_dir)
-        >= (int)sizeof path) {
-        hsv_fail("self-test cannot address the good fixture");
-        return -1;
-    }
-    if (hsv_check_log(path, NULL) != 0) {
-        hsv_fail("self-test rejected the valid cold fixture");
-        return -1;
-    }
-    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++)
-        if (!hsv_fixture_rejects(cases[i].name)) {
-            hsv_fail("self-test mutation survived: %s", cases[i].msg);
-            return -1;
-        }
-    return 0;
-}
-
-int check_hosted_suite_verdict_selftest(void)
-{
-    int failed;
-    if (hsv_selftest_dir() != 0)
-        return 1;
-    if (g_hsv_signal)
-        hsv_cleanup_and_raise();
-    failed = hsv_selftest_fixtures() != 0;
-    if (g_hsv_signal)
-        hsv_cleanup_and_raise();
-    if (!failed)
-        failed = hsv_selftest_rejections() != 0;
-    if (g_hsv_signal)
-        hsv_cleanup_and_raise();
-    hsv_cleanup_and_raise();      /* fixture tree removed on the normal path */
-    if (failed)
-        return 1;
-    printf("hosted-suite-verdict self-test: PASS "
-           "(valid cold + 4 rejecting mutations)\n");
-    return 0;
 }
 
 int check_hosted_suite_verdict_run(int argc, char **argv)
