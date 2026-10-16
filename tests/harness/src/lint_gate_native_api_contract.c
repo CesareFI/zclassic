@@ -177,29 +177,37 @@ int t_native_agent_api_contract(void)
         ASSERT(repo_path(agent_doc_path, sizeof(agent_doc_path),
                          "docs/AGENT_API.md") == 0);
         ASSERT(read_entire_file(main_path, &main_buf) == 0);
-        /* The node entry point spans main.c, main_cli_modes.c and args.c;
+        /* The node entry point spans main.c, main_cli_modes.c,
+         * cli_compare_runtime.c and args.c;
          * concatenate them into main_buf so the assertions cover the combined
          * agent surface. */
         {
             char main_cli_modes_path[PATH_MAX];
+            char compare_runtime_path[PATH_MAX];
             char args_path[PATH_MAX];
             char *main_cli_modes_buf = NULL;
+            char *compare_runtime_buf = NULL;
             char *args_buf = NULL;
             ASSERT(repo_path(main_cli_modes_path, sizeof(main_cli_modes_path),
                              "engine/entry/main_cli_modes.c") == 0);
             ASSERT(repo_path(args_path, sizeof(args_path),
                              "engine/composition/src/args.c") == 0);
+            ASSERT(repo_path(compare_runtime_path, sizeof(compare_runtime_path),
+                             "engine/entry/cli_compare_runtime.c") == 0);
             ASSERT(read_entire_file(main_cli_modes_path, &main_cli_modes_buf)
                    == 0);
             ASSERT(read_entire_file(args_path, &args_buf) == 0);
+            ASSERT(read_entire_file(compare_runtime_path, &compare_runtime_buf)
+                   == 0);
             size_t combined_len = strlen(main_buf) + strlen(main_cli_modes_buf)
-                                + strlen(args_buf) + 1;
+                                + strlen(compare_runtime_buf) + strlen(args_buf) + 1;
             char *combined = malloc(combined_len);
             ASSERT(combined != NULL);
-            snprintf(combined, combined_len, "%s%s%s", main_buf,
-                     main_cli_modes_buf, args_buf);
+            snprintf(combined, combined_len, "%s%s%s%s", main_buf,
+                     main_cli_modes_buf, compare_runtime_buf, args_buf);
             free(main_buf);
             free(main_cli_modes_buf);
+            free(compare_runtime_buf);
             free(args_buf);
             main_buf = combined;
         }
