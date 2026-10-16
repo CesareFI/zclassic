@@ -57,11 +57,74 @@
 #include <signal.h>
 #include "platform/os_proc.h"
 #include "../../../platform/modules/platform/src/os_proc_fdclose_internal.h"
+enum tw_signal_fault { TW_SIGNAL_OK, TW_SIGNAL_BLOCK, TW_SIGNAL_FORK,
+                       TW_SIGNAL_RESET, TW_SIGNAL_PARENT_RESTORE };
+static enum tw_signal_fault tw_signal_fault;
+static bool tw_signal_observe;
+static pid_t tw_signal_parent, tw_signal_child;
+static unsigned tw_mask_sets;
+static volatile sig_atomic_t tw_caught_calls;
+
+static void tw_caught_handler(int number)
+{
+    (void)number;
+    tw_caught_calls++;
+}
+
+/* Faults wrap actual source calls in this test twin, not a production hook. */
+static int tw_signal_sigprocmask(int how, const sigset_t *set, sigset_t *old)
+{
+    if (tw_signal_observe && getpid() == tw_signal_parent && set) {
+        ++tw_mask_sets;
+        if ((tw_signal_fault == TW_SIGNAL_BLOCK && tw_mask_sets == 1) ||
+            (tw_signal_fault == TW_SIGNAL_PARENT_RESTORE && tw_mask_sets == 2)) {
+            errno = EIO;
+            return -1;
+        }
+    }
+    return sigprocmask(how, set, old);
+}
+
+static int tw_signal_sigaction(int number, const struct sigaction *action,
+                                struct sigaction *old)
+{
+    if (tw_signal_observe && getpid() != tw_signal_parent &&
+        tw_signal_fault == TW_SIGNAL_RESET && number == SIGUSR1 && action) {
+        errno = EIO;
+        return -1;
+    }
+    return sigaction(number, action, old);
+}
+
+static pid_t tw_signal_fork(void)
+{
+    if (tw_signal_observe && tw_signal_fault == TW_SIGNAL_FORK) {
+        errno = EAGAIN;
+        return -1;
+    }
+    pid_t pid = fork();
+    if (tw_signal_observe && pid > 0) tw_signal_child = pid;
+    return pid;
+}
+
+/* Called only inside the real forked terminal child at the closure seam. */
+static bool tw_signal_state_at_closure(void)
+{
+    if (!tw_signal_observe) return true;
+    sigset_t mask;
+    struct sigaction caught, ignored;
+    return sigprocmask(SIG_SETMASK, NULL, &mask) == 0 &&
+        sigismember(&mask, SIGUSR1) == 1 && sigismember(&mask, SIGUSR2) == 1 &&
+        sigaction(SIGUSR1, NULL, &caught) == 0 && caught.sa_handler == SIG_DFL &&
+        sigaction(SIGUSR2, NULL, &ignored) == 0 && ignored.sa_handler == SIG_IGN;
+}
+
 /* The production terminal caller is compiled below. This test-only wrapper
  * selects the real platform fallback without modifying the kernel or rail. */
 static bool tw_force_fd_fallback;
 static bool tw_scrub_for_test(int report)
 {
+    if (!tw_signal_state_at_closure()) return false;
     if (!tw_force_fd_fallback) return os_proc_close_inherited_fds_except(report);
     struct stat st;
     if (report <= 2 || fstat(report, &st) != 0) return false;
@@ -104,12 +167,18 @@ static pid_t tw_fixture_waitpid(pid_t pid, int *status, int options)
     return waitpid(pid, status, options);
 }
 /* Compile the production callers with deterministic syscall observations. */
+#define sigprocmask tw_signal_sigprocmask
+#define sigaction(...) tw_signal_sigaction(__VA_ARGS__)
+#define fork tw_signal_fork
 #define os_proc_close_inherited_fds_except tw_scrub_for_test
 #define write partial_write
 #define poll partial_poll
 #define kill partial_kill
 #define waitpid tw_fixture_waitpid
 #include "../../../cognition/modules/session/src/mesh_terminal_worker.c"
+#undef sigprocmask
+#undef sigaction
+#undef fork
 #undef os_proc_close_inherited_fds_except
 #undef waitpid
 #undef kill
@@ -787,6 +856,128 @@ static int live_custody_order(void)
     return failures;
 }
 
+/* Compare logical masks, not opaque sigset_t padding bytes. */
+static bool tw_masks_equal(const sigset_t *a, const sigset_t *b)
+{
+    for (int number = 1; number < NSIG; ++number)
+        if (sigismember(a, number) != sigismember(b, number)) return false;
+    return true;
+}
+
+/* Caller signal state the boundary case perturbs and must give back. */
+struct tw_sigfix {
+    sigset_t original, chosen;
+    struct sigaction old1, old2;
+};
+
+static bool tw_sigfix_install(struct tw_sigfix *s)
+{
+    struct sigaction caught = {.sa_handler = tw_caught_handler};
+    struct sigaction ignored = {.sa_handler = SIG_IGN};
+    sigemptyset(&caught.sa_mask);
+    sigemptyset(&ignored.sa_mask);
+    if (sigprocmask(SIG_SETMASK, NULL, &s->original) != 0 ||
+        sigaction(SIGUSR1, NULL, &s->old1) != 0 || sigaction(SIGUSR2, NULL, &s->old2) != 0)
+        return false;
+    s->chosen = s->original;
+    sigdelset(&s->chosen, SIGUSR1);
+    sigaddset(&s->chosen, SIGUSR2);
+    return sigaction(SIGUSR1, &caught, NULL) == 0 && sigaction(SIGUSR2, &ignored, NULL) == 0 &&
+           sigprocmask(SIG_SETMASK, &s->chosen, NULL) == 0;
+}
+
+static bool tw_sigfix_restore(const struct tw_sigfix *s)
+{
+    tw_signal_observe = false;
+    bool restored = sigaction(SIGUSR1, &s->old1, NULL) == 0;
+    restored = sigaction(SIGUSR2, &s->old2, NULL) == 0 && restored;
+    return sigprocmask(SIG_SETMASK, &s->original, NULL) == 0 && restored;
+}
+
+/* What the spawn outcome must be for the injected fault. */
+static int tw_sigfix_outcome(enum tw_signal_fault fault, struct zcl_result result,
+                             struct mesh_terminal_worker *w)
+{
+    int failures = 0;
+    if (fault == TW_SIGNAL_OK) {
+        failures = check(failures, result.ok, "signal boundary: real spawn");
+        if (result.ok)
+            failures = check(failures, wait_exit(w, 5) && w->term_signal == 0 && w->exit_code == 0,
+                             "signal boundary: post-exec original mask and IGN survive");
+        return failures;
+    }
+    int expected = fault == TW_SIGNAL_RESET ? MESH_TERMINAL_WORKER_ERR_CONFINEMENT :
+                                              MESH_TERMINAL_WORKER_ERR_SPAWN;
+    failures = check(failures, !result.ok && result.code == expected && !w->running,
+                     "signal boundary: injected failure refuses exact stage");
+    if (tw_signal_child > 0)
+        failures = check(failures, kill(tw_signal_child, 0) < 0 && errno == ESRCH,
+                         "signal boundary: refused child reaped");
+    return failures;
+}
+
+/* The caller's mask and handlers after the spawn. */
+static int tw_sigfix_parent_state(enum tw_signal_fault fault, const struct tw_sigfix *s)
+{
+    sigset_t after;
+    struct sigaction got1, got2;
+    bool mask_ok = sigprocmask(SIG_SETMASK, NULL, &after) == 0 &&
+        (fault == TW_SIGNAL_PARENT_RESTORE ?
+         sigismember(&after, SIGUSR1) == 1 && sigismember(&after, SIGUSR2) == 1 :
+         tw_masks_equal(&s->chosen, &after));
+    int failures = check(0, mask_ok,
+                         "signal boundary: parent mask restored unless injected kernel refusal");
+    return check(failures, sigaction(SIGUSR1, NULL, &got1) == 0 &&
+                 sigaction(SIGUSR2, NULL, &got2) == 0 &&
+                 got1.sa_handler == tw_caught_handler && got2.sa_handler == SIG_IGN &&
+                 tw_caught_calls == 0, "signal boundary: parent handlers unchanged");
+}
+
+/* Every mutation is restored before returning; no signal is sent to the
+ * harness. Parent and child state are observed through real system calls. */
+static int live_signal_boundary_case(enum tw_signal_fault fault)
+{
+    struct tw_sigfix s;
+    char image[600];
+    if (!tw_sigfix_install(&s)) {
+        (void)tw_sigfix_restore(&s);
+        return check(0, false, "signal boundary: install fixture state");
+    }
+    int failures = 0;
+    if (!test_abs_path("build/fixtures/rcc_child", image, sizeof image)) {
+        failures = check(0, false, "signal boundary: trusted fixture path");
+    } else {
+        const char *const run[] = {image, "signal-state", "", NULL};
+        struct mesh_terminal_worker_config cfg;
+        struct mesh_terminal_worker w;
+        live_config(&cfg);
+        cfg.shell_path = image;
+        cfg.argv = run;
+        tw_signal_fault = fault;
+        tw_signal_parent = getpid();
+        tw_signal_child = 0;
+        tw_mask_sets = 0;
+        tw_caught_calls = 0;
+        tw_signal_observe = true;
+        struct zcl_result result = mesh_terminal_worker_spawn(
+            &cfg, (int64_t)platform_time_wall_time_t(), &w);
+        tw_signal_observe = false;
+        failures = tw_sigfix_outcome(fault, result, &w);
+        mesh_terminal_worker_kill(&w);
+        failures += tw_sigfix_parent_state(fault, &s);
+    }
+    return check(failures, tw_sigfix_restore(&s), "signal boundary: fixture restores caller state");
+}
+
+
+static int live_signal_boundary(void)
+{
+    int failures = 0;
+    for (int fault = TW_SIGNAL_OK; fault <= TW_SIGNAL_PARENT_RESTORE; ++fault)
+        failures += live_signal_boundary_case((enum tw_signal_fault)fault);
+}
+
+
 /* Real terminal spawn executes the trusted C fdwrite fixture: EBADF tests the
  * descriptor itself, independently of whether Landlock permits proc paths. */
 static int live_high_inherited_fd_closed(bool fallback)
@@ -1171,6 +1362,7 @@ static int test_mesh_terminal_worker_platform_arm(void)
     failures += live_inherited_fd_closed();
     failures += live_high_inherited_fd_closed(false);
     failures += live_high_inherited_fd_closed(true);
+    failures += live_signal_boundary();
     failures += live_two_mib_output();
 
     /* ── live: input byte budget ───────────────────────────────────── */

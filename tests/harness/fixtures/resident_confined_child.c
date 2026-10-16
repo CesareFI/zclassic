@@ -21,6 +21,7 @@
  *                  sleeps 30 s; the parent exits 0 once the pid is recorded
  *                  (a detached descendant)
  */
+#include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -140,9 +141,23 @@ static int rcc_daemon(const char *file)
     _exit(0);
 }
 
+/* Inspect post-exec state without sending a signal or opening a proc path. */
+static int rcc_signal_state(void)
+{
+    sigset_t mask;
+    struct sigaction caught, ignored;
+    if (sigprocmask(SIG_SETMASK, NULL, &mask) != 0 ||
+        sigaction(SIGUSR1, NULL, &caught) != 0 ||
+        sigaction(SIGUSR2, NULL, &ignored) != 0) return 80;
+    if (caught.sa_handler != SIG_DFL || ignored.sa_handler != SIG_IGN) return 81;
+    if (sigismember(&mask, SIGUSR1) != 0 || sigismember(&mask, SIGUSR2) != 1) return 82;
+    return 0;
+}
+
 static int rcc_misc(const char *verb, const char *arg, int *handled)
 {
     *handled = 1;
+    if (strcmp(verb, "signal-state") == 0) return rcc_signal_state();
     if (strcmp(verb, "fdwrite") == 0)
         return write(atoi(arg), "x", 1) == 1 ? 0 : errno;
     if (strcmp(verb, "fork") == 0) return rcc_fork();
