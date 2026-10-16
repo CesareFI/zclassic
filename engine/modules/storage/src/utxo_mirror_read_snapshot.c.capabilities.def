@@ -1,0 +1,8 @@
+/* Copyright 2026 Rhett Creighton. SPDX-License-Identifier: Apache-2.0
+ * Purpose: declare conservative reach of the offline projection reader. */
+ZCL_MODULE_CAPABILITY("engine/modules/storage/src/utxo_mirror_read_snapshot.c",
+    CAP_FS_READ|CAP_FS_WRITE|CAP_PRIVILEGE,
+    "Retained read-only open/openat/fstatat and SQLite column reads; generic "
+    "prepare/step/exec are conservatively FS_WRITE even for SELECT/read-only "
+    "transactions. sqlite3_db_config hardening is classified PRIVILEGE. "
+    "This declaration does not authorize writes to supplied input files.")

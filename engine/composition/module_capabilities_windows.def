@@ -130,6 +130,8 @@ ZCL_MODULE_CAPABILITY("engine/modules/sim/src/postmortem_inventory.c", CAP_NONE,
 ZCL_MODULE_CAPABILITY("engine/modules/sim/src/simnet_chaos_faults_rom.c", CAP_CLOCK|CAP_FS_READ|CAP_FS_WRITE|CAP_NETWORK, "The native chaos fixture reaches its isolated WinSock test lane.")
 ZCL_MODULE_CAPABILITY("engine/modules/storage/src/block_prefetch.c", CAP_CLOCK|CAP_FS_WRITE, "")
 ZCL_MODULE_CAPABILITY("engine/modules/storage/src/ldb_snapshot.c", CAP_NONE, "")
+ZCL_MODULE_CAPABILITY("engine/modules/storage/src/utxo_mirror_read_snapshot.c", CAP_NONE,
+    "Windows arm is an explicit refusal stub with output zeroing only.")
 ZCL_MODULE_CAPABILITY("engine/modules/storage/src/progress_store_directory.c", CAP_FS_READ, "")
 ZCL_MODULE_CAPABILITY("engine/modules/storage/src/sqlite_vfs_dir_windows.c", CAP_CLOCK|CAP_DYNLOAD|CAP_FS_READ|CAP_FS_WRITE|CAP_RANDOM, "Native retained-directory SQLite I/O resolves NT file primitives and provides bounded clock, filesystem, and randomness operations.")
 ZCL_MODULE_CAPABILITY("engine/modules/storage/src/sqlite_vfs_dir_windows_registration.c", CAP_DYNLOAD|CAP_FS_READ|CAP_FS_WRITE, "Registers and audits local NTFS retained-directory capabilities using native volume and file identity APIs.")

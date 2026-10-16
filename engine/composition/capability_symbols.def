@@ -1231,6 +1231,8 @@ ZCL_CAPABILITY_SYMBOL("sqlite3_set_clientdata", CAP_HARMLESS, "")
 ZCL_CAPABILITY_SYMBOL("sqlite3_sql", CAP_HARMLESS, "")
 ZCL_CAPABILITY_SYMBOL("sqlite3_stmt_busy", CAP_HARMLESS, "")
 ZCL_CAPABILITY_SYMBOL("sqlite3_stmt_readonly", CAP_HARMLESS, "")
+ZCL_CAPABILITY_SYMBOL("sqlite3_stricmp", CAP_HARMLESS,
+    "Compares two caller-supplied strings with SQLite case folding; performs no database or filesystem operation.")
 ZCL_CAPABILITY_SYMBOL("sqlite3_total_changes64", CAP_HARMLESS, "")
 ZCL_CAPABILITY_SYMBOL("sqlite3_trace_v2", CAP_HARMLESS,
     "Installs a callback that observes SQL text this process itself "

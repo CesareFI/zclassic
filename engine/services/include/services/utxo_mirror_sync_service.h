@@ -42,6 +42,7 @@
 #ifndef ZCL_SERVICES_UTXO_MIRROR_SYNC_SERVICE_H
 #define ZCL_SERVICES_UTXO_MIRROR_SYNC_SERVICE_H
 
+#include "storage/utxo_mirror_schema.h"
 #include "util/result.h"
 #include <pthread.h>
 #include <stdbool.h>
@@ -53,9 +54,6 @@ struct node_db;
 /* ── Defaults ──────────────────────────────────────────────── */
 
 #define UTXO_MIRROR_SYNC_DEFAULT_TICK_SECONDS 5
-/* Persisted node.db state key: the height the `utxos` mirror is synced to
- * (== the coins_kv applied frontier reflected in the mirror). */
-#define UTXO_MIRROR_SYNC_CURSOR_KEY "utxos_mirror_height"
 /* While the applied frontier is more than this many blocks below the header
  * tip we are catching up (IBD / P2P body fetch), the frontier climbs every
  * tick, and a full ~1.3M-row rebuild per tick is quadratic against sync
