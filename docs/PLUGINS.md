@@ -156,6 +156,7 @@ printf '%s\n' <64-hex-public-key> >> ~/.z23/plugins/trusted_keys
 ```sh
 z23 plugin install ./hello.plugin.json     # signature file and executable sit beside it
 z23 plugin list
+z23 plugin status hello                    # inspect one plugin without verification
 z23 plugin switch hello <128-hex generation>
 z23 plugin rollback hello
 z23 plugin run hello [seconds]             # supervise the current generation
@@ -170,7 +171,18 @@ z23 plugin pack ./hello --name=hello --version=1.0.0 --key=./publisher.key
   and replaced by the verified staged copy, so `current` never keeps pointing
   at a broken generation.
 - `list` prints, for each plugin, `current`, `last_good` and every stored
-  generation.
+  generation, plus `current_state`, `last_good_state` and `generations_state`.
+  Each state is `ok`, `missing`, `unreadable` or `corrupt`. Empty ids or an empty
+  generation list do not mean missing when the corresponding state reports a
+  read failure. A missing store root yields an empty list; failure to open or
+  completely enumerate an existing root is refused with `PLUGIN_IO`.
+- `status NAME` reports the named plugin's `current` and `last_good` ids,
+  `generations` count and the same state fields. It refuses an `unreadable` or
+  `corrupt` part with `PLUGIN_IO`, while `list` reports those per-plugin states.
+  A missing named plugin is `PLUGIN_NOT_INSTALLED`. Status scans the store but
+  verifies no signatures, hashes no executables and starts nothing; `work`
+  reports `scanned`, `verified` (0) and `hashed` (0). These state reads do not
+  establish that a generation's signed files verify.
 - `switch` verifies the generation again, sets `last-good` to the previous
   `current`, then points `current` at the generation. Switching to the
   generation that is already current changes nothing.
