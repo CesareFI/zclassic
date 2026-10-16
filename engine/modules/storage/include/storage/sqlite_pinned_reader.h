@@ -1,4 +1,5 @@
-/* Copyright 2026 Rhett Creighton - Apache License 2.0 */
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ * Purpose: checked read-only SQLite connections bound to retained file handles. */
 #ifndef ZCL_STORAGE_SQLITE_PINNED_READER_H
 #define ZCL_STORAGE_SQLITE_PINNED_READER_H
 #include <stdbool.h>

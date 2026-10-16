@@ -1,0 +1,7 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ * Purpose: declare the pinned reader's conservatively classified SQLite reach. */
+ZCL_MODULE_CAPABILITY("engine/modules/storage/src/sqlite_pinned_reader.c",
+    CAP_FS_WRITE|CAP_PRIVILEGE,
+    "Registers a nondefault retained-file VFS and uses generic SQLite APIs "
+    "classified FS_WRITE even for read-only flags/SQL; configures connection "
+    "hardening through sqlite3_db_config. The adapter refuses input writes.")

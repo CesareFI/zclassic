@@ -99,9 +99,9 @@ struct reader_fixture {
 };
 static bool setup_fixture(struct reader_fixture *f)
 {
-    snprintf(f->root, sizeof(f->root), "/tmp/zcl-pinned-reader-XXXXXX");
     platform_positioned_file_init(&f->file);
-    if (!mkdtemp(f->root)) return false;
+    if (!test_mkdtemp(f->root, sizeof(f->root), "sqlite_pinned_reader"))
+        return false;
     snprintf(f->directory, sizeof(f->directory), "%s/current", f->root);
     snprintf(f->moved, sizeof(f->moved), "%s/retained", f->root);
     snprintf(f->path, sizeof(f->path), "%s/current/input.db", f->root);

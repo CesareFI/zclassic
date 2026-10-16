@@ -386,6 +386,9 @@ ZCL_CAPABILITY_SYMBOL("sqlite3_exec", CAP_FS_WRITE,
 ZCL_CAPABILITY_SYMBOL("sqlite3_file_control", CAP_FS_WRITE,
     "Reaches the underlying file handle and the write ahead log "
     "controls.")
+ZCL_CAPABILITY_SYMBOL("sqlite3_initialize", CAP_FS_WRITE,
+    "Initializes SQLite's process-wide file layer, including built-in VFS "
+    "registration via sqlite3_os_init; follows the VFS registration class.")
 ZCL_CAPABILITY_SYMBOL("sqlite3_open", CAP_FS_WRITE,
     "Creates the database when it is missing, so a read only intent is "
     "not visible here.")
