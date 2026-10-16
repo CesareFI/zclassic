@@ -12,6 +12,7 @@
 #define _GNU_SOURCE
 #endif
 #include "resident_launch_confined.h"
+#include "os_proc_fdclose_internal.h"
 
 #if !defined(_WIN32)
 #include "base/hex.h"
@@ -335,9 +336,6 @@ bool resident_reproof_mapped(pid_t pid, struct resident_launch *launch,
  * slot, the pinned exec fd, the status pipe and every pre-opened grant fd
  * (Landlock still needs those until the sandbox is armed). */
 #define RESIDENT_KEEP_MAX 48u
-#ifndef __NR_close_range
-#define __NR_close_range 436
-#endif
 
 static size_t resident_keep_collect(const struct resident_child_plan *plan,
                                     int keep[RESIDENT_KEEP_MAX])
@@ -368,66 +366,6 @@ static size_t resident_keep_collect(const struct resident_child_plan *plan,
     return n;
 }
 
-/* Close [lo, hi] with close_range(2); false when the kernel refuses it. */
-static bool resident_close_span(unsigned lo, unsigned hi)
-{
-    if (lo > hi) return true;
-    return syscall(__NR_close_range, lo, hi, 0u) == 0;
-}
-
-struct resident_dirent64 {
-    uint64_t ino;
-    int64_t off;
-    unsigned short reclen;
-    unsigned char type;
-    char name[];
-};
-
-static bool resident_fd_kept(const int *keep, size_t n, int fd)
-{
-    for (size_t i = 0; i < n; ++i)
-        if (keep[i] == fd) return true;
-    return false;
-}
-
-/* Close the descriptor a /proc/self/fd entry names unless it is kept or is the
- * directory handle itself. True when a descriptor was closed. */
-static bool resident_close_entry(const struct resident_dirent64 *d, int dir,
-                                 const int *keep, size_t n)
-{
-    if (d->name[0] < '0' || d->name[0] > '9') return false; /* . and .. */
-    int fd = atoi(d->name);
-    if (fd == dir || resident_fd_kept(keep, n, fd)) return false;
-    return close(fd) == 0;
-}
-
-/* Close every descriptor of THIS process not in keep, found by listing the
- * proc fd directory (no allocation, no libc stream). Not bounded by
- * RLIMIT_NOFILE, which a limit reduction can leave below an open descriptor.
- * Repeats until a pass closes nothing; false = the directory is unusable. */
-static bool resident_close_listed(const int *keep, size_t n)
-{
-    int dir = open("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (dir < 0) return false;
-    bool closed_any = true, usable = true;
-    for (int pass = 0; closed_any && pass < 64; ++pass) {
-        char buf[2048];
-        long got;
-        closed_any = false;
-        if (lseek(dir, 0, SEEK_SET) < 0) { usable = false; break; }
-        while ((got = syscall(SYS_getdents64, dir, buf, sizeof(buf))) > 0) {
-            for (long off = 0; off < got;) {
-                const struct resident_dirent64 *d = (const void *)(buf + off);
-                off += d->reclen;
-                if (resident_close_entry(d, dir, keep, n)) closed_any = true;
-            }
-        }
-        if (got < 0) { usable = false; break; }
-    }
-    close(dir);
-    return usable && !closed_any;
-}
-
 /* Landlock does not revoke an already-open descriptor, so a confined child
  * must not inherit any the caller did not name. close_range first; if it is
  * unavailable, enumerate the open descriptors instead. When neither works the
@@ -436,19 +374,11 @@ void resident_child_close_inherited(const struct resident_child_plan *plan)
 {
     int keep[RESIDENT_KEEP_MAX];
     size_t n = resident_keep_collect(plan, keep);
-    unsigned next = 0;
-    bool swept = true;
+    bool try_range = true;
 #ifdef ZCL_TESTING
-    if (plan->no_close_range) swept = false; /* test seam: close_range unavailable */
+    try_range = !plan->no_close_range;
 #endif
-    for (size_t i = 0; swept && i < n; ++i) {
-        if (keep[i] < 0 || (unsigned)keep[i] < next) continue;
-        if ((unsigned)keep[i] > next)
-            swept = resident_close_span(next, (unsigned)keep[i] - 1u);
-        next = (unsigned)keep[i] + 1u;
-    }
-    swept = swept && resident_close_span(next, UINT_MAX);
-    if (swept || resident_close_listed(keep, n)) return;
+    if (os_proc_linux_close_fds_kept(keep, n, try_range)) return;
     unsigned char stage = RESIDENT_SANDBOX_STAGE_BYTE;
     ssize_t told = write(plan->status_write, &stage, 1);
     (void)told;

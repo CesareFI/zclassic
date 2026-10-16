@@ -579,11 +579,15 @@ static int rcr_lowered_limit_child(const char *image,
 {
     int low = open("/dev/null", O_WRONLY);
     struct rlimit lim = {.rlim_cur = 64, .rlim_max = 64};
-    if (low < 0 || dup2(low, 200) != 200) return 90;
+    int high = low >= 0 ? fcntl(low, F_DUPFD, 70000) : -1;
+    if (high < 0) { if (low >= 0) close(low); return 90; }
+    char fdarg[32];
+    int used = snprintf(fdarg, sizeof(fdarg), "%d", high);
+    if (used < 0 || (size_t)used >= sizeof(fdarg)) return 90;
     close(low);
-    if (setrlimit(RLIMIT_NOFILE, &lim) != 0) return 91; /* fd 200 now exceeds the hard limit */
+    if (setrlimit(RLIMIT_NOFILE, &lim) != 0) return 91; /* high FD remains open above both 65536 and the hard limit */
     struct rcr_opts o = {.manifest = m, .no_close_range = true};
-    struct rcr_outcome out = rcr_run_opts(image, &o, "fdwrite", "200");
+    struct rcr_outcome out = rcr_run_opts(image, &o, "fdwrite", fdarg);
     return out.spawned && out.exited && out.code == EBADF ? 0 : 1;
 }
 

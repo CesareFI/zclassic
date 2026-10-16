@@ -195,7 +195,11 @@ static int os_proc_preserved_report_fd_checks(void)
     int high = -1;
     pid_t child = -1;
     bool ready = pipe(report) == 0 && pipe(secret) == 0;
+#if defined(__linux__)
+    if (ready) high = fcntl(secret[0], F_DUPFD, 70000);
+#else
     if (ready) high = fcntl(secret[0], F_DUPFD, 200);
+#endif
     if (ready && high >= 0) child = fork();
     if (child == 0) os_proc_preserved_report_child(report, high);
     failures += os_proc_preserved_report_parent(report, secret, high, child);

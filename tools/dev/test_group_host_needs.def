@@ -407,3 +407,9 @@ ZCL_TEST_GROUP_BUILD_NEED("test_zcode_package_artifact", "build/bin/z23", "z23")
 
 /* mcp_serve drives `z23 mcp serve` over pipes against the dev binary. */
 ZCL_TEST_GROUP_BUILD_NEED("test_mcp_serve", "build/bin/z23-dev", "dev-bin")
+
+#if defined(__linux__)
+/* The terminal high-FD regression executes this existing trusted C fixture. */
+ZCL_TEST_GROUP_BUILD_NEED("test_mesh_terminal_worker",
+    "build/fixtures/rcc_child", "build/fixtures/rcc_child")
+#endif

@@ -6,6 +6,7 @@
 #define _GNU_SOURCE /* ptsname_r, pipe2 — must precede every include */
 
 #include "session/mesh_terminal_worker.h"
+#include "platform/os_proc.h"
 
 #if defined(__linux__)
 #include "platform/os_sandbox.h"
@@ -19,7 +20,6 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <termios.h> /* struct winsize */
 #include <unistd.h>
@@ -290,22 +290,6 @@ static size_t tw_grant_rules(const struct mesh_terminal_worker_config *cfg,
     _exit(code);
 }
 
-/* The confined program inherits only 0/1/2 (the pty slave) and the O_CLOEXEC
- * staging pipe: anything else the launcher left open (a database handle, a
- * socket, a pipe to the node) must not reach the shell. close_range(2) closes
- * everything except stage_fd; where the kernel lacks it a bounded loop does. */
-static void tw_close_inherited(int keep)
-{
-    for (int upper = 0; upper < 2; upper++) {
-        unsigned lo = upper ? (unsigned)keep + 1u : 3u;
-        unsigned hi = upper ? ~0u : (unsigned)keep - 1u;
-        if (lo > hi || (long)syscall(SYS_close_range, lo, hi, 0u) == 0)
-            continue;
-        for (unsigned fd = lo; fd <= hi && fd < 65536u; fd++)
-            (void)close((int)fd);
-    }
-}
-
 /* The child half of spawn: never returns; stages failures by name. */
 static void tw_child(const struct mesh_terminal_worker_config *cfg,
                      const char *slave_path, int master, int stage_fd)
@@ -324,7 +308,8 @@ static void tw_child(const struct mesh_terminal_worker_config *cfg,
     if (dup2(slave, STDIN_FILENO) < 0 || dup2(slave, STDOUT_FILENO) < 0 || dup2(slave, STDERR_FILENO) < 0) goto tty_fail;
     if (slave > STDERR_FILENO) close(slave);
 
-    tw_close_inherited(stage_fd);
+    if (!os_proc_close_inherited_fds_except(stage_fd))
+        tw_fail(stage_fd, TW_STAGE_CONFINEMENT, 126);
 
     if (chdir(cfg->workdir) < 0) tw_fail(stage_fd, TW_STAGE_CHDIR, 126);
     /* Own PID namespace: no outside pid is addressable. Fail closed. */

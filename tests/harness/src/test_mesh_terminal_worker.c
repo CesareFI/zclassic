@@ -55,6 +55,19 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include "platform/os_proc.h"
+#include "../../../platform/modules/platform/src/os_proc_fdclose_internal.h"
+/* The production terminal caller is compiled below. This test-only wrapper
+ * selects the real platform fallback without modifying the kernel or rail. */
+static bool tw_force_fd_fallback;
+static bool tw_scrub_for_test(int report)
+{
+    if (!tw_force_fd_fallback) return os_proc_close_inherited_fds_except(report);
+    struct stat st;
+    if (report <= 2 || fstat(report, &st) != 0) return false;
+    const int keep[] = {0, 1, 2, report};
+    return os_proc_linux_close_fds_kept(keep, 4u, false);
+}
 static bool partial_active;
 static unsigned partial_writes, partial_polls;
 static ssize_t partial_write(int fd, const void *buf, size_t n)
@@ -91,11 +104,13 @@ static pid_t tw_fixture_waitpid(pid_t pid, int *status, int options)
     return waitpid(pid, status, options);
 }
 /* Compile the production callers with deterministic syscall observations. */
+#define os_proc_close_inherited_fds_except tw_scrub_for_test
 #define write partial_write
 #define poll partial_poll
 #define kill partial_kill
 #define waitpid tw_fixture_waitpid
 #include "../../../cognition/modules/session/src/mesh_terminal_worker.c"
+#undef os_proc_close_inherited_fds_except
 #undef waitpid
 #undef kill
 #undef poll
@@ -772,6 +787,43 @@ static int live_custody_order(void)
     return failures;
 }
 
+/* Real terminal spawn executes the trusted C fdwrite fixture: EBADF tests the
+ * descriptor itself, independently of whether Landlock permits proc paths. */
+static int live_high_inherited_fd_closed(bool fallback)
+{
+    char image[600], fdarg[32];
+    if (!test_abs_path("build/fixtures/rcc_child", image, sizeof image))
+        return check(0, false, "high inherited fd: resolve trusted fixture");
+    int source = open("/dev/null", O_WRONLY);
+    int high = source >= 0 ? fcntl(source, F_DUPFD, 70000) : -1;
+    if (source >= 0) close(source);
+    if (high < 0) return check(0, false, "high inherited fd: plant above 65536");
+    int used = snprintf(fdarg, sizeof fdarg, "%d", high);
+    if (used < 0 || (size_t)used >= sizeof fdarg) {
+        close(high);
+        return check(0, false, "high inherited fd: encode descriptor");
+    }
+    const char *const run[] = {image, "fdwrite", fdarg, NULL};
+    struct mesh_terminal_worker_config cfg;
+    struct mesh_terminal_worker w;
+    live_config(&cfg);
+    cfg.shell_path = image;
+    cfg.argv = run;
+    tw_force_fd_fallback = fallback;
+    struct zcl_result result = mesh_terminal_worker_spawn(
+        &cfg, (int64_t)platform_time_wall_time_t(), &w);
+    tw_force_fd_fallback = false;
+    close(high);
+    int failures = check(0, result.ok, "high inherited fd: real terminal spawn");
+    if (result.ok)
+        failures = check(failures, wait_exit(&w, 5) &&
+                         w.term_signal == 0 && w.exit_code == EBADF,
+                         fallback ? "high inherited fd: forced proc fallback closes FD" :
+                                    "high inherited fd: default closure closes FD");
+    mesh_terminal_worker_kill(&w);
+    return failures;
+}
+
 /* First live child (non-zombie) of `parent` outside group `avoid_pgid` (0: any), by /proc scan; 0 if none. */
 static pid_t first_child_of(pid_t parent, pid_t avoid_pgid)
 {
@@ -1117,6 +1169,8 @@ static int test_mesh_terminal_worker_platform_arm(void)
     failures += live_custody_order();
     failures += live_pid_namespace();
     failures += live_inherited_fd_closed();
+    failures += live_high_inherited_fd_closed(false);
+    failures += live_high_inherited_fd_closed(true);
     failures += live_two_mib_output();
 
     /* ── live: input byte budget ───────────────────────────────────── */

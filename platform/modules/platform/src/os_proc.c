@@ -14,6 +14,7 @@
 #endif
 
 #include "platform/os_proc.h"
+#include "os_proc_fdclose_internal.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -751,7 +752,7 @@ bool os_proc_bind_parent_death(int signal_number, uint64_t expected_parent)
 #endif
 }
 
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__linux__)
 static bool os_proc_close_fd_except_entry(const struct dirent *entry,
                                           int own, int keep_fd)
 {
@@ -769,6 +770,107 @@ static bool os_proc_close_fd_except_entry(const struct dirent *entry,
 }
 #endif
 
+#if defined(__linux__)
+/* Allocation-free child descriptor census; never trusts RLIMIT_NOFILE. */
+static bool op_fd_kept(const int *keep, size_t n, int fd)
+{
+    for (size_t i = 0; i < n; ++i) if (keep[i] == fd) return true;
+    return false;
+}
+
+/* Decode only complete numeric proc names, without locale or allocation. */
+static bool op_fd_number(const char *name, size_t len, int *fd)
+{
+    if ((len == 1 && name[0] == '.') ||
+        (len == 2 && name[0] == '.' && name[1] == '.')) {
+        *fd = -1;
+        return true;
+    }
+    if (!len) return false;
+    unsigned value = 0;
+    for (size_t i = 0; i < len; ++i) {
+        if (name[i] < '0' || name[i] > '9') return false;
+        unsigned digit = (unsigned)(name[i] - '0');
+        if (value > ((unsigned)INT_MAX - digit) / 10u) return false;
+        value = value * 10u + digit;
+    }
+    *fd = (int)value;
+    return true;
+}
+
+/* Validate raw Linux dirent64 extents before interpreting their names. */
+static bool op_fd_batch(const unsigned char *buf, size_t size, int own,
+                         const int *keep, size_t n, bool *unwanted)
+{
+    size_t off = 0;
+    while (off < size) {
+        if (size - off < 20u) return false;
+        unsigned short len;
+        memcpy(&len, buf + off + 16u, sizeof(len));
+        if (len < 20u || len > size - off) return false;
+        const char *name = (const char *)buf + off + 19u;
+        size_t available = (size_t)len - 19u, used = 0;
+        while (used < available && name[used]) ++used;
+        int fd;
+        if (used == available || !op_fd_number(name, used, &fd)) return false;
+        if (fd >= 0 && fd != own && !op_fd_kept(keep, n, fd)) {
+            *unwanted = true;
+            if (close(fd) != 0 && errno != EBADF && errno != EINTR) return false;
+        }
+        off += len;
+    }
+    return true;
+}
+
+/* A clean full pass is required after closing: errors never imply emptiness. */
+static bool op_fd_census(int own, const int *keep, size_t n)
+{
+    for (unsigned pass = 0; pass < 64u; ++pass) {
+        unsigned char buf[2048];
+        bool unwanted = false;
+        if (lseek(own, 0, SEEK_SET) < 0) return false;
+        long got;
+        while ((got = syscall(SYS_getdents64, own, buf, sizeof(buf))) > 0) {
+            if (!op_fd_batch(buf, (size_t)got, own, keep, n, &unwanted)) return false;
+        }
+        if (got < 0) return false;
+        if (!unwanted) return true;
+    }
+    errno = EBUSY;
+    return false;
+}
+
+/* Sorted retained descriptors permit range closure; proc is the older-kernel
+ * fallback. Both paths operate on this child only, without libc streams. */
+bool os_proc_linux_close_fds_kept(const int *keep, size_t n, bool try_range)
+{
+    if (!keep || !n || n > 48u) { errno = EINVAL; return false; }
+    for (size_t i = 1; i < n; ++i)
+        if (keep[i] < keep[i - 1]) { errno = EINVAL; return false; }
+    unsigned next = 0;
+    bool swept = try_range;
+#if defined(SYS_close_range)
+    for (size_t i = 0; swept && i < n; ++i) {
+        if (keep[i] < 0 || (unsigned)keep[i] < next) continue;
+        if ((unsigned)keep[i] > next)
+            swept = syscall(SYS_close_range, next, (unsigned)keep[i] - 1u, 0u) == 0;
+        next = (unsigned)keep[i] + 1u;
+    }
+    swept = swept && syscall(SYS_close_range, next, UINT_MAX, 0u) == 0;
+#else
+    swept = false;
+#endif
+    if (swept) return true;
+    int own = os_proc_fd_dir_open();
+    if (own < 0) return false;
+    bool ok = op_fd_census(own, keep, n);
+    int saved = errno;
+    if (close(own) != 0) return false;
+    if (!ok) errno = saved;
+    return ok;
+}
+#endif
+
 bool os_proc_close_inherited_fds_except(int keep_fd)
 {
 #if defined(_WIN32)
@@ -783,6 +885,10 @@ bool os_proc_close_inherited_fds_except(int keep_fd)
     struct stat kept;
     if (fstat(keep_fd, &kept) < 0)
         return false; // raw-return-ok:caller-logs-context
+#if defined(__linux__)
+    const int keep[] = {0, 1, 2, keep_fd};
+    return os_proc_linux_close_fds_kept(keep, 4u, true);
+#else
     DIR *directory = opendir("/dev/fd");
     if (!directory) return false; // raw-return-ok:caller-logs-context
     int own = dirfd(directory);
@@ -801,6 +907,7 @@ bool os_proc_close_inherited_fds_except(int keep_fd)
         return false; // raw-return-ok:caller-logs-context
     if (!ok) errno = saved;
     return ok;
+#endif
 #endif
 }
 
