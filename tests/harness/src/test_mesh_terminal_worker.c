@@ -43,7 +43,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -55,6 +54,7 @@
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/resource.h>
 #include <signal.h>
 #include "platform/os_proc.h"
 #include "../../../platform/modules/platform/src/os_proc_fdclose_internal.h"
@@ -980,50 +980,35 @@ static int live_signal_boundary(void)
 }
 
 
-/* Raises the soft descriptor limit above `want` for one case and reports
- * whether it is in effect; `saved` holds the limit to restore. A hard limit
- * at or below `want` cannot be raised by an unprivileged test. */
-static bool tw_nofile_above(rlim_t want, struct rlimit *saved)
+enum tw_nofile { TW_NOFILE_RAISED, TW_NOFILE_HARD_CAP, TW_NOFILE_ERROR };
+
+/* Raises the soft descriptor limit above `want`; `saved` holds the limit to
+ * restore. A hard limit at or below `want` cannot be raised by an
+ * unprivileged test and is reported apart from a failed system call. */
+static enum tw_nofile tw_nofile_above(rlim_t want, struct rlimit *saved)
 {
     if (getrlimit(RLIMIT_NOFILE, saved) != 0)
-        return false;
+        return TW_NOFILE_ERROR;
     if (saved->rlim_cur > want)
-        return true;
+        return TW_NOFILE_RAISED;
     if (saved->rlim_max != RLIM_INFINITY && saved->rlim_max <= want)
-        return false;
+        return TW_NOFILE_HARD_CAP;
     struct rlimit raised = *saved;
     raised.rlim_cur = want + 16;
     if (raised.rlim_max != RLIM_INFINITY && raised.rlim_cur > raised.rlim_max)
         raised.rlim_cur = raised.rlim_max;
-    return setrlimit(RLIMIT_NOFILE, &raised) == 0;
+    return setrlimit(RLIMIT_NOFILE, &raised) == 0 ? TW_NOFILE_RAISED
+                                                   : TW_NOFILE_ERROR;
 }
 
 /* Real terminal spawn executes the trusted C fdwrite fixture: EBADF tests the
  * descriptor itself, independently of whether Landlock permits proc paths. */
-static int live_high_inherited_fd_closed(bool fallback)
+static int live_high_fd_spawn(const char *image, int high, bool fallback)
 {
-    char image[600], fdarg[32];
-    if (!test_abs_path("build/fixtures/rcc_child", image, sizeof image))
-        return check(0, false, "high inherited fd: resolve trusted fixture");
-    struct rlimit saved;
-    if (!tw_nofile_above(70000, &saved)) {
-        printf("mesh_terminal_worker: high inherited fd... UNOBSERVED "
-               "(descriptor hard limit is not above 70000)\n");
-        return 0;
-    }
-    int source = open("/dev/null", O_WRONLY);
-    int high = source >= 0 ? fcntl(source, F_DUPFD, 70000) : -1;
-    if (source >= 0) close(source);
-    if (high < 0) {
-        (void)setrlimit(RLIMIT_NOFILE, &saved);
-        return check(0, false, "high inherited fd: plant above 65536");
-    }
+    char fdarg[32];
     int used = snprintf(fdarg, sizeof fdarg, "%d", high);
-    if (used < 0 || (size_t)used >= sizeof fdarg) {
-        close(high);
-        (void)setrlimit(RLIMIT_NOFILE, &saved);
+    if (used < 0 || (size_t)used >= sizeof fdarg)
         return check(0, false, "high inherited fd: encode descriptor");
-    }
     const char *const run[] = {image, "fdwrite", fdarg, NULL};
     struct mesh_terminal_worker_config cfg;
     struct mesh_terminal_worker w;
@@ -1034,8 +1019,6 @@ static int live_high_inherited_fd_closed(bool fallback)
     struct zcl_result result = mesh_terminal_worker_spawn(
         &cfg, (int64_t)platform_time_wall_time_t(), &w);
     tw_force_fd_fallback = false;
-    close(high);
-    (void)setrlimit(RLIMIT_NOFILE, &saved);
     int failures = check(0, result.ok, "high inherited fd: real terminal spawn");
     if (result.ok)
         failures = check(failures, wait_exit(&w, 5) &&
@@ -1043,6 +1026,39 @@ static int live_high_inherited_fd_closed(bool fallback)
                          fallback ? "high inherited fd: forced proc fallback closes FD" :
                                     "high inherited fd: default closure closes FD");
     mesh_terminal_worker_kill(&w);
+    return failures;
+}
+
+/* The descriptor is planted above 65536 under a raised soft limit, and the
+ * caller's limit is restored before the spawn, so a closure bounded by
+ * RLIMIT_NOFILE would leave it open and fail the case. */
+static int live_high_inherited_fd_closed(bool fallback)
+{
+    char image[600];
+    if (!test_abs_path("build/fixtures/rcc_child", image, sizeof image))
+        return check(0, false, "high inherited fd: resolve trusted fixture");
+    struct rlimit saved;
+    switch (tw_nofile_above(70000, &saved)) {
+    case TW_NOFILE_HARD_CAP:
+        printf("mesh_terminal_worker: high inherited fd... UNOBSERVED "
+               "(descriptor hard limit %llu is not above 70000)\n",
+               (unsigned long long)saved.rlim_max);
+        return 0;
+    case TW_NOFILE_ERROR:
+        printf("mesh_terminal_worker: descriptor limit errno=%d\n", errno);
+        return check(0, false, "high inherited fd: raise descriptor limit");
+    case TW_NOFILE_RAISED:
+        break;
+    }
+    int source = open("/dev/null", O_WRONLY);
+    int high = source >= 0 ? fcntl(source, F_DUPFD, 70000) : -1;
+    if (source >= 0) close(source);
+    int failures = check(0, setrlimit(RLIMIT_NOFILE, &saved) == 0,
+                         "high inherited fd: descriptor limit restored");
+    if (high < 0)
+        return check(failures, false, "high inherited fd: plant above 65536");
+    failures += live_high_fd_spawn(image, high, fallback);
+    close(high);
     return failures;
 }
 
