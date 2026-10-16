@@ -290,12 +290,35 @@ static size_t tw_grant_rules(const struct mesh_terminal_worker_config *cfg,
     _exit(code);
 }
 
+/* Match exec's caught-handler reset before any descriptor sweep. Signals stay
+ * blocked until sandbox setup is complete; explicitly ignored signals retain
+ * their existing exec semantics. Reserved libc signal numbers may be EINVAL. */
+static bool tw_reset_caught_signals(void)
+{
+    struct sigaction reset = {.sa_handler = SIG_DFL};
+    if (sigemptyset(&reset.sa_mask) != 0) return false;
+    for (int number = 1; number < NSIG; ++number) {
+        if (number == SIGKILL || number == SIGSTOP) continue;
+        struct sigaction current;
+        if (sigaction(number, NULL, &current) != 0) {
+            if (errno == EINVAL) continue;
+            return false;
+        }
+        if (current.sa_handler != SIG_IGN && current.sa_handler != SIG_DFL &&
+            sigaction(number, &reset, NULL) != 0) return false;
+    }
+    return true;
+}
+
 /* The child half of spawn: never returns; stages failures by name. */
 static void tw_child(const struct mesh_terminal_worker_config *cfg,
-                     const char *slave_path, int master, int stage_fd)
+                     const char *slave_path, int master, int stage_fd,
+                     const sigset_t *original_mask)
 {
     /* Nothing here may return into the parent's execution state; every
      * path ends in _exit. */
+    if (!tw_reset_caught_signals())
+        tw_fail(stage_fd, TW_STAGE_CONFINEMENT, 126);
     close(master);
 
     if (setsid() < 0) goto tty_fail;
@@ -335,6 +358,8 @@ static void tw_child(const struct mesh_terminal_worker_config *cfg,
     char *const envp[] = { (char *)"TERM=xterm", home, pwd, NULL };
     char *const default_argv[] = { (char *)cfg->shell_path, NULL };
     char *const *exec_argv = cfg->argv ? (char *const *)cfg->argv : default_argv;
+    if (sigprocmask(SIG_SETMASK, original_mask, NULL) != 0)
+        tw_fail(stage_fd, TW_STAGE_CONFINEMENT, 126);
     execve(tw_binary(cfg), exec_argv, envp);
 
     tw_fail(stage_fd, TW_STAGE_EXEC, 127);
@@ -402,18 +427,41 @@ static struct zcl_result mesh_terminal_worker_spawn_platform_arm(
                        "stage pipe failed errno=%d", errno);
     }
 
-    pid_t pid = fork();
-    if (pid < 0) {
+    /* Only this calling thread's mask changes. Blocking before fork prevents
+     * an inherited caught handler from opening a descriptor around the sweep. */
+    sigset_t blocked, original_mask;
+    if (sigfillset(&blocked) != 0 ||
+        sigprocmask(SIG_SETMASK, &blocked, &original_mask) != 0) {
+        int saved = errno;
         close(master);
         close(stage_pipe[0]);
         close(stage_pipe[1]);
         return ZCL_ERR(MESH_TERMINAL_WORKER_ERR_SPAWN,
-                       "fork failed errno=%d", errno);
+                       "signal block failed errno=%d", saved);
     }
+    pid_t pid = fork();
+    int fork_error = errno;
     if (pid == 0) {
         close(stage_pipe[0]);
-        tw_child(cfg, slave_path, master, stage_pipe[1]);
+        tw_child(cfg, slave_path, master, stage_pipe[1], &original_mask);
         _exit(127); /* unreachable */
+    }
+    int restore_error = sigprocmask(SIG_SETMASK, &original_mask, NULL) == 0 ? 0 : errno;
+    if (pid < 0 || restore_error) {
+        /* A restore failure cannot discard ownership of a successfully forked
+         * child. Keep its PID unreaped until the existing settled-wait cleanup. */
+        if (pid > 0) {
+            (void)kill(-pid, SIGKILL);
+            (void)kill(pid, SIGKILL);
+            int status = 0;
+            (void)tw_wait_settled(pid, &status);
+        }
+        close(master);
+        close(stage_pipe[0]);
+        close(stage_pipe[1]);
+        return ZCL_ERR(MESH_TERMINAL_WORKER_ERR_SPAWN,
+                       "fork/signal restore failed errno=%d restore_errno=%d",
+                       pid < 0 ? fork_error : 0, restore_error);
     }
 
     /* Parent: read the staging pipe to EOF — zero bytes means the child

@@ -187,11 +187,25 @@ static bool pidns_map_identity(uid_t uid, gid_t gid)
     _exit(WEXITSTATUS(status));
 }
 
+/* The terminal worker forks with every signal blocked (so no inherited handler
+ * can open a descriptor around the fd sweep) and only the shell restores the
+ * caller mask, right before exec. The two wrapper processes keep the handling
+ * they need instead: with the mask left blocked the supervisor could not
+ * terminate the tracked process with SIGTERM, and the init could not take its
+ * parent-death signal. Both start from an empty mask. */
+static bool pidns_unblock_signals(void)
+{
+    sigset_t none;
+    return sigemptyset(&none) == 0 && sigprocmask(SIG_SETMASK, &none, NULL) == 0;
+}
+
 /* The supervisor-visible process: it only waits for the namespace init and
  * mirrors how the shell ended (the init reports the shell's raw status over
  * `status_fd`; if the init itself was killed, that death is mirrored). */
 [[noreturn]] static void pidns_outer(pid_t init, int status_fd)
 {
+    if (!pidns_unblock_signals())
+        _exit(127);
     int status = 0, shell_status = 0;
     /* Terminal-generated signals reach this process as the session leader and
      * as a member of the foreground group; they are the shell's to handle (a
@@ -269,6 +283,8 @@ int os_sandbox_pidns_enter(int close_fd)
         pidns_outer(init, sp[0]);
     }
     close(lp[1]);
+    if (!pidns_unblock_signals())
+        _exit(1);
     if (!pidns_arm_parent_death(lp[0]))
         _exit(1);
     close(lp[0]);
