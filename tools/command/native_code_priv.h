@@ -132,6 +132,24 @@ int code_commands_for_file(struct codeindex *ci, const char *def_path,
 int code_commands_for_symbol(const char *symbol_name,
                              const char **out, int cap);
 
+/* ── code.packet composition seams ────────────────────────────────────────
+ * Narrow wrappers so code.packet composes the existing readers instead of
+ * re-deriving them. Each is defined in exactly one sibling file. */
+
+/* (native_code_capsule.c) The exact generation roots of this open index
+ * handle as lowercase hex. False when the handle cannot name them. */
+bool code_generation_hex(struct codeindex *ci, char source_hex[65],
+                         char dep_hex[65]);
+
+/* (native_code_structure.c) Byte extent [*start, *end] of the definition that
+ * begins on 1-based `def_line` of `text`; *end is the closing `}` offset. */
+bool code_source_extent(const char *text, size_t len, int def_line,
+                        size_t *start, size_t *end);
+
+/* (native_devagent_receive.c) HEAD commit of the checkout at `ws`, read from
+ * .git files alone (gitfile, commondir, loose ref, packed-refs). */
+bool zcl_native_workspace_head(const char *ws, char *out, size_t cap);
+
 /* ── territory router port (defined in native_code_structure.c) ──────────── */
 
 /* The territory_proof_source `at` callback: the SAME test-group catalog

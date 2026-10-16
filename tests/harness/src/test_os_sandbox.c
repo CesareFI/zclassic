@@ -71,6 +71,11 @@ int test_exec_tier_pure_cases(void);
 #endif
 
 #if defined(__APPLE__)
+#include <signal.h>
+#include <spawn.h>
+#include <time.h>
+
+extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
 
 #define SB_CHECK(name, expr) do { \
     printf("os_sandbox: %s... ", (name)); \
@@ -164,6 +169,37 @@ static int c_macos_seatbelt_scope(void)
     return 0;
 }
 
+static int macos_descriptor_grant_refusal(bool leaf)
+{
+    int granted = open(g_macos_denied, O_RDONLY);
+    if (granted < 0) return 90;
+    struct os_sandbox_path_rule rules[6];
+    size_t count = macos_rules(rules);
+    /* The path is deliberately a different object: using it as fallback
+     * would silently replace descriptor authority with pathname authority. */
+    rules[0].has_fd = true;
+    rules[0].fd = granted;
+    struct zcl_result result = leaf ?
+        os_sandbox_package_leaf_restrict(rules, count) :
+        os_sandbox_package_restrict(rules, count);
+    if (close(granted) != 0) return 91;
+    if (result.ok || result.code != OS_SANDBOX_ERR_CONFINEMENT_UNAVAILABLE)
+        return 92;
+    int outside = open(g_macos_denied, O_RDONLY);
+    if (outside < 0) return 93;
+    return close(outside) == 0 ? 0 : 94;
+}
+
+static int c_macos_package_descriptor_refusal(void)
+{
+    return macos_descriptor_grant_refusal(false);
+}
+
+static int c_macos_leaf_descriptor_refusal(void)
+{
+    return macos_descriptor_grant_refusal(true);
+}
+
 static int c_macos_seatbelt_exec(void)
 {
     struct os_sandbox_path_rule rules[6];
@@ -172,6 +208,268 @@ static int c_macos_seatbelt_exec(void)
     if (!result.ok) return 70;
     execl("/usr/bin/true", "true", (char *)NULL);
     return 71;
+}
+
+static int macos_reap_created(pid_t child, bool leaf)
+{
+    /* Reap unexpected leaf children too; creation always fails that case. */
+    int status = 0;
+    pid_t waited;
+    do { waited = waitpid(child, &status, 0); }
+    while (waited < 0 && errno == EINTR);
+    if (waited != child) return 82;
+    if (leaf) return 83;
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 84;
+}
+
+/* Each wrapper runs in sb_run_child: the test parent retains its authority. */
+static int macos_process_creation(bool leaf, bool spawn)
+{
+    struct os_sandbox_path_rule rules[6];
+    size_t count = macos_rules(rules);
+    struct zcl_result result = leaf ?
+        os_sandbox_package_leaf_restrict(rules, count) :
+        os_sandbox_package_restrict(rules, count);
+    if (!result.ok) return 80;
+    pid_t child = -1;
+    int error;
+    if (spawn) {
+        char *const argv[] = {"true", NULL};
+        char *const env[] = {NULL};
+        error = posix_spawn(&child, "/usr/bin/true", NULL, NULL, argv, env);
+    } else {
+        child = fork();
+        if (child == 0) _exit(0);
+        error = child < 0 ? errno : 0;
+    }
+    if (error != 0)
+        return leaf && (error == EPERM || error == EACCES) ? 0 : 81;
+    return macos_reap_created(child, leaf);
+}
+
+static int c_macos_package_fork(void)
+{
+    return macos_process_creation(false, false);
+}
+
+static int c_macos_package_spawn(void)
+{
+    return macos_process_creation(false, true);
+}
+
+static int c_macos_leaf_fork(void)
+{
+    return macos_process_creation(true, false);
+}
+
+static int c_macos_leaf_spawn(void)
+{
+    return macos_process_creation(true, true);
+}
+
+/* SETEXEC replaces this confined child; it grants no new-process authority. */
+static int macos_leaf_setexec_flags(const char *image, char *const argv[], short flags)
+{
+    struct os_sandbox_path_rule rules[6];
+    size_t count = macos_rules(rules);
+    rules[count++] = (struct os_sandbox_path_rule){
+        .path = image, .allow_read = true, .allow_execute = true };
+    if (!os_sandbox_package_leaf_restrict(rules, count).ok) return 85;
+    posix_spawnattr_t attributes;
+    if (posix_spawnattr_init(&attributes) != 0) return 86;
+    if (posix_spawnattr_setflags(&attributes, flags) != 0) {
+        (void)posix_spawnattr_destroy(&attributes);
+        return 87;
+    }
+    char *const env[] = {NULL};
+    pid_t unexpected = -1;
+    (void)posix_spawn(&unexpected, image, NULL, &attributes, argv, env);
+    /* Successful replacement never returns. Even a returned success status
+     * fails this claim; reap any new process before the fixture exits. */
+    (void)posix_spawnattr_destroy(&attributes);
+    if (unexpected > 0 && unexpected != getpid())
+        (void)macos_reap_created(unexpected, true);
+    return 88;
+}
+
+static int macos_leaf_setexec(const char *image, char *const argv[])
+{
+    return macos_leaf_setexec_flags(image, argv, POSIX_SPAWN_SETEXEC);
+}
+
+static int c_macos_leaf_setexec(void)
+{
+    char *const argv[] = {"true", NULL};
+    return macos_leaf_setexec("/usr/bin/true", argv);
+}
+
+static int macos_leaf_fixture(const char *operation, const char *argument)
+{
+    char image[4096];
+    if (!realpath("build/fixtures/rcc_child", image)) return 89;
+    char *const argv[] = {image, (char *)operation, (char *)argument, NULL};
+    return macos_leaf_setexec(image, argv);
+}
+
+static int c_macos_leaf_replaced_open_allowed(void)
+{
+    /* The existing scope case creates this file before replacement checks. */
+    char path[320];
+    int length = snprintf(path, sizeof(path), "%s/output", g_macos_allowed);
+    if (length <= 0 || (size_t)length >= sizeof(path)) return 89;
+    return macos_leaf_fixture("open", path);
+}
+
+static int c_macos_leaf_replaced_open_denied(void)
+{
+    return macos_leaf_fixture("open", g_macos_denied);
+}
+
+static int c_macos_leaf_replaced_fork(void)
+{
+    return macos_leaf_fixture("fork", "");
+}
+
+static int macos_leaf_replaced_policy_cases(void)
+{
+    int failures = 0;
+    SB_CHECK("replaced leaf opens granted file read-only",
+             sb_run_child(c_macos_leaf_replaced_open_allowed) == 0);
+    int denied_open = sb_run_child(c_macos_leaf_replaced_open_denied);
+    SB_CHECK("replaced leaf retains file denial",
+             denied_open == EPERM || denied_open == EACCES);
+    int denied_fork = sb_run_child(c_macos_leaf_replaced_fork);
+    SB_CHECK("replaced leaf retains process-fork denial",
+             denied_fork == EPERM || denied_fork == EACCES);
+    return failures;
+}
+
+static int64_t macos_test_monotonic_ms(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+/* No blocking wait: both elapsed time and attempt count bound observation. */
+static bool macos_wait_event(pid_t child, int options, int *status)
+{
+    int64_t start = macos_test_monotonic_ms();
+    if (start < 0) return false;
+    for (unsigned attempt = 0; attempt < 1000; attempt++) {
+        pid_t waited = waitpid(child, status, options | WNOHANG);
+        if (waited == child) return true;
+        if (waited < 0 && errno != EINTR) return false;
+        int64_t now = macos_test_monotonic_ms();
+        if (now < start || now - start >= 5000) break;
+        struct timespec pause = {.tv_nsec = 5000000};
+        (void)nanosleep(&pause, NULL); /* real-clock: bounded wait for kernel child stop/exit; requires wall-clock progress */
+    }
+    errno = ETIMEDOUT;
+    return false;
+}
+
+static bool macos_cleanup_failure(pid_t child, const char *operation)
+{
+    int error = errno;
+    fprintf(stderr, "os_sandbox: child cleanup failed pid=%ld operation=%s errno=%d\n",
+            (long)child, operation, error);
+    errno = error;
+    return false;
+}
+
+static bool macos_kill_reap_test_child(pid_t *child)
+{
+    if (*child <= 0) return true;
+    if (kill(*child, SIGKILL) != 0 && errno != ESRCH)
+        return macos_cleanup_failure(*child, "kill");
+    int status = 0;
+    bool reaped = macos_wait_event(*child, 0, &status);
+    if (!reaped && errno != ECHILD)
+        return macos_cleanup_failure(*child, "bounded reap");
+    *child = -1;
+    return true;
+}
+
+static bool macos_nonzero_cdhash(pid_t child, unsigned char hash[20])
+{
+    enum { TEST_CS_OPS_CDHASH = 5 };
+    if (csops(child, TEST_CS_OPS_CDHASH, hash, 20) != 0) return false;
+    unsigned char any = 0;
+    for (size_t i = 0; i < 20; i++) any |= hash[i];
+    return any != 0;
+}
+
+/* The reference is a mapped control, not descriptor-derived image evidence. */
+static bool macos_control_cdhash(const char *image, unsigned char expected[20])
+{
+    posix_spawnattr_t attributes;
+    if (posix_spawnattr_init(&attributes) != 0) return false;
+    int error = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_START_SUSPENDED);
+    char *const argv[] = {(char *)image, "exit", "37", NULL};
+    char *const env[] = {NULL};
+    pid_t child = -1;
+    if (error == 0)
+        error = posix_spawn(&child, image, NULL, &attributes, argv, env);
+    (void)posix_spawnattr_destroy(&attributes);
+    int status = 0;
+    bool stopped = error == 0 && macos_wait_event(child, WUNTRACED, &status);
+    if (stopped && !WIFSTOPPED(status)) child = -1;
+    bool matched = stopped && WIFSTOPPED(status) && macos_nonzero_cdhash(child, expected);
+    bool cleaned = macos_kill_reap_test_child(&child);
+    return matched && cleaned;
+}
+
+static bool macos_marker_byte(const char *marker)
+{
+    int fd = open(marker, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) return false;
+    struct stat st;
+    char bytes[2] = {0};
+    bool exact = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size == 1 &&
+                 read(fd, bytes, sizeof(bytes)) == 1 && bytes[0] == 'x';
+    bool closed = close(fd) == 0;
+    return exact && closed;
+}
+
+static bool macos_observe_leaf_replacement(pid_t *child, const char *marker,
+                                           const unsigned char expected[20])
+{
+    int status = 0;
+    if (!macos_wait_event(*child, WUNTRACED, &status)) return false;
+    if (!WIFSTOPPED(status)) { *child = -1; return false; }
+    unsigned char mapped[20] = {0};
+    if (!macos_nonzero_cdhash(*child, mapped) || memcmp(mapped, expected, 20) != 0)
+        return false;
+    struct stat st;
+    if (lstat(marker, &st) == 0 || errno != ENOENT) return false;
+    if (kill(*child, SIGCONT) != 0) return false;
+    if (!macos_wait_event(*child, 0, &status)) return false;
+    *child = -1;
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0 && macos_marker_byte(marker);
+}
+
+static int macos_leaf_suspended_replacement(void)
+{
+    char image[4096], marker[320];
+    if (!realpath("build/fixtures/rcc_child", image)) return 1;
+    int length = snprintf(marker, sizeof(marker), "%s/suspended-marker", g_macos_allowed);
+    if (length <= 0 || (size_t)length >= sizeof(marker)) return 1;
+    struct stat st;
+    if (lstat(marker, &st) == 0 || errno != ENOENT) return 1;
+    unsigned char expected[20] = {0};
+    if (!macos_control_cdhash(image, expected)) return 1;
+    pid_t child = fork();
+    if (child < 0) return 1;
+    if (child == 0) {
+        char *const argv[] = {image, "write", marker, NULL};
+        _exit(macos_leaf_setexec_flags(image, argv,
+            POSIX_SPAWN_SETEXEC | POSIX_SPAWN_START_SUSPENDED));
+    }
+    bool observed = macos_observe_leaf_replacement(&child, marker, expected);
+    bool cleaned = macos_kill_reap_test_child(&child);
+    (void)unlink(marker);
+    return observed && cleaned ? 0 : 1;
 }
 
 static int c_macos_rlimit_fsize(void)
@@ -232,8 +530,25 @@ int test_os_sandbox(void)
                     "seatbelt") == 0);
     SB_CHECK("Seatbelt scopes files and denies network",
              sb_run_child(c_macos_seatbelt_scope) == 0);
+    SB_CHECK("package Seatbelt refuses descriptor grants before sandbox entry",
+             sb_run_child(c_macos_package_descriptor_refusal) == 0);
+    SB_CHECK("leaf Seatbelt refuses descriptor grants before sandbox entry",
+             sb_run_child(c_macos_leaf_descriptor_refusal) == 0);
     SB_CHECK("Seatbelt permits explicitly granted execution",
              sb_run_child(c_macos_seatbelt_exec) == 0);
+    SB_CHECK("package Seatbelt permits fork",
+             sb_run_child(c_macos_package_fork) == 0);
+    SB_CHECK("package Seatbelt permits posix_spawn of granted executable",
+             sb_run_child(c_macos_package_spawn) == 0);
+    SB_CHECK("leaf Seatbelt refuses fork with policy error",
+             sb_run_child(c_macos_leaf_fork) == 0);
+    SB_CHECK("leaf Seatbelt refuses posix_spawn with policy error",
+             sb_run_child(c_macos_leaf_spawn) == 0);
+    SB_CHECK("leaf Seatbelt permits same-process POSIX_SPAWN_SETEXEC replacement",
+             sb_run_child(c_macos_leaf_setexec) == 0);
+    failures += macos_leaf_replaced_policy_cases();
+    SB_CHECK("leaf replacement stops before target write, matches control CDHash, then resumes",
+             macos_leaf_suspended_replacement() == 0);
     SB_CHECK("POSIX resource limits are enforced",
              sb_run_child(c_macos_rlimit_fsize) == 0);
 

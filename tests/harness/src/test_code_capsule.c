@@ -23,6 +23,7 @@
  *                             identity/def/route are never dropped. */
 
 #include "test/test_core.h"
+#include "base/hex.h"
 #include "codeindex/codeindex.h"
 #include "config/command_catalog.h"
 #include "config/command_handler_index.h"
@@ -675,6 +676,77 @@ static int test_code_body_long_function_truncates(void)
     return failures;
 }
 
+static bool cap_generation_reply(const char *name, bool found,
+                                  char source_hex[65], char dep_hex[65])
+{
+    uint8_t source[32], dep[32];
+    struct codeindex *ci = codeindex_open(CAP_BUDGET_FIX);
+    if (!ci)
+        return false;
+    bool ok = codeindex_source_root_sha3(ci, source) &&
+              codeindex_dep_root_sha3(ci, dep);
+    codeindex_close(ci);
+    if (!ok)
+        return false;
+    zcl_hex_encode(source, sizeof source, source_hex);
+    zcl_hex_encode(dep, sizeof dep, dep_hex);
+    struct json_value input;
+    json_init(&input);
+    json_set_object(&input);
+    (void)json_push_kv_str(&input, "name", name);
+    struct zcl_command_context ctx = { .source_root = CAP_BUDGET_FIX };
+    struct zcl_command_request request = {
+        .input = &input, .context = &ctx, .view = "normal",
+        .invoked_name = "code.capsule",
+    };
+    struct zcl_command_reply reply;
+    zcl_command_reply_init(&reply, "zcl.code_capsule.v1");
+    zcl_native_handle_code_capsule(&request, &reply);
+    const char *got_source = json_get_str(json_get(&reply.data,
+                                                   "source_root_sha3"));
+    const char *got_dep = json_get_str(json_get(&reply.data, "dep_root_sha3"));
+    char serialized[ZCL_COMMAND_RESULT_BUDGET + 1];
+    size_t bytes = json_write(&reply.data, serialized, sizeof serialized);
+    ok = got_source && got_dep &&
+         strcmp(got_source, source_hex) == 0 && strcmp(got_dep, dep_hex) == 0 &&
+         json_get_bool(json_get(&reply.data, "found")) == found &&
+         bytes > 0 && bytes <= ZCL_COMMAND_RESULT_BUDGET;
+    zcl_command_reply_free(&reply);
+    json_free(&input);
+    return ok;
+}
+
+static int test_code_capsule_generation(void)
+{
+    int failures = 0;
+    TEST("code_capsule: exact index roots cover found, missing and mutated inputs") {
+        test_rm_rf_recursive(CAP_BUDGET_FIX);
+        ASSERT(write_cap_budget_fixture());
+        char source[65], dep[65], missing_source[65], missing_dep[65];
+        ASSERT(cap_generation_reply("cap_hot", true, source, dep));
+        ASSERT(cap_generation_reply("cap_missing_symbol", false,
+                                      missing_source, missing_dep));
+        ASSERT_STR_EQ(source, missing_source);
+        ASSERT_STR_EQ(dep, missing_dep);
+        ASSERT(cap_budget_mk_write(CAP_BUDGET_FIX,
+                   "core/modules/net/src/cap_hot.c",
+                   "void cap_hot(void) { int changed = 1; (void)changed; }\n"));
+        char changed_source[65], source_dep[65];
+        ASSERT(cap_generation_reply("cap_hot", true, changed_source, source_dep));
+        ASSERT(strcmp(source, changed_source) != 0);
+        ASSERT_STR_EQ(dep, source_dep);
+        ASSERT(cap_budget_mk_write(CAP_BUDGET_FIX, "build/obj/cap_hot.d",
+                   "build/obj/cap_hot.o: core/modules/net/src/cap_hot.c\n"));
+        char dep_source[65], changed_dep[65];
+        ASSERT(cap_generation_reply("cap_hot", true, dep_source, changed_dep));
+        ASSERT_STR_EQ(changed_source, dep_source);
+        ASSERT(strcmp(source_dep, changed_dep) != 0);
+        PASS();
+    } _test_next:;
+    test_rm_rf_recursive(CAP_BUDGET_FIX);
+    return failures;
+}
+
 int test_code_capsule(void)
 {
     int failures = 0;
@@ -687,6 +759,7 @@ int test_code_capsule(void)
     failures += test_code_change_plan_symbol();
     failures += test_code_change_plan_patch();
     failures += test_code_capsule_budget_shrink();
+    failures += test_code_capsule_generation();
     failures += test_code_relations_command_locus();
     failures += test_code_relations_refuses_false_absence();
     failures += test_code_relations_static_not_command_handler();

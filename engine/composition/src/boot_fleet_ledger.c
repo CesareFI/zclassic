@@ -37,8 +37,17 @@
 
 #define FLEET_LEDGER_PAIRINGS_MAX 64u
 
+struct ledger_peer_binding {
+    char pairing_id[MESH_PAIRING_ID_HEX + 1];
+    uint64_t revocation_generation;
+    uint8_t noise[32];
+    uint8_t master[32];
+    uint8_t signer[32];
+};
+
 /* The initiator's per-stream state: who we asked, and what came back. */
 struct fleet_pull_state {
+    struct ledger_peer_binding binding;
     uint8_t peer_box_id[32];
     uint8_t peer_signer[32];
     size_t len;
@@ -47,6 +56,7 @@ struct fleet_pull_state {
 
 /* The acceptor's per-stream state: one bounded answer, read once at open. */
 struct fleet_serve_state {
+    struct ledger_peer_binding binding;
     size_t len;
     size_t sent;
     uint8_t rows[FLEET_LEDGER_ANSWER_MAX];
@@ -56,6 +66,7 @@ struct fleet_serve_state {
  * lane only ever moves a pointer into here; every byte of verification and
  * every fsync happens in the tick, with no lock held. */
 struct fleet_inbox_slot {
+    struct ledger_peer_binding binding;
     bool used;
     uint8_t peer_box_id[32];
     uint8_t peer_signer[32];
@@ -86,7 +97,7 @@ static _Atomic uint64_t g_role_refused;
 /* See boot_fleet_ledger_test_bind_authority: the DHT composition root this
  * test group cannot host, and nothing else. */
 static bool g_test_authority;
-static struct vcs_zcode_dht_delegation g_test_delegation;
+static struct vcs_zcode_dht_delegation g_test_delegation[2];
 static uint8_t g_test_genesis[32];
 static int64_t g_test_now;
 #endif
@@ -147,11 +158,14 @@ static bool ledger_peer_delegation(const struct db_mesh_pairing *row,
 {
 #ifdef ZCL_TESTING
     if (g_test_authority) {
-        if (memcmp(row->peer_noise_pubkey,
-                   g_test_delegation.noise_static_pubkey, 32) != 0)
-            return false;
-        *out = g_test_delegation;
-        return true;
+        for (size_t i = 0; i < 2; i++) {
+            if (memcmp(row->peer_noise_pubkey,
+                       g_test_delegation[i].noise_static_pubkey, 32) == 0) {
+                *out = g_test_delegation[i];
+                return true;
+            }
+        }
+        return false;
     }
 #endif
     return boot_mesh_peer_delegation(row, out);
@@ -225,9 +239,26 @@ static bool ledger_pairing_for_peer(struct node_db *ndb,
     return found;
 }
 
+static bool ledger_capture_authorized(
+    struct node_db *ndb, const struct db_mesh_pairing *row,
+    const struct vcs_zcode_dht_delegation *peer,
+    const uint8_t peer_noise_static[32], int64_t now,
+    struct ledger_peer_binding *binding)
+{
+    if (!ledger_delegation_current(ndb, row, peer, peer_noise_static, now))
+        return false;
+    memcpy(binding->pairing_id, row->pairing_id, sizeof binding->pairing_id);
+    binding->revocation_generation = row->revocation_generation;
+    memcpy(binding->noise, peer_noise_static, 32);
+    memcpy(binding->master, peer->doc.master_pubkey, 32);
+    memcpy(binding->signer, peer->online_pubkey, 32);
+    return true;
+}
+
 /* Everything the accept side has to prove about a peer that is already
  * through the primitive's Noise and capability gates. */
-static bool ledger_accept_authorized(const uint8_t peer_noise_static[32])
+static bool ledger_accept_authorized(const uint8_t peer_noise_static[32],
+                                      struct ledger_peer_binding *binding)
 {
     struct node_db *ndb = app_runtime_node_db();
     if (!ndb || !app_runtime_node_db_handle_open(ndb))
@@ -242,7 +273,28 @@ static bool ledger_accept_authorized(const uint8_t peer_noise_static[32])
                  zcl_fleet_status_label(ZCL_FLEET_DELEGATION_EXPIRED));
         return false;
     }
-    return ledger_delegation_current(ndb, &row, &peer, peer_noise_static,
+    return ledger_capture_authorized(ndb, &row, &peer, peer_noise_static,
+                                      ledger_now(), binding);
+}
+
+static bool ledger_binding_current(const struct ledger_peer_binding *binding)
+{
+    struct node_db *ndb = app_runtime_node_db();
+    struct db_mesh_pairing row;
+    struct vcs_zcode_dht_delegation peer;
+    if (!ndb || !app_runtime_node_db_handle_open(ndb) ||
+        !db_mesh_pairing_find(ndb, binding->pairing_id, &row) ||
+        row.revocation_generation != binding->revocation_generation ||
+        memcmp(row.peer_noise_pubkey, binding->noise, 32) != 0 ||
+        memcmp(row.peer_master_pubkey, binding->master, 32) != 0 ||
+        !ledger_peer_delegation(&row, &peer) ||
+        memcmp(peer.doc.master_pubkey, binding->master, 32) != 0 ||
+        memcmp(peer.online_pubkey, binding->signer, 32) != 0) {
+        atomic_fetch_add_explicit(&g_delegation_refused, 1, memory_order_relaxed);
+        LOG_WARN("fleet.ledger", "effect refused: authorization binding changed");
+        return false;
+    }
+    return ledger_delegation_current(ndb, &row, &peer, binding->noise,
                                      ledger_now());
 }
 
@@ -272,7 +324,8 @@ static enum mesh_stream_refusal ledger_service_open(struct mesh_stream *st,
     /* Before ANY file is read: a peer whose delegation is no longer current
      * may not use this service, which is what REFUSED_PEER_UNPAIRED already
      * means. Nothing is read and nothing is answered. */
-    if (!ledger_accept_authorized(st->peer_static))
+    struct ledger_peer_binding binding;
+    if (!ledger_accept_authorized(st->peer_static, &binding))
         return MESH_STREAM_REFUSED_PEER_UNPAIRED;
 
     ledger_lock();
@@ -294,6 +347,7 @@ static enum mesh_stream_refusal ledger_service_open(struct mesh_stream *st,
         free(s);
         return MESH_STREAM_REFUSED_UNAVAILABLE;
     }
+    s->binding = binding;
     st->service_state = s;
     return MESH_STREAM_OK;
 }
@@ -341,6 +395,10 @@ static void ledger_service_tick(struct mesh_stream *st, int64_t now, void *ctx)
     }
     if (st->send_credit < remaining)
         return; /* wait for the window; never split a batch across frames */
+    if (!ledger_binding_current(&s->binding)) {
+        mesh_stream_close(st, MESH_STREAM_REFUSED_PEER_UNPAIRED, NULL, 0);
+        return;
+    }
     if (mesh_stream_send(st, s->rows + s->sent, remaining))
         s->sent += remaining;
 }
@@ -377,6 +435,7 @@ static void ledger_service_close(struct mesh_stream *st,
             slot = &g_inbox[i];
     if (slot) {
         slot->used = true;
+        slot->binding = p->binding;
         memcpy(slot->peer_box_id, p->peer_box_id, 32);
         memcpy(slot->peer_signer, p->peer_signer, 32);
         slot->len = p->len;
@@ -440,6 +499,10 @@ static void ledger_drain_inbox(struct zcl_fleet_ledger *ledger)
         zcl_mutex_unlock(&g_ledger_lock);
         if (!slot.used)
             continue;
+        if (!ledger_binding_current(&slot.binding)) {
+            free(slot.rows);
+            continue;
+        }
         size_t accepted = 0;
         enum zcl_fleet_status st =
             zcl_fleet_ledger_replicate(ledger, slot.peer_box_id,
@@ -481,20 +544,20 @@ static bool ledger_live_visitor(struct mesh_stream *st, void *ctx)
  * peer whose identity the caller has already verified. Both the lane and
  * the loopback test enter here, so a test drives the exact frame and the
  * exact per-stream state production does. */
-static bool ledger_open_pull(const uint8_t peer_noise[32],
-                             const uint8_t peer_box_id[32],
-                             const uint8_t peer_signer[32], uint64_t since_seq)
+static bool ledger_open_pull(const struct ledger_peer_binding *binding,
+                             uint64_t since_seq)
 {
     struct fleet_pull_state *p = zcl_calloc(1, sizeof *p, "fleet_ledger_pull");
     if (!p)
         return false;
-    memcpy(p->peer_box_id, peer_box_id, 32);
-    memcpy(p->peer_signer, peer_signer, 32);
+    p->binding = *binding;
+    memcpy(p->peer_box_id, binding->master, 32);
+    memcpy(p->peer_signer, binding->signer, 32);
     uint8_t frame[FLEET_LEDGER_PULL_BYTES];
     size_t frame_len = pull_encode(since_seq, frame);
     uint64_t stream_id = 0;
     enum mesh_stream_refusal refusal =
-        mesh_stream_open(FLEET_LEDGER_SERVICE_NAME, peer_noise, 0, frame,
+        mesh_stream_open(FLEET_LEDGER_SERVICE_NAME, binding->noise, 0, frame,
                          frame_len, p, &stream_id);
     if (refusal != MESH_STREAM_OK) {
         /* A peer that is simply not connected is the ordinary case on a
@@ -537,8 +600,10 @@ static void ledger_pull_paired_peers(struct zcl_fleet_ledger *ledger,
          * window says nothing about a master identity revoked or
          * superseded on chain, so a stale peer is neither asked nor
          * answered — the same question the accept side asks. */
-        if (!ledger_delegation_current(ndb, &rows[i], &peer,
-                                       rows[i].peer_noise_pubkey, now))
+        struct ledger_peer_binding binding;
+        if (!ledger_capture_authorized(ndb, &rows[i], &peer,
+                                        rows[i].peer_noise_pubkey, now,
+                                        &binding))
             continue;
         struct fleet_live_probe probe;
         memset(&probe, 0, sizeof probe);
@@ -548,10 +613,8 @@ static void ledger_pull_paired_peers(struct zcl_fleet_ledger *ledger,
         if (probe.found)
             continue;
 
-        (void)ledger_open_pull(
-            rows[i].peer_noise_pubkey, peer.doc.master_pubkey,
-            peer.online_pubkey,
-            zcl_fleet_ledger_peer_seq(ledger, peer.doc.master_pubkey));
+        (void)ledger_open_pull(&binding,
+            zcl_fleet_ledger_peer_seq(ledger, binding.master));
     }
     free(rows);
 }
@@ -862,7 +925,24 @@ bool boot_fleet_ledger_test_pull(const uint8_t peer_noise[32],
                                  const uint8_t peer_signer[32],
                                  uint64_t since_seq)
 {
-    return ledger_open_pull(peer_noise, peer_box_id, peer_signer, since_seq);
+    struct node_db *ndb = app_runtime_node_db();
+    struct db_mesh_pairing row;
+    struct vcs_zcode_dht_delegation peer;
+    struct ledger_peer_binding binding;
+    uint8_t genesis[32];
+    char pairing_id[MESH_PAIRING_ID_HEX + 1];
+    if (!ndb || !ledger_network_genesis(genesis) ||
+        !mesh_pairing_id_derive(genesis, peer_box_id, peer_noise, pairing_id) ||
+        !db_mesh_pairing_find(ndb, pairing_id, &row) ||
+        !ledger_peer_delegation(&row, &peer) ||
+        memcmp(peer.online_pubkey, peer_signer, 32) != 0 ||
+        !ledger_capture_authorized(ndb, &row, &peer, peer_noise, ledger_now(),
+                                    &binding)) {
+        LOG_WARN("fleet.ledger", "test pull refused: peer not authorized");
+        return false;
+    }
+    return ledger_open_pull(&binding, since_seq);
+
 }
 
 void boot_fleet_ledger_test_bind_authority(
@@ -871,7 +951,13 @@ void boot_fleet_ledger_test_bind_authority(
 {
     ledger_lock();
     if (peer_delegation && network_genesis && now > 0) {
-        g_test_delegation = *peer_delegation;
+        size_t at = 0;
+        if (g_test_authority &&
+            memcmp(g_test_delegation[0].noise_static_pubkey,
+                   peer_delegation->noise_static_pubkey, 32) != 0)
+            at = 1;
+        g_test_delegation[at] = *peer_delegation;
+
         memcpy(g_test_genesis, network_genesis, 32);
         g_test_now = now;
         g_test_authority = true;

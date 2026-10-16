@@ -35,6 +35,8 @@
  *  14. page_cache_pragmas    — open applies PRAGMA cache_size=-BIP_PAGE_CACHE_KIB;
  *                                ZCL_BIP_PAGE_CACHE_KIB=4096 → -4096;
  *                                out-of-range override is ignored
+ *  15. replay_resume_after_kill — SIGKILL-style exit mid-replay; reopen resumes
+ *                                from the last commit, no loss, no duplicate
  *
  * Scratch files live under ./test-tmp/bip_<pid>_<tag>/ in line with the
  * project's no-/tmp convention. */
@@ -44,6 +46,7 @@
 #include "platform/time_compat.h"
 #include "platform/os_proc.h"
 #include "util/storage_pacing.h"
+#include "util/boot_scan.h"
 #include "storage/block_index_projection.h"
 #include "storage/event_log.h"
 #include "storage/event_log_payloads.h"
@@ -62,6 +65,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 #define BIP_CHECK(name, expr) do { \
     printf("block_index_projection: %s... ", (name)); \
@@ -968,6 +972,7 @@ static int run_catch_up_wal_budget(int *failures)
     block_index_projection_t *p = block_index_projection_open(db_path, log);
     if (!p) { event_log_close(log); *failures += 1; goto done; }
     p->wal_budget_bytes = BIP_TEST_WAL_BUDGET_BYTES;
+    p->commit_events = BIP_BATCH_EVENTS;   /* pin the 1000-row WAL slack */
 
     uint64_t off = block_index_projection_catch_up(p);
     BIP_CHECK("wal_budget: catch_up succeeds", off != (uint64_t)-1);
@@ -1028,6 +1033,7 @@ static int run_catch_up_wal_reader(int *failures)
     block_index_projection_t *p = block_index_projection_open(db_path, log);
     if (!p) { event_log_close(log); *failures += 1; goto done; }
     p->wal_budget_bytes = BIP_TEST_WAL_BUDGET_BYTES;
+    p->commit_events = BIP_BATCH_EVENTS;   /* pin the 1000-row WAL slack */
 
     struct wal_reader_arg arg;
     memset(&arg, 0, sizeof(arg));
@@ -1264,6 +1270,121 @@ static int run_cache_file(int *failures)
     return *failures - start;
 }
 
+
+/* 15. A killed replay resumes from its last commit: rows and offset commit
+ * together, nothing is replayed twice, nothing is lost, progress is logged. */
+static void bip_kill_hook(uint64_t n) { if (n == 450) _exit(137); }
+
+static void bip_kill_child(const char *el, const char *db)
+{   /* small batches, then die before applying event 450 */
+    event_log_t *cl = event_log_open(el);
+    block_index_projection_t *c = cl ? block_index_projection_open(db, cl) : NULL;
+    if (c) { c->commit_events = 100; c->event_hook = bip_kill_hook;
+             (void)block_index_projection_catch_up(c); }
+    _exit(0);
+}
+
+static void bip_check_byte_cadence(event_log_t *log, const char *db, int n, int *failures)
+{   /* huge event cap, quarter-log byte cap */
+    block_index_projection_t *p = block_index_projection_open(db, log);
+    if (!p) { *failures += 1; return; }
+    p->commit_events = 1u << 30; p->commit_bytes = event_log_size(log) / 4;
+    (void)block_index_projection_catch_up(p);
+    BIP_CHECK("kill: log-byte cadence commits mid-replay",
+              p->batches_committed >= 4 && block_index_projection_count(p) == (uint64_t)n);
+    block_index_projection_close(p);
+}
+
+static int run_replay_resume_after_kill(int *failures)
+{
+    int start_failures = *failures;
+    char dir[256]; test_make_tmpdir(dir, sizeof(dir), "bip", "kill");
+    char el[320], db[320], db2[320];
+    snprintf(el, sizeof(el), "%s/log.bin", dir); snprintf(db, sizeof(db), "%s/p.db", dir);
+    snprintf(db2, sizeof(db2), "%s/p2.db", dir);
+    const int n = 1000;
+    event_log_t *log = event_log_open(el);
+    bool ok = log && emit_n_headers(log, 0xB000u, n);
+    if (log) event_log_close(log);
+    pid_t pid = ok ? fork() : -1;
+    if (pid == 0) bip_kill_child(el, db);
+    int st = 0;
+    BIP_CHECK("kill: child died mid-replay", pid > 0 && waitpid(pid, &st, 0) == pid &&
+              WIFEXITED(st) && WEXITSTATUS(st) == 137);
+    log = event_log_open(el);
+    block_index_projection_t *p = log ? block_index_projection_open(db, log) : NULL;
+    if (!p) { *failures += 1; goto done; }
+    BIP_CHECK("kill: only whole committed batches survive (400 rows, offset 400 events)",
+              block_index_projection_count(p) == 400 && p->events_consumed_total == 400 &&
+              p->last_consumed_offset > 0 && p->last_consumed_offset < event_log_size(log));
+    p->progress_ms = 0; p->progress_pct = 0;
+    uint64_t seen0 = boot_scan_value("block_index_projection.catch_up_events");
+    BIP_CHECK("kill: resume succeeds", block_index_projection_catch_up(p) != (uint64_t)-1);
+    BIP_CHECK("kill: no missing rows after resume", block_index_projection_count(p) == (uint64_t)n);
+    BIP_CHECK("kill: no duplicate replay (only the 600 uncommitted events re-applied)",
+              p->events_consumed_total == (uint64_t)n &&
+              boot_scan_value("block_index_projection.catch_up_events") - seen0 == 600);
+    BIP_CHECK("kill: progress line emitted", p->progress_lines >= 1);
+    block_index_projection_close(p);
+    bip_check_byte_cadence(log, db2, n, failures);
+done:
+    if (log) event_log_close(log);
+    bip_cleanup_dir(dir);
+    return *failures - start_failures;
+}
+
+/* 16. The replay WAL bound: the huge event/byte cadence leaves WAL size as
+ * the only commit trigger. Sampled before every event (the hook) and after
+ * every commit (max_wal_bytes_seen), the -wal never passes the replay budget
+ * plus one 256-event poll interval of frames. */
+#define BIP_TEST_REPLAY_WAL_BUDGET (1024u * 1024u)
+#define BIP_TEST_REPLAY_WAL_SLACK  (4u * 1024u * 1024u)
+static char g_bip_replay_wal[336];
+static uint64_t g_bip_replay_wal_peak;
+
+static void bip_replay_wal_hook(uint64_t n)
+{
+    (void)n;
+    uint64_t sz = (uint64_t)bip_file_size(g_bip_replay_wal);
+    if (sz > g_bip_replay_wal_peak) g_bip_replay_wal_peak = sz;
+}
+
+static int run_replay_wal_bound(int *failures)
+{
+    int start_failures = *failures;
+    char dir[256]; test_make_tmpdir(dir, sizeof(dir), "bip", "replay_wal");
+    char el[320], db[320];
+    snprintf(el, sizeof(el), "%s/log.bin", dir); snprintf(db, sizeof(db), "%s/p.db", dir);
+    snprintf(g_bip_replay_wal, sizeof(g_bip_replay_wal), "%s-wal", db);
+    g_bip_replay_wal_peak = 0;
+    const int n = 20000;
+    event_log_t *log = event_log_open(el);
+    block_index_projection_t *p = NULL;
+    if (!log || !emit_n_headers(log, 0xC000u, n)) { *failures += 1; goto done; }
+    p = block_index_projection_open(db, log);
+    if (!p) { *failures += 1; goto done; }
+    p->replay_wal_budget_bytes = BIP_TEST_REPLAY_WAL_BUDGET;
+    p->commit_events = 1u << 30; p->commit_bytes = UINT64_MAX;
+    p->commit_ms = INT64_MAX / 2;
+    p->event_hook = bip_replay_wal_hook;
+    BIP_CHECK("replay_wal: catch_up succeeds",
+              block_index_projection_catch_up(p) != (uint64_t)-1 &&
+              block_index_projection_count(p) == (uint64_t)n);
+    BIP_CHECK("replay_wal: WAL size alone forced mid-replay commits",
+              p->batches_committed >= 3);
+    BIP_CHECK("replay_wal: WAL (sampled per event) stayed within budget + slack",
+              g_bip_replay_wal_peak <=
+                  BIP_TEST_REPLAY_WAL_BUDGET + BIP_TEST_REPLAY_WAL_SLACK);
+    BIP_CHECK("replay_wal: WAL (sampled per commit) stayed within budget + slack",
+              p->max_wal_bytes_seen <=
+                  BIP_TEST_REPLAY_WAL_BUDGET + BIP_TEST_REPLAY_WAL_SLACK);
+done:
+    if (p) block_index_projection_close(p);
+    if (log) event_log_close(log);
+    bip_cleanup_dir(dir);
+    return *failures - start_failures;
+}
+
 /* One case table is the coverage authority for the eight forked groups.
  * Every case owns a PID-specific database directory; the process-local memory,
  * storage and environment overrides cannot cross shard children. */
@@ -1292,6 +1413,8 @@ static const struct bip_case g_bip_cases[] = {
     {"bound_dirty_delta", run_bound_dirty_delta, 6},
     {"catch_up_wal_budget", run_catch_up_wal_budget, 7},
     {"catch_up_wal_reader", run_catch_up_wal_reader, 0},
+    {"replay_resume_after_kill", run_replay_resume_after_kill, 1},
+    {"replay_wal_bound", run_replay_wal_bound, 2},
 };
 
 #define BIP_CASE_COUNT (sizeof(g_bip_cases) / sizeof(g_bip_cases[0]))
@@ -1403,8 +1526,8 @@ int test_block_index_projection(void)
     }
     size_t owned = 0;
     for (unsigned i = 0; i < BIP_SHARD_COUNT; i++) owned += counts[i];
-    BIP_CHECK("partition: all 17 cases have one owner",
-              BIP_CASE_COUNT == 17u && owned == BIP_CASE_COUNT && unique);
+    BIP_CHECK("partition: all 19 cases have one owner",
+              BIP_CASE_COUNT == 19u && owned == BIP_CASE_COUNT && unique);
     bool nonempty = true;
     for (unsigned i = 0; i < BIP_SHARD_COUNT; i++) nonempty &= counts[i] > 0;
     BIP_CHECK("partition: every shard carries work", nonempty);

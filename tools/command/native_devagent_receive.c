@@ -927,6 +927,16 @@ static bool rcv_head_of(const char *gitdir, char *out, size_t cap)
     return rcv_ref_head(gitdir, common, line + 5, out, cap);
 }
 
+/* HEAD of the checkout at `ws`, read from files alone (see above). The one
+ * reader code.packet shares so a packet's BASE and a workspace record's head
+ * can never be derived two ways. */
+bool zcl_native_workspace_head(const char *ws, char *out, size_t cap)
+{
+    char gitdir[RCV_PATH_MAX + 8];
+    return rcv_git_dir(ws, gitdir, sizeof(gitdir)) &&
+           rcv_head_of(gitdir, out, cap);
+}
+
 /* ── the DIRC index: the tree id and the tracked-path pre-state ────────── */
 
 /* One index entry's fields, already bounds-checked. The index is

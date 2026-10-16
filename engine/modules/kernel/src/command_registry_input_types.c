@@ -55,7 +55,7 @@ static bool cr_str_array(const struct json_value *value, size_t max_items,
 static bool cr_match_files(const char *key, const struct json_value *value,
                            bool *type_ok)
 {
-    if (strcmp(key, "files") != 0)
+    if (strcmp(key, "files") != 0 && strcmp(key, "symbols") != 0)
         return false;
     *type_ok = cr_str_array(value, ZCL_COMMAND_INPUT_FILES_MAX_ITEMS,
                             ZCL_COMMAND_INPUT_FILES_PATH_MAX);

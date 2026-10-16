@@ -22,7 +22,8 @@ enum device_host_runtime_entry_exit {
  * ordinary EOF/FIN drain after establishment; preauth/receiver HUP cancels.
  * Caller maintains independent stderr,
  * trusted ancestors/profile binding and exclusive stdio/signal ownership.
- * Linux only; other platforms refuse before private profile/socket effects. */
+ * Client runs on Linux/macOS; receiver remains Linux-only. Unsupported roles
+ * and platforms refuse before private profile/socket effects. */
 struct zcl_result device_host_runtime_entry_parse(struct json_value *out, const char *text,
     size_t length, bool receiver);
 struct zcl_result device_host_runtime_entry_run(

@@ -24,6 +24,10 @@ static inline int platform_pipe_cloexec_nonblock(int pipefd[2])
 #else
 #include <fcntl.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <time.h>
 
 static inline int platform_pipe_cloexec_nonblock(int pipefd[2])
 {
@@ -52,6 +56,78 @@ static inline int platform_pipe_cloexec_nonblock(int pipefd[2])
     return -1;
 #endif
 }
+static inline ssize_t platform_pipe_write_error(int error)
+{
+    errno = error;
+    return -1;
+}
+
+/* Caller exclusively owns the descriptor and its flag changes for this call;
+ * concurrent close, duplication, or writes through aliases are unsupported.
+ * Writes once, preserving partial writes and errno. Never changes process-wide
+ * signal disposition. Restoration failure returns -1 even after bytes were
+ * written: restoration or drain failures use terminal EIO. Callers must stop
+ * using the stream rather than retry those bytes, then log with context. This
+ * primitive performs no diagnostic writes, including on failure.
+ * On Linux, failed generated-signal drainage leaves SIGPIPE blocked in the
+ * calling thread, because restoring an unblocked mask would be unsafe. */
+static inline ssize_t platform_pipe_write_nosigpipe(int fd, const void *bytes,
+                                                   size_t size)
+{
+#if defined(__APPLE__)
+    int entry_errno = errno;
+    int previous = fcntl(fd, F_GETNOSIGPIPE);
+    if (previous < 0)
+        return platform_pipe_write_error(errno);
+    if (fcntl(fd, F_SETNOSIGPIPE, 1) < 0)
+        return platform_pipe_write_error(errno);
+    errno = entry_errno;
+    ssize_t written = write(fd, bytes, size);
+    int saved = errno;
+    if (fcntl(fd, F_SETNOSIGPIPE, previous) < 0)
+        return platform_pipe_write_error(EIO);
+    errno = saved;
+    return written;
+#elif defined(__linux__)
+    sigset_t blocked, previous, pending;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGPIPE);
+    int entry_errno = errno;
+    int error = pthread_sigmask(SIG_BLOCK, &blocked, &previous);
+    if (error)
+        return platform_pipe_write_error(error);
+    bool known = sigpending(&pending) == 0;
+    bool already = known && sigismember(&pending, SIGPIPE) == 1;
+    int saved = errno;
+    ssize_t written = -1;
+    if (known) {
+        errno = entry_errno;
+        written = write(fd, bytes, size);
+        saved = errno;
+    }
+    if (known && written < 0 && saved == EPIPE && !already) {
+        struct timespec zero = {0};
+        int drained;
+        do { drained = sigtimedwait(&blocked, NULL, &zero); }
+        while (drained < 0 && errno == EINTR);
+        if (drained != SIGPIPE && !(drained < 0 && errno == EAGAIN))
+            return platform_pipe_write_error(EIO);
+    }
+    error = pthread_sigmask(SIG_SETMASK, &previous, NULL);
+    if (error)
+        return platform_pipe_write_error(EIO);
+    if (!known)
+        return platform_pipe_write_error(saved);
+    errno = saved;
+    return written;
+#else
+    (void)fd;
+    (void)bytes;
+    (void)size;
+    return platform_pipe_write_error(ENOTSUP);
+#endif
+}
+
 #endif
 
 #endif

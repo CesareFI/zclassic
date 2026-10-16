@@ -617,6 +617,18 @@ static bool code_body_line_start(const char *text, size_t len, int line,
     return true;
 }
 
+/* The byte extent of the definition that starts on 1-based `def_line` of
+ * `text`: [*start, *end] where *end is the offset of the closing `}`. False
+ * when the line does not exist, the text there is a declaration, or no
+ * closing brace follows. Shared with code.packet so both agree on where a
+ * body ends. */
+bool code_source_extent(const char *text, size_t len, int def_line,
+                        size_t *start, size_t *end)
+{
+    return code_body_line_start(text, len, def_line, start) &&
+           code_body_find_end(text, len, *start, end);
+}
+
 /* Copy whole lines from `start` through the line holding `end` into `out`,
  * stopping before either cap; out->truncated records a stop before `end`. */
 static void code_body_span_fill(const char *text, size_t len, size_t start,

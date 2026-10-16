@@ -4,6 +4,11 @@
       "type": "http",
       "url": "${Z23_STEER_URL:-https://z23.sh/steer}",
       "headersHelper": "${CLAUDE_PLUGIN_ROOT}/bin/z23-steer-headers"
+    },
+    "z23-local": {
+      "type": "stdio",
+      "command": "z23",
+      "args": ["mcp", "serve", "--checkout=${CLAUDE_PROJECT_DIR}"]
     }
   }
 }

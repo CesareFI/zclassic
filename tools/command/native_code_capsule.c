@@ -12,6 +12,7 @@
 #include "command/native_code_priv.h"
 
 #include "codeindex/codeindex.h"
+#include "base/hex.h"
 #include "json/json.h"
 
 #include <stdio.h>
@@ -139,7 +140,7 @@ static bool code_capsule_sections_fit(const struct json_value *callers,
         size_t n = json_write(parts[p], scratch, sizeof(scratch));
         used += (n == 0 || n >= sizeof(scratch)) ? sizeof(scratch) : n;
     }
-    return used <= ZCL_COMMAND_RESULT_BUDGET - 2600;
+    return used <= ZCL_COMMAND_RESULT_BUDGET - 2800;
 }
 
 /* The static evidence/unknowns scaffolding: fixed keys this leaf always
@@ -344,6 +345,38 @@ static void code_capsule_emit_call_sections(
                                        sec->want_callees, sec->want_callers);
 }
 
+/* The exact generation roots of the index handle `ci`, as lowercase hex.
+ * False when the handle cannot name its generation; never a guess. Shared by
+ * code.capsule and code.packet so both bind to the SAME open. */
+bool code_generation_hex(struct codeindex *ci, char source_hex[65],
+                         char dep_hex[65])
+{
+    uint8_t source[32], dep[32];
+    if (!codeindex_source_root_sha3(ci, source) ||
+        !codeindex_dep_root_sha3(ci, dep))
+        return false;
+    zcl_hex_encode(source, sizeof source, source_hex);
+    zcl_hex_encode(dep, sizeof dep, dep_hex);
+    return true;
+}
+
+static bool code_capsule_emit_generation(struct codeindex *ci,
+                                          struct zcl_command_reply *reply)
+{
+    char source_hex[65], dep_hex[65];
+    if (!code_generation_hex(ci, source_hex, dep_hex)) {
+        zcl_command_reply_fail(reply, ZCL_COMMAND_STATUS_FAILED,
+                               ZCL_COMMAND_EXIT_INTERNAL, "CODEINDEX_GENERATION",
+                               "derive", false, false,
+                               "code index generation metadata is unavailable",
+                               "source_root_sha3,dep_root_sha3");
+        return false;
+    }
+    (void)json_push_kv_str(&reply->data, "source_root_sha3", source_hex);
+    (void)json_push_kv_str(&reply->data, "dep_root_sha3", dep_hex);
+    return true;
+}
+
 void zcl_native_handle_code_capsule(const struct zcl_command_request *request,
                                     struct zcl_command_reply *reply)
 {
@@ -357,6 +390,10 @@ void zcl_native_handle_code_capsule(const struct zcl_command_request *request,
     }
     struct codeindex *ci = code_open(request, reply);
     if (!ci) return;
+    if (!code_capsule_emit_generation(ci, reply)) {
+        codeindex_close(ci);
+        return;
+    }
 
     struct ci_symbol s;
     bool found = false;

@@ -51,7 +51,8 @@ struct device_host_runtime_receiver_spec {
     void (*ready)(void *context, const struct device_host_runtime_observation *observation);
     void *ready_context;
 };
-/* Foreground, Linux-only, one serialized owner. Borrowed store/cancellation
+/* Foreground, Linux client/receiver and macOS outbound client, one serialized
+ * owner. macOS receiver remains unsupported. Borrowed store/cancellation
  * and callback storage remain alive through return. Caller establishes trusted
  * owner-private profile/key-label binding and owner-approved current grant.
  * No secret constructor, DNS, shell, child process, automatic backup or service.

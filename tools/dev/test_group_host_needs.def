@@ -403,3 +403,6 @@ ZCL_TEST_GROUP_BUILD_NEED("test_device_host_runtime", "build/bin/z23", "z23")
 ZCL_TEST_GROUP_BUILD_NEED("test_device_host_runtime", "build/bin/tunnel", "native-tunnel")
 ZCL_TEST_GROUP_BUILD_NEED("test_device_command", "build/bin/z23", "z23")
 ZCL_TEST_GROUP_BUILD_NEED("test_zcode_package_artifact", "build/bin/z23", "z23")
+
+/* mcp_serve drives `z23 mcp serve` over pipes against the dev binary. */
+ZCL_TEST_GROUP_BUILD_NEED("test_mcp_serve", "build/bin/z23-dev", "dev-bin")

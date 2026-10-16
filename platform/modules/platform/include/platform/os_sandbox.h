@@ -152,7 +152,10 @@ const char *os_sandbox_package_confinement_name(
 /* Apply the host's package-child filesystem/network confinement to the
  * calling process. ONE-WAY and intended only for a freshly forked child.
  * Linux installs the filesystem half here and retains its existing seccomp
- * install immediately afterward; Seatbelt installs both halves atomically. */
+ * install immediately afterward; Seatbelt installs both halves atomically.
+ * Both Darwin package APIs reject has_fd grants with
+ * OS_SANDBOX_ERR_CONFINEMENT_UNAVAILABLE before entering the sandbox: Seatbelt
+ * pathname rules cannot preserve descriptor-bound grant semantics. */
 struct zcl_result os_sandbox_package_restrict(
     const struct os_sandbox_path_rule *rules, size_t n_rules);
 /* Preview programs are single-process values-to-view computations. In addition

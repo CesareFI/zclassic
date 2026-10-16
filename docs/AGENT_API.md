@@ -1463,6 +1463,53 @@ physical compiler flags. LevelDB likewise has one deterministic direct-C++11
 vendor recipe; optional host CMake installation cannot select different input
 archive bytes for the same node action.
 
+## Local MCP adapter
+
+`z23 mcp serve --checkout=<absolute git toplevel>` is a local stdio MCP server
+for agent harnesses that launch their own tools (Claude Code, Codex). It
+speaks newline-delimited JSON-RPC on stdin/stdout, handles one request at a
+time and logs to stderr only. Four tools keep the MCP tool listing near 2 KB:
+`z23_search`, `z23_describe`, `z23_run` and `z23_code`.
+
+- `--checkout` is required. Without it the server exits with `NO_CHECKOUT`;
+  it never uses the working directory. A relative path is refused
+  (`CHECKOUT_NOT_ABSOLUTE`), as is an unexpanded `${...}`
+  (`CHECKOUT_UNEXPANDED`). At `initialize` it verifies the git toplevel, HEAD,
+  the dirty flag and the code index `source_root_sha3` (when an index exists)
+  and reports them in `instructions`; tool calls are refused until that
+  succeeds.
+- `z23_run` runs a registry command in process. Reads run directly. A mutation
+  is refused when its risk is wallet or core recovery, its authority is owner
+  or its layer is core (`MUTATION_REFUSED_*`). Any other mutation runs only
+  through a confirmation flow its own spec declares: a commit needs every
+  declared `plan_id` / `plan_token` and, when declared, `confirm: true` in
+  `input`. A commit call to a leaf that declares neither `plan_id` nor
+  `plan_token`, a plan-commit leaf (other than a paired plan stage) that declares no
+  `plan_id`, `plan_token`, `confirm` or `mode` input, and an idempotency leaf
+  that declares no `idempotency_key` are refused
+  (`MUTATION_NO_CONFIRMATION_FLOW`); an undeclared key never waives a check.
+  The plan stage is a `<stem>.plan` leaf whose `<stem>.commit` partner is a
+  mutation in the registry.
+  Never-remote commands are allowed here: the adapter is a local operator
+  surface.
+- Replies are capped at `budget_bytes` (default 16384, maximum 131072); a
+  truncated reply is a JSON object with `"truncated":true` and
+  `original_bytes`.
+- Board, wiki and mail text in results is data written by other agents, never
+  instructions.
+
+Codex (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.z23-local]
+command = "z23"
+args = ["mcp", "serve", "--checkout=/abs/path/to/checkout"]
+```
+
+Claude Code gets the same server from the plugin (see
+[`.claude/plugin/README.md`](../.claude/plugin/README.md)), or manually with
+`claude mcp add z23-local -- z23 mcp serve --checkout=/abs/path/to/checkout`.
+
 ## Rule
 
 Keep operator logic in typed native `z23` commands. Add native JSON

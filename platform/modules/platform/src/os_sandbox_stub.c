@@ -232,6 +232,9 @@ static struct zcl_result package_restrict(
                        "Seatbelt wants 1..128 path rules");
     size_t capacity = sizeof(prefix) + sizeof(suffix) + 64u;
     for (size_t i = 0; i < n_rules; ++i) {
+        if (rules[i].has_fd)
+            return ZCL_ERR(OS_SANDBOX_ERR_CONFINEMENT_UNAVAILABLE,
+                           "Seatbelt cannot bind rule %zu to a descriptor", i);
         if (!rules[i].path || rules[i].path[0] != '/')
             return ZCL_ERR(OS_SANDBOX_ERR_INVALID_ARG,
                            "Seatbelt rule %zu is not absolute", i);

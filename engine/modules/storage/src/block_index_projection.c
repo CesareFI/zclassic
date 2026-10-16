@@ -30,6 +30,8 @@
 #include "event/event.h"
 #include "json/json.h"
 #include "util/boot_scan.h"
+#include "util/boot_progress.h"
+#include "util/boot_status.h"
 #include "util/log_macros.h"
 #include "util/safe_alloc.h"
 #include "crypto/sha3.h"
@@ -286,6 +288,12 @@ block_index_projection_t *block_index_projection_open(const char *path,
     snprintf(p->path, sizeof(p->path), "%s", path);
     p->opened_at = wall_now_s();
     p->wal_budget_bytes = BIP_WAL_BUDGET_BYTES;
+    p->replay_wal_budget_bytes = BIP_REPLAY_WAL_BUDGET_BYTES;
+    p->commit_events = BIP_COMMIT_EVENTS;
+    p->commit_bytes = BIP_COMMIT_LOG_BYTES;
+    p->commit_ms = BIP_COMMIT_MS;
+    p->progress_ms = BIP_PROGRESS_MS;
+    p->progress_pct = BIP_PROGRESS_PCT;
 
     /* Restore cursor + counters from prior session. */
     p->last_consumed_offset    = meta_get_u64(db, "last_consumed_offset", 0);
@@ -361,10 +369,14 @@ static void maybe_checkpoint_wal_budget(struct catch_up_ctx *c)
     if (c->blob_stmt) sqlite3_reset(c->blob_stmt);
     if (c->dirty_stmt) sqlite3_reset(c->dirty_stmt);
 
+    c->p->last_wal_frames = -1;
     uint64_t wal_bytes = wal_file_bytes(c->p->path);
     if (wal_bytes > c->p->max_wal_bytes_seen)
         c->p->max_wal_bytes_seen = wal_bytes;
-    if (wal_bytes <= c->p->wal_budget_bytes)
+    uint64_t limit = c->p->wal_budget_bytes;
+    if (c->wal_amp > 0.0 && c->p->replay_wal_budget_bytes < limit)
+        limit = c->p->replay_wal_budget_bytes;   /* replay: never above its own */
+    if (wal_bytes <= limit)
         return;
 
     int log_frames = 0;
@@ -373,6 +385,7 @@ static void maybe_checkpoint_wal_budget(struct catch_up_ctx *c)
         c->p->db, NULL, SQLITE_CHECKPOINT_PASSIVE,
         &log_frames, &ckpt_frames);
     c->p->wal_passive_checkpoints++;
+    c->p->last_wal_frames = log_frames;
     if (rc == SQLITE_BUSY ||
         (rc == SQLITE_OK && log_frames > 0 && ckpt_frames < log_frames)) {
         fprintf(stderr,  // obs-ok:block-index-projection-lifecycle
@@ -420,6 +433,140 @@ bool batch_commit(struct catch_up_ctx *c)
     return true;
 }
 
+static void pragma_exec(sqlite3 *db, const char *sql)
+{
+    char *err = NULL;
+    if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {  // raw-sql-ok:kernel-primitive
+        fprintf(stderr,  // obs-ok:block-index-projection-lifecycle
+                "[block_index_projection] %s: %s\n", sql,
+                err ? err : "(no message)");
+        if (err) sqlite3_free(err);
+    }
+}
+
+/* journal_size_limit lets the -wal FILE shrink after a reset, so the replay
+ * poll's stat of it reads the live size and not a past peak. */
+static void replay_wal_limit(const block_index_projection_t *p, long long v)
+{
+    char sql[64];
+    snprintf(sql, sizeof(sql), "PRAGMA journal_size_limit=%lld", v);
+    pragma_exec(p->db, sql);
+}
+
+/* ── replay cadence + progress ─────────────────────────────────────── */
+
+void bip_replay_begin(struct catch_up_ctx *c)
+{
+    replay_wal_limit(c->p, (long long)c->p->replay_wal_budget_bytes);
+    c->wal_amp = BIP_REPLAY_WAL_AMP_PRIOR;
+    int64_t now = mono_now_ms();
+    c->total_bytes = event_log_size(c->p->log);
+    c->start_offset = c->p->last_consumed_offset;
+    c->batch_start_offset = c->start_offset;
+    c->t_start_ms = now;
+    c->last_commit_ms = now;
+    c->last_report_ms = now;
+    c->last_report_pct = c->total_bytes
+        ? c->start_offset * 100u / c->total_bytes : 0;
+}
+
+void bip_replay_before_event(struct catch_up_ctx *c)
+{
+    c->events_seen++;
+    if (c->p->event_hook)
+        c->p->event_hook(c->events_seen);
+}
+
+/* The status-file fields always move (the writer caps itself to 1/s); the
+ * stderr line only when BOTH the time and the percent gap have passed. */
+static void replay_report(struct catch_up_ctx *c, int64_t now, bool final)
+{
+    uint64_t total = c->total_bytes;
+    uint64_t done = c->last_offset_after < total ? c->last_offset_after : total;
+    boot_progress_tick("block_index.replay");
+    boot_status_set_progress("block_index.replay", (int64_t)done,
+                             (int64_t)total);
+    if (total == 0)
+        return;
+    uint64_t pct = done * 100u / total;
+    bool due = final ? (c->p->progress_lines > 0 && c->last_report_pct < 100)
+                     : (now - c->last_report_ms >= c->p->progress_ms &&
+                        pct >= c->last_report_pct + c->p->progress_pct);
+    if (!due)
+        return;
+    int64_t el_ms = now > c->t_start_ms ? now - c->t_start_ms : 1;
+    double bps = (double)(done - c->start_offset) * 1000.0 / (double)el_ms;
+    uint64_t eta = bps > 0.0 ? (uint64_t)((double)(total - done) / bps) : 0;
+    fprintf(stderr,  // obs-ok:boot-phase-trace-marker
+            "[boot-phase] PROGRESS block_index.replay %" PRIu64 "/%" PRIu64
+            " (%" PRIu64 "%%) rate=%.1fMB/s eta=%" PRIu64 "s\n",
+            done, total, pct, bps / 1048576.0, eta);
+    fflush(stderr);
+    c->p->progress_lines++;
+    c->last_report_ms = now;
+    c->last_report_pct = pct;
+}
+
+/* Commit the open batch (opening one if only skipped events advanced the
+ * cursor). Rows and cursor share one transaction (batch_commit). */
+/* Learn WAL bytes per log byte from the commit just made. The frame count is
+ * only known when the commit crossed the checkpoint threshold (otherwise the
+ * WAL is under both budgets and the prior or last measure stands). */
+static void replay_learn_wal_amp(struct catch_up_ctx *c, uint64_t log_bytes)
+{
+    if (c->p->last_wal_frames > 0 && log_bytes > 0)
+        c->wal_amp = (double)c->p->last_wal_frames * BIP_WAL_PAGE_BYTES /
+                     (double)log_bytes;
+}
+
+bool bip_replay_commit(struct catch_up_ctx *c)
+{
+    uint64_t log_bytes = c->last_offset_after - c->batch_start_offset;
+    if ((c->batch_count == 0 && !batch_begin(c)) || !batch_commit(c)) {
+        c->error = true;
+        return false;
+    }
+    replay_learn_wal_amp(c, log_bytes);
+    int64_t now = mono_now_ms();
+    c->batch_start_offset = c->last_offset_after;
+    c->last_commit_ms = now;
+    c->p->batches_committed++;
+    replay_report(c, now, false);
+    return true;
+}
+
+bool bip_replay_after_event(struct catch_up_ctx *c)
+{
+    block_index_projection_t *p = c->p;
+    bool poll = (c->events_seen & 0xFFu) == 0;
+    int64_t now = poll ? mono_now_ms() : 0;
+    bool wal_due = false;
+    if (poll) {
+        replay_report(c, now, false);
+        uint64_t wal = wal_file_bytes(p->path);   /* one stat per poll */
+        if (wal > p->max_wal_bytes_seen)
+            p->max_wal_bytes_seen = wal;
+        /* the file size sees spilled frames; the projection sees the dirty
+         * pages still in cache that the commit will write */
+        double projected = c->wal_amp *
+            (double)(c->last_offset_after - c->batch_start_offset);
+        wal_due = wal > p->replay_wal_budget_bytes ||
+                  projected >= (double)p->replay_wal_budget_bytes;
+    }
+    bool due = c->batch_count >= p->commit_events ||
+               c->last_offset_after - c->batch_start_offset >= p->commit_bytes ||
+               wal_due || (poll && now - c->last_commit_ms >= p->commit_ms);
+    return !due || bip_replay_commit(c);
+}
+
+void bip_replay_finish(struct catch_up_ctx *c)
+{
+    replay_wal_limit(c->p, -1);
+    if (!c->error)
+        replay_report(c, mono_now_ms(), true);
+    boot_status_set_progress("", 0, 0);
+}
+
 /* catch_up_apply_status() (the EV_BLOCK_STATUS consumer) lives in
  * block_index_projection_status.c — split out to keep this file under the
  * file-size ceiling. It shares struct catch_up_ctx + batch_begin/commit via
@@ -435,14 +582,16 @@ static bool catch_up_cb(uint64_t offset, enum event_log_type type,
      * irrelevant types are simply skipped. */
     uint64_t event_end = offset + EVENT_LOG_FRAME_OVERHEAD + (uint64_t)len;  /* hdr + payload + sentinel */
     c->last_offset_after = event_end;
+    bip_replay_before_event(c);
 
     if (type == EV_BLOCK_STATUS)
-        return catch_up_apply_status(c, payload, len);
+        return catch_up_apply_status(c, payload, len) &&
+               bip_replay_after_event(c);
 
     if (type != EV_BLOCK_HEADER) {
         /* Not for us. Don't count it toward the batch (cursor still
-         * advances). */
-        return true;
+         * advances; the cadence may still persist it). */
+        return bip_replay_after_event(c);
     }
 
     struct ev_block_header h;
@@ -518,14 +667,8 @@ static bool catch_up_cb(uint64_t offset, enum event_log_type type,
      * regression that replays from offset 0 on a warm boot balloons it. */
     boot_scan_bump(c->scan_ctr);
 
-    /* Commit periodically. */
-    if (c->batch_count >= BIP_BATCH_EVENTS) {
-        if (!batch_commit(c)) {
-            c->error = true;
-            return false;
-        }
-    }
-    return true;
+    /* Commit on the replay cadence (events / log bytes / wall time). */
+    return bip_replay_after_event(c);
 }
 
 uint64_t block_index_projection_catch_up(block_index_projection_t *p)
@@ -540,6 +683,7 @@ uint64_t block_index_projection_catch_up(block_index_projection_t *p)
     c.p = p;
     c.last_offset_after = p->last_consumed_offset;
     c.scan_ctr = boot_scan_counter("block_index_projection.catch_up_events");
+    bip_replay_begin(&c);
 
     /* Prepare the INSERT statement once for the whole catch_up. */
     if (sqlite3_prepare_v2(p->db,
@@ -598,11 +742,9 @@ uint64_t block_index_projection_catch_up(block_index_projection_t *p)
     /* Flush trailing batch (if any) — must run even on stream error
      * to checkpoint partial progress, but ONLY if no per-event error
      * occurred (otherwise we rolled back already). */
-    if (!c.error && c.batch_count > 0) {
-        if (!batch_commit(&c)) {
-            c.error = true;
-        }
-    }
+    if (!c.error && c.last_offset_after > c.batch_start_offset)
+        (void)bip_replay_commit(&c);   /* sets c.error on failure */
+    bip_replay_finish(&c);
     sqlite3_finalize(c.ins_stmt);
     sqlite3_finalize(c.exists_stmt);
     sqlite3_finalize(c.blob_stmt);

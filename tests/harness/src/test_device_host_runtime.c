@@ -1588,6 +1588,13 @@ int test_device_host_runtime(void)
         runtime_hup_kept_open() + runtime_hup_priority(false) + runtime_hup_priority(true) + runtime_hup_signal_restore() + runtime_hup_stdio_restore() + runtime_sparse_measurement() +
         runtime_preauth_slots(1, 3, false) + runtime_preauth_slots(64, 70, false) + runtime_preauth_slots(1, 256, true) + runtime_session_cap_before_target() + runtime_restart_rebind() + runtime_long_caps_limits() + runtime_long_caps_revoke();
 }
+#elif defined(__APPLE__)
+int host_runtime_darwin_cases(void);
+int test_device_host_runtime(void);
+int test_device_host_runtime(void)
+{
+    return host_runtime_darwin_cases();
+}
 #else
 int test_device_host_runtime(void);
 int test_device_host_runtime(void)

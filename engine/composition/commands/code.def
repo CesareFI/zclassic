@@ -364,6 +364,31 @@ ZCL_COMMAND_READY_READ(
     ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_change_plan)
 
 ZCL_COMMAND_READY_READ(
+    "code.packet", "code", "",
+    "Assemble a builder's work packet in one call",
+    "A ready-to-hand work packet for a change: verbatim symbol excerpts with "
+    "exact line spans (head and tail elided past max_lines), the covering "
+    "test groups with their catalog rows and host needs, the nearest existing "
+    "test case, per-file blast radius, module_capabilities and remote-class "
+    "authority rows, the exact gate command lines, the lint traps the touched "
+    "paths trigger, and the same packet rendered as markdown. Composed from "
+    "the index-backed code.* readers; bound to the exact index generation "
+    "(source_root_sha3, dep_root_sha3) and the checkout HEAD. Refuses a stale "
+    "or absent index, an unsafe path, or an input past its bounds; never "
+    "rebuilds, writes, locks or spawns.", 65536,
+    "code,packet,brief,scout,excerpt,tests,impact,gates",
+    "zcl.code_packet.input.v1", "zcl.code_packet.v1",
+    "goal,symbols,files,max_lines,change", "goal",
+    "z23 code packet \"Harden download hold\" --input '{\"symbols\":[\"dl_hold\"]}'",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_packet)
+
+ZCL_COMMAND_READY_READ(
     "code.refs", "code", "",
     "List references to one symbol",
     "Call sites and references to one symbol from the code index, capped by "

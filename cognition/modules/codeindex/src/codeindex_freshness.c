@@ -64,13 +64,6 @@ static bool store_is_stale_profile(struct codeindex *ci,
     return true;
 }
 
-bool codeindex_is_stale(struct codeindex *ci, bool *stale)
-{
-    if (stale) *stale = true;
-    if (!ci || !ci->store) LOG_FAIL("codeindex", "null arg to is_stale");
-    return store_is_stale_profile(ci, true, stale);
-}
-
 static bool source_view_metadata_matches(struct ci_store *s,
                                          const uint8_t snap_root[32])
 {
@@ -93,6 +86,39 @@ static bool source_view_metadata_matches(struct ci_store *s,
            schema_found && schema_len == sizeof(CI_SCHEMA_VERSION) - 1 &&
            memcmp(stored_schema, CI_SCHEMA_VERSION,
                   sizeof(CI_SCHEMA_VERSION) - 1) == 0;
+}
+
+bool codeindex_is_stale(struct codeindex *ci, bool *stale)
+{
+    if (stale) *stale = true;
+    if (!ci || !ci->store) LOG_FAIL("codeindex", "null arg to is_stale");
+    bool have_snapshot = false, unchanged = false;
+    uint8_t source_root[32];
+    if (!ci_merkle_snapshot_inventory_current(ci->root, &have_snapshot,
+                                              &unchanged, source_root))
+        return false;
+    if (!have_snapshot || !unchanged)
+        return store_is_stale_profile(ci, true, stale);
+
+    /* Settled source keys reuse the sealed root; include edges still require
+     * their complete active depfile metadata observation. */
+    uint8_t current_deps[32], stored_deps[32];
+    size_t len = 0;
+    bool found = false;
+    if (!ci_deps_stat_root_sha3(ci->root, current_deps) ||
+        !ci_store_meta_get(ci->store, "dep_stat_root_sha3", stored_deps,
+                           sizeof(stored_deps), &len, &found))
+        LOG_FAIL("codeindex", "read full-view depfile freshness");
+    bool current = source_view_metadata_matches(ci->store, source_root) &&
+        found && len == sizeof(stored_deps) &&
+        memcmp(current_deps, stored_deps, sizeof(stored_deps)) == 0;
+    ci_merkle_free(ci->pending_merkle);
+    ci->pending_merkle = NULL;
+    ci->pending_merkle_snapshot_used = false;
+    ci->pending_merkle_full_rescan = false;
+    ci->pending_merkle_inventory_changed = false;
+    if (stale) *stale = !current;
+    return true;
 }
 
 bool ci_codeindex_source_view_is_stale(struct codeindex *ci, bool *stale)

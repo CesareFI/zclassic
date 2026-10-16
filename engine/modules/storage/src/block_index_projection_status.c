@@ -143,12 +143,5 @@ bool catch_up_apply_status(struct catch_up_ctx *c,
     c->batch_count++;
     c->collisions++;   /* a status update is always a replace by definition */
     boot_scan_bump(c->scan_ctr);
-
-    if (c->batch_count >= BIP_BATCH_EVENTS) {
-        if (!batch_commit(c)) {
-            c->error = true;
-            return false;
-        }
-    }
-    return true;
+    return true;   /* the replay cadence (bip_replay_after_event) commits */
 }

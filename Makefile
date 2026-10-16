@@ -1026,7 +1026,7 @@ DEVLOOP_SRCS = $(filter-out $(DEV_ONLY_SRCS),$(DEVLOOP_ALL_SRCS))
 # discover leaves ship in the release binary, so this is part of ALL_SRCS
 # rather than the dev-only lane. Header path -Itools is provided by TOOLS_INCLUDES.
 COMMAND_SRCS = $(call zcl_filter_ephemeral_sources,\
-	$(wildcard tools/command/*.c))
+	$(wildcard tools/command/*.c tools/mcp/*.c))
 COMMAND_SRCS += contexts/commons/packages/zutf8/src/zutf8.c
 COMMAND_SRCS += contexts/commons/packages/zbase64/src/zbase64.c
 
@@ -16363,7 +16363,7 @@ z23kernel-identity: $(BIN_DIR)/z23kernel.identity
 NATIVE_TUNNEL_SRCS := $(shell awk -F '"' '/^ZCL_TUNNEL_SOURCE/ {print $$2}' tools/native_tunnel_sources.def)
 NATIVE_TUNNEL_HEADERS := $(shell awk -F '"' '/^ZCL_TUNNEL_(HEADER|INTERNAL)/ {print $$2}' tools/native_tunnel_sources.def)
 NATIVE_TUNNEL_INCLUDES := $(sort $(shell awk -F '"' '/^ZCL_TUNNEL_HEADER/ {p=$$2; sub(/\/include\/.*/, "/include", p); print p}' tools/native_tunnel_sources.def))
-NATIVE_TUNNEL_FLAGS = -std=c23 -O1 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L $(addprefix -I,$(NATIVE_TUNNEL_INCLUDES))
+NATIVE_TUNNEL_FLAGS = -std=c23 -O1 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L $(ZCL_PLATFORM_CPPFLAGS) $(addprefix -I,$(NATIVE_TUNNEL_INCLUDES))
 $(BIN_DIR)/tunnel: tools/native_tunnel.c tools/native_tunnel_sources.def $(NATIVE_TUNNEL_SRCS) $(NATIVE_TUNNEL_HEADERS) Makefile | $(BIN_DIR)
 	$(CC) $(NATIVE_TUNNEL_FLAGS) tools/native_tunnel.c $(NATIVE_TUNNEL_SRCS) -o $@
 $(BIN_DIR)/tunnel-static: tools/native_tunnel.c tools/native_tunnel_sources.def $(NATIVE_TUNNEL_SRCS) $(NATIVE_TUNNEL_HEADERS) Makefile | $(BIN_DIR)

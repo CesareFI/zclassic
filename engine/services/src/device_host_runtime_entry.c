@@ -71,7 +71,7 @@ struct zcl_result device_host_runtime_entry_parse(struct json_value *out, const 
     json_free(out); json_init(out);
     return ZCL_ERR(-2, "cannot parse or validate HOST runtime JSON object, fields or types");
 }
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 #include "platform/socket_compat.h"
 #include <signal.h>
 #include <sys/stat.h>
@@ -246,8 +246,27 @@ static const char *raw_result_name(enum device_host_bridge_result result)
     static const char *const names[] = {"ready", "wait", "progress", "eof", "refused", "deadline", "io_error", "cancelled", "unsupported"};
     return (unsigned)result < sizeof(names) / sizeof(names[0]) ? names[result] : "invalid";
 }
+static void raw_runtime_run(struct raw_runtime *runtime, bool receiver,
+    const struct raw_stdio *stdio, struct device_host_runtime_observation *out)
+{
+    struct zcl_result result;
+    if (receiver) result = device_host_runtime_receiver_run(&runtime->receiver, out);
+    else {
+        runtime->client.input_fd = stdio->descriptors[0];
+        runtime->client.output_fd = stdio->descriptors[1];
+        result = device_host_runtime_client_run(&runtime->client, out);
+    }
+    if (!result.ok) fprintf(stderr, "error=HOST_RUNTIME_FAILURE %s\n", result.message);
+}
 static enum device_host_runtime_entry_exit device_host_runtime_entry_run_state(const struct json_value *input, bool receiver)
 {
+#if defined(__APPLE__)
+    if (receiver) {
+        fprintf(stderr, "error=HOST_RUNTIME_UNSUPPORTED role=receiver platform=unqualified\n");
+        return DEVICE_HOST_ENTRY_UNSUPPORTED;
+    }
+#endif
+
     if (!entry_object_valid(input, receiver)) {
         fprintf(stderr, "error=HOST_RUNTIME_INPUT_REFUSED\n"); return DEVICE_HOST_ENTRY_INVALID;
     }
@@ -258,17 +277,7 @@ static enum device_host_runtime_entry_exit device_host_runtime_entry_run_state(c
     struct device_host_runtime_observation out = {.result = DEVICE_HOST_BRIDGE_REFUSED, .cleanup_complete = true};
     struct raw_stdio stdio = {.descriptors = {-1, -1}, .flags = {-1, -1}};
     bool stdio_ok = receiver || raw_stdio_open(&stdio);
-    if (installed && stdio_ok) {
-        if (receiver) {
-            struct zcl_result result = device_host_runtime_receiver_run(&runtime.receiver, &out);
-            if (!result.ok) fprintf(stderr, "error=HOST_RUNTIME_FAILURE %s\n", result.message);
-        }
-        else {
-            runtime.client.input_fd = stdio.descriptors[0]; runtime.client.output_fd = stdio.descriptors[1];
-            struct zcl_result result = device_host_runtime_client_run(&runtime.client, &out);
-            if (!result.ok) fprintf(stderr, "error=HOST_RUNTIME_FAILURE %s\n", result.message);
-        }
-    }
+    if (installed && stdio_ok) raw_runtime_run(&runtime, receiver, &stdio, &out);
     bool restored = raw_stdio_restore(&stdio, out.io_taken);
     restored = raw_signals_restore(&signals) && restored;
     device_identity_close(&runtime.identity);

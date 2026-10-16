@@ -1,9 +1,14 @@
 /* Copyright 2026 Rhett Creighton. SPDX-License-Identifier: Apache-2.0
  * Purpose: one-command remote shell over the HOST tunnel: exec a fixed ssh
  * whose ProxyCommand is this binary's raw HOST client. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "command/native_command.h"
 #include "services/device_host_runtime_entry.h"
 #include "platform/os_proc.h"
+#include "platform/clock.h"
+#include "platform/pipe_compat.h"
 #include "json/json.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,12 +18,15 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <poll.h>
+#include <signal.h>
+#include <spawn.h>
+extern char **environ;
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
 
 static const char shell_kex_sntrup[] = "sntrup761x25519-sha512@openssh.com";
-static const char shell_kex_mlkem[] = "mlkem768x25519-sha256";
 
 /* ssh hands ProxyCommand to "$SHELL -c exec ...", and expands %-tokens in
  * it first, so every interpolated byte is drawn from a set with no shell or
@@ -187,29 +195,8 @@ bool zcl_native_device_host_shell_resolve(const char *path_env, char *out, size_
 #endif
 }
 
-#if defined(__linux__)
-/* Child half of the probe: fixed argv, stdout to the pipe, stdin/stderr null. */
-[[noreturn]] static void shell_kex_probe_child(int output, const char *ssh)
-{
-    int null = open("/dev/null", O_RDWR | O_CLOEXEC);
-    if (null < 0 || dup2(null, 0) < 0 || dup2(output, 1) < 0 || dup2(null, 2) < 0) _exit(127);
-    char *const argv[] = {(char *)"ssh", (char *)"-Q", (char *)"kex", NULL};
-    execv(ssh, argv);
-    _exit(127);
-}
-
-static size_t shell_read_all(int fd, char *text, size_t capacity)
-{
-    size_t total = 0;
-    while (total < capacity - 1) {
-        ssize_t got = read(fd, text + total, capacity - 1 - total);
-        if (got < 0 && errno == EINTR) continue;
-        if (got <= 0) break;
-        total += (size_t)got;
-    }
-    text[total] = '\0';
-    return total;
-}
+#if defined(__linux__) || defined(__APPLE__)
+static const char shell_kex_mlkem[] = "mlkem768x25519-sha256";
 
 static void shell_kex_lines(char *text, bool *mlkem, bool *sntrup)
 {
@@ -223,37 +210,106 @@ static void shell_kex_lines(char *text, bool *mlkem, bool *sntrup)
     }
 }
 
-static bool shell_cloexec_pipe(int pipefd[2])
+static bool shell_probe_reaped(pid_t seen, pid_t child)
 {
-    if (pipe(pipefd) != 0) return false;
-    if (fcntl(pipefd[0], F_SETFD, FD_CLOEXEC) == 0 && fcntl(pipefd[1], F_SETFD, FD_CLOEXEC) == 0) return true;
-    close(pipefd[0]); close(pipefd[1]);
+    return seen == child || (seen < 0 && errno == ECHILD);
+}
+
+/* Only the probe PID is signalled, after waitpid establishes child custody.
+ * Never signal a process group: ssh inherits the invoking CLI's group. */
+static bool shell_probe_reap(pid_t child, bool reaped)
+{
+    if (reaped) return true;
+    int status;
+    pid_t seen = waitpid(child, &status, WNOHANG);
+    if (shell_probe_reaped(seen, child)) return true;
+    if (seen < 0 && errno != EINTR) return false;
+    if (kill(child, SIGKILL) < 0 && errno != ESRCH) return false;
+    int64_t end = clock_now_monotonic_ns() + INT64_C(2000000000);
+    for (unsigned attempt = 0; attempt < 400 && clock_now_monotonic_ns() < end; attempt++) {
+        seen = waitpid(child, &status, WNOHANG);
+        if (shell_probe_reaped(seen, child)) return true;
+        if (seen < 0 && errno != EINTR) return false;
+        (void)poll(NULL, 0, 5);
+    }
+    return false;
+}
+
+static bool shell_probe_spawn(const char *ssh, int read_fd, int write_fd, pid_t *child)
+{
+    posix_spawn_file_actions_t actions;
+    int rc = posix_spawn_file_actions_init(&actions);
+    if (rc != 0) { errno = rc; return false; }
+    rc = posix_spawn_file_actions_addclose(&actions, read_fd);
+    if (rc == 0) rc = posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0);
+    if (rc == 0) rc = posix_spawn_file_actions_adddup2(&actions, write_fd, 1);
+    if (rc == 0) rc = posix_spawn_file_actions_addclose(&actions, write_fd);
+    if (rc == 0) rc = posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0);
+    char *const argv[] = {(char *)"ssh", (char *)"-Q", (char *)"kex", NULL};
+    if (rc == 0) rc = posix_spawn(child, ssh, &actions, NULL, argv, environ);
+    (void)posix_spawn_file_actions_destroy(&actions);
+    if (rc != 0) { errno = rc; return false; }
+    return true;
+}
+
+struct shell_probe_output { char text[16384]; size_t used; bool eof; };
+static bool shell_probe_read(int fd, struct shell_probe_output *out)
+{
+    ssize_t got = read(fd, out->text + out->used, sizeof(out->text) - 1 - out->used);
+    if (got > 0) {
+        if (memchr(out->text + out->used, 0, (size_t)got)) return false;
+        out->used += (size_t)got;
+        return out->used < sizeof(out->text) - 1;
+    }
+    if (got == 0) { out->eof = true; return true; }
+    return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
+}
+
+static bool shell_probe_collect(pid_t child, int fd, struct shell_probe_output *out, bool *reaped)
+{
+    int status = 0;
+    int64_t end = clock_now_monotonic_ns() + INT64_C(2000000000);
+    for (unsigned attempt = 0; attempt < 2000 && clock_now_monotonic_ns() < end; attempt++) {
+        if (!out->eof && !shell_probe_read(fd, out)) return false;
+        if (!*reaped) {
+            pid_t seen = waitpid(child, &status, WNOHANG);
+            if (seen == child) *reaped = true;
+            else if (seen < 0 && errno != EINTR) return false;
+        }
+        if (*reaped && out->eof) return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        (void)poll(NULL, 0, 1);
+    }
     return false;
 }
 #endif
 
-/* `ssh -Q kex`: which of the two pinned algorithms this ssh offers. */
+/* Probe output, process completion and failure cleanup all have finite bounds. */
 static bool shell_kex_probe(const char *ssh, bool *mlkem, bool *sntrup)
 {
     *mlkem = *sntrup = false;
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
     int pipefd[2];
-    if (!shell_cloexec_pipe(pipefd)) return false;
-    pid_t child = fork();
-    if (child == 0) shell_kex_probe_child(pipefd[1], ssh);
+    if (platform_pipe_cloexec_nonblock(pipefd) != 0) return false;
+    /* Keep action sources above stdio even when the caller closed stdio. */
+    int output = fcntl(pipefd[1], F_DUPFD_CLOEXEC, 3);
     close(pipefd[1]);
-    char text[16384] = {0};
-    if (child > 0) (void)shell_read_all(pipefd[0], text, sizeof(text));
+    if (output < 0) { close(pipefd[0]); return false; }
+    pid_t child = -1;
+    bool spawned = shell_probe_spawn(ssh, pipefd[0], output, &child);
+    close(output);
+    if (!spawned) { close(pipefd[0]); return false; }
+    struct shell_probe_output out = {0}; bool reaped = false;
+    bool ok = shell_probe_collect(child, pipefd[0], &out, &reaped);
     close(pipefd[0]);
-    if (child < 0) return false;
-    int status = 0;
-    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return false;
-    shell_kex_lines(text, mlkem, sntrup);
+    if (!shell_probe_reap(child, reaped)) {
+        fprintf(stderr, "error=HOST_SHELL_PROBE_REAP_FAILED pid=%ld errno=%d\n", (long)child, errno);
+        return false;
+    }
+    if (!ok) return false;
+    shell_kex_lines(out.text, mlkem, sntrup);
     return true;
 #else
-    (void)ssh;
-    return false;
+    (void)ssh; return false;
 #endif
 }
 
@@ -311,7 +367,7 @@ static int shell_dry_run(const struct zcl_native_host_shell_argv *sntrup, const 
 
 static int shell_exec(const struct zcl_native_host_shell_argv *plan, const char *ssh)
 {
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
     fflush(NULL);
     execv(ssh, (char *const *)plan->argv);
     fprintf(stderr, "error=HOST_SHELL_EXEC_FAILED errno=%d\n", errno);
@@ -348,6 +404,10 @@ int zcl_native_device_host_shell_run(const struct json_value *input)
     }
     struct zcl_native_host_shell_argv plan, both; const char *refusal = NULL;
     bool mlkem = false, sntrup = false;
+    /* Refuse malformed requests before executing even the fixed KEX probe. */
+    if (!zcl_native_device_host_shell_argv(self, request.user, request.host, request.route, false, &plan, &refusal))
+        return shell_refused(refusal);
+    if (!shell_route_valid(request.route)) return shell_refused("route_input_not_a_client_input");
     /* dry_run executes nothing, so it cannot probe: it reports both shapes. */
     if (!request.dry_run && (!shell_kex_probe(ssh, &mlkem, &sntrup) || !sntrup)) {
         fprintf(stderr, "error=HOST_SHELL_SSH_KEX_UNAVAILABLE required=%s\n", shell_kex_sntrup);
@@ -358,6 +418,5 @@ int zcl_native_device_host_shell_run(const struct json_value *input)
     if (request.dry_run &&
         !zcl_native_device_host_shell_argv(self, request.user, request.host, request.route, true, &both, &refusal))
         return shell_refused(refusal);
-    if (!shell_route_valid(request.route)) return shell_refused("route_input_not_a_client_input");
     return request.dry_run ? shell_dry_run(&plan, &both, ssh) : shell_exec(&plan, ssh);
 }

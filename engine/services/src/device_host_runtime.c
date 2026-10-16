@@ -6,7 +6,7 @@
 #include "base/bytes.h"
 #include <string.h>
 #include "util/log_macros.h"
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 #include <sys/stat.h>
 
 static enum device_host_bridge_result host_call_device_host_psk_bridge_open(struct device_host_psk_bridge *bridge,
@@ -302,6 +302,7 @@ static bool runtime_running(enum device_host_bridge_result result)
 {
     return result == DEVICE_HOST_BRIDGE_READY || result == DEVICE_HOST_BRIDGE_WAIT || result == DEVICE_HOST_BRIDGE_PROGRESS;
 }
+#if defined(__linux__)
 /* Session-cap reservation at PSK success, before any target connect. */
 static bool runtime_reserve_target(void *context)
 {
@@ -309,6 +310,7 @@ static bool runtime_reserve_target(void *context)
     if (*reserve->accepted >= reserve->max) return false;
     ++*reserve->accepted; *reserve->counted = true; return true;
 }
+#endif
 static void runtime_slot_init(struct runtime_slot *slot, const struct device_host_runtime_common *common,
     int64_t ceiling)
 {
@@ -427,6 +429,7 @@ static enum device_host_bridge_result device_host_runtime_client_run_state(
     runtime_collect(out, &slot.bridge.observation); return out->result;
 }
 
+#if defined(__linux__)
 static bool runtime_receiver_valid(const struct device_host_runtime_receiver_spec *spec)
 {
     if (!spec || !runtime_common_valid(&spec->common) || !runtime_address_valid(spec->listen_address_be)) return false;
@@ -597,6 +600,15 @@ static enum device_host_bridge_result device_host_runtime_receiver_run_state(
     if (listener >= 0) platform_socket_close(listener);
     runtime_stop_slots(slots, spec->max_active, out->result, out); return out->result;
 }
+#else
+static enum device_host_bridge_result device_host_runtime_receiver_run_state(
+    const struct device_host_runtime_receiver_spec *spec, struct device_host_runtime_observation *out)
+{
+    (void)spec;
+    if (out) { memset(out, 0, sizeof(*out)); out->result = DEVICE_HOST_BRIDGE_UNSUPPORTED; out->cleanup_complete = true; }
+    return DEVICE_HOST_BRIDGE_UNSUPPORTED;
+}
+#endif
 #else
 static enum device_host_bridge_result device_host_runtime_client_run_state(
     const struct device_host_runtime_client_spec *spec, struct device_host_runtime_observation *out)

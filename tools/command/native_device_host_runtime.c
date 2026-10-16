@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__linux__)
 struct installed_input {
     const char *datadir, *text;
     uint8_t root[32], receipt[32], digest[32];
@@ -27,6 +28,8 @@ static bool installed_number(const struct json_value *input, const char *key,
     if (!v || v->type != JSON_INT || v->val.i <= 0 || (uint64_t)v->val.i > maximum) return false;
     *out = (uint32_t)v->val.i; return true;
 }
+
+#endif
 
 static bool installed_keys(const struct json_value *input)
 {
@@ -44,6 +47,7 @@ static bool installed_keys(const struct json_value *input)
     return true;
 }
 
+#if defined(__linux__)
 static bool installed_approval(const struct json_value *input, struct installed_input *out)
 {
     const struct json_value *accept = json_get(input, "accept_execution");
@@ -75,7 +79,6 @@ static bool installed_input_read(const struct json_value *input, struct installe
     json_free(&runtime); return valid;
 }
 
-#if defined(__linux__)
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -320,14 +323,10 @@ bool zcl_native_device_host_package_terminal_for_test(int64_t deadline_ns)
     return installed_success(&process, true, true, result);
 }
 #endif
-#else
-static int installed_run(const struct json_value *input)
-{
-    struct installed_input selected; (void)installed_input_read(input, &selected);
-    fprintf(stderr, "error=HOST_PACKAGE_UNSUPPORTED\n"); return ZCL_COMMAND_EXIT_BLOCKED;
-}
 #endif
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
+#include <fcntl.h>
+#include <unistd.h>
 #include <sys/stat.h>
 /* A named input binds a route, so it must be an owner-written regular file
  * that does not change while it is read. */
@@ -386,7 +385,7 @@ bool zcl_native_device_host_input_file_read(const char *path, char *text, size_t
     if (length) *length = 0;
     if (text && capacity) text[0] = '\0';
     if (!input_file_arguments(path, text, capacity, length)) return false;
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
     size_t total = 0;
     if (!input_file_load(path, text, capacity, &total)) { text[0] = '\0'; return false; }
     /* One trailing newline is an editor artifact, not part of the object. */
@@ -482,6 +481,21 @@ void zcl_native_device_host_runtime_exit_if_requested(int argc, char **argv)
         }
     }
     else fprintf(stderr, "error=HOST_RUNTIME_INPUT_REFUSED detail=one_bounded_registered_input_object_required\n");
+#elif defined(__APPLE__)
+    if (!strcmp(path, "ops.mesh.device.host.shell")) {
+        if (valid) result = zcl_native_device_host_shell_run(&input);
+        else fprintf(stderr, "error=HOST_RUNTIME_INPUT_REFUSED detail=one_bounded_registered_input_object_required\n");
+    } else if (!strcmp(path, "ops.mesh.device.host.client")) {
+        if (valid) {
+            enum device_host_runtime_entry_exit status = DEVICE_HOST_ENTRY_INVALID;
+            struct zcl_result ran = device_host_runtime_entry_run(&input, false, &status);
+            result = (int)status;
+            if (!ran.ok && result == DEVICE_HOST_ENTRY_OK) result = DEVICE_HOST_ENTRY_FAILED;
+        } else fprintf(stderr, "error=HOST_RUNTIME_INPUT_REFUSED detail=one_bounded_registered_input_object_required\n");
+    } else {
+        fprintf(stderr, "error=HOST_RUNTIME_UNSUPPORTED platform=unqualified\n");
+        result = ZCL_COMMAND_EXIT_BLOCKED;
+    }
 #else
     (void)valid;
     fprintf(stderr, "error=HOST_RUNTIME_UNSUPPORTED platform=unqualified\n"); result = ZCL_COMMAND_EXIT_BLOCKED;

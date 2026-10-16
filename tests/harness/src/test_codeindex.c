@@ -694,6 +694,23 @@ static bool set_contains(char set[CI_DISK_MODULES_MAX][CI_DISK_MODULE_NAME], int
     return false;
 }
 
+static int check_full_freshness_stale(struct codeindex *ci, const char *label)
+{
+    int failures = 0;
+    bool stale = false;
+    CI_CHECK(label, ci && codeindex_is_stale(ci, &stale) && stale);
+    return failures;
+}
+
+static int check_existing_full_freshness_stale(const char *root,
+                                                const char *label)
+{
+    struct codeindex *ci = codeindex_open_existing(root);
+    int failures = check_full_freshness_stale(ci, label);
+    if (ci) codeindex_close(ci);
+    return failures;
+}
+
 static int test_codeindex_metrics_warm_view(int64_t files_indexed)
 {
     int failures = 0;
@@ -707,6 +724,9 @@ static int test_codeindex_metrics_warm_view(int64_t files_indexed)
              idx &&
              codeindex_source_view_is_current(idx, &current) &&
              current);
+    bool full_stale = true;
+    CI_CHECK("full view agrees with the sealed source-view generation",
+             idx && codeindex_is_stale(idx, &full_stale) && !full_stale);
     CI_CHECK("cached table counts are present after rebuild",
              idx &&
              codeindex_table_counts(idx, &nfiles, &nsymbols,
@@ -716,6 +736,12 @@ static int test_codeindex_metrics_warm_view(int64_t files_indexed)
              ci_merkle_snapshot_inventory_current(
                  MET_FIX, &have_snap, &unchanged, digest) &&
              have_snap);
+    CI_CHECK("new source inventory fixture writes",
+             mk_write(MET_FIX, "core/modules/net/src/inventory_added.c",
+                      "int inventory_added(void) { return 1; }\n"));
+    full_stale = false;
+    CI_CHECK("full view rejects an added source file",
+             idx && codeindex_is_stale(idx, &full_stale) && full_stale);
     if (idx) codeindex_close(idx);
     return failures;
 }
@@ -1427,6 +1453,8 @@ static int test_codeindex_platform_arm(void)
         utimensat(AT_FDCWD, FIX "/" CUR_EPOCH_DEP, dep_times, 0) == 0;
     CI_CHECK("same-size depfile edit restores exact previous mtime",
              dep_mtime);
+    failures += check_full_freshness_stale(
+        ci, "full freshness rejects same-size restored-mtime depfile edit");
     if (ci) { codeindex_close(ci); ci = NULL; }
     ci = codeindex_open_source_view(FIX);
     memset(includes, 0, sizeof(includes));
@@ -1476,6 +1504,8 @@ static int test_codeindex_platform_arm(void)
     bool same_mtime = same_stat && same_write &&
         utimensat(AT_FDCWD, FIX "/core/modules/net/src/foo.c", same_times, 0) == 0;
     CI_CHECK("same-size edit restores the exact previous mtime", same_mtime);
+    failures += check_existing_full_freshness_stale(
+        FIX, "full freshness rejects same-size restored-mtime source edit");
     ci = codeindex_open_source_view(FIX);
     bool found_new = false, found_old = true;
     if (ci) {
@@ -1784,6 +1814,8 @@ static int test_codeindex_platform_arm(void)
                  !published_meta_get(CG_FIX "/.codeindex/index.kv",
                                      "ci_schema_version", meta_val,
                                      sizeof(meta_val)));
+        failures += check_existing_full_freshness_stale(
+            CG_FIX, "full freshness rejects absent schema metadata");
         struct codeindex *migr = codeindex_open(CG_FIX);
         CI_CHECK("open with absent ci_schema_version rebuilds", migr != NULL);
         CI_CHECK("rebuild restamps ci_schema_version",

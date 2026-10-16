@@ -18,8 +18,9 @@ void device_host_psk_bridge_init(struct device_host_psk_bridge *bridge)
 {
     if (bridge) *bridge = (struct device_host_psk_bridge){.target_fd = -1};
 }
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 #include "platform/socket_compat.h"
+#include "platform/pipe_compat.h"
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
@@ -310,39 +311,9 @@ static bool transient_error(int error)
     return error == EAGAIN || error == EWOULDBLOCK || error == EINTR;
 }
 
-static bool drain_sigpipe(const sigset_t *blocked)
-{
-    struct timespec zero = {0};
-    int drained;
-    do { drained = sigtimedwait(blocked, NULL, &zero); } while (drained < 0 && errno == EINTR);
-    return drained == SIGPIPE || (drained < 0 && errno == EAGAIN);
-}
-
-/* LOG_RETURN evaluates its value after logging: restore the captured error
- * for the owning caller even if the diagnostic write changes errno. */
-static ssize_t pipe_write_error(int error, const char *operation)
-{
-    LOG_RETURN((errno = error, -1), "device_host_bridge", "%s (error=%d)", operation, error);
-}
 static ssize_t pipe_write(int fd, const void *bytes, size_t size)
 {
-    sigset_t blocked, previous, pending;
-    sigemptyset(&blocked);
-    sigaddset(&blocked, SIGPIPE);
-    int error = pthread_sigmask(SIG_BLOCK, &blocked, &previous);
-    if (error) return pipe_write_error(error, "cannot block thread-local SIGPIPE");
-    bool known = sigpending(&pending) == 0;
-    bool already = known && sigismember(&pending, SIGPIPE);
-    ssize_t written = known ? write(fd, bytes, size) : -1;
-    int saved = errno;
-    if (written < 0 && saved == EPIPE && !already && !drain_sigpipe(&blocked)) {
-        int drain_error = errno;
-        return pipe_write_error(drain_error, "cannot drain generated SIGPIPE; thread mask remains blocked");
-    }
-    error = pthread_sigmask(SIG_SETMASK, &previous, NULL);
-    if (error) return pipe_write_error(error, "cannot restore thread-local SIGPIPE mask");
-    errno = saved;
-    return written;
+    return platform_pipe_write_nosigpipe(fd, bytes, size);
 }
 
 static enum device_host_bridge_result read_buffer(struct device_host_bridge *bridge, int fd,
@@ -986,7 +957,7 @@ static enum device_host_bridge_result device_host_bridge_run_state(struct device
 void device_host_bridge_close(struct device_host_bridge *bridge,
     enum device_host_bridge_result result)
 {
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 
     if (!bridge) return;
     if (bridge->active) {
@@ -1006,7 +977,7 @@ void device_host_bridge_close(struct device_host_bridge *bridge,
 
 void device_host_psk_bridge_close(struct device_host_psk_bridge *bridge, enum device_host_bridge_result result)
 {
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 
     if (!bridge) return;
     if (bridge->active) {

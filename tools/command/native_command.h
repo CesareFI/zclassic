@@ -384,11 +384,13 @@ void zcl_native_device_prepare_test_interrupt(unsigned stage);
 void zcl_native_device_host_runtime_exit_if_requested(int argc, char **argv);
 /* --input-file=<absolute> source: a non-symlink regular file owned by the
  * caller, not group/other writable, 1..capacity-1 bytes with no NUL; one
- * trailing newline is dropped. Linux only; elsewhere refuses. */
+ * trailing newline is dropped. Linux/macOS; elsewhere refuses. */
 bool zcl_native_device_host_input_file_read(const char *path, char *text, size_t capacity, size_t *length);
-#if defined(ZCL_TESTING) && defined(__linux__)
+#if defined(ZCL_TESTING) && (defined(__linux__) || defined(__APPLE__))
 /* Runs once between the --input-file read and its stability re-check. */
 void zcl_native_device_host_input_file_hook_for_test(void (*hook)(const char *path));
+#endif
+#if defined(ZCL_TESTING) && defined(__linux__)
 bool zcl_native_device_host_package_input_for_test(const struct json_value *input);
 bool zcl_native_device_host_package_terminal_for_test(int64_t deadline_ns);
 /* Drives installed_wait with one pending SIGHUP whose forward fails; when
@@ -485,6 +487,12 @@ void zcl_native_handle_code_capsule(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);
 void zcl_native_handle_code_change_plan(
+    const struct zcl_command_request *request,
+    struct zcl_command_reply *reply);
+/* code.packet — one call that assembles a builder's work packet (verbatim
+ * excerpts, covering tests, impact, authority, gates, traps, markdown) from
+ * the index-backed code.* readers (tools/command/native_code_packet.c). */
+void zcl_native_handle_code_packet(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);
 void zcl_native_handle_code_refs(

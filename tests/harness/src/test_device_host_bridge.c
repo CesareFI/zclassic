@@ -34,7 +34,9 @@ static_assert(_Generic(device_host_psk_pending_acquire(NULL, NULL, NULL, NULL, N
 static_assert(_Generic(device_host_psk_pending_written(NULL, NULL, 0, NULL), struct zcl_result: 1, default: 0),
     "fallible domain API returns canonical zcl_result");
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
+#include "platform/socket_compat.h"
+#include "platform/pipe_compat.h"
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
@@ -183,8 +185,36 @@ static int64_t fixture_mono(void *opaque)
 }
 static bool fixture_socket_pair(int pair[2])
 {
-    return socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, pair) == 0;
+    if (!platform_socket_pair(pair)) return false;
+    for (size_t i = 0; i < 2; i++) {
+        if (fcntl(pair[i], F_SETFD, FD_CLOEXEC) == 0 &&
+            platform_socket_set_nonblocking(pair[i], true)) continue;
+        int saved = errno;
+        close(pair[0]); close(pair[1]); pair[0] = pair[1] = -1;
+        errno = saved; return false;
+    }
+    return true;
 }
+
+static int fixture_accept(int listener)
+{
+    int fd = accept(listener, NULL, NULL);
+    if (fd < 0) return -1;
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC) == 0 &&
+        platform_socket_set_nonblocking(fd, true)) return fd;
+    int saved = errno; close(fd); errno = saved; return -1;
+}
+
+static int fixture_pipe(int descriptors[2], int flags)
+{
+    if (platform_pipe_cloexec_nonblock(descriptors) != 0) return -1;
+    if (flags & O_NONBLOCK) return 0;
+    if (platform_socket_set_nonblocking(descriptors[0], false) &&
+        platform_socket_set_nonblocking(descriptors[1], false)) return 0;
+    int saved = errno; close(descriptors[0]); close(descriptors[1]);
+    descriptors[0] = descriptors[1] = -1; errno = saved; return -1;
+}
+
 static void fixture_init(struct bridge_fixture *fixture)
 {
     memset(fixture, 0, sizeof(*fixture));
@@ -336,9 +366,20 @@ static int bridge_pending_refusal(unsigned reason)
     return failures;
 }
 
+static bool fixture_wait_readable(int fd)
+{
+    int64_t deadline = clock_now_monotonic_ns() + INT64_C(5000000000);
+    for (unsigned attempt = 0; attempt < 500 && clock_now_monotonic_ns() < deadline; attempt++) {
+        struct pollfd event = {.fd = fd, .events = POLLIN};
+        int ready = poll(&event, 1, 10);
+        if (ready > 0) return (event.revents & (POLLIN | POLLHUP)) != 0;
+        if (ready < 0 && errno != EINTR) return false;
+    }
+    return false;
+}
 static int loopback_listener(uint16_t *port)
 {
-    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    int fd = platform_socket_open(AF_INET, SOCK_STREAM, 0, true, true);
     if (fd < 0) return -1;
     struct sockaddr_in address = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
     socklen_t size = sizeof(address);
@@ -351,7 +392,7 @@ static int loopback_listener(uint16_t *port)
 }
 static bool no_connection(int listener)
 {
-    int fd = accept4(listener, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
+    int fd = fixture_accept(listener);
     if (fd >= 0) { close(fd); return false; }
     return errno == EAGAIN || errno == EWOULDBLOCK;
 }
@@ -379,15 +420,17 @@ static int bridge_fixed_inbound(void)
         fixture.spec.authenticated_binding = fixture.row.host_scope.binding;
         ASSERT_EQ(typed_test_device_host_bridge_open(&fixture.bridge, &fixture.spec), DEVICE_HOST_BRIDGE_READY);
         fixture.input[1] = fixture.output[1] = -1;
-        target = accept4(listener, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK); ASSERT(target >= 0);
+        target = fixture_accept(listener); ASSERT(target >= 0);
         ASSERT(fixture.bridge.observation.target_connected);
         uint8_t bytes[] = {0, 1, 2, 0xff, '\n', 0x80, 0};
         ASSERT_EQ(send(fixture.input[0], bytes, sizeof(bytes), MSG_NOSIGNAL), sizeof(bytes));
         ASSERT_EQ(typed_test_device_host_bridge_step(&fixture.bridge), DEVICE_HOST_BRIDGE_PROGRESS);
         uint8_t observed[sizeof(bytes)];
+        ASSERT(fixture_wait_readable(target));
         ASSERT_EQ(recv(target, observed, sizeof(observed), MSG_DONTWAIT), sizeof(bytes));
         ASSERT(!memcmp(bytes, observed, sizeof(bytes)));
         ASSERT_EQ(send(target, bytes, sizeof(bytes), MSG_NOSIGNAL), sizeof(bytes));
+        ASSERT(fixture_wait_readable(fixture.bridge.transport_fd));
         ASSERT_EQ(typed_test_device_host_bridge_step(&fixture.bridge), DEVICE_HOST_BRIDGE_PROGRESS);
         ASSERT_EQ(recv(fixture.output[0], observed, sizeof(observed), MSG_DONTWAIT), sizeof(bytes));
         ASSERT(!memcmp(bytes, observed, sizeof(bytes)));
@@ -404,7 +447,7 @@ static int bridge_invalid_transport(void)
     struct bridge_fixture fixture; fixture_init(&fixture);
     TEST_CASE("device_host_bridge: unconnected outbound socket refuses before taking descriptors") {
         ASSERT(fixture_open(&fixture));
-        unconnected = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        unconnected = platform_socket_open(AF_INET, SOCK_STREAM, 0, true, true);
         ASSERT(unconnected >= 0);
         fixture.spec.outbound_fd = unconnected;
         ASSERT_EQ(typed_test_device_host_bridge_open(&fixture.bridge, &fixture.spec), DEVICE_HOST_BRIDGE_REFUSED);
@@ -491,6 +534,38 @@ static bool cleanup_fixture_child(pid_t child)
         (long)child, errno);
     return false;
 }
+static int bridge_closed_transport_child(void)
+{
+    struct sigaction action = {.sa_handler = SIG_DFL}; sigemptyset(&action.sa_mask);
+    if (sigaction(SIGPIPE, &action, NULL) != 0) return 120;
+    sigset_t signals; sigemptyset(&signals); sigaddset(&signals, SIGPIPE);
+    if (sigprocmask(SIG_UNBLOCK, &signals, NULL) != 0) return 121;
+    struct bridge_fixture fixture; fixture_init(&fixture);
+    if (!fixture_open(&fixture)) { fixture_close(&fixture); return 122; }
+    if (fixture_admit(&fixture) != DEVICE_HOST_BRIDGE_READY) { fixture_close(&fixture); return 123; }
+    /* Queue an actual bridge write, then remove its transport reader. */
+    fixture.bridge.forward.bytes[0] = 0x5a;
+    fixture.bridge.forward.used = 1;
+    close(fixture.transport[1]); fixture.transport[1] = -1;
+    enum device_host_bridge_result result = typed_test_device_host_bridge_step(&fixture.bridge);
+    bool refused = result == DEVICE_HOST_BRIDGE_IO_ERROR && !fixture.bridge.active &&
+        fixture.bridge.observation.error_number == EPIPE;
+    fixture_close(&fixture); return refused ? 0 : 124;
+}
+static int bridge_closed_transport(void)
+{
+    int failures = 0; pid_t child = -1;
+    TEST_CASE("device_host_bridge: closed socket transport under default unblocked SIGPIPE terminates IO cleanly") {
+        ASSERT_EQ(fflush(NULL), 0);
+        child = fork(); ASSERT(child >= 0);
+        if (child == 0) _exit(bridge_closed_transport_child());
+        int status;
+        ASSERT(reap_fixture(child, &status)); child = -1;
+        ASSERT(WIFEXITED(status)); ASSERT_EQ(WEXITSTATUS(status), 0);
+    } TEST_END
+    if (child > 0 && !cleanup_fixture_child(child)) failures++;
+    return failures;
+}
 static int bridge_idle_revoke(void)
 {
     int failures = 0, ready[2] = {-1, -1};
@@ -498,7 +573,7 @@ static int bridge_idle_revoke(void)
     struct bridge_fixture fixture; fixture_init(&fixture);
     TEST_CASE("device_host_bridge: idle run refuses unavailable or revoked authority; bounded owner retry completes revoke") {
         ASSERT(fixture_open(&fixture)); ASSERT_EQ(fixture_admit(&fixture), DEVICE_HOST_BRIDGE_READY);
-        ASSERT(pipe2(ready, O_CLOEXEC) == 0);
+        ASSERT(fixture_pipe(ready, O_CLOEXEC) == 0);
         child = fork(); ASSERT(child >= 0);
         if (!child) {
             close(ready[0]); close(fixture.input[0]); close(fixture.output[0]); close(fixture.transport[1]);
@@ -580,7 +655,7 @@ static int bridge_broken_pipe(void)
         ASSERT(fixture_open(&fixture));
         close(fixture.output[0]); close(fixture.output[1]);
         fixture.output[0] = fixture.output[1] = -1;
-        ASSERT(pipe2(fixture.output, O_CLOEXEC | O_NONBLOCK) == 0);
+        ASSERT(fixture_pipe(fixture.output, O_CLOEXEC | O_NONBLOCK) == 0);
         fixture.spec.output_fd = fixture.output[1];
         ASSERT_EQ(fixture_admit(&fixture), DEVICE_HOST_BRIDGE_READY);
         close(fixture.output[0]); fixture.output[0] = -1;
@@ -770,7 +845,7 @@ static bool psk_io_fixture_ready(struct psk_io_fixture *f)
     while (psk_io_fixture_mono(f) < deadline) {
         if (!psk_io_pair_step(&f->client, &f->server)) return false;
         if (f->target < 0) {
-            f->target = accept4(f->listener, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
+            f->target = fixture_accept(f->listener);
             if (f->target < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return false;
         }
         if (f->client.session.phase == DEVICE_HOST_PSK_ESTABLISHED && f->server.session.phase == DEVICE_HOST_PSK_ESTABLISHED)
@@ -985,7 +1060,7 @@ static int psk_io_preflight_refusals(void)
         bad.carrier_input_fd = bad.carrier_output_fd = f.plain[1];
         ASSERT_EQ(typed_test_device_host_psk_bridge_open(&f.client, &bad), DEVICE_HOST_BRIDGE_REFUSED);
         ASSERT(!f.client.observation.io_taken); ASSERT(fcntl(f.plain[1], F_GETFD) >= 0);
-        unconnected = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0); ASSERT(unconnected >= 0);
+        unconnected = platform_socket_open(AF_UNIX, SOCK_STREAM, 0, true, true); ASSERT(unconnected >= 0);
         bad = f.client_spec; bad.carrier_input_fd = bad.carrier_output_fd = unconnected;
         ASSERT_EQ(typed_test_device_host_psk_bridge_open(&f.client, &bad), DEVICE_HOST_BRIDGE_REFUSED);
         ASSERT(fcntl(unconnected, F_GETFD) >= 0);
@@ -1004,7 +1079,7 @@ static bool psk_io_backup_ready(struct psk_io_fixture *f, struct device_host_psk
     int64_t deadline = psk_io_fixture_mono(f) + INT64_C(5000000000);
     while (psk_io_fixture_mono(f) < deadline) {
         if (!psk_io_pair_step(client, server)) return false;
-        if (*target < 0) *target = accept4(f->listener, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
+        if (*target < 0) *target = fixture_accept(f->listener);
         if (client->session.phase == DEVICE_HOST_PSK_ESTABLISHED && server->session.phase == DEVICE_HOST_PSK_ESTABLISHED)
             return *target >= 0;
         (void)poll(NULL, 0, 1);
@@ -1049,8 +1124,80 @@ static int psk_io_explicit_backup(void)
     if (target >= 0) close(target);
     psk_io_fixture_close(&f); return failures;
 }
+#if defined(__APPLE__)
+/* Pause the peer and queue only authenticated records until the real kernel
+ * accepts a positive prefix. Queue pressure is observed, not inferred from a
+ * platform-specific number of socket-buffer allocations. */
+static bool psk_io_fill_authenticated(struct psk_io_fixture *f, const uint8_t payload[4096],
+    size_t *complete, uint64_t *before)
+{
+    *complete = 0;
+    for (unsigned record = 0; record < 64; record++) {
+        if (send(f->plain[0], payload, 4096, MSG_NOSIGNAL) != 4096) return false;
+        *before = f->client.observation.carrier_written_bytes;
+        if (!psk_io_live_result(typed_test_device_host_psk_bridge_step(&f->client))) return false;
+        if (f->client.session.pending_sent > 0 &&
+            f->client.session.pending_sent < f->client.session.pending_used) return true;
+        if (f->client.session.pending_used != 0) return false;
+        ++*complete;
+    }
+    return false;
+}
+static bool psk_io_drain_authenticated_prefix(struct psk_io_fixture *f,
+    const uint8_t payload[4096], size_t records)
+{
+    size_t total = records * 4096, seen = 0;
+    int64_t deadline = psk_io_fixture_mono(f) + INT64_C(5000000000);
+    for (unsigned attempt = 0; attempt < 5000 && psk_io_fixture_mono(f) < deadline; attempt++) {
+        if (!psk_io_live_result(typed_test_device_host_psk_bridge_step(&f->server))) return false;
+        uint8_t bytes[4096]; ssize_t n = recv(f->target, bytes, sizeof(bytes), MSG_DONTWAIT);
+        if (n > 0) {
+            if ((size_t)n > total - seen) return false;
+            for (size_t i = 0; i < (size_t)n; i++)
+                if (bytes[i] != payload[(seen + i) % 4096]) return false;
+            seen += (size_t)n;
+        } else if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) return false;
+        if (seen == total && f->server.observation.plaintext_written_bytes == total &&
+            f->server.session.incoming_used > 0) return true;
+        (void)poll(NULL, 0, 1);
+    }
+    return false;
+}
+static int psk_io_partial_ciphertext_mac(void)
+{
+    int failures = 0; struct psk_io_fixture f; psk_io_fixture_init(&f);
+    struct shake_wrap_state sealed = {0};
+    TEST_CASE("host PSK IO: actual short ciphertext syscall retains suffix/state and no premature plaintext on macOS") {
+        ASSERT(psk_io_fixture_open(&f, 0, false)); ASSERT(psk_io_fixture_admit(&f)); ASSERT(psk_io_fixture_ready(&f));
+        int small = 1024, low = 1;
+        ASSERT_EQ(setsockopt(f.client.spec.carrier_output_fd, SOL_SOCKET, SO_SNDBUF, &small, sizeof(small)), 0);
+        ASSERT_EQ(setsockopt(f.client.spec.carrier_output_fd, SOL_SOCKET, SO_SNDLOWAT, &low, sizeof(low)), 0);
+        uint8_t payload[4096]; for (size_t i = 0; i < sizeof(payload); i++) payload[i] = (uint8_t)i;
+        size_t complete = 0; uint64_t before = 0;
+        ASSERT(psk_io_fill_authenticated(&f, payload, &complete, &before));
+        ASSERT(f.client.session.pending_sent > 0); ASSERT(f.client.session.pending_sent < f.client.session.pending_used);
+        sealed = f.client.session.send; ASSERT_EQ(f.client.session.send_sequence, complete + 1);
+        ASSERT(psk_io_drain_authenticated_prefix(&f, payload, complete));
+        ASSERT_EQ(f.server.session.plaintext_used, 0);
+        ASSERT(f.server.session.incoming_used > 0); ASSERT(f.server.session.incoming_used < DEVICE_HOST_PSK_WIRE);
+        uint8_t byte; ASSERT_EQ(recv(f.target, &byte, 1, MSG_DONTWAIT), -1);
+        ASSERT(errno == EAGAIN || errno == EWOULDBLOCK);
+        int64_t deadline = psk_io_fixture_mono(&f) + INT64_C(5000000000); size_t seen = 0;
+        while (psk_io_fixture_mono(&f) < deadline && seen < sizeof(payload)) {
+            ASSERT(psk_io_pair_step(&f.client, &f.server)); ASSERT(psk_io_try_receive(f.target, payload, sizeof(payload), &seen));
+        }
+        ASSERT_EQ(seen, sizeof(payload)); ASSERT_EQ(f.client.observation.carrier_written_bytes - before, DEVICE_HOST_PSK_WIRE);
+        ASSERT_EQ(f.client.session.send_sequence, complete + 1); ASSERT(!memcmp(&sealed, &f.client.session.send, sizeof(sealed)));
+        ASSERT_EQ(f.server.observation.plaintext_written_bytes, (complete + 1) * sizeof(payload));
+    } TEST_END
+    shake_wrap_destroy(&sealed); psk_io_fixture_close(&f); return failures;
+}
+#endif
 static int psk_io_partial_ciphertext(void)
 {
+#if defined(__APPLE__)
+    return psk_io_partial_ciphertext_mac();
+#else
     int failures = 0; struct psk_io_fixture f; psk_io_fixture_init(&f);
     struct shake_wrap_state sealed = {0};
     TEST_CASE("host PSK IO: actual short ciphertext syscall retains suffix/state and no plaintext before full authenticated record") {
@@ -1094,6 +1241,7 @@ static int psk_io_partial_ciphertext(void)
         ASSERT_EQ(f.server.observation.plaintext_written_bytes, sizeof(warm) + sizeof(payload));
     } TEST_END
     shake_wrap_destroy(&sealed); psk_io_fixture_close(&f); return failures;
+#endif
 }
 struct bridge_deadline_clock {
     int64_t now, expired;
@@ -1311,7 +1459,7 @@ static int psk_io_poll_reverse_fin(void)
         ASSERT_EQ(typed_test_device_host_psk_queue_fin(&f.client.session), DEVICE_HOST_PSK_PROGRESS);
         ASSERT(psk_io_live_result(typed_test_device_host_psk_bridge_step(&f.client))); ASSERT(f.client.carrier_half_closed);
         ASSERT(psk_io_live_result(typed_test_device_host_psk_bridge_step(&f.server))); ASSERT(f.server.session.receive_fin);
-        uint8_t byte; ASSERT_EQ(recv(f.target, &byte, 1, MSG_DONTWAIT), 0);
+        uint8_t byte; ASSERT_EQ(psk_io_wait_byte(&f, f.target, &byte), 0);
         ASSERT_EQ(typed_test_device_host_psk_queue_fin(&f.server.session), DEVICE_HOST_PSK_PROGRESS);
         ASSERT(f.server.session.pending_used > 0);
         struct device_host_bridge_poll_plan plan;
@@ -1514,7 +1662,7 @@ int test_device_host_bridge(void)
         bridge_pending_refusal(2) + bridge_pending_refusal(3) + bridge_pending_refusal(4) +
         bridge_pending_refusal(5) + bridge_fixed_inbound() +
         bridge_invalid_transport() + bridge_halfclose() + bridge_partial_release() +
-        bridge_broken_pipe() + bridge_idle_revoke() + bridge_fullbytes() +
+        bridge_broken_pipe() + bridge_closed_transport() + bridge_idle_revoke() + bridge_fullbytes() +
         bridge_write_boundary(true) + bridge_write_boundary(false) + psk_io_admission_and_bytes() +
         psk_io_wrong_key_and_truncation() + psk_io_buffered_revoke() + psk_io_actual_guard_boundary() +
         psk_io_fin_and_extra() + psk_io_refused_target() + psk_io_closed_stderr() +

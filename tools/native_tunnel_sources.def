@@ -80,6 +80,7 @@ ZCL_TUNNEL_HEADER("platform/modules/platform/include/platform/private_file_state
 ZCL_TUNNEL_HEADER("platform/modules/platform/include/platform/rename_compat.h","include/platform/rename_compat.h")
 ZCL_TUNNEL_HEADER("platform/modules/platform/include/platform/rng.h","include/platform/rng.h")
 ZCL_TUNNEL_HEADER("platform/modules/platform/include/platform/socket_compat.h","include/platform/socket_compat.h")
+ZCL_TUNNEL_HEADER("platform/modules/platform/include/platform/pipe_compat.h","include/platform/pipe_compat.h")
 ZCL_TUNNEL_HEADER("platform/modules/platform/include/platform/thread_compat.h","include/platform/thread_compat.h")
 ZCL_TUNNEL_HEADER("platform/modules/platform/include/platform/time_compat.h","include/platform/time_compat.h")
 ZCL_TUNNEL_HEADER("platform/modules/platform/include/platform/windows_path.h","include/platform/windows_path.h")

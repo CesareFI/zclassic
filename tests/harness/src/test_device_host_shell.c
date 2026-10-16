@@ -47,7 +47,7 @@ static int shell_receiver_unit(void)
     return failures;
 }
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 static bool shell_write(const char *path, const char *text, mode_t mode)
 {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
@@ -129,6 +129,7 @@ static int shell_input_file_rewrite(void)
     return failures;
 }
 
+#if defined(__linux__)
 /* Drive the registered leaf exactly as dispatch would: catalog spec plus one
  * {"key": path} input object. */
 static bool psk_new_call(const char *path, struct zcl_command_reply *reply)
@@ -265,6 +266,7 @@ static int shell_psk_cleanup_honesty(void)
     return failures;
 }
 
+#endif
 static bool shell_argv_equal(const struct zcl_native_host_shell_argv *plan, const char *const *want, size_t count)
 {
     if (plan->argc != count || plan->argv[count] != NULL) return false;
@@ -489,6 +491,7 @@ static int shell_injection_refused(void)
     return failures;
 }
 
+#if defined(__linux__)
 static int shell_package_hangup_race(void)
 {
     int failures = 0;
@@ -502,14 +505,18 @@ static int shell_package_hangup_race(void)
     return failures;
 }
 #endif
+#endif
 
 int test_device_host_shell(void);
 int test_device_host_shell(void)
 {
     int failures = shell_receiver_unit();
+#if defined(__linux__) || defined(__APPLE__)
+    failures += shell_input_file() + shell_input_file_rewrite();
+    failures += shell_dry_run_argv() + shell_dry_run_executes_nothing() + shell_ssh_resolution() + shell_injection_refused();
 #if defined(__linux__)
-    failures += shell_input_file() + shell_input_file_rewrite() + shell_psk_fingerprint() + shell_psk_new() + shell_psk_cleanup_honesty();
-    failures += shell_dry_run_argv() + shell_dry_run_executes_nothing() + shell_ssh_resolution() + shell_injection_refused() + shell_package_hangup_race();
+    failures += shell_psk_fingerprint() + shell_psk_new() + shell_psk_cleanup_honesty() + shell_package_hangup_race();
+#endif
 #endif
     return failures;
 }

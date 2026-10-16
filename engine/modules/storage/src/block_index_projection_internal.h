@@ -20,14 +20,40 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Commit periodically during a long catch_up so a single crash re-consumes
- * at most one batch's worth of events, not the whole backlog. */
+/* Small batch size (events). No longer the production commit cadence; the
+ * WAL-budget tests pin it through commit_events. */
 #define BIP_BATCH_EVENTS 1000
+
+/* Replay commit cadence. One transaction carries the rows AND the consumed
+ * offset; it commits at the first of: this many events, this many log bytes,
+ * or this much wall time. A killed boot resumes from the last commit, so the
+ * cost of a kill is bounded by these, while fewer and larger batches let
+ * SQLite coalesce random B-tree page writes (the spinning-disk cost).
+ * synchronous stays NORMAL and the journal stays WAL: no durability change. */
+#define BIP_COMMIT_EVENTS    262144u
+#define BIP_COMMIT_LOG_BYTES (64ull * 1024ull * 1024ull)
+#define BIP_COMMIT_MS        10000
+
+/* Progress line: at most once per 10 s AND once per 1 percent. */
+#define BIP_PROGRESS_MS      10000
+#define BIP_PROGRESS_PCT     1u
 
 /* Mid-catch-up PASSIVE checkpoint bound. 32 MiB is ~10x under the 4.19 GB /
  * (13200/1000) ≈ 320 MB per-batch WAL growth measured on a 2-vCPU node
  * applying ~22 headers/s with no checkpoint until the stream ended. */
 #define BIP_WAL_BUDGET_BYTES (32u * 1024u * 1024u)
+
+/* Replay WAL bound: the 262144-event cadence would otherwise let one batch
+ * grow the WAL far past the steady-state bound. The replay poll (every 256
+ * events) stats the -wal and commits once it reaches this. Larger than the
+ * steady-state budget so replay keeps most of its fsync saving. */
+#define BIP_REPLAY_WAL_BUDGET_BYTES (128 * 1024ull * 1024ull)
+/* Prior WAL bytes per log byte before the first commit reports a measure
+ * (a 1.5 KiB header row dirties about 3 of the 4 KiB pages of its B-trees;
+ * measured 3x). A dirty page set stays in the 256 MiB cache until commit, so
+ * the file size alone cannot see a batch growing: the poll projects it. */
+#define BIP_REPLAY_WAL_AMP_PRIOR 6.0
+#define BIP_WAL_PAGE_BYTES       4096u
 
 /* Page cache for the hash-keyed WITHOUT ROWID block_index B-tree.
  *
@@ -71,6 +97,20 @@ struct block_index_projection {
     uint64_t       wal_budget_bytes;
     uint64_t       max_wal_bytes_seen;
     uint64_t       wal_passive_checkpoints;
+    uint64_t       replay_wal_budget_bytes;   /* replay commit trigger */
+    int64_t        last_wal_frames;           /* WAL frames at the last commit, -1 unknown */
+
+    /* Replay cadence (defaults above; tests override on the open handle). */
+    uint64_t       commit_events;
+    uint64_t       commit_bytes;
+    int64_t        commit_ms;
+    int64_t        progress_ms;
+    uint64_t       progress_pct;
+    uint64_t       batches_committed;   /* commits made by catch_up */
+    uint64_t       progress_lines;      /* [boot-phase] lines printed */
+    /* Test seam, NULL in production: called before each log event is
+     * applied with the 1-based event number within this catch_up. */
+    void         (*event_hook)(uint64_t event_no);
 };
 
 struct catch_up_ctx {
@@ -84,7 +124,16 @@ struct catch_up_ctx {
     uint64_t collisions;           /* INSERT OR REPLACE that found a prior row */
     uint64_t status_orphans;       /* EV_BLOCK_STATUS with no prior row — logged, skipped */
     uint64_t last_offset_after;    /* offset *after* the last consumed event */
+    uint64_t batch_start_offset;   /* cursor at the last commit */
+    uint64_t start_offset;         /* cursor when this catch_up began */
+    uint64_t total_bytes;          /* log size when this catch_up began */
+    uint64_t events_seen;          /* every event delivered, any type */
+    int64_t  t_start_ms;
+    int64_t  last_commit_ms;
+    int64_t  last_report_ms;
+    uint64_t last_report_pct;
     atomic_uint_least64_t *scan_ctr; /* boot O(delta) witness (util/boot_scan.h) */
+    double   wal_amp;              /* WAL bytes written per log byte, learned per commit */
     bool     error;
 };
 
@@ -92,6 +141,12 @@ struct catch_up_ctx {
  * transaction boundary + durable counters). */
 bool batch_begin(struct catch_up_ctx *c);
 bool batch_commit(struct catch_up_ctx *c);
+/* Replay cadence + progress (block_index_projection.c). */
+void bip_replay_begin(struct catch_up_ctx *c);
+void bip_replay_before_event(struct catch_up_ctx *c);
+bool bip_replay_after_event(struct catch_up_ctx *c);
+bool bip_replay_commit(struct catch_up_ctx *c);
+void bip_replay_finish(struct catch_up_ctx *c);
 bool block_index_projection_prepare_dirty(struct catch_up_ctx *c);
 bool block_index_projection_mark_dirty(struct catch_up_ctx *c,
                                        const uint8_t hash[32]);

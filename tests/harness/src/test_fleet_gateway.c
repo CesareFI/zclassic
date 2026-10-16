@@ -2046,6 +2046,11 @@ static bool gw_qnext(char *state, size_t cap)
         s = (v && v->type == JSON_STR) ? json_get_str(v) : NULL;
         if (s && snprintf(state, cap, "%s", s) > 0)
             ok = true;
+        else
+            printf("[queue next: missing string state or state copy failed]\n");
+    } else {
+        printf("[queue next refused: code=%.63s message=%.191s]\n",
+               c.rep.error.code, c.rep.error.message);
     }
     gw_qend(&c);
     return ok;

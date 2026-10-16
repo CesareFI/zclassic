@@ -225,6 +225,8 @@ ZCL_CAPABILITY_SYMBOL("posix_spawn_file_actions_addclose", CAP_PROCESS,
     "Builds the descriptor inheritance policy for a posix_spawn child.")
 ZCL_CAPABILITY_SYMBOL("posix_spawn_file_actions_adddup2", CAP_PROCESS,
     "Builds the descriptor inheritance policy for a posix_spawn child.")
+ZCL_CAPABILITY_SYMBOL("posix_spawn_file_actions_addopen", CAP_PROCESS,
+    "Configures a posix_spawn child to open a path into its own descriptor table at spawn; the open happens in the child, not in this process.")
 ZCL_CAPABILITY_SYMBOL("posix_spawn_file_actions_destroy", CAP_PROCESS,
     "Kept with the complete posix_spawn configuration family.")
 ZCL_CAPABILITY_SYMBOL("posix_spawn_file_actions_init", CAP_PROCESS,
@@ -439,6 +441,7 @@ ZCL_CAPABILITY_SYMBOL("fdopendir", CAP_FS_READ, "")
 ZCL_CAPABILITY_SYMBOL("fflush", CAP_FS_READ,
     "Commits buffered bytes only if a CAP_FS_WRITE call put them there, "
     "so the handle itself is all the reach this symbol adds.")
+ZCL_CAPABILITY_SYMBOL("__uflow", CAP_FS_READ, "")
 ZCL_CAPABILITY_SYMBOL("fgetc", CAP_FS_READ, "")
 ZCL_CAPABILITY_SYMBOL("ungetc", CAP_FS_READ,
     "Pushes a byte back into an existing input stream; does not write external storage.")
@@ -1256,6 +1259,9 @@ ZCL_CAPABILITY_SYMBOL("SSL_get_error", CAP_HARMLESS,
 ZCL_CAPABILITY_SYMBOL("stderr", CAP_HARMLESS,
     "A stream object, not a call. Referencing it emits nothing; the "
     "emitting calls carry the class.")
+ZCL_CAPABILITY_SYMBOL("stdin", CAP_HARMLESS,
+    "A stream object, not a call. Referencing it emits nothing; the "
+    "reading calls carry the class.")
 ZCL_CAPABILITY_SYMBOL("stdout", CAP_HARMLESS,
     "A stream object, not a call. Referencing it emits nothing; the "
     "emitting calls carry the class.")

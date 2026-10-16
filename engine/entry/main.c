@@ -36,6 +36,7 @@
 #include "config/args.h"                /* flag ladder, -loglevel, usage text */
 #include "main_cli_modes.h"             /* bench/cli/import/gen run-and-exit modes */
 #include "command/native_command.h"
+#include "mcp/mcp_serve.h"              /* z23 mcp serve (local stdio MCP) */
 #include "net/file_service.h"           /* -filesync fast path (fs_client_sync) */
 #include "controllers/agent_controller.h" /* rpc_agent_set_boot_context */
 #include "views/ui_present.h"           /* detached reviewed UI child */
@@ -437,12 +438,24 @@ static bool main_dispatch_recovery_modes(int argc, char **argv, int *rc)
     return false;
 }
 
+/* `z23 mcp serve --checkout=<root>`: the local stdio MCP adapter. Exact first
+ * word, ahead of the CLI command words and before any node configuration, so
+ * the server reads a datadir only through the leaves a caller runs. */
+static bool main_dispatch_mcp_mode(int argc, char **argv, int *rc)
+{
+    if (!zcl_mcp_serve_selected(argc, argv))
+        return false;
+    *rc = zcl_mcp_serve_main(argc, argv);
+    return true;
+}
+
 /* The run-and-exit mode ladder, in its historical order. `||` short-circuits
  * exactly as the original if-chain fell through, so the first mode that
  * matches is the one that runs. */
 static bool main_dispatch_standalone_mode(int argc, char **argv, int *rc)
 {
     return main_dispatch_priority_modes(argc, argv, rc) ||
+           main_dispatch_mcp_mode(argc, argv, rc) ||
            main_dispatch_snapshot_and_cli_modes(argc, argv, rc) ||
            main_dispatch_recovery_modes(argc, argv, rc);
 }

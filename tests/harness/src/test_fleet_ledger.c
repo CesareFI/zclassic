@@ -95,6 +95,42 @@ static bool fl_box_open(struct fl_box *b, const char *root, const char *name,
     return b->ledger != NULL && report.status == ZCL_FLEET_OK;
 }
 
+static bool fl_wire_responder(struct mesh_term_fixture *f,
+                               struct mesh_term_peer *peer,
+                               struct fl_box *box, const char *root)
+{
+    uint8_t master_seed[32];
+    memset(master_seed, 0x88, sizeof master_seed);
+    memcpy(peer->noise_pub, f->resp_noise_pub, 32);
+    if (vcs_zcode_dht_delegation_sign(
+            &peer->delegation, f->genesis, f->resp_online_pub,
+            f->resp_noise_pub, f->term_peer.delegation.beacon_height,
+            f->term_peer.delegation.beacon_hash, 1000, 4000, 7,
+            master_seed) != VCS_ZCODE_DHT_DELEGATION_OK)
+        return false;
+    memset(master_seed, 0, sizeof master_seed);
+    struct zid_identity identity;
+    if (!db_zid_identity_find(&f->ndb,
+            f->term_peer.delegation.doc.master_pubkey, &identity))
+        return false;
+    memcpy(identity.master_pubkey, f->resp_master_pub, 32);
+    if (!db_zid_identity_save(&f->ndb, &identity) ||
+        !mesh_term_pair_row(f, peer, MESH_PAIRING_CAP_STATUS_READ,
+                            FL_PAIRED_AT, FL_PAIRING_EXPIRES))
+        return false;
+    memset(box, 0, sizeof *box);
+    if (snprintf(box->dir, sizeof box->dir, "%s/wire_a", root) >=
+        (int)sizeof box->dir)
+        return false;
+    memcpy(box->seed, f->resp_online_seed, 32);
+    memcpy(box->box_id, f->resp_master_pub, 32);
+    memcpy(box->signer, f->resp_online_pub, 32);
+    struct zcl_fleet_report report;
+    box->ledger = zcl_fleet_ledger_open(box->dir, box->box_id, box->signer,
+                                       &report);
+    return box->ledger && report.status == ZCL_FLEET_OK;
+}
+
 static void fl_box_close(struct fl_box *b)
 {
     zcl_fleet_ledger_close(b->ledger);
@@ -849,6 +885,7 @@ int test_fleet_ledger(void)
     bool wa_open = false, wb_open = false, ex_open = false;
 
     struct mesh_term_fixture f;
+    struct mesh_term_peer responder = {0};
     bool fixture_open = false;
     bool registered = false;
     struct net_manager nm;
@@ -1688,7 +1725,10 @@ int test_fleet_ledger(void)
     TEST("fleet ledger: a pull over the real stream wire replicates a "
          "paired peer's rows, and an unpaired peer never reaches the "
          "service") {
-        ASSERT(fl_box_open(&wa, root, "wire_a", 0x41));
+        ASSERT(mesh_term_fixture_open(&f, wire_dir));
+        fixture_open = true;
+        ASSERT(fl_wire_responder(&f, &responder, &wa, root));
+
         wa_open = true;
         ASSERT(fl_box_open(&wb, root, "wire_b", 0x51));
         wb_open = true;
@@ -1697,8 +1737,6 @@ int test_fleet_ledger(void)
                 fl_add_usage(&wa, ZCL_FLEET_PROVIDER_GLM, 10 + i, i, "w"),
                 ZCL_FLEET_OK);
 
-        ASSERT(mesh_term_fixture_open(&f, wire_dir));
-        fixture_open = true;
         zcl_mutex_init(&nm.cs_nodes);
         zcl_mutex_init(&nm.cs_last_node_id);
         struct net_address addr;
@@ -1775,6 +1813,9 @@ int test_fleet_ledger(void)
         boot_fleet_ledger_test_bind_authority(&f.term_peer.delegation,
                                               f.genesis, FL_AUTHORITY_NOW);
 
+        boot_fleet_ledger_test_bind_authority(&responder.delegation,
+                                              f.genesis, FL_AUTHORITY_NOW);
+
         /* Box wb asks box wa for everything after what it holds, which is
          * nothing, and commits what comes back. */
         ASSERT_EQ(zcl_fleet_ledger_peer_seq(wb.ledger, wa.box_id),
@@ -1833,14 +1874,14 @@ int test_fleet_ledger(void)
         uint64_t seq_before = zcl_fleet_ledger_peer_seq(wb.ledger, wa.box_id);
 
         /* With the identity ACTIVE the REAL pull lane — pairing list,
-         * delegation lookup, authority and all — opens exactly one stream
-         * toward this peer, and refuses nothing. */
+         * delegation lookup, authority and all — opens both authorized peers'
+         * streams and refuses nothing. */
         mesh_loop_discard(asker, ask_queue, f.res_term);
         mesh_loop_discard(answerer, answer_queue, f.term_peer.ini);
         mesh_stream_test_reset();
         boot_fleet_ledger_test_pull_paired(wb.ledger, FL_AUTHORITY_NOW);
         ASSERT_EQ(mesh_stream_test_live_count(FLEET_LEDGER_SERVICE_NAME),
-                  (size_t)1);
+                  (size_t)2);
         ASSERT_EQ(boot_fleet_ledger_delegation_refused_count(), refused);
 
         /* The peer's master identity is revoked on chain. */
@@ -1863,13 +1904,15 @@ int test_fleet_ledger(void)
         mesh_loop_discard(answerer, answer_queue, f.term_peer.ini);
         mesh_stream_test_reset();
 
-        /* PULL: the peer is not asked. No stream is opened at all, and the
+        /* PULL: the revoked peer is not asked; the responder still opens. The
          * refusal is counted under the name the catalog already carried. */
         boot_fleet_ledger_test_pull_paired(wb.ledger, FL_AUTHORITY_NOW);
         ASSERT_EQ(mesh_stream_test_live_count(FLEET_LEDGER_SERVICE_NAME),
-                  (size_t)0);
+                  (size_t)1);
         ASSERT_EQ(boot_fleet_ledger_delegation_refused_count(), refused + 1);
         ASSERT_EQ(zcl_fleet_ledger_peer_seq(wb.ledger, wa.box_id), seq_before);
+
+        mesh_stream_test_reset();
 
         /* ACCEPT: the peer is not answered. The pairing row still grants
          * the capability, so the primitive admits the OPEN and it is THIS
@@ -1969,6 +2012,109 @@ int test_fleet_ledger(void)
         ASSERT(json_get_int(refused) > 0);
         zcl_command_reply_free(&reply);
         zcl_native_bridge_bind_rpc("", 0);
+        PASS();
+    }
+
+    TEST("fleet ledger: expiry after OPEN sends no ledger DATA") {
+        mesh_loop_discard(asker, ask_queue, f.res_term);
+        mesh_loop_discard(answerer, answer_queue, f.term_peer.ini);
+        mesh_stream_test_reset();
+        ASSERT(boot_fleet_ledger_test_pull(f.resp_noise_pub, wa.box_id,
+                                           wa.signer, 0));
+        ASSERT_EQ(mesh_loop_pump(asker, ask_queue, f.res_term, &mp, answerer),
+                  (size_t)1);
+        boot_fleet_ledger_test_bind_authority(&f.term_peer.delegation,
+                                              f.genesis, 4000);
+        boot_fleet_ledger_test_serve();
+        uint8_t wire[MESH_LOOP_WIRE_MAX], kind = 0;
+        bool more = false;
+        size_t len = mesh_loop_take(answerer, answer_queue, f.term_peer.ini,
+                                    wire, sizeof wire, &more);
+        ASSERT(more);
+        ASSERT(mesh_stream_test_read_header(wire, len, &kind, NULL));
+        ASSERT_EQ(kind, MESH_STREAM_KIND_CLOSE);
+        ASSERT_EQ(wire[MESH_STREAM_FRAME_PREFIX_LEN + 1u + 8u],
+                  MESH_STREAM_REFUSED_PEER_UNPAIRED);
+        ASSERT_EQ(mesh_loop_take(answerer, answer_queue, f.term_peer.ini,
+                                 wire, sizeof wire, &more), (size_t)0);
+        boot_fleet_ledger_test_bind_authority(&f.term_peer.delegation,
+                                              f.genesis, FL_AUTHORITY_NOW);
+        PASS();
+    }
+
+    TEST("fleet ledger: expiry after receipt prevents replica commit") {
+        ASSERT_EQ(fl_add_usage(&wa, ZCL_FLEET_PROVIDER_GLM, 81, 1, "expiry"),
+                  ZCL_FLEET_OK);
+        uint64_t before = zcl_fleet_ledger_peer_seq(wb.ledger, wa.box_id);
+        mesh_loop_discard(asker, ask_queue, f.res_term);
+        mesh_loop_discard(answerer, answer_queue, f.term_peer.ini);
+        mesh_stream_test_reset();
+        ASSERT(boot_fleet_ledger_test_pull(f.resp_noise_pub, wa.box_id,
+                                           wa.signer, before));
+        ASSERT_EQ(mesh_loop_pump(asker, ask_queue, f.res_term, &mp, answerer),
+                  (size_t)1);
+        boot_fleet_ledger_test_serve();
+        boot_fleet_ledger_test_serve();
+        ASSERT(mesh_loop_pump(answerer, answer_queue, f.term_peer.ini, &mp,
+                              asker) >= (size_t)2);
+        boot_fleet_ledger_test_bind_authority(&responder.delegation,
+                                              f.genesis, 4000);
+        boot_fleet_ledger_test_drain_into(wb.ledger);
+        ASSERT_EQ(zcl_fleet_ledger_peer_seq(wb.ledger, wa.box_id), before);
+        boot_fleet_ledger_test_bind_authority(&responder.delegation,
+                                              f.genesis, FL_AUTHORITY_NOW);
+        PASS();
+    }
+
+    TEST("fleet ledger: revocation after receipt prevents replica commit") {
+        ASSERT_EQ(fl_add_usage(&wa, ZCL_FLEET_PROVIDER_GLM, 91, 1, "new"),
+                  ZCL_FLEET_OK);
+        uint64_t before = zcl_fleet_ledger_peer_seq(wb.ledger, wa.box_id);
+        mesh_loop_discard(asker, ask_queue, f.res_term);
+        mesh_loop_discard(answerer, answer_queue, f.term_peer.ini);
+        mesh_stream_test_reset();
+        ASSERT(boot_fleet_ledger_test_pull(f.resp_noise_pub, wa.box_id,
+                                           wa.signer, before));
+        ASSERT_EQ(mesh_loop_pump(asker, ask_queue, f.res_term, &mp, answerer),
+                  (size_t)1);
+        boot_fleet_ledger_test_serve();
+        boot_fleet_ledger_test_serve();
+        ASSERT(mesh_loop_pump(answerer, answer_queue, f.term_peer.ini, &mp,
+                              asker) >= (size_t)2);
+        ASSERT(db_mesh_pairing_revoke(&f.ndb, responder.pairing.pairing_id,
+                                      FL_AUTHORITY_NOW));
+        boot_fleet_ledger_test_drain_into(wb.ledger);
+        ASSERT_EQ(zcl_fleet_ledger_peer_seq(wb.ledger, wa.box_id), before);
+        PASS();
+    }
+
+    TEST("fleet ledger: revocation after OPEN sends no ledger DATA") {
+        mesh_loop_discard(asker, ask_queue, f.res_term);
+        mesh_loop_discard(answerer, answer_queue, f.term_peer.ini);
+        mesh_stream_test_reset();
+        uint8_t frame[MESH_LOOP_WIRE_MAX], pull[FLEET_LEDGER_PULL_BYTES] = {0};
+        pull[0] = FLEET_LEDGER_MSG_PULL;
+        pull[1] = 1;
+        size_t len = mesh_stream_test_open_frame(10, 4096,
+            FLEET_LEDGER_SERVICE_NAME, pull, sizeof pull, frame, sizeof frame);
+        ASSERT(len > 0);
+        ASSERT(mesh_stream_frame(&mp, answerer, frame, len, NULL));
+        ASSERT_EQ(mesh_stream_test_live_count(FLEET_LEDGER_SERVICE_NAME),
+                  (size_t)1);
+        ASSERT(db_mesh_pairing_revoke(&f.ndb, f.term_peer.pairing.pairing_id,
+                                      FL_AUTHORITY_NOW));
+        boot_fleet_ledger_test_serve();
+        bool more = false;
+        uint8_t kind = 0;
+        len = mesh_loop_take(answerer, answer_queue, f.term_peer.ini,
+                             frame, sizeof frame, &more);
+        ASSERT(more);
+        ASSERT(mesh_stream_test_read_header(frame, len, &kind, NULL));
+        ASSERT_EQ(kind, MESH_STREAM_KIND_CLOSE);
+        ASSERT_EQ(frame[MESH_STREAM_FRAME_PREFIX_LEN + 1u + 8u],
+                  MESH_STREAM_REFUSED_PEER_UNPAIRED);
+        ASSERT_EQ(mesh_loop_take(answerer, answer_queue, f.term_peer.ini,
+                                 frame, sizeof frame, &more), (size_t)0);
         PASS();
     }
 

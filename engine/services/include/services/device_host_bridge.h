@@ -44,7 +44,7 @@ struct device_host_bridge {
     int transport_fd;
     bool active, output_socket;
 };
-/* Linux-only raw service, no framing/diagnostic writes to supplied descriptors.
+/* Linux/macOS raw service, no framing/diagnostic writes to supplied descriptors.
  * Existing pairing refusals may log contextual diagnostics to stderr.
  * Caller independently
  * verifies handshake possession and exclusive-key engine context; roots alone
@@ -113,7 +113,7 @@ struct device_host_bridge_poll_plan {
     struct device_host_bridge_poll_entry entries[5]; size_t count;
     int64_t deadline_ns; bool immediate;
 };
-/* Linux-only backend2 over one selected, potentially untrusted carrier. No
+/* Linux/macOS backend2 over one selected, potentially untrusted carrier. No
  * automatic fallback/dial of carriers. Caller explicitly selects fresh carrier
  * and NEW context after failure; old cryptographic state is never reused.
  * All caller descriptors are independent nonblocking pipes/connected stream
