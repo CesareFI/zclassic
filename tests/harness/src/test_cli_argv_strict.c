@@ -116,7 +116,7 @@ static bool cas_contains(const char *hay, const char *needle)
 
 /* Bind to port 0, read back the OS-assigned free port, close. Same idiom as
  * test_cli_auth_robust.c's car_reserve_port() / test_cookie_rotation.c. */
-static uint16_t cas_reserve_port(void)
+static uint16_t cas_reserve_port_once(void)
 {
     platform_socket_t fd = platform_socket_open(AF_INET, SOCK_STREAM, 0,
                                                 true, false);
@@ -140,6 +140,18 @@ static uint16_t cas_reserve_port(void)
     if (port >= 39070 && port <= 39073)
         return 0;
     return port;
+}
+
+/* A transient bind failure under a loaded pool must not read as "no port":
+ * retry a bounded number of times (each attempt asks the OS for a fresh
+ * ephemeral port) before giving up. */
+static uint16_t cas_reserve_port(void)
+{
+    for (int attempt = 0; attempt < 16; attempt++) {
+        uint16_t port = cas_reserve_port_once();
+        if (port != 0) return port;
+    }
+    return 0;
 }
 
 /* Minimal envp: HOME=<home>, a fixed PATH, ZCL_CLI_TEST_NO_SERVICE_LOOKUP=1
@@ -648,7 +660,7 @@ static int cas_test_daemon_mode_tolerant_and_warns(void)
          "WARNs with the exact single-dash correction") {
         uint16_t port = cas_reserve_port();
         if (port == 0) {
-            printf("SKIP (cli_argv_strict: could not reserve a test port — "
+            printf("UNOBSERVED (cli_argv_strict: could not reserve a test port — "
                    "daemon-tolerant case)\n");
             return 0;
         }
@@ -708,7 +720,7 @@ static int cas_test_noisetransport_is_recognized(void)
         uint16_t rpc_port = cas_reserve_port();
         uint16_t p2p_port = cas_reserve_port();
         if (rpc_port == 0 || p2p_port == 0) {
-            printf("SKIP (cli_argv_strict: could not reserve test ports — "
+            printf("UNOBSERVED (cli_argv_strict: could not reserve test ports — "
                    "noisetransport case)\n");
             return 0;
         }
@@ -739,7 +751,11 @@ static int cas_test_noisetransport_is_recognized(void)
 
         uint16_t legacy_rpc_port = cas_reserve_port();
         uint16_t legacy_p2p_port = cas_reserve_port();
-        ASSERT(legacy_rpc_port != 0 && legacy_p2p_port != 0);
+        if (legacy_rpc_port == 0 || legacy_p2p_port == 0) {
+            printf("UNOBSERVED (cli_argv_strict: could not reserve legacy "
+                   "noisetransport test ports)\n");
+            return failures;
+        }
         char legacy_home[PATH_MAX], legacy_datadir[PATH_MAX];
         test_fmt_tmpdir(legacy_home, sizeof(legacy_home),
                         "zcl_cas_legacy_noise", "home");
