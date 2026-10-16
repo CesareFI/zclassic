@@ -729,6 +729,8 @@ ZCL_TEST_GROUP(mesh_terminal_worker)
 ZCL_TEST_GROUP(boot_mesh_terminal)
 /* mesh terminal requester: receipt binding, DATA sequence, credit, watchdogs */
 ZCL_TEST_GROUP(mesh_terminal_client)
+/* terminal hub: keyed hello, exit status, resize, limits, wrong key, cap, audit, latency */
+ZCL_TEST_GROUP(mesh_terminal_hub)
 /* multiplexed streams: frames, credit, per-peer cap, named refusals */
 ZCL_TEST_GROUP(mesh_stream)
 /* mesh tunnels: the two admission gates, bytes both ways, back-pressure */

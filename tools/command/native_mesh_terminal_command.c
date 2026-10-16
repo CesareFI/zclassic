@@ -14,6 +14,7 @@
 
 #include "command/mesh_terminal_attach.h"
 #include "command/native_command.h"
+#include "native_mesh_terminal_hub.h"
 
 #include "session/mesh_terminal_proto.h"
 
@@ -295,6 +296,8 @@ bool zcl_native_mesh_terminal_try_attach(const char *const *words,
                                          size_t count, size_t consumed,
                                          int *rc)
 {
+    if (zcl_native_mesh_terminal_hub_try(words, count, consumed, rc))
+        return true;
     const char *pairing = terminal_pairing_arg(words, count, consumed);
     if (!pairing || !pairing[0]) {
         fprintf(stderr, "z23: refused: INVALID_ARGUMENTS: usage: "

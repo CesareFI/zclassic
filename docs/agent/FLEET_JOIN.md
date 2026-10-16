@@ -319,6 +319,115 @@ in node and responder text with `?`. For a Windows peer, piped input must use
 CR line ends and the trailing end-of-transmission byte is not end-of-file
 there; there is no option for it yet.
 
+### A confined shell over the PSK device-host tunnel (terminal hub)
+
+For a fleet machine that has the device-host receiver but no paired node, no
+ZID master and no sshd, `z23 ops mesh terminal serve` and `connect` give the
+same confined shell over the existing post-quantum tunnel (sntrup761x25519
+inside the hash-PSK). The receiver is unchanged: it connects to a loopback
+port, and `serve` is what listens there (point the receiver's `target_port` at
+it; the second receiver unit is the hub operator's change, not this one).
+
+```sh
+# once, on the server host: make the terminal key (never printed, 0600)
+z23 ops mesh terminal serve --init-key --key_file=/path/hub.key
+#   event=TERMINAL_HUB_KEY_CREATED key_fingerprint=<16 hex> path=...
+# copy the key to the lead over a channel you trust; compare the fingerprint.
+
+z23 ops mesh terminal serve --key_file=/path/hub.key \
+    --shell=/abs/path/fbsh --workdir=/abs/dir --listen_port=<port> \
+    --audit_file=/path/audit.log          # default audit: stderr
+#   event=TERMINAL_HUB_LISTENING listen_port=<port> key_fingerprint=<16 hex>
+
+# on the lead, through the tunnel (the device-host client runs as a child):
+z23 ops mesh terminal connect --key_file=/path/hub.key \
+    --route_input=<device-host client json> [--name=<label>]
+# or straight to a loopback server, with no tunnel:
+z23 ops mesh terminal connect --key_file=/path/hub.key --direct_port=<port>
+```
+
+Admission. `serve` binds `127.0.0.1` only, and anything on the host can reach
+that port, so every connection first answers a random 32-byte challenge with
+a SHA3-256 MAC keyed by the terminal key, within 2 s; any other first bytes,
+a wrong key, a replayed hello or silence closes the connection and no shell
+starts. The key file must be a regular file you own with mode exactly `0600`
+and 32 bytes, and is never followed through a symlink; `serve` and `connect`
+refuse anything else (`KEY_FILE_REFUSED`, exit 2). The key is separate from
+the PSK, so losing one does not give the other. Anyone who can read the key
+file can open a shell: that is the same trust boundary as the PSK store. A
+local process without the key can still occupy a session slot for up to 2 s;
+the slots are `--max_active` (default 4, at most 16, pre-authentication
+connections included), and an over-limit connection is told `busy` before any
+work is done.
+
+What the tunnel gives and what it does not. The tunnel is the confidentiality
+and authenticity layer for the bytes. The hub's frames carry no signed
+evidence (no receipt, no capsule): the exit status rides an unsigned `EXIT`
+frame and is exactly as trustworthy as the tunnel. The hello `--name` is a
+label the lead chooses; it is not verified and the audit line says so
+(`name_verified=0`). A hello that fails the MAC leaves no label at all.
+
+Confinement is the existing terminal worker, unchanged except for the argv
+option below: Landlock grants the per-server `--workdir` (read, write, create,
+execute; shared by that server's sessions, and also the shell's cwd and HOME)
+plus the one granted binary, with the terminal seccomp set and W^X. The
+environment has no `PATH`. A program you want to run must either be that
+binary or live inside the workdir.
+
+`connect --exec='["/abs/program","arg",...]'` runs that argv (1 to 16 strings,
+2000 bytes in all, `argv[0]` an absolute path) instead of the server's shell,
+in the same cage: `argv[0]` becomes the one granted binary (read and
+execute), the standard library directories that exist (`/lib`, `/lib64`,
+`/usr/lib`, `/usr/lib64`) are granted read and execute, the workdir is
+read-write, and the seccomp set is unchanged. Because W^X denies executable
+file mappings, a dynamically linked program dies there (measured:
+`/usr/bin/true` is killed by SIGSYS and `connect` exits 159, so the library
+directory grants do nothing until the seccomp set changes); a statically
+linked program (such as `fbsh -c '...'`) runs. A program the server
+cannot run (relative path, missing, not a regular executable file) is refused
+by name before any process starts: `EXEC_REFUSED`, exit 2. A write outside the
+workdir fails inside the cage with the program's own error.
+
+Client. On a terminal `connect` puts the tty in raw mode, sends the window
+size in the hello and every SIGWINCH as a resize, and restores the tty on
+every exit path (the termination signals are turned into a close, exit `130`).
+When stdin is not a terminal the remote echo is turned off, so the output is
+only what the remote wrote; end the input with `exit` (a bare end of input
+sends one end-of-transmission byte, which a shell takes only at a prompt). The
+screen always ends on a fresh line. The process exit code is the remote shell's
+(`128+S` for a signal), like ssh; the local classes are `2` invalid or
+refused request, `3` blocked, `4` the key was refused, `5` transient (busy,
+lost, no answer, idle or lifetime limit), `6` internal, `1` other. An error is
+one line, `z23: refused|ended: <CODE>: <words>`, with the codes
+`AUTH_REFUSED`, `BUSY`, `EXEC_REFUSED`, `CONFINEMENT_UNAVAILABLE`,
+`CONNECTION_LOST`, `NO_ANSWER`, `IDLE_TIMEOUT`, `LIFETIME_LIMIT`,
+`BYTE_LIMIT`, `SERVER_STOPPING`, `INTERRUPTED`; a failed tunnel adds the
+client's own `error=` line in parentheses.
+
+Limits per session (flags on `serve`): `--idle_s` 600, `--lifetime_s` 3600,
+`--max_bytes_in` 16 MiB, `--max_bytes_out` 1 GiB; a session is one forked
+child, so a crash in one cannot touch another.
+
+Audit. One line per connection on the server, to `--audit_file` (appended) or
+stderr:
+
+```text
+event=TERMINAL_HUB_SESSION admitted=1 refusal=none start=<unix> end=<unix> duration_s=N reason=worker-exited exit_code=7 signal=- bytes_in=N bytes_out=N name=<label> name_verified=0 exec="-"
+```
+
+`exec` is the escaped argv (`-` for the shell): space, `"`, `\` and every
+non-printable byte appear as `\xNN`, cut at 256 bytes with `...`. A refused
+connection shows `admitted=0 refusal=auth|busy|request|exec|confinement` and
+`name=-`.
+
+Cost. A keystroke or a screen chunk is one 3-byte frame header and one
+`send`/`write`; there is no polling, sleep or tick on the path (the server and
+client block in `poll`), TCP_NODELAY is set on both loopback ends, and the
+only wakeups are bytes and the lifetime and idle deadlines. The census check
+that watches for a fork bomb runs at most once a second while busy. The
+measured keystroke round trips (kernel echo through the hub) are in the
+`mesh_terminal_hub` and `device_host_runtime` test output.
+
 ## Where the state lives
 
 Under the owner-private state root, never inside a checkout:

@@ -558,6 +558,56 @@ static int live_exit_status(void)
     return failures;
 }
 
+/* Live: an explicit argv replaces the shell inside the same cage. */
+static int live_explicit_argv(void)
+{
+    int failures = 0;
+    struct mesh_terminal_worker_config cfg;
+    struct mesh_terminal_worker w;
+    char outside[160];
+    char outside_dir[160];
+    test_make_tmpdir(outside_dir, sizeof outside_dir, "terminal_worker_live", "outside");
+    snprintf(outside, sizeof outside, "%s/leak", outside_dir);
+    unlink(outside);
+    char script[240];
+    snprintf(script, sizeof script, "echo leaked > %s; exit 6", outside);
+    const char *const run[] = { g_fbsh, "-c", script, NULL };
+    live_config(&cfg);
+    cfg.argv = run;
+    int64_t t0 = (int64_t)platform_time_wall_time_t();
+    struct zcl_result r = mesh_terminal_worker_spawn(&cfg, t0, &w);
+    failures = check(failures, r.ok, "argv: spawn");
+    if (r.ok)
+        failures = check(failures, wait_exit(&w, 5) && w.exit_code == 6 &&
+                         w.close_reason == MESH_TERMINAL_CLOSE_WORKER_EXITED,
+                         "argv: the program ran and its exit code 6 propagates");
+    mesh_terminal_worker_kill(&w);
+    struct stat st;
+    failures = check(failures, stat(outside, &st) != 0,
+                     "argv: a write outside the granted workdir is denied");
+    unlink(outside);
+
+    static const char *const relative[] = { "fbsh", "-c", "exit 0", NULL };
+    static const char *const empty[] = { NULL };
+    static const char *const missing[] = { "/nonexistent/z23-prog", NULL };
+    static const char *const too_many[] = { "/a", "/a", "/a", "/a", "/a", "/a", "/a", "/a", "/a",
+                                            "/a", "/a", "/a", "/a", "/a", "/a", "/a", "/a", NULL };
+    static const struct { const char *const *argv; int code; const char *label; } bad[] = {
+        { relative, MESH_TERMINAL_WORKER_ERR_CONFIG, "argv: a relative argv[0] -> config" },
+        { empty, MESH_TERMINAL_WORKER_ERR_CONFIG, "argv: an empty argv -> config" },
+        { too_many, MESH_TERMINAL_WORKER_ERR_CONFIG, "argv: 17 strings -> config" },
+        { missing, MESH_TERMINAL_WORKER_ERR_EXEC, "argv: a missing program -> exec, by name" },
+    };
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        live_config(&cfg);
+        cfg.argv = bad[i].argv;
+        r = mesh_terminal_worker_spawn(&cfg, t0, &w);
+        failures = check(failures, !r.ok && r.code == bad[i].code, bad[i].label);
+        mesh_terminal_worker_kill(&w);
+    }
+    return failures;
+}
+
 /* Live: 2 MiB of output under the service byte budget. */
 static int live_two_mib_output(void)
 {
@@ -775,6 +825,7 @@ static int test_mesh_terminal_worker_platform_arm(void)
     }
 
     failures += live_exit_status();
+    failures += live_explicit_argv();
     failures += live_two_mib_output();
 
     /* ── live: input byte budget ───────────────────────────────────── */

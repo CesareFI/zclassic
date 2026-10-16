@@ -312,6 +312,7 @@ ZCL_TEST_GROUP_BUILD_NEED("test_importblockindex_cli_dispatch",
  * where it is absent. The proof's prefork step builds fbsh for every test
  * selection, so only a local run needs this row. */
 ZCL_TEST_GROUP_BUILD_NEED("test_freebsd_sh", "build/bin/fbsh", "fbsh")
+ZCL_TEST_GROUP_BUILD_NEED("test_mesh_terminal_hub", "build/bin/fbsh", "fbsh")
 
 /* The registered snapshot acceptance requires this exact locally built helper;
  * it fails when absent. A selected proof builds it before either dimension. */

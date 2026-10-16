@@ -33,6 +33,7 @@
  * pointer, and reads output into the CALLER's buffer — the node never
  * allocates under remote control. */
 #define MESH_TERMINAL_WORKER_IO_CHUNK 4096u
+#define MESH_TERMINAL_WORKER_ARGV_MAX 16u
 
 /* Failure names for the zcl_result .code field. Every spawn, pump, and
  * resize refusal carries one of these, so a regression can be asserted by
@@ -139,6 +140,12 @@ struct mesh_terminal_worker_config {
     uint64_t max_bytes_out;     /* screen bytes to the peer */
     uint64_t lifetime_seconds;  /* wall clock from spawn */
     uint64_t idle_seconds;      /* no I/O in either direction */
+    /* Optional: run this program instead of the shell. NULL-terminated, at
+     * most MESH_TERMINAL_WORKER_ARGV_MAX strings; argv[0] is an absolute path
+     * and becomes the ONE granted binary (read+execute, plus the standard
+     * library directories); the environment stays PATH-less. NULL means the
+     * configured shell, exactly as before. POSIX only. */
+    const char *const *argv;
 };
 
 struct mesh_terminal_worker {

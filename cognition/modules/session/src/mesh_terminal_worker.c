@@ -264,6 +264,34 @@ static pid_t tw_wait_settled(pid_t pid, int *status)
     return got;
 }
 
+/* The granted binary: an explicit argv names it, otherwise the shell. */
+static const char *tw_binary(const struct mesh_terminal_worker_config *cfg)
+{
+    return cfg->argv ? cfg->argv[0] : cfg->shell_path;
+}
+
+#define TW_RULES_MAX 6u
+
+/* The cage's filesystem grants: the workdir read/write, the one binary
+ * read/execute, and for an explicit argv the standard library directories
+ * that exist, read/execute. The seccomp set is unchanged. */
+static size_t tw_grant_rules(const struct mesh_terminal_worker_config *cfg,
+                             struct os_sandbox_path_rule *rules)
+{
+    static const char *const libs[] = { "/lib", "/lib64", "/usr/lib", "/usr/lib64" };
+    rules[0] = (struct os_sandbox_path_rule){ .path = cfg->workdir,
+        .allow_read = true, .allow_write = true, .allow_execute = true,
+        .allow_create = true };
+    rules[1] = (struct os_sandbox_path_rule){ .path = tw_binary(cfg),
+        .allow_read = true, .allow_execute = true };
+    size_t n = 2;
+    for (size_t i = 0; cfg->argv && i < sizeof libs / sizeof libs[0]; i++)
+        if (access(libs[i], F_OK) == 0)
+            rules[n++] = (struct os_sandbox_path_rule){ .path = libs[i],
+                .allow_read = true, .allow_execute = true };
+    return n;
+}
+
 /* The child half of spawn: never returns; stages failures by name. */
 static void tw_child(const struct mesh_terminal_worker_config *cfg,
                      const char *slave_path, int master, int stage_fd)
@@ -297,15 +325,12 @@ static void tw_child(const struct mesh_terminal_worker_config *cfg,
     }
 
     /* The grant IS the filesystem: the per-terminal workdir (the child's
-     * cwd and HOME) plus the one granted shell binary. */
-    struct os_sandbox_path_rule rules[2] = {
-        { .path = cfg->workdir, .allow_read = true, .allow_write = true,
-          .allow_execute = true, .allow_create = true },
-        { .path = cfg->shell_path, .allow_read = true,
-          .allow_execute = true },
-    };
+     * cwd and HOME) plus the one granted binary (and, for an explicit argv,
+     * the standard library directories). */
+    struct os_sandbox_path_rule rules[TW_RULES_MAX];
+    size_t n_rules = tw_grant_rules(cfg, rules);
     struct os_sandbox_profile profile =
-        os_sandbox_terminal_worker_profile(rules, 2);
+        os_sandbox_terminal_worker_profile(rules, n_rules);
     if (!os_sandbox_enter(&profile).ok) {
         uint8_t stage = TW_STAGE_CONFINEMENT;
         ssize_t reported = write(stage_fd, &stage, 1); /* pre-exit stage report: the parent names this failure from its own EOF read */
@@ -319,8 +344,9 @@ static void tw_child(const struct mesh_terminal_worker_config *cfg,
     (void)snprintf(home, sizeof home, "HOME=%s", cfg->workdir);
     (void)snprintf(pwd, sizeof pwd, "PWD=%s", cfg->workdir);
     char *const envp[] = { (char *)"TERM=xterm", home, pwd, NULL };
-    char *const argv[] = { (char *)cfg->shell_path, NULL };
-    execve(cfg->shell_path, argv, envp);
+    char *const default_argv[] = { (char *)cfg->shell_path, NULL };
+    char *const *exec_argv = cfg->argv ? (char *const *)cfg->argv : default_argv;
+    execve(tw_binary(cfg), exec_argv, envp);
 
     {
         uint8_t stage = TW_STAGE_EXEC;
@@ -1385,10 +1411,42 @@ static void mesh_terminal_worker_kill_platform_arm(struct mesh_terminal_worker *
 
 #endif /* __linux__ / _WIN32 */
 
+/* An explicit argv is bounded and its program is an absolute path; the
+ * program is the ONE binary the cage grants (plus the standard library
+ * directories). Windows has no argv grant. NULL when acceptable, otherwise
+ * the reason. */
+static const char *tw_argv_refusal(const struct mesh_terminal_worker_config *cfg,
+                                  int *code)
+{
+    if (!cfg->argv)
+        return NULL;
+#if defined(_WIN32)
+    (void)code;
+    return "spawn: an explicit argv is POSIX-only";
+#else
+    size_t n = 0;
+    while (n <= MESH_TERMINAL_WORKER_ARGV_MAX && cfg->argv[n])
+        n++;
+    if (n == 0 || n > MESH_TERMINAL_WORKER_ARGV_MAX)
+        return "spawn: argv must hold 1..16 strings";
+    if (!mesh_terminal_shell_path_valid(MESH_TERMINAL_PLATFORM_POSIX, cfg->argv[0]))
+        return "spawn: argv[0] must be an absolute path";
+    if (access(cfg->argv[0], X_OK) != 0) {
+        *code = MESH_TERMINAL_WORKER_ERR_EXEC;
+        return "spawn: argv[0] is not an executable file";
+    }
+    return NULL;
+#endif
+}
+
 struct zcl_result mesh_terminal_worker_spawn(
     const struct mesh_terminal_worker_config *cfg, int64_t now_unix,
     struct mesh_terminal_worker *out)
 {
+    int bad_code = MESH_TERMINAL_WORKER_ERR_CONFIG;
+    const char *bad = cfg ? tw_argv_refusal(cfg, &bad_code) : NULL;
+    if (bad)
+        return ZCL_ERR(bad_code, "%s", bad);
     return mesh_terminal_worker_spawn_platform_arm(cfg, now_unix, out);
 }
 

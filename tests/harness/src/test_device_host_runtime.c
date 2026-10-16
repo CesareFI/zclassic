@@ -7,6 +7,7 @@
 #include "services/device_identity.h"
 #include "services/device_host_runtime.h"
 #include "services/device_host_runtime_entry.h"
+#include "session/mesh_terminal_hub.h"
 static_assert(_Generic(device_host_runtime_client_run(NULL, NULL), struct zcl_result: 1, default: 0),
     "runtime reports explicit observation and canonical result");
 static_assert(_Generic(device_host_runtime_receiver_run(NULL, NULL), struct zcl_result: 1, default: 0),
@@ -390,6 +391,204 @@ static int runtime_binary_sessions(bool standalone)
          * configuration or node directory. */
         ASSERT(runtime_fixture_home_only_profiles(&fixture));
     } TEST_END
+    json_free(&input); if (!runtime_fixture_close(&fixture)) ++failures; return failures;
+}
+/* The terminal hub behind the real PSK receiver: the hub listens on the
+ * fixture's target port, the receiver carries a real client's bytes to it, and
+ * this process speaks the hub protocol on the client's stdin/stdout. */
+static bool hop_wait(int fd, short events, int64_t deadline)
+{
+    struct pollfd p = {.fd = fd, .events = events};
+    int64_t left = (deadline - clock_now_monotonic_ns()) / 1000000;
+    return left > 0 && poll(&p, 1, (int)left) > 0 && (p.revents & (events | POLLHUP)) != 0;
+}
+static bool hop_send(int fd, uint8_t type, const void *payload, size_t length)
+{
+    uint8_t frame[MESH_TERMINAL_HUB_FRAME_MAX]; if (length) memcpy(frame + 3, payload, length);
+    size_t total = mesh_terminal_hub_frame_seal(frame, type, length), done = 0;
+    int64_t deadline = clock_now_monotonic_ns() + INT64_C(5000000000);
+    while (total && done < total) {
+        ssize_t n = write(fd, frame + done, total - done);
+        if (n > 0) done += (size_t)n;
+        else if (n < 0 && errno != EAGAIN && errno != EINTR) return false;
+        else if (!hop_wait(fd, POLLOUT, deadline)) return false;
+    }
+    return total != 0;
+}
+static bool hop_frame(int fd, uint8_t *type, uint8_t *payload, size_t *length)
+{
+    uint8_t buffer[MESH_TERMINAL_HUB_FRAME_MAX]; size_t have = 0, want = 3;
+    int64_t deadline = clock_now_monotonic_ns() + INT64_C(8000000000);
+    while (have < want) {
+        if (!hop_wait(fd, POLLIN, deadline)) return false;
+        ssize_t n = read(fd, buffer + have, want - have);
+        if (n == 0) return false;
+        if (n < 0) { if (errno == EAGAIN || errno == EINTR) continue; return false; }
+        have += (size_t)n;
+        if (have == 3 && want == 3) {
+            if (!mesh_terminal_hub_frame_header(buffer, 3, type, length)) return false;
+            want = 3 + *length;
+        }
+    }
+    memcpy(payload, buffer + 3, *length); return true;
+}
+/* Reads DATA until `needle` appears (if given) or EXIT arrives; *code is the EXIT code or -1. */
+static bool hop_until(int fd, const char *needle, int *code)
+{
+    char seen[2048]; size_t fill = 0; seen[0] = 0; *code = -1;
+    for (;;) {
+        uint8_t type, payload[MESH_TERMINAL_HUB_PAYLOAD_MAX]; size_t length;
+        if (!hop_frame(fd, &type, payload, &length)) return false;
+        if (type == MESH_TERMINAL_HUB_EXIT && length == 4) { *code = (payload[1] & 1) ? payload[2] : -1; return needle == NULL; }
+        if (type != MESH_TERMINAL_HUB_DATA) continue;
+        for (size_t i = 0; i < length && fill + 1 < sizeof(seen); ++i) seen[fill++] = (char)payload[i];
+        seen[fill] = 0;
+        if (needle && strstr(seen, needle)) return true;
+    }
+}
+static int hop_compare(const void *a, const void *b)
+{
+    int64_t x = *(const int64_t *)a, y = *(const int64_t *)b; return (x > y) - (x < y);
+}
+static int runtime_hub_hop(void)
+{
+    enum { SAMPLES = 100 };
+    int failures = 0; struct runtime_fixture fixture; runtime_fixture_init(&fixture); struct json_value input = {0};
+    pid_t hub = -1; char shell[600];
+    TEST_CASE("HOST runtime: terminal hub behind the real PSK receiver, exit status and keystroke round trip") {
+        ASSERT(test_abs_path("build/bin/fbsh", shell, sizeof(shell)));
+        ASSERT(runtime_fixture_open(&fixture));
+        hub = fork(); ASSERT(hub >= 0);
+        if (hub == 0) {
+            struct mesh_terminal_hub_listen_cfg cfg; memset(&cfg, 0, sizeof(cfg));
+            for (int i = 0; i < 32; ++i) cfg.serve.key[i] = (uint8_t)(100 + i);
+            cfg.serve.shell_path = shell; cfg.serve.workdir = fixture.home;
+            cfg.serve.max_bytes_in = 1u << 20; cfg.serve.max_bytes_out = 1u << 24;
+            cfg.serve.lifetime_seconds = 60; cfg.serve.idle_seconds = 30; cfg.serve.stop_fd = -1;
+            cfg.max_active = 1; cfg.max_sessions = 1; cfg.audit_fd = open("/dev/null", O_WRONLY);
+            _exit(mesh_terminal_hub_listen_run(fixture.target_listener, &cfg));
+        }
+        runtime_test_close(&fixture.target_listener);
+        ASSERT(runtime_input_receiver(&input, &fixture, 1));
+        ASSERT(runtime_process_start(&fixture.receiver, &fixture, &input, true, false)); ASSERT(runtime_wait_receiver(&fixture));
+        json_free(&input);
+        ASSERT(runtime_input_client(&input, &fixture)); ASSERT(runtime_process_start(&fixture.client, &fixture, &input, false, false));
+        int in = fixture.client.input, out = fixture.client.output, code;
+        uint8_t type, payload[MESH_TERMINAL_HUB_PAYLOAD_MAX], hello[MESH_TERMINAL_HUB_PAYLOAD_MAX], key[32]; size_t length;
+        for (int i = 0; i < 32; ++i) key[i] = (uint8_t)(100 + i);
+        ASSERT(hop_frame(out, &type, payload, &length)); ASSERT_EQ(type, MESH_TERMINAL_HUB_CHALLENGE);
+        struct mesh_terminal_hub_request request = {.cols = 80, .rows = 24, .name = "hop"};
+        size_t hello_length = mesh_terminal_hub_hello_build(hello, key, payload + 1, &request);
+        ASSERT(hello_length != 0 && hop_send(in, MESH_TERMINAL_HUB_HELLO, hello, hello_length));
+        ASSERT(hop_frame(out, &type, payload, &length)); ASSERT_EQ(type, MESH_TERMINAL_HUB_READY);
+        const char *line = "echo Z23HU\"B\"_HOP\n";
+        ASSERT(hop_send(in, MESH_TERMINAL_HUB_DATA, line, strlen(line))); ASSERT(hop_until(out, "Z23HUB_HOP", &code));
+        int64_t samples[SAMPLES];
+        for (int i = 0; i < SAMPLES; ++i) {
+            char probe[2] = {(char)('a' + i % 26), 0}; int64_t start = clock_now_monotonic_ns();
+            ASSERT(hop_send(in, MESH_TERMINAL_HUB_DATA, probe, 1)); ASSERT(hop_until(out, probe, &code));
+            samples[i] = (clock_now_monotonic_ns() - start) / 1000;
+        }
+        qsort(samples, SAMPLES, sizeof(samples[0]), hop_compare);
+        printf("\n  keystroke round trip through the PSK receiver and client (n=%d): min=%lld us median=%lld us p99=%lld us\n",
+            SAMPLES, (long long)samples[0], (long long)samples[SAMPLES / 2], (long long)samples[SAMPLES * 99 / 100]);
+        ASSERT(samples[SAMPLES / 2] < 20000);
+        const char *leave = "\nexit 3\n";
+        ASSERT(hop_send(in, MESH_TERMINAL_HUB_DATA, leave, strlen(leave))); ASSERT(hop_until(out, NULL, &code)); ASSERT_EQ(code, 3);
+        runtime_test_close(&fixture.client.input);
+        ASSERT(runtime_process_wait(&fixture.client, clock_now_monotonic_ns() + INT64_C(5000000000)));
+        ASSERT(runtime_process_cleanup(&fixture.client));
+        ASSERT(runtime_process_wait(&fixture.receiver, clock_now_monotonic_ns() + INT64_C(5000000000)));
+        int status = 0; ASSERT_EQ(waitpid(hub, &status, 0), hub); hub = -1; ASSERT(WIFEXITED(status));
+    } TEST_END
+    if (hub > 0) { kill(hub, SIGKILL); (void)waitpid(hub, NULL, 0); }
+    json_free(&input); if (!runtime_fixture_close(&fixture)) ++failures; return failures;
+}
+/* The real command, `terminal connect --route_input`, over the same hop: the
+ * lead's process forks the device-host client itself. */
+static pid_t hop_spawn_hub(struct runtime_fixture *fixture, const char *shell)
+{
+    pid_t hub = fork();
+    if (hub != 0) return hub;
+    struct mesh_terminal_hub_listen_cfg cfg; memset(&cfg, 0, sizeof(cfg));
+    for (int i = 0; i < 32; ++i) cfg.serve.key[i] = (uint8_t)(100 + i);
+    cfg.serve.shell_path = shell; cfg.serve.workdir = fixture->home;
+    cfg.serve.max_bytes_in = 1u << 20; cfg.serve.max_bytes_out = 1u << 24;
+    cfg.serve.lifetime_seconds = 60; cfg.serve.idle_seconds = 30; cfg.serve.stop_fd = -1;
+    cfg.max_active = 1; cfg.max_sessions = 1; cfg.audit_fd = open("/dev/null", O_WRONLY);
+    _exit(mesh_terminal_hub_listen_run(fixture->target_listener, &cfg));
+}
+static bool hop_write_files(const struct runtime_fixture *fixture, const struct json_value *input, char *key_path, char *json_path)
+{
+    char wire[4097]; uint8_t key[32];
+    for (int i = 0; i < 32; ++i) key[i] = (uint8_t)(100 + i);
+    snprintf(key_path, 1300, "%s/hub.key", fixture->home); snprintf(json_path, 1300, "%s/client.json", fixture->home);
+    int len = json_write(input, wire, sizeof(wire)); if (len <= 0) return false;
+    int fd = open(key_path, O_WRONLY | O_CREAT | O_EXCL, 0600); if (fd < 0) return false;
+    bool ok = write(fd, key, 32) == 32; close(fd);
+    fd = open(json_path, O_WRONLY | O_CREAT | O_EXCL, 0600); if (fd < 0) return false;
+    ok = ok && write(fd, wire, (size_t)len) == len; close(fd); return ok;
+}
+static void hop_drain(int fd, char *text, size_t cap, size_t *used)
+{
+    ssize_t seen = read(fd, text + *used, cap - 1 - *used);
+    if (seen > 0) { *used += (size_t)seen; text[*used] = 0; }
+}
+static bool hop_connect(const char *key_path, const char *json_path, const char *typed, char *out, char *err, int *status)
+{
+    int in[2], o[2], e[2]; if (pipe(in) || pipe(o) || pipe(e)) return false;
+    pid_t pid = fork(); if (pid < 0) return false;
+    if (pid == 0) {
+        char keyarg[1400], routearg[1400];
+        snprintf(keyarg, sizeof keyarg, "--key_file=%s", key_path); snprintf(routearg, sizeof routearg, "--route_input=%s", json_path);
+        char *argv[] = {"build/bin/z23", "ops", "mesh", "terminal", "connect", keyarg, routearg, NULL};
+        char *env[] = {"PATH=/usr/bin:/bin", NULL};
+        dup2(in[0], 0); dup2(o[1], 1); dup2(e[1], 2);
+        for (int i = 0; i < 2; ++i) { close(in[i]); close(o[i]); close(e[i]); }
+        execve(argv[0], argv, env); _exit(127);
+    }
+    close(in[0]); close(o[1]); close(e[1]);
+    bool ok = write(in[1], typed, strlen(typed)) == (ssize_t)strlen(typed); close(in[1]);
+    size_t uo = 0, ue = 0; out[0] = err[0] = 0; int64_t deadline = clock_now_monotonic_ns() + INT64_C(20000000000);
+    bool done = false;
+    while (!done && clock_now_monotonic_ns() < deadline) {
+        struct pollfd p[2] = {{o[0], POLLIN, 0}, {e[0], POLLIN, 0}};
+        (void)poll(p, 2, 50);
+        if (p[0].revents) hop_drain(o[0], out, 4096, &uo);
+        if (p[1].revents) hop_drain(e[0], err, 4096, &ue);
+        done = waitpid(pid, status, WNOHANG) == pid;
+    }
+    if (!done) { kill(pid, SIGKILL); (void)waitpid(pid, status, 0); ok = false; }
+    hop_drain(o[0], out, 4096, &uo); hop_drain(e[0], err, 4096, &ue);
+    close(o[0]); close(e[0]); return ok;
+}
+static int runtime_hub_connect(bool wrong)
+{
+    int failures = 0; struct runtime_fixture fixture; runtime_fixture_init(&fixture); struct json_value input = {0};
+    fixture.different_secret = wrong; pid_t hub = -1; char shell[600], key_path[1300], json_path[1300], out[4096], err[4096];
+    TEST_CASE(wrong ? "HOST runtime: terminal connect --route_input with a wrong PSK ends in one typed line"
+                    : "HOST runtime: terminal connect --route_input runs a script and returns its exit code") {
+        ASSERT(test_abs_path("build/bin/fbsh", shell, sizeof(shell)));
+        ASSERT(runtime_fixture_open(&fixture)); hub = hop_spawn_hub(&fixture, shell); ASSERT(hub >= 0);
+        runtime_test_close(&fixture.target_listener);
+        ASSERT(runtime_input_receiver(&input, &fixture, 1));
+        ASSERT(runtime_process_start(&fixture.receiver, &fixture, &input, true, false)); ASSERT(runtime_wait_receiver(&fixture));
+        json_free(&input); ASSERT(runtime_input_client(&input, &fixture));
+        ASSERT(hop_write_files(&fixture, &input, key_path, json_path));
+        int status = 0;
+        ASSERT(hop_connect(key_path, json_path, "echo Z23ROUTE_OK; exit 3\n", out, err, &status));
+        ASSERT(WIFEXITED(status));
+        if (!wrong) {
+            ASSERT_EQ(WEXITSTATUS(status), 3); ASSERT(strstr(out, "Z23ROUTE_OK") != NULL);
+        } else {
+            ASSERT(WEXITSTATUS(status) != 0 && WEXITSTATUS(status) != 127); ASSERT(strstr(out, "Z23ROUTE_OK") == NULL);
+            size_t lines = 0; for (const char *c = err; *c; ++c) lines += *c == '\n';
+            ASSERT_EQ(lines, 1u); ASSERT(strncmp(err, "z23: ", 5) == 0);
+        }
+        (void)kill(fixture.receiver.pid, SIGTERM);
+        ASSERT(runtime_process_wait(&fixture.receiver, clock_now_monotonic_ns() + INT64_C(5000000000)));
+    } TEST_END
+    if (hub > 0) { kill(hub, SIGKILL); (void)waitpid(hub, NULL, 0); }
     json_free(&input); if (!runtime_fixture_close(&fixture)) ++failures; return failures;
 }
 static int runtime_raw_refusals(bool standalone)
@@ -1575,7 +1774,8 @@ int test_device_host_runtime(void);
 int test_device_host_runtime(void)
 {
     int failures = runtime_typed_outputs() + runtime_binary_sessions(false) + runtime_raw_refusals(false) +
-        runtime_binary_sessions(true) + runtime_raw_refusals(true);
+        runtime_binary_sessions(true) + runtime_raw_refusals(true) + runtime_hub_hop() +
+        runtime_hub_connect(false) + runtime_hub_connect(true);
     for (unsigned field = 0; field < 3; ++field)
         failures += runtime_client_authority_refusal(field);
     for (unsigned fault = 0; fault < 6; ++fault)
