@@ -399,30 +399,92 @@ static bool artifact_command_call(const struct json_value *input, bool admit,
 }
 
 static bool artifact_registry_call(const struct json_value *input, bool admit,
-    uint8_t root[32])
+    enum zcl_command_authority ceiling, bool denied, uint8_t root[32])
 {
     const struct zcl_command_registry *registry = zcl_command_catalog();
     const struct zcl_command_spec *spec = zcl_command_registry_find(registry,
         admit ? "zcode.release.artifact.admit" : "zcode.release.artifact.prepare", NULL);
     if (!spec) return false;
     struct zcl_command_context context = {.registry = registry,
-        .granted_capabilities = UINT64_MAX, .authority_ceiling = ZCL_COMMAND_AUTH_OWNER};
+        .granted_capabilities = UINT64_MAX, .authority_ceiling = ceiling};
     char wire[16384];
     enum zcl_command_exit code = ZCL_COMMAND_EXIT_INTERNAL;
     size_t len = zcl_command_registry_execute_json(registry, spec, &context,
         input, false, spec->path, "normal", 0, 0, NULL, wire, sizeof(wire), &code);
     struct json_value envelope = {0};
-    bool ok = len > 0 && len < sizeof(wire) && code == ZCL_COMMAND_EXIT_OK &&
+    bool ok = len > 0 && len < sizeof(wire) &&
         json_read(&envelope, wire, len);
-    const struct json_value *data = json_get(&envelope, "data");
-    const char *hex = json_get_str(json_get(data, "manifest_root"));
-    const char *stage = json_get_str(json_get(data, "stage"));
-    ok = ok && hex && zcl_hex_decode_lower(hex, root, 32) && stage &&
-        strcmp(stage, admit ? "admitted" : "prepared") == 0;
+    if (denied) {
+        const struct json_value *error = json_get(&envelope, "error");
+        const char *error_code = json_get_str(json_get(error, "code"));
+        const char *status = json_get_str(json_get(&envelope, "status"));
+        const struct json_value *mutated = json_get(error, "mutated");
+        ok = ok && code == ZCL_COMMAND_EXIT_DENIED && error_code &&
+            strcmp(error_code, "AUTHORITY_DENIED") == 0 && status &&
+            strcmp(status, "blocked") == 0 && mutated &&
+            mutated->type == JSON_BOOL && !json_get_bool(mutated);
+    } else {
+        const struct json_value *data = json_get(&envelope, "data");
+        const char *hex = json_get_str(json_get(data, "manifest_root"));
+        const char *stage = json_get_str(json_get(data, "stage"));
+        ok = ok && code == ZCL_COMMAND_EXIT_OK && hex &&
+            zcl_hex_decode_lower(hex, root, 32) && stage &&
+            strcmp(stage, admit ? "admitted" : "prepared") == 0;
+    }
     if (!ok) fprintf(stderr, "artifact registry dispatch code=%d response=%.512s\n",
         (int)code, len ? wire : "no response");
     json_free(&envelope);
     return ok;
+}
+
+static int artifact_authority_test(void)
+{
+    int failures = 0;
+    char directory[1024], program_path[1200], license_path[1200], datadir[1200];
+    char cas_directory[1400];
+    test_make_tmpdir(directory, sizeof(directory), "zcode_release_artifact", "authority");
+    snprintf(program_path, sizeof(program_path), "%s/program", directory);
+    snprintf(license_path, sizeof(license_path), "%s/LICENSE", directory);
+    snprintf(datadir, sizeof(datadir), "%s/store", directory);
+    snprintf(cas_directory, sizeof(cas_directory), "%s/zcode", datadir);
+    struct json_value input = {0};
+    struct vcs_package_store *store = NULL;
+    struct vcs_release_artifact verified;
+    uint8_t prepared[32], admitted[32], *program = NULL;
+    size_t program_len = 0;
+    TEST_CASE("artifact registry requires operator authority before creating CAS") {
+        ASSERT(artifact_write_snapshot(program_path, artifact_program,
+            sizeof(artifact_program)));
+        ASSERT(artifact_write_snapshot(license_path, artifact_license,
+            sizeof(artifact_license) - 1u));
+        ASSERT(mkdir(datadir, 0700) == 0);
+        ASSERT(artifact_command_input(&input, NULL, program_path, license_path));
+        ASSERT(artifact_registry_call(&input, false,
+            ZCL_COMMAND_AUTH_OPERATOR, false, prepared));
+        ASSERT(json_push_kv_str(&input, "datadir", datadir));
+        struct stat st;
+        ASSERT(stat(cas_directory, &st) != 0 && errno == ENOENT);
+        for (int ceiling = ZCL_COMMAND_AUTH_PUBLIC;
+             ceiling < ZCL_COMMAND_AUTH_OPERATOR; ++ceiling) {
+            ASSERT(artifact_registry_call(&input, true,
+                (enum zcl_command_authority)ceiling, true, admitted));
+            ASSERT(stat(cas_directory, &st) != 0 && errno == ENOENT);
+        }
+        ASSERT(artifact_registry_call(&input, true,
+            ZCL_COMMAND_AUTH_OPERATOR, false, admitted));
+        ASSERT(memcmp(prepared, admitted, 32) == 0);
+        store = vcs_package_store_open(datadir, VCS_PACKAGE_STORE_DEFAULT_QUOTA_BYTES);
+        ASSERT(store != NULL);
+        ASSERT(vcs_release_artifact_verify(store, admitted, &verified, &program,
+            &program_len));
+        ASSERT_EQ(program_len, sizeof(artifact_program));
+        ASSERT(memcmp(program, artifact_program, program_len) == 0);
+    } TEST_END
+    free(program);
+    vcs_package_store_close(store);
+    json_free(&input);
+    test_rm_rf_recursive(directory);
+    return failures;
 }
 
 static int artifact_command_test(void)
@@ -441,7 +503,8 @@ static int artifact_command_test(void)
         ASSERT(artifact_write_snapshot(license_path, artifact_license,
             sizeof(artifact_license) - 1u));
         ASSERT(artifact_command_input(&input, NULL, program_path, license_path));
-        ASSERT(artifact_registry_call(&input, false, prepared));
+        ASSERT(artifact_registry_call(&input, false,
+            ZCL_COMMAND_AUTH_OWNER, false, prepared));
         ASSERT(artifact_command_call(&input, false, NULL, admitted));
         ASSERT(memcmp(prepared, admitted, 32) == 0);
         ASSERT(json_push_kv_str(&input, "datadir", datadir));
@@ -459,7 +522,8 @@ static int artifact_command_test(void)
         ParseParameters(1, reset);
         ASSERT(artifact_command_call(&input, true, NULL, admitted));
         ASSERT(memcmp(prepared, admitted, 32) == 0);
-        ASSERT(artifact_registry_call(&input, true, admitted));
+        ASSERT(artifact_registry_call(&input, true,
+            ZCL_COMMAND_AUTH_OWNER, false, admitted));
         ASSERT(memcmp(prepared, admitted, 32) == 0);
         json_free(&input);
         ASSERT(artifact_command_input(&input, datadir, program_path, license_path));
@@ -531,6 +595,7 @@ int test_zcode_release_artifact(void)
     return artifact_codec_tests() + artifact_root_tests() + artifact_store_tests()
         + artifact_partial_tests() + artifact_chunk_test()
         + artifact_corruption_test(1) + artifact_corruption_test(2)
-        + artifact_command_test() + artifact_metadata_mismatch_test(false)
+        + artifact_command_test() + artifact_authority_test()
+        + artifact_metadata_mismatch_test(false)
         + artifact_metadata_mismatch_test(true);
 }
