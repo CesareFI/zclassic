@@ -3186,6 +3186,14 @@ static int test_work_envelope_ceiling(void)
 }
 
 static int g_blocker_page_case;
+static int64_t blocker_page_retry_budget(void)
+{
+    return g_blocker_page_case == 11 || g_blocker_page_case == 12 ? -1
+        : g_blocker_page_case == 13 ? -2
+        : g_blocker_page_case == 14 ? INT64_C(2147483648)
+        : g_blocker_page_case == 17 ? 0 : g_blocker_page_case == 18 ? INT32_MAX : 5;
+}
+
 static void blocker_page_rows(struct json_value *rows, int total)
 {
     char reason[256]; memset(reason, 'r', 255); reason[255] = 0;
@@ -3209,10 +3217,7 @@ static void blocker_page_rows(struct json_value *rows, int total)
         if (g_blocker_page_case == 15)
             json_push_kv_str(&row, "retry_budget", "-1");
         else
-            json_push_kv_int(&row, "retry_budget", g_blocker_page_case == 11 ||
-                g_blocker_page_case == 12 ? -1 : g_blocker_page_case == 13 ? -2
-                : g_blocker_page_case == 14 ? INT64_C(2147483648)
-                : g_blocker_page_case == 17 ? 0 : g_blocker_page_case == 18 ? INT32_MAX : 5);
+            json_push_kv_int(&row, "retry_budget", blocker_page_retry_budget());
         json_push_kv_int(&row, "fire_count", 1);
         json_push_kv_int(&row, "age_us", g_blocker_page_case == 1 ? 20 : 10);
         json_push_kv_int(&row, "deadline_remaining_us", 0);
