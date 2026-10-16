@@ -94,8 +94,9 @@ struct cik_report {
     struct cik_buf miss, divg, stale, unread, unres;
 };
 /* Closes the call graph and judges every leaf against the baseline file.
- * Returns 0, 1 when the baseline cannot be created, 3 when the call closure
- * did not settle. */
+ * Returns 0 when the verdict was reached, 1 when the baseline is absent and
+ * cannot be created, 2 when the baseline exists but cannot be read, 3 when the
+ * call closure did not settle. */
 int cik_analyze(const char *baseline, struct cik_index *x,
                 const struct cik_defs *d, struct cik_report *r, FILE *err);
 void cik_report_free(struct cik_report *r);
