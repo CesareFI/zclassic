@@ -1992,7 +1992,12 @@ else ifneq ($(filter fast-compile dev-build-only dev-package-verifier,$(ZCL_DEPF
 ZCL_DEPFILE_PROFILES := dev
 else ifneq ($(filter dev-bin z23-dev zclassic23-dev,$(ZCL_DEPFILE_SINGLE_GOAL)),)
 ZCL_DEPFILE_PROFILES := dev $(if $(ZCL_HOST_WINDOWS),,test-fast)
-else ifneq ($(filter dev-proof-bundle dev-proof-bundle-prefork,$(ZCL_DEPFILE_SINGLE_GOAL)),)
+else ifneq ($(filter lint lint-cached lint-cold-audit lint-preflight,$(ZCL_DEPFILE_SINGLE_GOAL)),)
+# Keep in step with the matching ZCL_EPOCH_PROFILES branch: these umbrellas
+# compile and link the dev node and package verifier, so a header edit must
+# invalidate those objects.  An empty profile relinked stale objects.
+ZCL_DEPFILE_PROFILES := dev
+else ifneq ($(filter dev-proof-bundle dev-proof-bundle-prefork ff,$(ZCL_DEPFILE_SINGLE_GOAL)),)
 ZCL_DEPFILE_PROFILES := dev test-fast
 else ifneq ($(filter t-fast t-fast-exact t-hotswap hotswap-test-so test_parallel_fast test-parallel-fast-active test-parallel-fast-active-locked t-fast-locked t-fast-exact-locked ff-test-lint,$(ZCL_DEPFILE_SINGLE_GOAL)),)
 ZCL_DEPFILE_PROFILES := $(strip $(if $(filter test-parallel-fast-active-locked ff-test-lint,$(ZCL_DEPFILE_SINGLE_GOAL)),dev) test-fast)
@@ -2010,7 +2015,7 @@ else ifneq ($(filter coverage coverage-locked,$(ZCL_DEPFILE_SINGLE_GOAL)),)
 ZCL_DEPFILE_PROFILES := coverage
 else ifneq ($(filter fuzz fuzz-ci fuzz-ci-leaks fuzz-replay fuzz_block fuzz_script fuzz_p2p fuzz_http fuzz_compactblock fuzz_snapshot fuzz_tx_bundle fuzz_rom_manifest fuzz_overlay fuzz_ecdsa fuzz_mesh_status_proto,$(ZCL_DEPFILE_SINGLE_GOAL)),)
 ZCL_DEPFILE_PROFILES := fuzz
-else ifneq ($(filter lint lint-fast lint-land lint-preflight watcher-safety-gates check-dev-loop-profiles dev-loop-profile-flags print-dev-profile-dirs dev-failure-execution-id ff t-changed fast-changed-compile fast-rebuild rebuild-fast dev-rebuild hot-rebuild super-rebuild fast-ci agent-fast-ci dev-ci agent-plan agent-loop agent-dev-loop pre-push-ci,$(ZCL_DEPFILE_SINGLE_GOAL)),)
+else ifneq ($(filter lint-fast lint-land watcher-safety-gates check-dev-loop-profiles dev-loop-profile-flags print-dev-profile-dirs dev-failure-execution-id t-changed fast-changed-compile fast-rebuild rebuild-fast dev-rebuild hot-rebuild super-rebuild fast-ci agent-fast-ci dev-ci agent-plan agent-loop agent-dev-loop pre-push-ci,$(ZCL_DEPFILE_SINGLE_GOAL)),)
 ZCL_DEPFILE_PROFILES :=
 endif
 endif

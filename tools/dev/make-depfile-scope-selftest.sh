@@ -209,5 +209,39 @@ assert_exact_profiles "$WORK/mixed.out" "build-only dev test-fast test-strict no
 assert_exact_profiles "$WORK/unknown.out" "build-only dev test-fast test-strict node-c23"
 assert_exact_profiles "$WORK/default.out" node-c23
 
+# A goal that compiles objects of a profile must import that profile's
+# depfiles.  The lint umbrellas and ff build the dev node (and ff the fast test
+# objects) yet had an EMPTY depfile selection, so a header change left their
+# objects fresh and `make lint` relinked stale objects ("undefined symbol").
+# Compare the final ZCL_EPOCH_PROFILES and ZCL_DEPFILE_PROFILES values the
+# real Makefile computes for each goal: every epoch profile must be imported.
+consistency_goals=(lint lint-cached lint-cold-audit lint-preflight ff dev-bin
+    dev-proof-bundle fast-compile dev-build-only dev-package-verifier)
+consistency_pids=()
+for goal in "${consistency_goals[@]}"; do
+    (
+        cd "$ROOT"
+        make -pn --no-print-directory "$goal" 2>/dev/null |
+            awk -v g="$goal" '
+                /^ZCL_EPOCH_PROFILES :?= ?/ { e = $0; sub(/^[^=]*= ?/, "", e) }
+                /^ZCL_DEPFILE_PROFILES :?= ?/ { d = $0; sub(/^[^=]*= ?/, "", d) }
+                END { printf "%s|%s|%s\n", g, e, d }'
+    ) > "$WORK/consistency.$goal" &
+    consistency_pids+=("$!")
+done
+for pid in "${consistency_pids[@]}"; do
+    wait "$pid" || true
+done
+for goal in "${consistency_goals[@]}"; do
+    IFS='|' read -r _ epoch_profiles depfile_profiles < "$WORK/consistency.$goal"
+    [ -n "$epoch_profiles" ] || fail "cannot read epoch profiles for goal $goal"
+    for profile in $epoch_profiles; do
+        case " $depfile_profiles " in
+            *" $profile "*) ;;
+            *) fail "goal $goal builds $profile objects (epoch: $epoch_profiles) but imports depfiles only for: ${depfile_profiles:-nothing}" ;;
+        esac
+    done
+done
+
 printf '%s\n' \
-    'make-depfile-scope-selftest: PASS header_rebuild=true single_goal_scoped=true node_c23_scoped=true hot_module_scoped=true mixed_unknown_all=true default_node_c23=true'
+    'make-depfile-scope-selftest: PASS header_rebuild=true single_goal_scoped=true node_c23_scoped=true hot_module_scoped=true mixed_unknown_all=true default_node_c23=true epoch_depfile_consistent=true'
