@@ -4674,6 +4674,16 @@ bool zcl_fleet_steer_test_input(unsigned mode, const char *body, const char *ref
 }
 #endif
 
+/* These mail refusals carry static policy guidance, never submitted body
+ * text or host-local evidence. Do not forward arbitrary sibling errors. */
+static bool fmc_mail_guidance_code(const char *code)
+{
+    return strcmp(code, "MAIL_REFUSED_PATH") == 0 ||
+           strcmp(code, "MAIL_REFUSED_IP") == 0 ||
+           strcmp(code, "MAIL_REFUSED_ONION") == 0 ||
+           strcmp(code, "MAIL_REFUSED_KEY") == 0;
+}
+
 /* Post one directive through the mail sibling. Returns the accepted seq,
  * or -1 with `why` (caller buffer) naming the sibling's refusal. The code
  * is copied out before the sub reply is freed: it never points at it. */
@@ -4682,11 +4692,13 @@ static long long fmc_post_directive(const struct zcl_command_request *req,
                                     const char *body,
                                     const char *ref,
                                     const struct fmc_sender *s,
-                                    char *why, size_t why_cap)
+                                    char *why, size_t why_cap,
+                                    char *message, size_t message_cap)
 {
     struct fmc_sub sub;
     char input[FMC_INPUT_CAP];
     long long seq;
+    message[0] = '\0';
     if (why && why_cap > 0)
         (void)snprintf(why, why_cap, "sibling_refused");
     if (!fmc_post_input(input, sizeof(input), to, kind, body, ref, s))
@@ -4703,6 +4715,8 @@ static long long fmc_post_directive(const struct zcl_command_request *req,
     zcl_native_handle_dev_agent_mail(&sub.request, &sub.reply);
     sub.ran = true;
     if (!fmc_sub_ok(&sub)) {
+        if (fmc_mail_guidance_code(sub.reply.error.code))
+            (void)snprintf(message, message_cap, "%s", sub.reply.error.message);
         if (why && why_cap > 0) {
             if (sub.reply.error.code[0])
                 (void)snprintf(why, why_cap, "%s",
@@ -4795,8 +4809,9 @@ static bool fmc_send_item_fields(const struct json_value *it,
 }
 
 /* One refused item result. */
-static void fmc_send_item_refused(struct json_value *items, size_t index,
-                                  const char *to, const char *error)
+static void fmc_send_item_refused_message(struct json_value *items, size_t index,
+                                  const char *to, const char *error,
+                                  const char *message)
 {
     struct json_value item;
     json_init(&item);
@@ -4805,8 +4820,16 @@ static void fmc_send_item_refused(struct json_value *items, size_t index,
     (void)json_push_kv_str(&item, "state", "refused");
     (void)json_push_kv_str(&item, "error", error ? error : "BAD_INPUT");
     (void)json_push_kv_str(&item, "to", to ? to : "");
+    if (message && message[0] && !json_push_kv_str(&item, "message", message))
+        LOG_ERROR(FMC_LOG, "send: could not append static refusal guidance");
     (void)json_push_back(items, &item);
     json_free(&item);
+}
+
+static void fmc_send_item_refused(struct json_value *items, size_t index,
+                                  const char *to, const char *error)
+{
+    fmc_send_item_refused_message(items, index, to, error, NULL);
 }
 
 /* One accepted item result, after recording key->seq plus the payload
@@ -4906,6 +4929,7 @@ static bool fmc_send_item(const struct zcl_command_request *req,
     struct fmc_item_fields f;
     long long seq;
     char why[64];
+    char message[sizeof(((struct zcl_command_reply *)0)->error.message)];
     const char *from = fmc_sender_name(s);
     const char *shape_error = "BAD_INPUT";
     if (!fmc_send_item_fields(it, from, &f, &shape_error)) {
@@ -4958,10 +4982,10 @@ static bool fmc_send_item(const struct zcl_command_request *req,
     }
     why[0] = '\0';
     seq = fmc_post_directive(req, f.to, f.kind, f.body, f.ref, s, why,
-                             sizeof(why));
+                             sizeof(why), message, sizeof(message));
     if (seq < 0) {
-        fmc_send_item_refused(items, index, f.to,
-                              why[0] ? why : "POST_FAILED");
+        fmc_send_item_refused_message(items, index, f.to,
+                              why[0] ? why : "POST_FAILED", message);
         return false;
     }
     fmc_send_item_accept(items, index, &f, seq, false, sent_path, from,

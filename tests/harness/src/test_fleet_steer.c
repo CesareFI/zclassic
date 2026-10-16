@@ -1037,6 +1037,62 @@ _test_next:;
     return failures;
 }
 
+static int fmx_t_send_refusal_guidance(bool mixed)
+{
+    int failures = 0;
+    struct fmx_call c = {0};
+    struct json_value items, item;
+    json_init(&items);
+    json_init(&item);
+    TEST("steer: mail path refusal explains remediation without echoing the body") {
+        char gid[64];
+        fmx_isolate(mixed ? "refusal_mixed" : "refusal_only");
+        ASSERT(fmx_mint("send", gid, sizeof(gid)));
+        long long before = fmx_mail_count();
+        json_set_array(&items);
+        fmx_item(&item, "field-agent", "inspect /secrets/unique-private-fixture",
+                 "path-check", "path-check-key");
+        ASSERT(json_push_back(&items, &item));
+        json_free(&item);
+        if (mixed) {
+            fmx_item(&item, "field-agent", "inspect docs/DEVELOPING.md",
+                     "safe-check", "safe-check-key");
+            ASSERT(json_push_back(&items, &item));
+            json_free(&item);
+            json_set_object(&item); /* Missing recipient remains BAD_INPUT. */
+            ASSERT(json_push_back(&items, &item));
+            json_free(&item);
+        }
+        ASSERT(fmx_send(&c, gid, &items));
+        ASSERT(fmx_ok(&c));
+        ASSERT_EQ(fmx_int(&c, "accepted"), mixed ? 1 : 0);
+        ASSERT_EQ(fmx_mail_count(), before + (mixed ? 1 : 0));
+        const struct json_value *results = json_get(&c.reply.data, "items");
+        const struct json_value *row = json_at(results, 0);
+        ASSERT_STR_EQ(json_get_str(json_get(row, "state")), "refused");
+        ASSERT_STR_EQ(json_get_str(json_get(row, "error")), "MAIL_REFUSED_PATH");
+        const char *message = json_get_str(json_get(row, "message"));
+        ASSERT(message != NULL && strstr(message, "repo-relative") != NULL);
+        ASSERT(strstr(message, "unique-private-fixture") == NULL);
+        ASSERT(json_get(row, "body") == NULL && json_get(row, "evidence") == NULL);
+        if (mixed) {
+            row = json_at(results, 1);
+            ASSERT_STR_EQ(json_get_str(json_get(row, "state")), "queued");
+            ASSERT(json_get(row, "message") == NULL);
+            row = json_at(results, 2);
+            ASSERT_STR_EQ(json_get_str(json_get(row, "error")), "BAD_INPUT");
+            ASSERT(json_get(row, "message") == NULL);
+        }
+        PASS();
+    }
+_test_next:;
+    json_free(&item);
+    json_free(&items);
+    fmx_end(&c);
+    fmx_restore();
+    return failures;
+}
+
 static int fmx_t_brief_changes(void)
 {
     int failures = 0;
@@ -6033,6 +6089,8 @@ int test_fleet_steer(void)
     failures += fmx_t_register();
     failures += fmx_t_brief_empty();
     failures += fmx_t_send_flow();
+    failures += fmx_t_send_refusal_guidance(false);
+    failures += fmx_t_send_refusal_guidance(true);
     failures += fmx_t_brief_changes();
     failures += fmx_t_brief_newer_low_seq();
     failures += fmx_t_brief_watermark();
