@@ -17,6 +17,8 @@
 #include "controllers/app_native_handlers.h"
 #include "controllers/chain_native_handlers.h"
 #include "controllers/rpc_client.h"
+#include "controllers/wallet_native_handlers.h"
+#include "util/safe_alloc.h"
 #include "util/boot_status.h"
 #include "util/boot_phase.h"
 #include "platform/clock.h"
@@ -1948,6 +1950,225 @@ static int test_wallet_utxo_list_envelope(void)
         PASS();
     } _test_next:;
     node_rpc_client_set_test_hook(NULL);
+    return failures;
+}
+
+/* core.wallet.transaction.list wraps the bare listtransactions array in the
+ * declared zcl.wallet_tx_list.v1 envelope and fails closed on every other
+ * RPC answer (it used to return the bare array, which the bridge rejected as
+ * BAD_TOOL_BODY). */
+static const char *g_txlist_fixture;
+
+static char *txlist_mock_rpc(const char *method, const char *params_json)
+{
+    (void)params_json;
+    if (strcmp(method, "listtransactions") != 0 || !g_txlist_fixture)
+        return NULL;
+    return strdup(g_txlist_fixture);
+}
+
+/* Run the body against `fixture`; returns the body (or NULL) and fills err. */
+static char *txlist_body(const char *fixture, struct zcl_native_body_err *err)
+{
+    memset(err, 0, sizeof(*err));
+    g_txlist_fixture = fixture;
+    node_rpc_client_set_test_hook(txlist_mock_rpc);
+    char *body = zcl_native_listtransactions_body(NULL, err);
+    node_rpc_client_set_test_hook(NULL);
+    g_txlist_fixture = NULL;
+    return body;
+}
+
+/* Fixture that must fail with `status` and a message naming `needle`. */
+static bool txlist_fails(const char *fixture,
+                         enum zcl_native_body_status status,
+                         const char *needle)
+{
+    struct zcl_native_body_err err;
+    char *body = txlist_body(fixture, &err);
+    bool ok = body == NULL && err.status == status &&
+              strstr(err.message, needle) != NULL;
+    if (!ok)
+        fprintf(stderr, "txlist fixture %s: body=%s status=%d msg=%s\n",
+                fixture ? fixture : "(null)", body ? "set" : "NULL",
+                (int)err.status, err.message);
+    free(body);
+    return ok;
+}
+
+static bool txlist_reply(const char *fixture, char *out, size_t out_size,
+                         enum zcl_command_exit *code)
+{
+    const struct zcl_command_registry *reg = zcl_command_catalog();
+    const struct zcl_command_spec *s =
+        find_spec(reg, "core.wallet.transaction.list");
+    g_txlist_fixture = fixture;
+    node_rpc_client_set_test_hook(txlist_mock_rpc);
+    bool dispatched = s && exec_leaf(reg, s, out, out_size, code);
+    node_rpc_client_set_test_hook(NULL);
+    g_txlist_fixture = NULL;
+    return dispatched;
+}
+
+static int test_wallet_tx_list_envelope(void)
+{
+    int failures = 0;
+    char out[ZCL_COMMAND_LIST_BUDGET + 1];
+    TEST("core.wallet.transaction.list wraps the RPC array in "
+         "zcl.wallet_tx_list.v1, order and count kept") {
+        const struct zcl_command_registry *reg = zcl_command_catalog();
+        const struct zcl_command_spec *s =
+            find_spec(reg, "core.wallet.transaction.list");
+        ASSERT(s != NULL);
+        ASSERT_STR_EQ(s->output_schema, "zcl.wallet_tx_list.v1");
+        ASSERT(bridge_has_exact_binding("core.wallet.transaction.list"));
+
+        enum zcl_command_exit code = ZCL_COMMAND_EXIT_INTERNAL;
+        ASSERT(txlist_reply(
+            "[{\"txid\":\"bb\",\"category\":\"send\",\"amount\":-1.0},"
+            "{\"txid\":\"aa\",\"category\":\"receive\",\"amount\":2.5}]",
+            out, sizeof(out), &code));
+        ASSERT_EQ(code, ZCL_COMMAND_EXIT_OK);
+        struct json_value root;
+        ASSERT(json_read(&root, out, strlen(out)) && root.type == JSON_OBJ);
+        ASSERT(json_get_bool(json_get(&root, "ok")));
+        const struct json_value *data = json_get(&root, "data");
+        ASSERT(data != NULL && data->type == JSON_OBJ);
+        ASSERT_STR_EQ(json_get_str(json_get(data, "schema")),
+                      "zcl.wallet_tx_list.v1");
+        const struct json_value *txs = json_get(data, "transactions");
+        ASSERT(txs != NULL && txs->type == JSON_ARR);
+        ASSERT_EQ((int64_t)txs->num_children, (int64_t)2);
+        ASSERT_STR_EQ(json_get_str(json_get(json_at(txs, 0), "txid")), "bb");
+        ASSERT_STR_EQ(json_get_str(json_get(json_at(txs, 1), "txid")), "aa");
+        ASSERT_EQ(json_get_int(json_get(data, "count")), (int64_t)2);
+        json_free(&root);
+
+        /* An empty wallet history is an answer: count 0. */
+        ASSERT(txlist_reply("[]", out, sizeof(out), &code));
+        ASSERT_EQ(code, ZCL_COMMAND_EXIT_OK);
+        ASSERT(json_read(&root, out, strlen(out)));
+        data = json_get(&root, "data");
+        ASSERT(data != NULL);
+        txs = json_get(data, "transactions");
+        ASSERT(txs != NULL && txs->type == JSON_ARR);
+        ASSERT_EQ((int64_t)txs->num_children, (int64_t)0);
+        ASSERT_EQ(json_get_int(json_get(data, "count")), (int64_t)0);
+        json_free(&root);
+        PASS();
+    } _test_next:;
+    node_rpc_client_set_test_hook(NULL);
+    g_txlist_fixture = NULL;
+    return failures;
+}
+
+static int test_wallet_tx_list_fails_closed(void)
+{
+    int failures = 0;
+    char out[ZCL_COMMAND_LIST_BUDGET + 1];
+    TEST("core.wallet.transaction.list fails closed, never an empty success") {
+        /* Each non-array answer is a typed PROTOCOL failure naming the cause. */
+        ASSERT(txlist_fails("null", ZCL_NATIVE_BODY_PROTOCOL,
+                            "did not return a transaction array"));
+        ASSERT(txlist_fails("42", ZCL_NATIVE_BODY_PROTOCOL,
+                            "did not return a transaction array"));
+        ASSERT(txlist_fails("\"nope\"", ZCL_NATIVE_BODY_PROTOCOL,
+                            "did not return a transaction array"));
+        ASSERT(txlist_fails("{\"txid\":\"aa\"}", ZCL_NATIVE_BODY_PROTOCOL,
+                            "did not return a transaction array"));
+        ASSERT(txlist_fails("[{\"txid\":", ZCL_NATIVE_BODY_PROTOCOL,
+                            "unparseable"));
+        /* No RPC answer at all is UNAVAILABLE. */
+        ASSERT(txlist_fails(NULL, ZCL_NATIVE_BODY_UNAVAILABLE,
+                            "returned null"));
+
+        /* Through the bridge: a scalar is a failure, not ok:true. */
+        enum zcl_command_exit code = ZCL_COMMAND_EXIT_OK;
+        ASSERT(txlist_reply("42", out, sizeof(out), &code));
+        ASSERT_EQ(code, ZCL_COMMAND_EXIT_FAILED);
+        struct json_value root;
+        ASSERT(json_read(&root, out, strlen(out)));
+        ASSERT(!json_get_bool(json_get(&root, "ok")));
+        json_free(&root);
+
+        /* An RPC error object surfaces as the node's own typed TOOL_ERROR. */
+        ASSERT(txlist_reply(
+            "{\"error\":{\"code\":-13,\"message\":\"wallet locked\"}}",
+            out, sizeof(out), &code));
+        ASSERT_EQ(code, ZCL_COMMAND_EXIT_FAILED);
+        ASSERT(strstr(out, "TOOL_ERROR") != NULL);
+        ASSERT(strstr(out, "wallet locked") != NULL);
+        ASSERT(strstr(out, "BAD_TOOL_BODY") == NULL);
+        PASS();
+    } _test_next:;
+    node_rpc_client_set_test_hook(NULL);
+    g_txlist_fixture = NULL;
+    return failures;
+}
+
+static int test_wallet_tx_list_budget_and_alloc(void)
+{
+    int failures = 0;
+    char out[ZCL_COMMAND_LIST_BUDGET + 1];
+    TEST("core.wallet.transaction.list field-truncates a large list "
+         "explicitly, refuses a body over the cap, and fails on alloc fault") {
+        /* 200 rows overrun the 8192-byte list budget. This shows the bridge's
+         * existing field projection (the rows are NOT delivered here; row
+         * level paging is an open follow-up), not a useful list;
+         * see the assertions below for what the registry does with it. */
+        static char big[40000];
+        size_t n = 0;
+        big[n++] = '[';
+        for (int i = 0; i < 200; i++)
+            n += (size_t)snprintf(big + n, sizeof(big) - n,
+                "%s{\"txid\":\"%064d\",\"category\":\"receive\","
+                "\"amount\":1.0,\"confirmations\":%d}",
+                i ? "," : "", i, i);
+        big[n++] = ']';
+        big[n] = '\0';
+        enum zcl_command_exit code = ZCL_COMMAND_EXIT_OK;
+        ASSERT(txlist_reply(big, out, sizeof(out), &code));
+        /* The registry pages by top-level field and says so: the reply is
+         * flagged truncated and never carries a partial array as complete. */
+        ASSERT_EQ(code, ZCL_COMMAND_EXIT_OK);
+        struct json_value big_root;
+        ASSERT(json_read(&big_root, out, strlen(out)));
+        const struct json_value *big_data = json_get(&big_root, "data");
+        ASSERT(big_data != NULL);
+        const struct json_value *pg = json_get(big_data, "_page");
+        ASSERT(pg != NULL && json_get_bool(json_get(pg, "truncated")));
+        ASSERT(json_get(pg, "next_cursor") != NULL);
+        const struct json_value *big_txs = json_get(big_data, "transactions");
+        ASSERT(big_txs == NULL || json_size(big_txs) == 200);
+        json_free(&big_root);
+
+        /* A result larger than the 262144-byte body cap is a typed INTERNAL
+         * refusal from the body itself, never a truncated or empty success. */
+        static char huge[600000];
+        size_t hn = 0;
+        huge[hn++] = '[';
+        for (int i = 0; i < 4000; i++)
+            hn += (size_t)snprintf(huge + hn, sizeof(huge) - hn,
+                "%s{\"txid\":\"%064d\",\"category\":\"receive\","
+                "\"amount\":1.0,\"confirmations\":%d}",
+                i ? "," : "", i, i);
+        huge[hn++] = ']';
+        huge[hn] = '\0';
+        ASSERT(hn > 262144 && hn < sizeof(huge));
+        ASSERT(txlist_fails(huge, ZCL_NATIVE_BODY_INTERNAL,
+                            "did not fit the body buffer"));
+
+        /* Render allocation failure is an INTERNAL failure, no body. */
+        zcl_alloc_fault_fail_nth("shielded_body", 1u);
+        bool failed = txlist_fails("[{\"txid\":\"aa\"}]",
+                                   ZCL_NATIVE_BODY_INTERNAL, "malloc failed");
+        zcl_alloc_fault_clear();
+        ASSERT(failed);
+        PASS();
+    } _test_next:;
+    zcl_alloc_fault_clear();
+    node_rpc_client_set_test_hook(NULL);
+    g_txlist_fixture = NULL;
     return failures;
 }
 
@@ -5470,6 +5691,9 @@ int test_command_registry_catalog(void)
     failures += test_status_brief_flat_lean_envelope();
     failures += test_status_journey_safe_money_frontdoor();
     failures += test_wallet_utxo_list_envelope();
+    failures += test_wallet_tx_list_envelope();
+    failures += test_wallet_tx_list_fails_closed();
+    failures += test_wallet_tx_list_budget_and_alloc();
     failures += test_status_brief_overdue_transient_surfaces();
     failures += test_status_brief_overdue_transient_absent_when_zero();
     failures += test_status_brief_trust_tier_surfaces();

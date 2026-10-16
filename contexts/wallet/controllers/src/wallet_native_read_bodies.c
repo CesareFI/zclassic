@@ -105,6 +105,23 @@ char *zcl_native_listunspent_body(const struct json_value *args,
     return out;
 }
 
+/* Fail the tx list body with a typed status and log the context. */
+static char *wnh_tx_fail(struct zcl_native_body_err *err,
+                        enum zcl_native_body_status status, const char *why)
+{
+    err->status = status;
+    snprintf(err->message, sizeof(err->message),
+             "RPC %s %s", "listtransactions", why);
+    LOG_NULL("native.wallet", "RPC %s %s", "listtransactions", why);
+}
+
+/* listtransactions answers a BARE ARRAY and the bridge drops non-object
+ * bodies (BAD_TOOL_BODY), so the array rides inside the declared
+ * zcl.wallet_tx_list.v1 envelope in RPC order. Unlike listunspent, anything
+ * that is not an array (or an RPC error object, forwarded verbatim so the
+ * bridge types it TOOL_ERROR) is a PROTOCOL failure, never an empty list.
+ * Size is bounded twice: the render buffer here and the registry's
+ * RESPONSE_BUDGET_EXCEEDED check on the reply; neither truncates rows. */
 char *zcl_native_listtransactions_body(const struct json_value *args,
                                         struct zcl_native_body_err *err)
 {
@@ -112,13 +129,50 @@ char *zcl_native_listtransactions_body(const struct json_value *args,
     snprintf(params, sizeof(params), "[\"\",%lld,%lld]",
              (long long)json_get_int_or(args, "count", 10),
              (long long)json_get_int_or(args, "skip",   0));
-    char *out = node_rpc_call("listtransactions", params);
-    if (!out) {
+    char *raw = node_rpc_call("listtransactions", params);
+    if (!raw) {
         err->status = ZCL_NATIVE_BODY_UNAVAILABLE;
         snprintf(err->message, sizeof(err->message),
                  "RPC %s returned null", "listtransactions");
         LOG_NULL("native.wallet", "RPC %s returned null", "listtransactions");
     }
+    struct json_value rows;
+    json_init(&rows);
+    bool parsed = json_read(&rows, raw, strlen(raw));
+    free(raw);
+    if (!parsed) {
+        json_free(&rows);
+        return wnh_tx_fail(err, ZCL_NATIVE_BODY_PROTOCOL,
+                    "returned an unparseable body");
+    }
+    if (rows.type == JSON_OBJ) {
+        const struct json_value *e = json_get(&rows, "error");
+        if (e && e->type != JSON_NULL) {
+            char *passthru = wnh_body_render(&rows, "listtransactions",
+                                             WNH_LIST_BODY, err);
+            json_free(&rows);
+            return passthru;
+        }
+    }
+    if (rows.type != JSON_ARR) {
+        json_free(&rows);
+        return wnh_tx_fail(err, ZCL_NATIVE_BODY_PROTOCOL,
+                    "did not return a transaction array");
+    }
+    struct json_value doc;
+    json_init(&doc);
+    json_set_object(&doc);
+    bool built = json_push_kv_str(&doc, "schema", "zcl.wallet_tx_list.v1") &&
+                 json_push_kv(&doc, "transactions", &rows) &&
+                 json_push_kv_int(&doc, "count", (int64_t)rows.num_children);
+    json_free(&rows);
+    if (!built) {
+        json_free(&doc);
+        return wnh_tx_fail(err, ZCL_NATIVE_BODY_INTERNAL,
+                    "envelope could not be built");
+    }
+    char *out = wnh_body_render(&doc, "listtransactions", WNH_LIST_BODY, err);
+    json_free(&doc);
     return out;
 }
 
