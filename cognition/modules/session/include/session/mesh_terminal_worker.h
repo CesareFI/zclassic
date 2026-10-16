@@ -52,7 +52,8 @@ enum mesh_terminal_worker_error {
     MESH_TERMINAL_WORKER_ERR_IO = -10,         /* pty i/o failed           */
     MESH_TERMINAL_WORKER_ERR_GEOMETRY = -11,   /* cols/rows out of proto bounds */
     MESH_TERMINAL_WORKER_ERR_UNSUPPORTED = -12, /* non-Linux: honest refusal */
-    MESH_TERMINAL_WORKER_ERR_JOB_ASSIGN = -13   /* Windows: shell could not join its job */
+    MESH_TERMINAL_WORKER_ERR_JOB_ASSIGN = -13,  /* Windows: shell could not join its job */
+    MESH_TERMINAL_WORKER_ERR_PIDNS_UNAVAILABLE = -14 /* Linux: no user+PID namespace; no unconfined fallback */
 };
 
 const char *mesh_terminal_worker_error_string(

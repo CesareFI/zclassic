@@ -737,3 +737,10 @@ struct zcl_result os_sandbox_enter(const struct os_sandbox_profile *value)
     return unavailable("Linux process confinement");
 #endif
 }
+
+int os_sandbox_pidns_enter(int close_fd)
+{
+    (void)close_fd;
+    errno = ENOSYS;
+    return -1;
+}

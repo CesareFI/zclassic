@@ -365,6 +365,21 @@ const int *os_sandbox_node_steady_denied_syscalls(size_t *count_out);
  * length. Named the TERMINAL WORKER deny-set constant. */
 const int *os_sandbox_terminal_worker_denied_syscalls(size_t *count_out);
 
+/* PID namespace for the confined shell (Linux; the terminal worker is the
+ * only caller, in the forked child before os_sandbox_enter). unshare(CLONE_NEWUSER
+ * |CLONE_NEWPID) with the caller's own uid/gid mapped to itself (setgroups
+ * denied, NOT root), then two forks: the caller stays outside as the process
+ * the supervisor tracks (it closes `close_fd`, waits, and exits mirroring the
+ * shell's raw status; it never returns); the first child is pid 1, a bare
+ * reaper with PR_SET_PDEATHSIG=SIGKILL (an init cannot be signalled from
+ * inside, so the shell must not be it) whose death takes the whole namespace;
+ * the second child returns 0 as pid 2 and goes on to be the shell. Inside,
+ * kill(2) resolves pids in the new namespace, so no outside process is
+ * addressable. Returns -1 with errno set when the host refuses (unprivileged
+ * user namespaces disabled): the caller must fail closed, there is no
+ * unconfined fallback. */
+int os_sandbox_pidns_enter(int close_fd);
+
 /* Install a hand-rolled seccomp-bpf DENY-list (no libseccomp): every syscall
  * in `denied` returns SECCOMP_RET_KILL_PROCESS; everything else defaults to
  * SECCOMP_RET_ALLOW. A deny-list (not an allow-list) is deliberate — even a
@@ -396,7 +411,9 @@ struct zcl_result os_sandbox_seccomp_deny_ext(
  * other kill, including of a negative own-job pgid, passes. Installed with
  * the same TSYNC/prctl rules as the deny filter; os_sandbox_enter() calls it
  * when the profile sets seccomp_guard_signals. Positive pids of unrelated
- * same-uid processes are NOT covered (seccomp cannot tell them apart). */
+ * same-uid processes are NOT covered by this filter (seccomp cannot tell them
+ * apart); the terminal worker closes that gap with os_sandbox_pidns_enter(),
+ * after which no outside pid is addressable at all. */
 struct zcl_result os_sandbox_seccomp_guard_signals(void);
 
 /* The RESIDENT NODE's -confine ALLOW-list: the empirically-derived steady-state

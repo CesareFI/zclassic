@@ -7,11 +7,21 @@
  * Compiled only on Linux (the Makefile filter-outs pair this file with
  * os_sandbox_linux.c); the portable stub carries the same entry points. */
 
+#define _GNU_SOURCE
 #include "platform/os_sandbox.h"
 
 #include <stddef.h>
 #include <stdint.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 /* Kernel ABI numbers for syscalls an older libc header set may lack (the same
  * fallbacks os_sandbox_plugin.c carries; 425..427 and 424/434/438 are identical
@@ -132,4 +142,126 @@ struct os_sandbox_profile os_sandbox_terminal_worker_profile(
         .seccomp_deny_exec_mmap = true,
         .seccomp_guard_signals = true,
     };
+}
+
+/* ── PID namespace for the confined shell ──────────────────────────────── */
+
+static bool pidns_write_file(const char *path, const char *text)
+{
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0)
+        return false;
+    size_t n = strlen(text);
+    ssize_t w = write(fd, text, n);
+    int saved = errno;
+    close(fd);
+    errno = saved;
+    return w == (ssize_t)n;
+}
+
+/* Identity map: the same uid/gid inside, so file ownership in the workdir is
+ * unchanged and the user namespace confers nothing past the PID namespace.
+ * setgroups must be denied before an unprivileged gid_map write. */
+static bool pidns_map_identity(uid_t uid, gid_t gid)
+{
+    char line[64];
+    if (!pidns_write_file("/proc/self/setgroups", "deny"))
+        return false;
+    snprintf(line, sizeof line, "%u %u 1\n", (unsigned)gid, (unsigned)gid);
+    if (!pidns_write_file("/proc/self/gid_map", line))
+        return false;
+    snprintf(line, sizeof line, "%u %u 1\n", (unsigned)uid, (unsigned)uid);
+    return pidns_write_file("/proc/self/uid_map", line);
+}
+
+/* Mirror a raw wait status as this process's own death: the supervisor's
+ * waitpid must see the same signal / exit code the shell produced. */
+[[noreturn]] static void pidns_mirror(int status)
+{
+    if (WIFSIGNALED(status)) {
+        (void)signal(WTERMSIG(status), SIG_DFL);
+        (void)raise(WTERMSIG(status));
+        _exit(128 + WTERMSIG(status));
+    }
+    _exit(WEXITSTATUS(status));
+}
+
+/* The supervisor-visible process: it only waits for the namespace init and
+ * mirrors how the shell ended (the init reports the shell's raw status over
+ * `status_fd`; if the init itself was killed, that death is mirrored). */
+[[noreturn]] static void pidns_outer(pid_t init, int status_fd)
+{
+    int status = 0, shell_status = 0;
+    /* Terminal-generated signals reach this process as the session leader and
+     * as a member of the foreground group; they are the shell's to handle (a
+     * shell that ignores HUP must survive its terminal closing), so this
+     * wrapper must not die of them. Set here, after the fork, so the shell
+     * does not inherit the ignores. */
+    static const int tty_signals[] = { SIGHUP, SIGINT, SIGQUIT, SIGTSTP, SIGTTIN, SIGTTOU };
+    for (size_t i = 0; i < sizeof tty_signals / sizeof tty_signals[0]; i++)
+        (void)signal(tty_signals[i], SIG_IGN);
+    while (waitpid(init, &status, 0) < 0)
+        if (errno != EINTR)
+            _exit(127);
+    if (WIFSIGNALED(status))
+        pidns_mirror(status);
+    if (read(status_fd, &shell_status, sizeof shell_status) != (ssize_t)sizeof shell_status)
+        _exit(127);
+    pidns_mirror(shell_status);
+}
+
+/* Pid 1 of the namespace: signals sent from inside the namespace never
+ * reach an init (so the shell could not `kill -9 $$` if it were pid 1), so
+ * the init is a bare reaper and the shell is its child. It reaps orphans
+ * until the shell ends, reports the shell's raw status, and exits, which
+ * takes every remaining process in the namespace with it. */
+[[noreturn]] static void pidns_init(pid_t shell, int status_fd)
+{
+    int status = 0;
+    pid_t got;
+    while ((got = waitpid(-1, &status, 0)) != shell)
+        if (got < 0 && errno != EINTR)
+            _exit(127);
+    if (write(status_fd, &status, sizeof status) != (ssize_t)sizeof status)
+        _exit(127);
+    _exit(0);
+}
+
+int os_sandbox_pidns_enter(int close_fd)
+{
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    int sp[2];
+    if (pipe2(sp, O_CLOEXEC) != 0)
+        return -1;
+    if (unshare(CLONE_NEWUSER | CLONE_NEWPID) != 0 || !pidns_map_identity(uid, gid))
+        goto fail;
+    pid_t init = fork();
+    if (init < 0)
+        goto fail;
+    if (init > 0) {
+        if (close_fd >= 0)
+            close(close_fd);
+        close(sp[1]);
+        pidns_outer(init, sp[0]);
+    }
+    if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0)
+        goto fail;
+    pid_t shell = fork();
+    if (shell < 0)
+        goto fail;
+    if (shell > 0) {
+        if (close_fd >= 0)
+            close(close_fd);
+        pidns_init(shell, sp[1]);
+    }
+    close(sp[0]);
+    close(sp[1]);
+    return 0;
+fail:;
+    int saved = errno;
+    close(sp[0]);
+    close(sp[1]);
+    errno = saved;
+    return -1;
 }

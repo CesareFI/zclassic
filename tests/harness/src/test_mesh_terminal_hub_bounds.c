@@ -236,14 +236,29 @@ static void prep_wedged(void)
     mesh_terminal_hub_testing_children_ignore_term(true); /* a wedged session */
 }
 
-/* The worker leader's group id, announced on the screen as PGID=<n>. */
-static bool read_pgid(struct cl *c, int *leader)
+static unsigned children_of(pid_t parent, pid_t *out, unsigned cap);
+
+/* The worker leader's group id as the host sees it. The shell runs in its own
+ * PID namespace, so the PGID=<n> it announces is namespace-local and is only
+ * the readiness signal; the real group is the setsid leader that is a child of
+ * one of the supervisor's session processes. */
+static bool read_pgid(struct cl *c, pid_t sup, int *leader)
 {
     char screen[256];
-    return read_until(c->screen_r, "\n", screen, sizeof screen, 8000) && strstr(screen, "PGID=") &&
-           sscanf(strstr(screen, "PGID="), "PGID=%d", leader) == 1;
+    pid_t sessions[8], workers[8];
+    if (!read_until(c->screen_r, "\n", screen, sizeof screen, 8000) || !strstr(screen, "PGID="))
+        return false;
+    unsigned ns = children_of(sup, sessions, 8);
+    for (unsigned i = 0; i < ns; i++) {
+        unsigned nw = children_of(sessions[i], workers, 8);
+        for (unsigned j = 0; j < nw; j++)
+            if (getpgid(workers[j]) == workers[j]) {
+                *leader = workers[j];
+                return true;
+            }
+    }
+    return false;
 }
-
 #define HUP_TRAP_RUN "trap '' HUP; echo PGID=$$; (while :; do :; done)"
 
 static void rig_end(struct cl *c, bool up, int net, int audit_fd)
@@ -281,7 +296,7 @@ static int stop_orphan_case(void)
     pid_t sup = cfg.audit_fd < 0 ? -1 : sup_start(&cfg, &port, prep_wedged);
     int net = sup > 0 ? tcp_connect(port) : -1;
     bool up = net >= 0 && cl_start(&c, net, -1, run);
-    bool said = up && read_pgid(&c, &leader);
+    bool said = up && read_pgid(&c, sup, &leader);
     failures = check(failures, said && group_running(leader) >= 2,
                      "worker stop: the worker group (a HUP-ignoring leader and its child) is running");
     if (sup > 0)
@@ -494,7 +509,7 @@ static int stale_slot_case(void)
     pid_t sup = cfg.audit_fd < 0 ? -1 : sup_start(&cfg, &port, prep_stale);
     int net = sup > 0 ? tcp_connect(port) : -1;
     bool up = net >= 0 && cl_start(&c, net, -1, run);
-    bool said = up && read_pgid(&c, &leader);
+    bool said = up && read_pgid(&c, sup, &leader);
     if (sup > 0)
         kill(sup, SIGTERM);
     bool stopped = sup > 0 && exits_within(sup, 5000, &status);

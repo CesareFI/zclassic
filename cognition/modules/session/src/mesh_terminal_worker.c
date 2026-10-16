@@ -64,27 +64,20 @@ enum {
     TW_STAGE_CHDIR = 2,      /* workdir chdir */
     TW_STAGE_CONFINEMENT = 3,/* sandbox enter */
     TW_STAGE_EXEC = 4,       /* execve */
+    TW_STAGE_PIDNS = 5,      /* PID namespace unshare */
 };
 
 const char *mesh_terminal_worker_error_string(
     enum mesh_terminal_worker_error error)
 {
-    switch (error) {
-    case MESH_TERMINAL_WORKER_ERR_NONE: return "ok";
-    case MESH_TERMINAL_WORKER_ERR_NULL: return "null";
-    case MESH_TERMINAL_WORKER_ERR_CONFIG: return "config";
-    case MESH_TERMINAL_WORKER_ERR_PTY: return "pty";
-    case MESH_TERMINAL_WORKER_ERR_SPAWN: return "spawn";
-    case MESH_TERMINAL_WORKER_ERR_CONFINEMENT: return "confinement";
-    case MESH_TERMINAL_WORKER_ERR_EXEC: return "exec";
-    case MESH_TERMINAL_WORKER_ERR_TTY: return "tty";
-    case MESH_TERMINAL_WORKER_ERR_NOT_RUNNING: return "not-running";
-    case MESH_TERMINAL_WORKER_ERR_BYTE_LIMIT: return "byte-limit";
-    case MESH_TERMINAL_WORKER_ERR_IO: return "io";
-    case MESH_TERMINAL_WORKER_ERR_GEOMETRY: return "geometry";
-    case MESH_TERMINAL_WORKER_ERR_UNSUPPORTED: return "unsupported";
-    case MESH_TERMINAL_WORKER_ERR_JOB_ASSIGN: return "job-assign";
-    }
+    /* Indexed by -code: ERR_NONE is 0, every failure counts down from -1. */
+    static const char *const names[] = {
+        "ok", "null", "config", "pty", "spawn", "confinement", "exec", "tty",
+        "not-running", "byte-limit", "io", "geometry", "unsupported",
+        "job-assign", "pidns-unavailable",
+    };
+    if (error <= 0 && (size_t)-error < sizeof names / sizeof names[0])
+        return names[-error];
     return "unknown";
 }
 
@@ -334,6 +327,8 @@ static void tw_child(const struct mesh_terminal_worker_config *cfg,
     tw_close_inherited(stage_fd);
 
     if (chdir(cfg->workdir) < 0) tw_fail(stage_fd, TW_STAGE_CHDIR, 126);
+    /* Own PID namespace: no outside pid is addressable. Fail closed. */
+    if (os_sandbox_pidns_enter(stage_fd) != 0) tw_fail(stage_fd, TW_STAGE_PIDNS, 126);
 
     /* The grant IS the filesystem: the per-terminal workdir (the child's
      * cwd and HOME) plus the one granted binary (and, for an explicit argv,
@@ -464,29 +459,18 @@ static struct zcl_result mesh_terminal_worker_spawn_platform_arm(
         tw_slot(cfg->pgid_slot, 0);
         (void)tw_wait_settled(pid, &status);
         close(master);
-        enum mesh_terminal_worker_error code =
-            MESH_TERMINAL_WORKER_ERR_SPAWN;
+        static const struct { uint8_t stage; enum mesh_terminal_worker_error code; const char *what; } k[] = {
+            { TW_STAGE_TTY, MESH_TERMINAL_WORKER_ERR_TTY, "pty slave/ctty/winsize setup" },
+            { TW_STAGE_CHDIR, MESH_TERMINAL_WORKER_ERR_CONFIG, "workdir chdir" },
+            { TW_STAGE_CONFINEMENT, MESH_TERMINAL_WORKER_ERR_CONFINEMENT, "sandbox enter" },
+            { TW_STAGE_EXEC, MESH_TERMINAL_WORKER_ERR_EXEC, "execve" },
+            { TW_STAGE_PIDNS, MESH_TERMINAL_WORKER_ERR_PIDNS_UNAVAILABLE,
+              "TERMINAL_PIDNS_UNAVAILABLE: user+PID namespace refused; no unconfined fallback" },
+        };
+        enum mesh_terminal_worker_error code = MESH_TERMINAL_WORKER_ERR_SPAWN;
         const char *what = "unknown stage";
-        switch (stage) {
-        case TW_STAGE_TTY:
-            code = MESH_TERMINAL_WORKER_ERR_TTY;
-            what = "pty slave/ctty/winsize setup";
-            break;
-        case TW_STAGE_CHDIR:
-            code = MESH_TERMINAL_WORKER_ERR_CONFIG;
-            what = "workdir chdir";
-            break;
-        case TW_STAGE_CONFINEMENT:
-            code = MESH_TERMINAL_WORKER_ERR_CONFINEMENT;
-            what = "sandbox enter";
-            break;
-        case TW_STAGE_EXEC:
-            code = MESH_TERMINAL_WORKER_ERR_EXEC;
-            what = "execve";
-            break;
-        default:
-            break;
-        }
+        for (size_t i = 0; i < sizeof k / sizeof k[0]; i++)
+            if (k[i].stage == stage) { code = k[i].code; what = k[i].what; }
         return ZCL_ERR(code, "worker child failed at %s (stage %u)",
                        what, (unsigned)stage);
     }

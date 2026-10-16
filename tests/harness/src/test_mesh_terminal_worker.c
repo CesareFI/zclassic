@@ -693,7 +693,12 @@ static int live_orphan_descendant(void)
     if (!r.ok)
         return failures;
     failures = check(failures, wait_exit(&w, 5) && w.term_signal == 9, "orphan: the leader dies while its child runs on");
-    failures = check(failures, group_running(w.pgid) > 0, "orphan: the HUP-ignoring child outlives its leader");
+    /* The leader is pid 1 of its own PID namespace: its death takes every
+     * descendant with it, so no orphan can outlive it (the pgid kill below
+     * stays as the fallback). */
+    unsigned live = group_running(w.pgid);
+    for (int i = 0; i < 100 && live; i++) { usleep(20000); /* real-clock: async kernel teardown */ live = group_running(w.pgid); }
+    failures = check(failures, live == 0, "orphan: the namespace init dying takes the HUP-ignoring child with it");
     mesh_terminal_worker_kill(&w);
     unsigned left = group_running(w.pgid);
     for (int i = 0; i < 100 && left; i++) {
@@ -729,7 +734,9 @@ static int live_custody_order(void)
         return failures;
     mesh_terminal_worker_testing_order(&killpg_seq, &reap_seq);
     failures = check(failures, wait_exit(&w, 5) && !w.running, "custody: the leader exits by itself");
-    failures = check(failures, group_running(w.pgid) > 0, "custody: its HUP-ignoring child outlives it");
+    unsigned live = group_running(w.pgid);
+    for (int i = 0; i < 100 && live; i++) { usleep(20000); /* real-clock: async kernel teardown */ live = group_running(w.pgid); }
+    failures = check(failures, live == 0, "custody: the namespace init dying takes its HUP-ignoring child with it");
     bool zombie = waitid(P_PID, (id_t)w.pid, &si, WEXITED | WNOHANG | WNOWAIT) == 0 && si.si_pid == w.pid;
     failures = check(failures, zombie && w.leader_held, "custody: the exited leader is still unreaped, holding the group id");
     mesh_terminal_worker_kill(&w);
@@ -745,6 +752,88 @@ static int live_custody_order(void)
     failures = check(failures, left == 0, "custody: the descendant died with the group");
     if (left)
         (void)kill(-w.pgid, SIGKILL);
+    return failures;
+}
+
+/* First live child (non-zombie) of `parent` outside group `avoid_pgid` (0: any), by /proc scan; 0 if none. */
+static pid_t first_child_of(pid_t parent, pid_t avoid_pgid)
+{
+    pid_t found = 0;
+    DIR *proc = opendir("/proc");
+    struct dirent *ent;
+    while (proc && !found && (ent = readdir(proc)) != NULL) {
+        char path[64], buf[512];
+        long pid = strtol(ent->d_name, NULL, 10);
+        if (pid <= 0)
+            continue;
+        snprintf(path, sizeof path, "/proc/%ld/stat", pid);
+        int fd = open(path, O_RDONLY);
+        ssize_t n = fd < 0 ? -1 : read(fd, buf, sizeof buf - 1);
+        if (fd >= 0)
+            close(fd);
+        const char *after = n > 0 ? (buf[n] = '\0', strrchr(buf, ')')) : NULL;
+        char state = 0;
+        long ppid = 0;
+        if (after && sscanf(after + 1, " %c %ld", &state, &ppid) == 2 && ppid == parent && state != 'Z' && (avoid_pgid == 0 || getpgid((pid_t)pid) != avoid_pgid))
+            found = (pid_t)pid;
+    }
+    if (proc)
+        closedir(proc);
+    return found;
+}
+
+/* Live: the shell runs in its own PID namespace. A same-uid process the test
+ * started outside the cage is unaddressable (ESRCH, not EPERM and not 0), the
+ * test process itself is too, the shell is pid 1 and still runs its own jobs.
+ * A job in a group of its own (set -m) escapes the worker's pgid, so ending
+ * the session must still take it down through the namespace init. */
+static int live_pid_namespace(void)
+{
+    int failures = 0;
+    struct stat st;
+    if (stat("/bin/sh", &st) != 0)
+        return check(0, false, "pidns: /bin/sh is present");
+    pid_t sibling = fork();
+    if (sibling == 0) {
+        for (;;)
+            pause();
+    }
+    char script[512];
+    snprintf(script, sizeof script,
+             "kill -0 %ld; S=$?; kill -0 %ld; P=$?; "
+             "(while :; do :; done) & kill $!; wait $!; J=$?; "
+             "set -m; (while :; do :; done) & echo RES self=$$ sib=$S par=$P job=$J; while :; do :; done",
+             (long)sibling, (long)getpid());
+    const char *const run[] = { "/bin/sh", "-c", script, NULL };
+    struct mesh_terminal_worker_config cfg;
+    struct mesh_terminal_worker w;
+    live_config(&cfg);
+    cfg.argv = run;
+    struct zcl_result r = mesh_terminal_worker_spawn(&cfg, (int64_t)platform_time_wall_time_t(), &w);
+    failures = check(failures, r.ok, "pidns: spawn");
+    if (r.ok) {
+        char saw[256] = { 0 };
+        bool res = drain_until(&w, "RES self=2 sib=1 par=1 job=143\r", 5, NULL, saw, sizeof saw);
+        if (!res)
+            printf("pidns: saw [%s]\n", saw);
+        failures = check(failures, res,
+                         "pidns: shell is pid 2; outside sibling and supervisor are ESRCH; own job kill works");
+        pid_t init = first_child_of(w.pid, 0);
+        pid_t shell = init > 0 ? first_child_of(init, 0) : 0;
+        pid_t other = shell > 0 ? first_child_of(shell, w.pgid) : 0;
+        failures = check(failures, init > 0 && other > 0,
+                         "pidns: a job outside the worker's pgid exists");
+        mesh_terminal_worker_kill(&w);
+        for (int i = 0; i < 100 && other > 0 && kill(other, 0) == 0; i++)
+            usleep(20000); /* real-clock: the kernel finishes the teardown asynchronously */
+        failures = check(failures, other > 0 && kill(other, 0) != 0,
+                         "pidns: ending the session takes the out-of-group job down with the namespace");
+        failures = check(failures, kill(sibling, 0) == 0, "pidns: the outside sibling was not touched");
+        if (other > 0 && kill(other, 0) == 0)
+            (void)kill(other, SIGKILL);
+    }
+    (void)kill(sibling, SIGKILL);
+    (void)waitpid(sibling, NULL, 0);
     return failures;
 }
 
@@ -1009,6 +1098,7 @@ static int test_mesh_terminal_worker_platform_arm(void)
     failures += live_dynamic_argv();
     failures += live_orphan_descendant();
     failures += live_custody_order();
+    failures += live_pid_namespace();
     failures += live_inherited_fd_closed();
     failures += live_two_mib_output();
 
