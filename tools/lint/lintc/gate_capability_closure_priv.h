@@ -77,6 +77,9 @@ struct ccg_cfg {
     int strip;            /* Mach-O underscore and $VARIANT decoration in nm names */
     int symmetry;         /* a declared class the object never uses is a violation */
     long baseline;        /* shrink-only count of declared rows with no compiled object */
+    const char *cflags;   /* the compile line, or NULL to ask `make print-CFLAGS` */
+    const char *record;   /* BUILD_SOURCE_RECORD for the repository's own flag query */
+    const char *repo;     /* the checkout whose unreadable flags are fatal, or NULL */
     FILE *out, *err;      /* the report, and the sidecar diagnostic */
 };
 
@@ -85,6 +88,14 @@ struct ccg_cfg {
 int ccg_check_root(const struct ccg_cfg *cfg, const char *root);
 /* The host's class and the environment's settings, writing to stdout and stderr. */
 void ccg_host_cfg(struct ccg_cfg *cfg);
+
+/* Macros the compile line defines: -D adds one, a later -U blanks it. */
+struct ccg_macros { struct ccd_map def; int loaded; };
+/* 0 once loaded, 1 when the repository's own flag query failed. */
+int ccg_macros_load(const struct ccg_cfg *cfg, const char *root, struct ccg_macros *m);
+/* Comma-joined guard macros of the file's first code line when none of them is
+ * defined, else NULL; the caller frees it. The line must open with `#if`. */
+char *ccg_compiled_out(const struct ccg_macros *m, const char *root, const char *path);
 
 /* Fixture helpers of the data-layer selftest, shared with the gate selftest. */
 struct ccs_fx { char base[1024]; };

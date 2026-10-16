@@ -1,12 +1,12 @@
 /* Copyright 2026 Rhett Creighton - Apache License 2.0
  *
- * purpose: the capability-closure gate in C23. Every undefined symbol in the newest
- * build epoch must be classified; every object that reaches a classified capability
- * must be declared to; a declared capability must be used; a scan below the object
- * floor or missing declared files is UNPROVEN; a raw syscall or inline-asm trap in a
- * file without CAP_PRIVILEGE is banned. The compiled-out honesty follows. Output
- * strings and exit statuses (0 clean, 1 violations, 2 unproven) are those of the
- * shell gate this replaced.
+ * purpose: the capability-closure gate in C23. Every undefined symbol in the
+ * newest build epoch must be classified; every object that reaches a
+ * classified capability must be declared to; a declared capability must be
+ * used; a scan below the object floor or missing declared files is UNPROVEN;
+ * a raw syscall or inline-asm trap in a file without CAP_PRIVILEGE is banned.
+ * Output strings and exit statuses (0 clean, 1 violations, 2 unproven) are
+ * those of the shell gate this replaced.
  */
 #define _POSIX_C_SOURCE 200809L
 #include <dirent.h>
@@ -43,7 +43,7 @@ struct ccg_list { char **s; size_t n, cap; };
 
 struct ccg_counts {
     int unclassified, undeclared, overdeclared, platform_unobserved, missing;
-    int syscall, unobserved, excluded, stale;
+    int syscall, unobserved, excluded, stale, compiled_out;
 };
 
 struct ccg_scan {
@@ -53,7 +53,8 @@ struct ccg_scan {
     struct ccd_map sym, compiled, used, defined, undef, foreign;
     size_t n_sym;
     struct ccd_mods mods;
-    struct ccg_list objs, uses, unobs;
+    struct ccg_list objs, uses, unobs, compiled_out;
+    struct ccg_macros macros;
     struct ccd_nm nm;
     struct ccg_counts c;
 };
@@ -98,11 +99,13 @@ static void ccg_free(struct ccg_scan *s)
     ccd_map_free(&s->defined);
     ccd_map_free(&s->undef);
     ccd_map_free(&s->foreign);
+    ccd_map_free(&s->macros.def);
     ccd_mods_free(&s->mods);
     ccd_nm_free(&s->nm);
     ccg_list_free(&s->objs);
     ccg_list_free(&s->uses);
     ccg_list_free(&s->unobs);
+    ccg_list_free(&s->compiled_out);
 }
 
 static int ccg_is_file(const char *root, const char *rel)
@@ -448,24 +451,56 @@ static void ccg_overdeclared(struct ccg_scan *s, const char *path, const char *t
     s->c.overdeclared++;
 }
 
+/* A declared class nothing used, in a file whose primary arm no guard macro of
+ * this build lets compile, proves nothing either way. */
+static void ccg_unobserved(struct ccg_scan *s, const char *path, const char *tok, const char *macros)
+{
+    char row[2 * CCD_PATH];
+    ccg_say(s, "check_capability_closure: UNOBSERVED (compiled out: %s) " CCG_DASH "\n"
+               "  %s declares %s but its primary implementation never\n"
+               "  compiled here: the guard macro(s) %s are not defined in\n"
+               "  this build's CFLAGS. Not a violation and not a pass " CCG_DASH " the code\n"
+               "  that would prove or disprove %s did not run through this host's\n"
+               "  compiler. Validate on a host that defines %s.\n", macros, path, tok, macros, tok, macros);
+    snprintf(row, sizeof row, "    %s declares %s, undefined macro(s): %s", path, tok, macros);
+    s->c.compiled_out += ccg_list_add(&s->compiled_out, row) == 0;
+}
+
+/* 2 when the compile line cannot be read. */
+static int ccg_unused_class(struct ccg_scan *s, const char *path, const char *tok)
+{
+    char *macros;
+    if (!s->macros.loaded && ccg_macros_load(s->cfg, s->root, &s->macros) != 0)
+        return 2;
+    macros = ccg_compiled_out(&s->macros, s->root, path);
+    if (macros)
+        ccg_unobserved(s, path, tok, macros);
+    else
+        ccg_overdeclared(s, path, tok);
+    free(macros);
+    return 0;
+}
+
 /* Item 3a for one granted class of a compiled source. */
-static void ccg_symmetry_class(struct ccg_scan *s, const char *path, const char *tok)
+static int ccg_symmetry_class(struct ccg_scan *s, const char *path, const char *tok)
 {
     char key[2 * CCD_PATH];
     if (strcmp(tok, "CAP_NONE") == 0 || snprintf(key, sizeof key, "%s\t%s", path, tok) >= (int)sizeof key
         || ccd_map_get(&s->used, key))
-        return;
-    if (!s->cfg->symmetry)
+        return 0;
+    if (!s->cfg->symmetry) {
         s->c.platform_unobserved++;
-    else
-        ccg_overdeclared(s, path, tok);
+        return 0;
+    }
+    return ccg_unused_class(s, path, tok);
 }
 
 /* Items 3a and 3b: a granted class must be used, and a row's source must
  * exist. A source with no object here is unobserved, not unused. */
-static void ccg_symmetry(struct ccg_scan *s)
+static int ccg_symmetry(struct ccg_scan *s)
 {
-    for (size_t i = 0; i < s->mods.raw.n; i++) {
+    int rc = 0;
+    for (size_t i = 0; rc == 0 && i < s->mods.raw.n; i++) {
         const char *path = s->mods.raw.ent[i].key;
         char *raw = zcl_strdup(s->mods.raw.ent[i].val, "ccg_symmetry raw"), *save = NULL;
         if (!ccg_is_file(s->root, path)) {
@@ -473,11 +508,12 @@ static void ccg_symmetry(struct ccg_scan *s)
                        "  names '%s', which does not exist in this tree.\n", path);
             s->c.missing++;
         } else if (ccd_map_get(&s->compiled, path)) {
-            for (char *tok = raw ? strtok_r(raw, "|", &save) : NULL; tok; tok = strtok_r(NULL, "|", &save))
-                ccg_symmetry_class(s, path, tok);
+            for (char *tok = raw ? strtok_r(raw, "|", &save) : NULL; tok && rc == 0; tok = strtok_r(NULL, "|", &save))
+                rc = ccg_symmetry_class(s, path, tok);
         }
         free(raw);
     }
+    return rc;
 }
 
 /* Coverage floor, other half: a baseline above the true count is a ratchet
@@ -582,10 +618,15 @@ static void ccg_summary(const struct ccg_scan *s)
                "  declared-but-unobserved=%d (coverage baseline=%ld)\n"
                "  platform-target-excluded=%d\n"
                "  foreign-objects=%zu (no source in this tree; not graded)\n"
-               "  platform-exact-overrides=%zu\n",
+               "  platform-exact-overrides=%zu\n"
+               "  compiled-out-unobserved=%d (never a violation, never a pass " CCG_DASH " see UNOBSERVED lines above)\n",
             s->objs.n, s->epoch, s->n_sym, s->mods.count, c->unclassified, c->undeclared, c->overdeclared,
             c->platform_unobserved, s->cfg->symmetry, c->missing, c->syscall, c->unobserved, s->cfg->baseline,
-            c->excluded, s->foreign.n, s->mods.platform_count);
+            c->excluded, s->foreign.n, s->mods.platform_count, c->compiled_out);
+    if (c->compiled_out > 0)
+        ccg_say(s, "  compiled-out rows:\n");
+    for (size_t i = 0; i < s->compiled_out.n; i++)
+        ccg_say(s, "%s\n", s->compiled_out.s[i]);
 }
 
 static int ccg_verdict(const struct ccg_scan *s)
@@ -607,7 +648,8 @@ static int ccg_grade(struct ccg_scan *s)
     if (ccg_uses(s) != 0)
         return 2;
     ccg_declaration(s);
-    ccg_symmetry(s);
+    if (ccg_symmetry(s) != 0)
+        return 2;
     ccg_stale_baseline(s);
     return ccg_syscall_ban(s) == 0 ? 0 : 2;
 }
@@ -659,6 +701,8 @@ void ccg_host_cfg(struct ccg_cfg *cfg)
     cfg->strip = cfg->os == CCD_DARWIN;
     cfg->symmetry = strcmp(ccg_env("ZCL_CAP_CLOSURE_ENFORCE_SYMMETRY", cfg->os == CCD_DARWIN ? "0" : "1"), "1") == 0;
     cfg->baseline = strtol(ccg_env("ZCL_CAP_CLOSURE_COVERAGE_BASELINE", base), NULL, 10);
+    cfg->cflags = getenv("CAP_CLOSURE_CFLAGS_OVERRIDE");
+    cfg->record = ccg_env("ZCL_CAP_CLOSURE_SOURCE_RECORD", NULL);
     cfg->out = stdout;
     cfg->err = stderr;
 }
@@ -676,6 +720,7 @@ int check_capability_closure_run(int argc, char **argv)
     if (cic_repo_root(root, sizeof root) != 0 || lsc_install() != 0)
         return 2;
     ccg_host_cfg(&cfg);
+    cfg.repo = root;
     rc = ccg_check_root(&cfg, root);
     fflush(stdout);
     sig = lsc_pending();

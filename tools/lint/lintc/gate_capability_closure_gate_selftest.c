@@ -16,7 +16,7 @@
 #include "lintc_proc.h"
 #include "lintc_sig.h"
 
-enum { CGS_CASES = 12, CGS_FILLER = 500 };
+enum { CGS_CASES = 15, CGS_FILLER = 500 };
 
 static const char k_fx0[] = "build/dev-obj/epochs/fx0";
 
@@ -35,6 +35,9 @@ static void cgs_cfg(struct ccg_cfg *cfg)
     ccg_host_cfg(cfg);
     cfg->symmetry = 1;
     cfg->baseline = 0;
+    cfg->cflags = NULL;
+    cfg->record = NULL;
+    cfg->repo = NULL;
 }
 
 static int cgs_cc_once(const char *src, const char *obj, const char *flag, int c23)
@@ -332,6 +335,87 @@ static int cgs_case_m(const struct ccs_fx *fx)
     return cgs_check(fx, "m", &cfg, 0, NULL, "M: a symbol-free object is present coverage evidence");
 }
 
+/* N1. a declaration behind a guard macro this build never defines is
+ * UNOBSERVED: clean exit, never a violation. */
+static int cgs_case_n1(const struct ccs_fx *fx)
+{
+    struct ccg_cfg cfg;
+    struct cgs_res r;
+    char row[CCD_PATH];
+    cgs_cfg(&cfg);
+    cfg.cflags = "";
+    if (cgs_base(fx, "n", cgs_row(row, sizeof row, "fixture_src/compiled_out_user.c", "CAP_NETWORK")) != 0
+        || cgs_unit(fx, "n", "fixture_src/compiled_out_user.c",
+                    "#if defined(FIXTURE_N_MISSING_MACRO)\nextern int connect(int, int, int);\n"
+                    "int use_compiled_out(void) { return connect(1, 2, 3); }\n#else\n"
+                    "typedef int compiled_out_user_unused;\n#endif\n", NULL) != 0)
+        return ccs_say(0, "N1: fixture");
+    cgs_run(fx, "n", &cfg, &r);
+    int ok = r.rc == 0 && r.text && strstr(r.text, "UNOBSERVED (compiled out: FIXTURE_N_MISSING_MACRO)")
+             && !strstr(r.text, "check_capability_closure: VIOLATION");
+    if (!ok)
+        cgs_show(r.text);
+    free(r.text);
+    return ccs_say(ok, "N1: a declaration behind a guard this build never defines is UNOBSERVED, exit 0, never a VIOLATION");
+}
+
+static const char k_n2_src[] = "#if defined(FIXTURE_N_PRESENT_MACRO)\nstatic int nothing_dangerous(int x) { return x + 1; }\n"
+                               "int still_overdeclared_export(int x) { return nothing_dangerous(x); }\n#else\n"
+                               "typedef int still_overdeclared_user_unused;\n#endif\n";
+
+/* N2. the same guard shape with the macro defined is not compiled out, so a
+ * genuine overdeclaration behind it still fails. */
+static int cgs_case_n2(const struct ccs_fx *fx)
+{
+    struct ccg_cfg cfg;
+    char row[CCD_PATH];
+    const char *const need[] = { "still_overdeclared_user.c declares CAP_NETWORK", NULL };
+    cgs_cfg(&cfg);
+    cfg.cflags = "-DFIXTURE_N_PRESENT_MACRO";
+    if (cgs_base(fx, "n2", cgs_row(row, sizeof row, "fixture_src/still_overdeclared_user.c", "CAP_NETWORK")) != 0
+        || cgs_unit(fx, "n2", "fixture_src/still_overdeclared_user.c", k_n2_src, "-DFIXTURE_N_PRESENT_MACRO") != 0)
+        return ccs_say(0, "N2: fixture");
+    return cgs_check(fx, "n2", &cfg, -1, need,
+                     "N2: a guard this build DOES define is not compiled-out \xe2\x80\x94 genuine overdeclaration still VIOLATIONs");
+}
+
+/* Lines of the file the flag query appends to, or -1. */
+static int cgs_loads(const struct ccs_fx *fx)
+{
+    char path[CCD_PATH], line[64];
+    int n = 0;
+    FILE *f;
+    ccs_path(fx, "n2/flags-loads", path);
+    if (!(f = fopen(path, "r")))
+        return -1;
+    while (fgets(line, sizeof line, f))
+        n++;
+    fclose(f);
+    return n;
+}
+
+/* O. several capabilities share one flags observation per check, but a later
+ * check must see changed flags rather than inherit that cache. */
+static int cgs_case_o(const struct ccs_fx *fx)
+{
+    struct ccg_cfg cfg;
+    struct cgs_res r;
+    int ok;
+    cgs_cfg(&cfg);
+    if (ccs_put(fx, "n2/engine/composition/module_capabilities.def",
+                "ZCL_MODULE_CAPABILITY(\"fixture_src/still_overdeclared_user.c\", CAP_NETWORK|CAP_CLOCK, \"test\")\n") != 0
+        || ccs_put(fx, "n2/Makefile", "print-CFLAGS:\n\t@echo load >> flags-loads\n") != 0)
+        return ccs_say(0, "O: fixture");
+    ok = cgs_run(fx, "n2", &cfg, &r) == 0 && cgs_loads(fx) == 1;
+    free(r.text);
+    if (ok) {
+        cfg.cflags = "-DFIXTURE_N_PRESENT_MACRO -UFIXTURE_N_PRESENT_MACRO -DFIXTURE_N_PRESENT_MACRO";
+        ok = cgs_run(fx, "n2", &cfg, &r) == 1 && r.text && strstr(r.text, "declares CAP_NETWORK");
+        free(r.text);
+    }
+    return ccs_say(ok, "O: flags load once per check and changed flags still reject overdeclaration");
+}
+
 /* Q. the raw syscall ban reports a source that has no object in this epoch. */
 static int cgs_case_q(const struct ccs_fx *fx)
 {
@@ -360,7 +444,8 @@ static int cgs_case_r(const struct ccs_fx *fx)
 static int cgs_cases(const struct ccs_fx *fx)
 {
     return cgs_case_a(fx) + cgs_case_b(fx) + cgs_case_c(fx) + cgs_case_d(fx) + cgs_case_e(fx) + cgs_case_f(fx) +
-           cgs_case_g(fx) + cgs_case_j(fx) + cgs_case_k(fx) + cgs_case_m(fx) + cgs_case_q(fx) + cgs_case_r(fx);
+           cgs_case_g(fx) + cgs_case_j(fx) + cgs_case_k(fx) + cgs_case_m(fx) + cgs_case_n1(fx) + cgs_case_n2(fx) +
+           cgs_case_o(fx) + cgs_case_q(fx) + cgs_case_r(fx);
 }
 
 int check_capability_closure_selftest(void)
