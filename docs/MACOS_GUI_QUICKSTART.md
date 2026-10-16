@@ -176,7 +176,7 @@ headless run; the bundled executable must print it and exit 0, which is also
 the check that the signature actually launches rather than being killed by the
 kernel. The same gate with no arguments proves the default subject; the lint
 umbrella runs that form on every push
-(`tools/lint/check_app_bundle_reproducible.sh`).
+(`z23-lint check-app-bundle-reproducible`, which `tools/lint/check_app_bundle_reproducible.sh` runs).
 
 ## Measured on one host
 

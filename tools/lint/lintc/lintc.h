@@ -405,6 +405,8 @@ int check_no_new_repair_rung_run(int argc, char **argv);
 int check_no_new_repair_rung_selftest(void);
 int check_no_new_coordination_shell_run(int argc, char **argv);
 int check_no_new_coordination_shell_selftest(void);
+int check_app_bundle_reproducible_run(int argc, char **argv);
+int check_app_bundle_reproducible_selftest(void);
 int check_no_new_bash_run(int argc, char **argv);
 int check_no_new_bash_selftest(void);
 int check_no_bare_tmp_fixture_run(int argc, char **argv);

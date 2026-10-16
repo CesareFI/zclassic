@@ -213,6 +213,8 @@ static const struct lint_gate k_gates[] = {
       check_no_new_repair_rung_selftest },
     { "check-no-new-coordination-shell", check_no_new_coordination_shell_run,
       check_no_new_coordination_shell_selftest },
+    { "check-app-bundle-reproducible", check_app_bundle_reproducible_run,
+      check_app_bundle_reproducible_selftest },
     { "check-no-new-bash", check_no_new_bash_run, check_no_new_bash_selftest },
     { "check-no-bare-tmp-fixture", check_no_bare_tmp_fixture_run,
       check_no_bare_tmp_fixture_selftest },

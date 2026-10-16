@@ -393,7 +393,7 @@ static int cks_long_args(const struct cks_fx *fx)
 static int cks_runner_cap(void)
 {
     char *argv[] = { (char *)"sh", (char *)"-c", (char *)"head -c 70000000 /dev/zero | tr '\\0' a", NULL };
-    struct lcp_spec s = { argv, NULL, NULL, LCP_OUT, CKS_GRACE_MS };
+    struct lcp_spec s = { argv, NULL, NULL, LCP_OUT, CKS_GRACE_MS, NULL };
     struct lcp_buf out = { 0 };
     int code = -1, rc;
     if (lsc_install() != 0)

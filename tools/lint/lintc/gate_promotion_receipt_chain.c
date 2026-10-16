@@ -98,7 +98,7 @@ int prc_bash(struct prc_run *g, const char *const *args, const char *const *set,
     for (; *args; args++)
         argv[n++] = (char *)*args;
     argv[n] = NULL;
-    struct lcp_spec s = { argv, set, unset, (enum lcp_mode)mode, g->cfg->grace_ms };
+    struct lcp_spec s = { argv, set, unset, (enum lcp_mode)mode, g->cfg->grace_ms, NULL };
     int rc = prc_exec(g, &s, out);
     free(argv);
     return rc;
@@ -106,7 +106,7 @@ int prc_bash(struct prc_run *g, const char *const *args, const char *const *set,
 
 int prc_git(struct prc_run *g, char *const argv[], int mode, char **out)
 {
-    struct lcp_spec s = { argv, NULL, NULL, (enum lcp_mode)mode, g->cfg->grace_ms };
+    struct lcp_spec s = { argv, NULL, NULL, (enum lcp_mode)mode, g->cfg->grace_ms, NULL };
     return prc_exec(g, &s, out);
 }
 

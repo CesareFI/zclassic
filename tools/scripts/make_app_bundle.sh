@@ -31,7 +31,7 @@
 #     the signature, which would make two builds of identical input differ.
 #   * codesign embeds the signature in the Mach-O and writes CodeResources,
 #     so hashing every file under the bundle hashes the signature too.
-#     tools/lint/check_app_bundle_reproducible.sh proves this end to end.
+#     z23-lint check-app-bundle-reproducible proves this end to end.
 #
 # The bundle is the MINIMAL launchable one: no Resources/, no icon, no
 # entitlements, no hardened-runtime option. A GUI app can grow those later;

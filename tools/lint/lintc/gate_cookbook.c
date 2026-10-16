@@ -82,7 +82,7 @@ static int ck_slurp(const char *path, struct ck_str *out)
 /* Exit status of argv with all output discarded; 127 when it cannot start. */
 static int ck_status(const struct ck_cfg *cfg, char *const argv[])
 {
-    struct lcp_spec s = { argv, NULL, NULL, LCP_QUIET, cfg->grace_ms };
+    struct lcp_spec s = { argv, NULL, NULL, LCP_QUIET, cfg->grace_ms, NULL };
     int code = 127;
     return lcp_run(&s, NULL, &code) == 0 ? code : 127;
 }
@@ -92,7 +92,7 @@ static int ck_status(const struct ck_cfg *cfg, char *const argv[])
 static char *ck_capture(const struct ck_cfg *cfg, char *const argv[], int *lost)
 {
     struct lcp_buf out = { 0 };
-    struct lcp_spec s = { argv, NULL, NULL, LCP_BOTH, cfg->grace_ms };
+    struct lcp_spec s = { argv, NULL, NULL, LCP_BOTH, cfg->grace_ms, NULL };
     int code = 0, rc = lcp_run(&s, &out, &code);
     char *copy = NULL;
     if (rc == 0) {

@@ -6386,7 +6386,7 @@ LINTC_TOOL = $(BIN_DIR)/z23-lint
 LINTC_CFLAGS = -std=c23 -O2 -Wall -Wextra -Werror -pedantic \
     -D_POSIX_C_SOURCE=200809L -Iplatform/modules/base/include \
     -Iplatform/modules/sha3/include -Iplatform/modules/platform/include \
-    -Iplatform/modules/util/include \
+    -Iplatform/modules/util/include -Icontexts/commons/packages/zsha256/include \
     $(ZCL_PLATFORM_CPPFLAGS) $(REPRO_CFLAGS)
 # Base-relative premise selection (tools/lint/lintc/premise.h): the premise
 # core, its `select --dry` / `premise` subcommands, and `unit-exec`, the
@@ -6396,7 +6396,7 @@ LINTC_PREMISE_SRCS = $(LINTC_PREMISE_CORE_SRCS) tools/lint/lintc/selection.c
 # build/lintc-obj/node/): SHA3-256 for premise roots, and the os_sandbox
 # confinement builders (Landlock + seccomp on Linux; the refusing stub
 # elsewhere) that unit-exec enters.
-LINTC_NODE_SRCS = platform/modules/sha3/src/sha3.c $(ZCL_TOOL_SANDBOX_SRC) \
+LINTC_NODE_SRCS = platform/modules/sha3/src/sha3.c contexts/commons/packages/zsha256/src/zsha256.c $(ZCL_TOOL_SANDBOX_SRC) \
     platform/modules/util/src/spawn.c platform/modules/platform/src/clock.c \
     platform/modules/base/src/log_level.c platform/modules/base/src/result.c \
     platform/modules/base/src/safe_alloc.c
@@ -6471,6 +6471,10 @@ LINTC_SRCS = $(LINTC_LIVE_DATADIR_SRCS) tools/lint/lintc/lib.c tools/lint/lintc/
     tools/lint/lintc/gate_no_new_repair_rung.c \
     tools/lint/lintc/gate_no_new_coordination_shell.c \
     tools/lint/lintc/gate_no_new_bash.c \
+    tools/lint/lintc/gate_app_bundle_reproducible.c \
+    tools/lint/lintc/gate_app_bundle_reproducible_manifest.c \
+    tools/lint/lintc/gate_app_bundle_reproducible_proof.c \
+    tools/lint/lintc/gate_app_bundle_reproducible_selftest.c \
     tools/lint/lintc/gate_no_bare_tmp_fixture.c \
     tools/lint/lintc/gate_network_tool_hardening.c \
     tools/lint/lintc/gate_object_reproducible.c \
@@ -9343,7 +9347,7 @@ check-onion-pair-watch: jsonq
 # The minimal launchable bundle — Contents/{MacOS/<exe>,Info.plist,PkgInfo},
 # ad-hoc signed with the timestamp server off — around an already-built tool
 # binary, reproducibly: identical binary in, byte-identical bundle out,
-# signature included. tools/lint/check_app_bundle_reproducible.sh proves the
+# signature included. z23-lint check-app-bundle-reproducible proves the
 # reproducibility half and launches the product; this target is the wired
 # user path over tools/scripts/make_app_bundle.sh, which any other package
 # binary can use directly.
@@ -13886,10 +13890,10 @@ check-standalone-tools-link:
 # product must actually LAUNCH — a bundle whose signature the kernel rejects
 # is SIGKILLed, which an exit-code-only smoke test cannot distinguish from a
 # clean nonzero exit. See the gate header for the probe contract.
-check-app-bundle-reproducible:
+check-app-bundle-reproducible: $(LINTC_TOOL)
 	@echo "→ Gate: app_bundle_reproducible (bundle is byte-identical across runs and launches)"
-	@./tools/lint/check_app_bundle_reproducible.sh --selftest
-	@./tools/lint/check_app_bundle_reproducible.sh
+	@./build/bin/z23-lint check-app-bundle-reproducible --selftest
+	@./build/bin/z23-lint check-app-bundle-reproducible
 
 # North Star invariant 1 (single writer per frontier), made mechanical for the
 # sealed ROM segment store: only the designated sealer/RPC/healer/writer surface

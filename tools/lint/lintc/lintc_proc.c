@@ -36,8 +36,10 @@ static int lcp_code(int st)
 static void lcp_redirect(enum lcp_mode mode, int wfd)
 {
     int null = open("/dev/null", O_WRONLY);
-    int out = (mode == LCP_OUT || mode == LCP_BOTH) ? wfd : null;
-    int err = (mode == LCP_BOTH || mode == LCP_ERR) ? wfd : null;
+    int out = (mode == LCP_OUT || mode == LCP_BOTH || mode == LCP_OUT_ERRPASS) ? wfd
+              : (mode == LCP_PASS ? 1 : null);
+    int err = (mode == LCP_BOTH || mode == LCP_ERR) ? wfd
+              : (mode == LCP_PASS || mode == LCP_OUT_ERRPASS ? 2 : null);
     if (null < 0 || dup2(out, 1) < 0 || dup2(err, 2) < 0)
         _exit(127);
 }
@@ -55,6 +57,11 @@ static void lcp_child(const struct lcp_spec *s, int wfd)
         if (!name || setenv(name, eq + 1, 1) != 0)
             _exit(127);
         free(name);
+    }
+    if (s->stdin_path) {
+        int in = open(s->stdin_path, O_RDONLY);
+        if (in < 0 || dup2(in, 0) < 0)
+            _exit(127);
     }
     lcp_redirect(s->mode, wfd);
     execvp(s->argv[0], s->argv);

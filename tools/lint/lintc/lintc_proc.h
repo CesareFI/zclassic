@@ -15,7 +15,9 @@ enum lcp_mode {
     LCP_QUIET, /* stdout and stderr discarded */
     LCP_OUT,   /* stdout captured, stderr discarded */
     LCP_BOTH,  /* stdout and stderr captured as one stream */
-    LCP_ERR    /* stderr captured, stdout discarded */
+    LCP_ERR,   /* stderr captured, stdout discarded */
+    LCP_PASS,  /* nothing captured; stdout and stderr stay the caller's */
+    LCP_OUT_ERRPASS /* stdout captured, stderr stays the caller's */
 };
 
 /* Captured bytes beyond this size are drained and dropped, and the run is
@@ -36,6 +38,7 @@ struct lcp_spec {
     const char *const *unsetenv;  /* names, NULL-terminated, or NULL */
     enum lcp_mode mode;
     int grace_ms;                 /* wait after a forwarded signal before SIGKILL */
+    const char *stdin_path;       /* file opened as stdin, or NULL to inherit */
 };
 
 /* Requires lsc_install() to have run. Returns 0 with *code set (the exit
