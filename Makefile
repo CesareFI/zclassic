@@ -6479,6 +6479,8 @@ LINTC_SRCS = $(LINTC_LIVE_DATADIR_SRCS) tools/lint/lintc/lib.c tools/lint/lintc/
     tools/lint/lintc/gate_app_bundle_reproducible_manifest.c \
     tools/lint/lintc/gate_app_bundle_reproducible_proof.c \
     tools/lint/lintc/gate_app_bundle_reproducible_selftest.c \
+    tools/lint/lintc/gate_accel_oracle_pinned.c \
+    tools/lint/lintc/gate_accel_oracle_pinned_selftest.c \
     tools/lint/lintc/gate_no_bare_tmp_fixture.c \
     tools/lint/lintc/gate_network_tool_hardening.c \
     tools/lint/lintc/gate_object_reproducible.c \
@@ -13435,9 +13437,10 @@ check-core-seal-root-mirror: $(LINTC_TOOL)
 # stay editable for speed, so they are pinned by property instead of by bytes:
 # each one carries a differential oracle proving it byte-identical to a
 # portable reference. Registry: tools/lint/accel_oracle_registry.txt
-check-accel-oracle-pinned:
+check-accel-oracle-pinned: $(LINTC_TOOL)
 	@echo "══ LINT: accelerator differential-oracle pin (below the core seal) ══"
-	@./tools/lint/check_accel_oracle_pinned.sh
+	@./build/bin/z23-lint check-accel-oracle-pinned --selftest
+	@./build/bin/z23-lint check-accel-oracle-pinned
 
 # ADX overclaim: a crypto tier may not advertise ADCX/ADOX carry chains its own
 # object code does not contain. The oracle above proves an accelerator computes

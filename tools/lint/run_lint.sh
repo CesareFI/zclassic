@@ -205,7 +205,7 @@ gate_command() {
         check-core-include-boundary)       echo './build/bin/z23-lint check-core-include-boundary --selftest && ./build/bin/z23-lint check-core-include-boundary' ;;
         check-core-seal)                   echo '__core_seal__' ;;
         check-core-seal-root-mirror)       echo './tools/lint/check_core_seal_root_mirror.sh' ;;
-        check-accel-oracle-pinned)         echo './tools/lint/check_accel_oracle_pinned.sh' ;;
+        check-accel-oracle-pinned)         echo './build/bin/z23-lint check-accel-oracle-pinned --selftest && ./build/bin/z23-lint check-accel-oracle-pinned' ;;
         check-no-adx-overclaim)            echo './tools/lint/check_no_adx_overclaim.sh --selftest && ./tools/lint/check_no_adx_overclaim.sh && ./build/bin/z23-lint check-asan-adx-exception --selftest && ./build/bin/z23-lint check-asan-adx-exception' ;;
         check-simd-os-support)             echo './build/bin/z23-lint check-simd-os-support' ;;
         check-supervisor-registration)     echo './tools/scripts/check_supervisor_registration.sh --selftest && ./tools/scripts/check_supervisor_registration.sh' ;;

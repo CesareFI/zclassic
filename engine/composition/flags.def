@@ -1580,7 +1580,7 @@ Z23_FLAG("ZCL_MODEL_SQL_FILE_FLOOR", "env_build", "80", "-",
 Z23_FLAG("ZCL_MODEL_SQL_SCAN_ROOT", "env_build", "-", "-",
           "undocumented; first use tools/lint/lintc/gate_model_sql_literals.c:auto")
 Z23_FLAG("ZCL_MODULE_DIRS", "env_build", "-", "-",
-          "undocumented; first use tools/lint/check_accel_oracle_pinned.sh:auto")
+          "undocumented; first use tools/lint/check_clang_portability.sh:auto")
 Z23_FLAG("ZCL_MSC_PRODUCER", "env_test", "-", "-",
           "undocumented; first use tests/harness/src/test_mint_skip_crypto.c:auto")
 Z23_FLAG("ZCL_MSC_WAL_DIR", "env_test", "-", "-",

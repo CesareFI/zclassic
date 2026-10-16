@@ -503,5 +503,7 @@ int capability_closure_data_run(int argc, char **argv);
 int capability_closure_data_selftest(void);
 int check_capability_closure_run(int argc, char **argv);
 int check_capability_closure_selftest(void);
+int check_accel_oracle_pinned_run(int argc, char **argv);
+int check_accel_oracle_pinned_selftest(void);
 
 #endif
