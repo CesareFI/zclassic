@@ -16,9 +16,11 @@
 #include "lintc_proc.h"
 #include "lintc_sig.h"
 
-enum { CGS_CASES = 2, CGS_FILLER = 500 };
+enum { CGS_CASES = 7, CGS_FILLER = 500 };
 
 static const char k_fx0[] = "build/dev-obj/epochs/fx0";
+
+static const char k_use[] = "extern int connect(int, int, int);\nint use_it(void) { return connect(1, 2, 3); }\n";
 
 struct cgs_res { char *text; int rc; };
 
@@ -26,6 +28,7 @@ struct cgs_res { char *text; int rc; };
 static void cgs_cfg(struct ccg_cfg *cfg)
 {
     ccg_host_cfg(cfg);
+    cfg->symmetry = 1;
     cfg->baseline = 0;
 }
 
@@ -104,6 +107,15 @@ static int cgs_base(const struct ccs_fx *fx, const char *dir, const char *rows)
     return bad | ccs_put(fx, rel, rows);
 }
 
+/* Writes dir/src and compiles it to its epoch object, .c becoming .o. */
+static int cgs_unit(const struct ccs_fx *fx, const char *dir, const char *src, const char *code, const char *flag)
+{
+    char s[CCD_PATH], o[CCD_PATH];
+    snprintf(s, sizeof s, "%s/%s", dir, src);
+    snprintf(o, sizeof o, "%s/%s/%.*s.o", dir, k_fx0, (int)(strlen(src) - 2), src);
+    return ccs_put(fx, s, code) == 0 && cgs_cc(fx, s, o, flag) == 0 ? 0 : -1;
+}
+
 /* A pre-formatted module row. */
 static const char *cgs_row(char *buf, size_t cap, const char *path, const char *caps)
 {
@@ -163,6 +175,33 @@ static int cgs_check(const struct ccs_fx *fx, const char *dir, const struct ccg_
     return cgs_verdict(&r, want, needles, label);
 }
 
+/* A. an undeclared strong-undefined reach is the core property. */
+static int cgs_case_a(const struct ccs_fx *fx)
+{
+    struct ccg_cfg cfg;
+    const char *const need[] = { "undeclared reach", NULL };
+    cgs_cfg(&cfg);
+    if (cgs_base(fx, "a", "") != 0 || cgs_unit(fx, "a", "fixture_src/undeclared_user.c", k_use, NULL) != 0)
+        return ccs_say(0, "A: fixture");
+    return cgs_check(fx, "a", &cfg, -1, need, "A: undeclared strong-undefined reach to a classified symbol");
+}
+
+/* D. a correct fixture passes; restart-base.o, a relocatable aggregate of the
+ * same objects, carries an unclassified edge and must stay unscanned. */
+static int cgs_case_d(const struct ccs_fx *fx)
+{
+    struct ccg_cfg cfg;
+    char row[CCD_PATH];
+    cgs_cfg(&cfg);
+    if (cgs_base(fx, "d", cgs_row(row, sizeof row, "fixture_src/declared_user.c", "CAP_NETWORK")) != 0
+        || cgs_unit(fx, "d", "fixture_src/declared_user.c", k_use, NULL) != 0
+        || ccs_put(fx, "d/.restart-base.c", "extern int aggregate_only_unknown(void);\n"
+                                           "int aggregate_edge(void) { return aggregate_only_unknown(); }\n") != 0
+        || cgs_cc(fx, "d/.restart-base.c", "d/build/dev-obj/epochs/fx0/restart-base.o", NULL) != 0)
+        return ccs_say(0, "D: fixture");
+    return cgs_check(fx, "d", &cfg, 0, NULL, "D: a correctly declared, fully-used fixture passes (positive control)");
+}
+
 /* E. an epoch below the object floor is UNPROVEN, never a clean pass. */
 static int cgs_case_e(const struct ccs_fx *fx)
 {
@@ -176,6 +215,21 @@ static int cgs_case_e(const struct ccs_fx *fx)
         || ccs_put(fx, "e/engine/composition/module_capabilities.def", "") != 0)
         return ccs_say(0, "E: fixture");
     return cgs_check(fx, "e", &cfg, 2, need, "E: an epoch below the object floor is UNPROVEN, exit 2, never 0");
+}
+
+/* C. a WEAK-undefined reach is still a reach: the regression case for an
+ * extraction that kept only strong references. */
+static int cgs_case_c(const struct ccs_fx *fx)
+{
+    struct ccg_cfg cfg;
+    const char *const need[] = { "undeclared reach", NULL };
+    cgs_cfg(&cfg);
+    if (cgs_base(fx, "c", "") != 0
+        || cgs_unit(fx, "c", "fixture_src/weak_undeclared_user.c",
+                    "extern __attribute__((weak)) int connect(int, int, int);\n"
+                    "int use_weak(void) { return connect(1, 2, 3); }\n", NULL) != 0)
+        return ccs_say(0, "C: fixture");
+    return cgs_check(fx, "c", &cfg, -1, need, "C: undeclared WEAK-undefined reach to a classified symbol (regression)");
 }
 
 /* F. a declared row with no compiled object, above the baseline, is a scan
@@ -194,9 +248,37 @@ static int cgs_case_f(const struct ccs_fx *fx)
                      "F: a partial epoch missing a declared file (above the coverage baseline) is UNPROVEN, exit 2, never 0 or 1");
 }
 
+/* M. a valid object with no symbols is still compiled evidence: nm prints no
+ * row for it, so coverage must come from the frozen object list. */
+static int cgs_case_m(const struct ccs_fx *fx)
+{
+    struct ccg_cfg cfg;
+    char row[CCD_PATH];
+    cgs_cfg(&cfg);
+    cfg.os = CCD_LINUX;
+    if (cgs_base(fx, "m", cgs_row(row, sizeof row, "fixture_src/empty_user.c", "CAP_NONE")) != 0
+        || cgs_unit(fx, "m", "fixture_src/empty_user.c", "typedef int empty_user_not_on_this_platform;\n", NULL) != 0)
+        return ccs_say(0, "M: fixture");
+    return cgs_check(fx, "m", &cfg, 0, NULL, "M: a symbol-free object is present coverage evidence");
+}
+
+/* R. the leftover object of a failed candidate has no source in this tree: it is
+ * foreign, counted and not graded. Case A is the other half. */
+static int cgs_case_r(const struct ccs_fx *fx)
+{
+    struct ccg_cfg cfg;
+    const char *const need[] = { "foreign-objects=1", NULL };
+    cgs_cfg(&cfg);
+    if (cgs_base(fx, "r", "") != 0 || ccs_put(fx, ".foreign_verify_attest.c", k_use) != 0
+        || cgs_cc(fx, ".foreign_verify_attest.c", "r/build/dev-obj/epochs/fx0/tools/dev/verify_attest.o", NULL) != 0)
+        return ccs_say(0, "R: fixture");
+    return cgs_check(fx, "r", &cfg, 0, need, "R: an object whose source is absent is foreign, counted, and not graded");
+}
+
 static int cgs_cases(const struct ccs_fx *fx)
 {
-    return cgs_case_e(fx) + cgs_case_f(fx);
+    return cgs_case_a(fx) + cgs_case_c(fx) + cgs_case_d(fx) + cgs_case_e(fx) + cgs_case_f(fx) + cgs_case_m(fx) +
+           cgs_case_r(fx);
 }
 
 int check_capability_closure_selftest(void)

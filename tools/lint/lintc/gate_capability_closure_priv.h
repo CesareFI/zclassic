@@ -75,12 +75,13 @@ int ccd_grants(const char *raw, const char *want);
 struct ccg_cfg {
     enum ccd_os os;       /* host class: target selection and coverage exclusions */
     int strip;            /* Mach-O underscore and $VARIANT decoration in nm names */
+    int symmetry;         /* a declared class the object never uses is a violation */
     long baseline;        /* shrink-only count of declared rows with no compiled object */
     FILE *out, *err;      /* the report, and the sidecar diagnostic */
 };
 
-/* Collects the evidence of one tree: 0 when the object and coverage floors hold,
- * 2 when the scan is unproven. Needs lsc_install(). */
+/* Grades one tree and returns the gate exit status: 0 clean, 1 violations,
+ * 2 unproven. Needs lsc_install(). */
 int ccg_check_root(const struct ccg_cfg *cfg, const char *root);
 /* The host's class and the environment's settings, writing to stdout and stderr. */
 void ccg_host_cfg(struct ccg_cfg *cfg);

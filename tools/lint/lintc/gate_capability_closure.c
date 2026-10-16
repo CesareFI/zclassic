@@ -1,10 +1,11 @@
 /* Copyright 2026 Rhett Creighton - Apache License 2.0
  *
- * purpose: evidence stage of the capability-closure gate in C23. Loads the symbol and
- * module tables, freezes the object list of the newest build epoch, runs nm over it
- * once and enforces the object and coverage floors, so a hollow or partial epoch is
- * UNPROVEN (exit 2). The grading passes follow in the next steps. Output strings are
- * those of the shell gate this replaces.
+ * purpose: the capability-closure gate in C23, closure and declaration stage. Every
+ * undefined symbol in the newest build epoch must be classified and every object
+ * that reaches a classified capability must be declared to; a scan below the object
+ * floor or missing declared files is UNPROVEN. Symmetry, the syscall ban and the
+ * compiled-out honesty follow in the next steps. Output strings and exit statuses
+ * (0 clean, 1 violations, 2 unproven) are those of the shell gate this replaces.
  */
 #define _POSIX_C_SOURCE 200809L
 #include <dirent.h>
@@ -17,6 +18,7 @@
 #include "base/safe_alloc.h"
 #include "gate_capability_closure_priv.h"
 #include "lintc.h"
+#include "lintc_sig.h"
 
 #define CCG_DASH "\xe2\x80\x94"
 
@@ -35,16 +37,19 @@ static const char k_ccg_nm_short[] = " Refusing to trust a partial read:\n";
 
 struct ccg_list { char **s; size_t n, cap; };
 
-struct ccg_counts { int unobserved, excluded; };
+struct ccg_counts {
+    int unclassified, undeclared, overdeclared, platform_unobserved, missing;
+    int syscall, unobserved, excluded, stale;
+};
 
 struct ccg_scan {
     const struct ccg_cfg *cfg;
     const char *root;
     char epoch[CCD_PATH];
-    struct ccd_map sym, compiled, defined, undef, foreign;
+    struct ccd_map sym, compiled, used, defined, undef, foreign;
     size_t n_sym;
     struct ccd_mods mods;
-    struct ccg_list objs, unobs;
+    struct ccg_list objs, uses, unobs;
     struct ccd_nm nm;
     struct ccg_counts c;
 };
@@ -85,12 +90,14 @@ static void ccg_free(struct ccg_scan *s)
 {
     ccd_map_free(&s->sym);
     ccd_map_free(&s->compiled);
+    ccd_map_free(&s->used);
     ccd_map_free(&s->defined);
     ccd_map_free(&s->undef);
     ccd_map_free(&s->foreign);
     ccd_mods_free(&s->mods);
     ccd_nm_free(&s->nm);
     ccg_list_free(&s->objs);
+    ccg_list_free(&s->uses);
     ccg_list_free(&s->unobs);
 }
 
@@ -357,7 +364,117 @@ static int ccg_coverage_floor(struct ccg_scan *s)
     return 2;
 }
 
-/* Collects the evidence of one tree; 0 when the floors hold, 2 when the scan is unproven. */
+/* Item 1: a symbol undefined here and defined nowhere in the tree must be in
+ * the table, even if the table calls it harmless. */
+static void ccg_closure(struct ccg_scan *s)
+{
+    for (size_t i = 0; i < s->undef.n; i++) {
+        const char *name = s->undef.ent[i].key;
+        if (ccd_map_get(&s->defined, name) || ccd_map_get(&s->sym, name))
+            continue;
+        ccg_say(s, "check_capability_closure: VIOLATION " CCG_DASH " unclassified external symbol '%s'\n"
+                   "  Reached by this tree, absent from config/capability_symbols.def.\n"
+                   "  Add a row: ZCL_CAPABILITY_SYMBOL(\"%s\", CAP_..., \"why\")\n", name, name);
+        s->c.unclassified++;
+    }
+}
+
+/* Records that source src uses class cls, once, in first-seen order. */
+static int ccg_use_add(struct ccg_scan *s, const char *src, const char *cls)
+{
+    char key[2 * CCD_PATH];
+    if (snprintf(key, sizeof key, "%s\t%s", src, cls) >= (int)sizeof key)
+        return -1;
+    if (ccd_map_get(&s->used, key))
+        return 0;
+    return ccd_map_put(&s->used, key, "") || ccg_list_add(&s->uses, key) ? -1 : 0;
+}
+
+/* Classes each source uses, from the undefined rows of its object; the table's
+ * harmless class is no use. */
+static int ccg_uses(struct ccg_scan *s)
+{
+    size_t el = strlen(s->epoch);
+    char src[CCD_PATH];
+    for (size_t i = 0; i < s->nm.n; i++) {
+        const struct ccd_nmrow *r = &s->nm.row[i];
+        const char *cls = ccg_is_undef(r->type) ? ccd_map_get(&s->sym, r->name) : NULL;
+        if (!cls || strcmp(cls, "CAP_HARMLESS") == 0)
+            continue;
+        ccg_c_of(strncmp(r->path, s->epoch, el) == 0 && r->path[el] == '/' ? r->path + el + 1 : r->path,
+                 src, sizeof src);
+        if (ccg_use_add(s, src, cls) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+static void ccg_undeclared(struct ccg_scan *s, const char *src, const char *cls, const char *granted)
+{
+    ccg_say(s, "check_capability_closure: VIOLATION " CCG_DASH " undeclared reach: %s uses %s\n", src, cls);
+    if (granted)
+        ccg_say(s, "  but its row only grants: %s\n", granted);
+    else
+        ccg_say(s, "  with no module_capabilities.def row at all (declares CAP_NONE).\n");
+    ccg_say(s, "  Add/extend: ZCL_MODULE_CAPABILITY(\"%s\", ...|%s, \"why\")\n", src, cls);
+    s->c.undeclared++;
+}
+
+/* Item 2: every class a source uses must be granted by its row. */
+static void ccg_declaration(struct ccg_scan *s)
+{
+    for (size_t i = 0; i < s->uses.n; i++) {
+        char use[2 * CCD_PATH], *cls;
+        const char *granted;
+        snprintf(use, sizeof use, "%s", s->uses.s[i]);
+        cls = strchr(use, '\t');
+        *cls++ = '\0';
+        granted = ccd_map_get(&s->mods.raw, use);
+        granted = granted && granted[0] ? granted : NULL;
+        if (!granted || !ccd_grants(granted, cls))
+            ccg_undeclared(s, use, cls, granted);
+    }
+}
+
+static void ccg_summary(const struct ccg_scan *s)
+{
+    const struct ccg_counts *c = &s->c;
+    ccg_say(s, "check_capability_closure: scanned %zu objects under %s,\n"
+               "  %zu classified symbols, %zu module rows.\n"
+               "  unclassified=%d undeclared=%d overdeclared=%d\n"
+               "  platform-unobserved=%d symmetry-enforced=%d\n"
+               "  missing-source-rows=%d raw-syscall=%d\n"
+               "  declared-but-unobserved=%d (coverage baseline=%ld)\n"
+               "  platform-target-excluded=%d\n"
+               "  foreign-objects=%zu (no source in this tree; not graded)\n"
+               "  platform-exact-overrides=%zu\n",
+            s->objs.n, s->epoch, s->n_sym, s->mods.count, c->unclassified, c->undeclared, c->overdeclared,
+            c->platform_unobserved, s->cfg->symmetry, c->missing, c->syscall, c->unobserved, s->cfg->baseline,
+            c->excluded, s->foreign.n, s->mods.platform_count);
+}
+
+static int ccg_verdict(const struct ccg_scan *s)
+{
+    const struct ccg_counts *c = &s->c;
+    int bad = c->unclassified + c->undeclared + c->overdeclared + c->missing + c->stale + c->syscall;
+    if (bad > 0) {
+        ccg_say(s, "check_capability_closure: FAIL " CCG_DASH " %d violation(s)\n", bad);
+        return 1;
+    }
+    ccg_say(s, "check_capability_closure: OK " CCG_DASH " closed\n");
+    return 0;
+}
+
+/* The grading passes over the collected evidence; 2 when a pass could not run. */
+static int ccg_grade(struct ccg_scan *s)
+{
+    ccg_closure(s);
+    if (ccg_uses(s) != 0)
+        return 2;
+    ccg_declaration(s);
+    return 0;
+}
+
 int ccg_check_root(const struct ccg_cfg *cfg, const char *root)
 {
     struct ccg_scan s = { .cfg = cfg, .root = root };
@@ -365,6 +482,11 @@ int ccg_check_root(const struct ccg_cfg *cfg, const char *root)
     rc = rc ? rc : ccg_objects(&s);
     rc = rc ? rc : ccg_nm(&s);
     rc = rc ? rc : ccg_coverage_floor(&s);
+    rc = rc ? rc : ccg_grade(&s);
+    if (rc == 0) {
+        ccg_summary(&s);
+        rc = ccg_verdict(&s);
+    }
     ccg_free(&s);
     return rc;
 }
@@ -398,6 +520,7 @@ void ccg_host_cfg(struct ccg_cfg *cfg)
     snprintf(base, sizeof base, "%d", CCG_HOST_BASELINE);
     cfg->os = ccg_host_os();
     cfg->strip = cfg->os == CCD_DARWIN;
+    cfg->symmetry = strcmp(ccg_env("ZCL_CAP_CLOSURE_ENFORCE_SYMMETRY", cfg->os == CCD_DARWIN ? "0" : "1"), "1") == 0;
     cfg->baseline = strtol(ccg_env("ZCL_CAP_CLOSURE_COVERAGE_BASELINE", base), NULL, 10);
     cfg->out = stdout;
     cfg->err = stderr;
@@ -405,6 +528,21 @@ void ccg_host_cfg(struct ccg_cfg *cfg)
 
 int check_capability_closure_run(int argc, char **argv)
 {
-    return die("z23-lint: check-capability-closure has a selftest only until its grading passes land: %s\n",
-               argc > 0 ? argv[0] : "use --selftest");
+    char root[CCD_PATH];
+    struct ccg_cfg cfg;
+    int rc, sig;
+    (void)argv;
+    if (argc > 0) {
+        fputs("usage: tools/lint/check_capability_closure.sh [--selftest]\n", stderr);
+        return 2;
+    }
+    if (cic_repo_root(root, sizeof root) != 0 || lsc_install() != 0)
+        return 2;
+    ccg_host_cfg(&cfg);
+    rc = ccg_check_root(&cfg, root);
+    fflush(stdout);
+    sig = lsc_pending();
+    if (sig)
+        lsc_finish(sig);
+    return rc;
 }
