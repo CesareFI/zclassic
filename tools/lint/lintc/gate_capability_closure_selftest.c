@@ -47,7 +47,7 @@ static int ccs_parse(const char *text, int strip, struct ccd_nm *nm)
 
 static int ccs_case_parse(void)
 {
-    struct ccd_nm a, b, c, d;
+    struct ccd_nm a = {0}, b = {0}, c = {0}, d = {0};
     int ok = ccs_parse("C:/work/epoch/dialer.o:         U connect\nD:\\obj\\x.o:0000000000000000 T main\n", 0, &a) == 0;
     int f = ccs_say(ok && a.n == 2 && ccs_row(&a, 0, "C:/work/epoch/dialer.o", "U", "connect")
                     && ccs_row(&a, 1, "D:\\obj\\x.o", "T", "main"),
@@ -162,7 +162,7 @@ static int ccs_case_symbols(const struct ccs_fx *fx)
 static int ccs_case_platform(const struct ccs_fx *fx)
 {
     char cent[CCD_PATH], plat[CCD_PATH], root[CCD_PATH];
-    struct ccd_mods m;
+    struct ccd_mods m = {0};
     ccs_path(fx, "j/engine/composition/module_capabilities.def", cent);
     ccs_path(fx, "j/engine/composition/module_capabilities_windows.def", plat);
     ccs_path(fx, "j", root);
@@ -193,7 +193,7 @@ static int ccs_case_platform(const struct ccs_fx *fx)
 static int ccs_sidecar(const struct ccs_fx *fx, const char *name, const char *why, int want)
 {
     char cent[CCD_PATH], root[CCD_PATH], msg[CCD_ERR];
-    struct ccd_mods m;
+    struct ccd_mods m = {0};
     ccs_path(fx, "p/engine/composition/module_capabilities.def", cent);
     ccs_path(fx, "p", root);
     int rc = ccd_modules_load(cent, NULL, root, &m);

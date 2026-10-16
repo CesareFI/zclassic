@@ -10,6 +10,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <regex.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,9 +22,14 @@
 
 static void *ccd_grow(void *p, size_t *cap, size_t need, size_t elem)
 {
-    size_t c = *cap ? *cap : 16;
+    if (!elem || need > SIZE_MAX / elem)
+        return NULL;
+    size_t limit = SIZE_MAX / elem;
+    size_t c = *cap ? *cap : (limit < 16 ? limit : 16);
+    if (c > limit)
+        return NULL;
     while (c < need)
-        c *= 2;
+        c = c > limit / 2 ? need : c * 2;
     void *q = realloc(p, c * elem); // raw-alloc-ok:lint-runtime
     if (q)
         *cap = c;
@@ -57,13 +63,20 @@ int ccd_map_put(struct ccd_map *m, const char *key, const char *val)
         m->ent[at].val = v;
         return 0;
     }
+    if (m->n == SIZE_MAX) {
+        free(v);
+        return -1;
+    }
     struct ccd_ent *e = m->n < m->cap ? m->ent : ccd_grow(m->ent, &m->cap, m->n + 1, sizeof *e);
+    /* Publish a moved allocation before the next fallible operation. n still
+     * names only complete entries, so cleanup stays valid if strdup fails. */
+    if (e)
+        m->ent = e;
     char *k = e ? strndup(key, strlen(key)) : NULL;
     if (!k) {
         free(v);
         return -1;
     }
-    m->ent = e;
     memmove(e + at + 1, e + at, (m->n++ - at) * sizeof *e);
     e[at] = (struct ccd_ent){ k, v };
     return 0;
@@ -169,7 +182,13 @@ static void ccd_undecorate(char **name)
 static int ccd_nm_push(struct ccd_nm *o, const char *path, size_t pl, const char *type, const char *name)
 {
     size_t tl = strlen(type), nl = strlen(name);
+    if (pl > SIZE_MAX - tl || pl + tl > SIZE_MAX - nl ||
+        pl + tl + nl > SIZE_MAX - 3 || o->n == SIZE_MAX)
+        return -1;
     struct ccd_nmrow *r = o->n < o->cap ? o->row : ccd_grow(o->row, &o->cap, o->n + 1, sizeof *r);
+    /* A failed row allocation must leave the container owner up to date. */
+    if (r)
+        o->row = r;
     char *b = r ? malloc(pl + tl + nl + 3) : NULL; // raw-alloc-ok:lint-runtime
     if (!b)
         return -1;
@@ -177,7 +196,6 @@ static int ccd_nm_push(struct ccd_nm *o, const char *path, size_t pl, const char
     b[pl] = '\0';
     memcpy(b + pl + 1, type, tl + 1);
     memcpy(b + pl + tl + 2, name, nl + 1);
-    o->row = r;
     o->row[o->n++] = (struct ccd_nmrow){ b, b + pl + 1, b + pl + tl + 2 };
     return 0;
 }
@@ -538,12 +556,17 @@ struct ccd_list { char **s; size_t n, cap; };
 
 static int ccd_list_add(struct ccd_list *l, const char *path)
 {
+    if (l->n == SIZE_MAX)
+        return -1;
     char **s = ccd_grow(l->s, &l->cap, l->n + 1, sizeof *s);
     if (!s)
         return -1;
     l->s = s;
     s[l->n] = strndup(path, strlen(path));
-    return s[l->n++] ? 0 : -1;
+    if (!s[l->n])
+        return -1;
+    l->n++;
+    return 0;
 }
 
 static int ccd_is_sidecar_name(const char *name)
