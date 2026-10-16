@@ -106,6 +106,7 @@
  *   muse-scope: src/[,tests/x.c]              (1-4 prefixes, no "..")
  *   muse-gate: group_name                     (a test group name)
  *   muse-model: model-id                      (optional)
+ *   muse-engine: engine-id                    (optional, a registered engine)
  *   muse-kind: file|doc                       (optional, default file)
  *   muse-sha: <7..40 hex>                      (optional HEAD pin)
  *   muse-priority: 0|1|2|3                     (optional, default 3)
@@ -1189,6 +1190,7 @@ struct rcv_direction {
     char scope[512];
     char gate[64];
     char model[160];
+    char engine[64];      /* optional muse-engine id, "" = legacy glm */
     char kind[8];
     char sha[65];         /* optional muse-sha pin, 7..40 lowercase hex */
     char priority[4];     /* optional queue priority digit, "" = 3 */
@@ -1247,6 +1249,7 @@ static bool rcv_dir_header(const char *line, size_t len,
             {"scope", d->scope, sizeof(d->scope)},
             {"gate", d->gate, sizeof(d->gate)},
             {"model", d->model, sizeof(d->model)},
+            {"engine", d->engine, sizeof(d->engine)},
             {"kind", d->kind, sizeof(d->kind)},
             {"sha", d->sha, sizeof(d->sha)},
             {"priority", d->priority, sizeof(d->priority)},
@@ -1303,6 +1306,22 @@ static bool rcv_dir_order_ok(struct rcv_direction *d)
         return false;
     }
     return true;
+}
+
+/* The optional engine: a registered engine id, and a model of that engine's
+ * family when a model is also named. The queue's own rule decides both, so a
+ * pair the queue would refuse is refused here with the queue's code. */
+static bool rcv_dir_engine_ok(struct rcv_direction *d)
+{
+    const char *code = NULL;
+    if (!d->engine[0])
+        return true;
+    if (zcl_devagent_engine_model_ok(d->engine,
+                                     d->model[0] ? d->model : NULL, &code))
+        return true;
+    (void)snprintf(d->code, sizeof(d->code), "%s", code);
+    (void)snprintf(d->why, sizeof(d->why), "muse-engine");
+    return false;
 }
 
 /* The three required fields plus the optional ones. */
@@ -1384,7 +1403,9 @@ static bool rcv_direction_parse(const char *body, struct rcv_direction *d)
         (void)snprintf(d->why, sizeof(d->why), "no-prompt-after-header");
         return false;
     }
-    return rcv_dir_fields_ok(d);
+    if (!rcv_dir_fields_ok(d))
+        return false;
+    return rcv_dir_engine_ok(d);
 }
 
 /* ── reading one pulled directive row ──────────────────────────────────── */
@@ -1632,15 +1653,19 @@ static long long rcv_queue_post(const char *ref, const struct rcv_direction *d,
     struct rcv_sub sub;
     char ebrief[8192];
     char input[RCV_INPUT_CAP];
+    char efrag[96];
     long long seq = -1;
     if (!rcv_escape(briefpath, ebrief, sizeof(ebrief)))
         return -1;
+    efrag[0] = '\0';
+    if (d->engine[0])
+        (void)snprintf(efrag, sizeof(efrag), ",\"engine\":\"%s\"", d->engine);
     if (snprintf(input, sizeof(input),
                  "{\"action\":\"post\",\"kind\":\"%s\",\"name\":\"%s\","
                  "\"group\":\"%s\",\"path\":\"%s\",\"brief\":\"%s\","
-                 "\"model\":\"%s\",\"priority\":%c,\"depends_on\":\"%s\"}",
+                 "\"model\":\"%s\"%s,\"priority\":%c,\"depends_on\":\"%s\"}",
                  d->kind, ref, d->gate, d->scope, ebrief,
-                 d->model[0] ? d->model : "",
+                 d->model[0] ? d->model : "", efrag,
                  d->priority[0] ? d->priority[0] : '3', d->depends_on) >=
         (int)sizeof(input))
         return -1;

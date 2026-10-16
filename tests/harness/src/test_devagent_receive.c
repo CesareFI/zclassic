@@ -1022,6 +1022,191 @@ _test_next:;
  * One directive's admission is decided with no write anywhere: no mail,
  * queue row, brief/received/evidence file, answer, or marker. */
 
+/* The queue row's engine for `ref`, read back through the queue's own
+ * status. "" when the row is absent or was posted without an engine. */
+static void rtx_queued_engine(const char *ref, char *out, size_t cap)
+{
+    struct rtx_call c;
+    const struct json_value *arr;
+    out[0] = '\0';
+    rtx_begin(&c, "dev.agent.queue", "zcl.agent_queue.v1");
+    (void)json_push_kv_str(&c.input, "action", "status");
+    (void)json_push_kv_bool(&c.input, "json", true);
+    zcl_native_handle_dev_agent_queue(&c.request, &c.reply);
+    arr = rtx_ok(&c) ? json_get(&c.reply.data, "queued") : NULL;
+    for (size_t i = 0; arr && arr->type == JSON_ARR && i < json_size(arr);
+         i++) {
+        const struct json_value *r = json_at(arr, i);
+        const char *n = r ? json_get_str(json_get(r, "name")) : NULL;
+        const char *e = r ? json_get_str(json_get(r, "engine")) : NULL;
+        if (n && strcmp(n, ref) == 0)
+            (void)snprintf(out, cap, "%s", e ? e : "");
+    }
+    rtx_end(&c);
+}
+
+/* muse-engine rides into the queue row; a pair the queue refuses is refused
+ * at receive, typed the way the queue types it, and never queued. */
+static int test_receive_engine_haiku(void)
+{
+    int failures = 0;
+
+    TEST("muse-engine claude-haiku rides into the queue row") {
+        struct rcv_drive_opts o;
+        struct rcv_beat_stats st;
+        char eng[64], ws[1200];
+        rtx_isolate("eng-haiku");
+        (void)snprintf(ws, sizeof(ws), "%s/wt", g_rtx_base);
+        ASSERT(rtx_checkout(ws, "6666666666666666666666666666666666666666"));
+        ASSERT(rtx_mint("chatgpt", "send", 3600, NULL, 0));
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-haiku",
+            "muse-workspace: receiver\nmuse-scope: src/x.c\n"
+            "muse-gate: hex_codec\nmuse-engine: claude-haiku\n\nHaiku.\n", 1));
+        rtx_opts_ws(&o, ws);
+        memset(&st, 0, sizeof(st));
+        ASSERT_EQ(zcl_devagent_receive_drive(&o, &st), 1);
+        ASSERT_EQ(st.admitted, 1);
+        ASSERT_EQ(rtx_queue_count("queued", "job-haiku"), 1);
+        rtx_queued_engine("job-haiku", eng, sizeof(eng));
+        ASSERT_STR_EQ(eng, "claude-haiku");
+        rtx_restore();
+        PASS();
+    }
+_test_next:;
+    rtx_restore();
+    return failures;
+}
+
+static int test_receive_engine_mismatch(void)
+{
+    int failures = 0;
+
+    TEST("muse-engine gpt-sol with a gpt-4 model is refused as a mismatch") {
+        struct rcv_drive_opts o;
+        struct rcv_beat_stats st;
+        char ws[1200];
+        rtx_isolate("eng-mismatch");
+        (void)snprintf(ws, sizeof(ws), "%s/wt", g_rtx_base);
+        ASSERT(rtx_checkout(ws, "6666666666666666666666666666666666666666"));
+        ASSERT(rtx_mint("chatgpt", "send", 3600, NULL, 0));
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-mismatch",
+            "muse-workspace: receiver\nmuse-scope: src/x.c\n"
+            "muse-gate: hex_codec\nmuse-engine: gpt-sol\n"
+            "muse-model: gpt-4.1-mini\n\nMismatch.\n", 1));
+        rtx_opts_ws(&o, ws);
+        memset(&st, 0, sizeof(st));
+        ASSERT_EQ(zcl_devagent_receive_drive(&o, &st), 1);
+        ASSERT_EQ(st.admitted, 0);
+        ASSERT_EQ(st.refused, 1);
+        ASSERT_EQ(rtx_queue_count("queued", "job-mismatch"), 0);
+        ASSERT_EQ(rtx_answers("job-mismatch", "ENGINE_MODEL_MISMATCH"), 1);
+        rtx_restore();
+        PASS();
+    }
+_test_next:;
+    rtx_restore();
+    return failures;
+}
+
+static int test_receive_engine_unknown(void)
+{
+    int failures = 0;
+
+    TEST("an unregistered muse-engine is refused as UNKNOWN_ENGINE") {
+        struct rcv_drive_opts o;
+        struct rcv_beat_stats st;
+        char ws[1200];
+        rtx_isolate("eng-unknown");
+        (void)snprintf(ws, sizeof(ws), "%s/wt", g_rtx_base);
+        ASSERT(rtx_checkout(ws, "6666666666666666666666666666666666666666"));
+        ASSERT(rtx_mint("chatgpt", "send", 3600, NULL, 0));
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-unknown",
+            "muse-workspace: receiver\nmuse-scope: src/x.c\n"
+            "muse-gate: hex_codec\nmuse-engine: no-such-engine\n\nUnknown.\n", 1));
+        rtx_opts_ws(&o, ws);
+        memset(&st, 0, sizeof(st));
+        ASSERT_EQ(zcl_devagent_receive_drive(&o, &st), 1);
+        ASSERT_EQ(st.admitted, 0);
+        ASSERT_EQ(st.refused, 1);
+        ASSERT_EQ(rtx_queue_count("queued", "job-unknown"), 0);
+        ASSERT_EQ(rtx_answers("job-unknown", "UNKNOWN_ENGINE"), 1);
+        rtx_restore();
+        PASS();
+    }
+_test_next:;
+    rtx_restore();
+    return failures;
+}
+
+static int test_receive_engine_legacy(void)
+{
+    int failures = 0;
+
+    TEST("no muse-engine keeps the legacy row with no engine") {
+        struct rcv_drive_opts o;
+        struct rcv_beat_stats st;
+        char eng[64], ws[1200];
+        rtx_isolate("eng-legacy");
+        (void)snprintf(ws, sizeof(ws), "%s/wt", g_rtx_base);
+        ASSERT(rtx_checkout(ws, "6666666666666666666666666666666666666666"));
+        ASSERT(rtx_mint("chatgpt", "send", 3600, NULL, 0));
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-legacy",
+            "muse-workspace: receiver\nmuse-scope: src/x.c\n"
+            "muse-gate: hex_codec\n\nLegacy.\n", 1));
+        rtx_opts_ws(&o, ws);
+        memset(&st, 0, sizeof(st));
+        ASSERT_EQ(zcl_devagent_receive_drive(&o, &st), 1);
+        ASSERT_EQ(st.admitted, 1);
+        ASSERT_EQ(rtx_queue_count("queued", "job-legacy"), 1);
+        rtx_queued_engine("job-legacy", eng, sizeof(eng));
+        ASSERT_STR_EQ(eng, "glm");
+        rtx_restore();
+        PASS();
+    }
+_test_next:;
+    rtx_restore();
+    return failures;
+}
+
+static int test_receive_engine_replay(void)
+{
+    int failures = 0;
+
+    TEST("a replayed directive reconciles and keeps the requested engine") {
+        struct rcv_drive_opts o;
+        struct rcv_beat_stats st;
+        char eng[64], ws[1200];
+        const char *body =
+            "muse-workspace: receiver\nmuse-scope: src/x.c\n"
+            "muse-gate: hex_codec\nmuse-engine: claude-haiku\n\nReplay.\n";
+        rtx_isolate("eng-replay");
+        (void)snprintf(ws, sizeof(ws), "%s/wt", g_rtx_base);
+        ASSERT(rtx_checkout(ws, "6666666666666666666666666666666666666666"));
+        ASSERT(rtx_mint("chatgpt", "send", 3600, NULL, 0));
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-replay", body, 1));
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-replay", body, 2));
+        rtx_opts_ws(&o, ws);
+        memset(&st, 0, sizeof(st));
+        ASSERT_EQ(zcl_devagent_receive_drive(&o, &st), 1);
+        ASSERT_EQ(st.admitted, 1);
+        ASSERT_EQ(rtx_queue_count("queued", "job-replay"), 1);
+        rtx_queued_engine("job-replay", eng, sizeof(eng));
+        ASSERT_STR_EQ(eng, "claude-haiku");
+        rtx_restore();
+        PASS();
+    }
+_test_next:;
+    rtx_restore();
+    return failures;
+}
+
+static int test_receive_engine(void)
+{
+    return test_receive_engine_haiku() + test_receive_engine_mismatch()
+        + test_receive_engine_unknown() + test_receive_engine_legacy()
+        + test_receive_engine_replay();
+}
+
 static long long rtx_reply_int(const struct rtx_call *c, const char *key)
 {
     const struct json_value *v = json_get(&c->reply.data, key);
@@ -1552,6 +1737,7 @@ int test_devagent_receive(void)
     failures += test_receive_intake_paging();
     failures += test_receive_answer_fields();
     failures += test_receive_queue_order();
+    failures += test_receive_engine();
     failures += test_receive_preflight();
     failures += test_receive_install_failure(false);
     failures += test_receive_install_failure(true);

@@ -93,6 +93,12 @@ bool zcl_devagent_closed_pass(const char *verdict, long long rc);
 
 bool zcl_devagent_name_ok(const char *name);
 
+/* The queue's engine rules: a registered engine id, and a model of that
+ * engine's family when both are named. NULL engine is legacy and passes.
+ * On refusal *code is UNKNOWN_ENGINE or ENGINE_MODEL_MISMATCH. */
+bool zcl_devagent_engine_model_ok(const char *engine, const char *model,
+                                  const char **code);
+
 /* ── resident dev worker ──────────────────────────────────────────────────
  * The dev-only loop that consumes dev.agent.queue continuously. One active
  * job per worker; the queue stays the only ledger (claim/running/outcome

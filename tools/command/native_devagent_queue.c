@@ -1124,6 +1124,16 @@ static bool dvq_engine_model_ok(const char *engine, const char *model,
     return false;
 }
 
+/* The engine and engine/model pair rules, exposed so the receiver refuses a
+ * directive with the queue's own code before anything is queued. */
+bool zcl_devagent_engine_model_ok(const char *engine, const char *model,
+                                  const char **code)
+{
+    const char *msg = NULL;
+    const char *why = NULL;
+    return dvq_engine_model_ok(engine, model, &msg, &why, code);
+}
+
 /* attempt, model and the READY-order inputs: each wrong shape refuses with
  * its own message, and nothing is stored. */
 static bool dvq_post_scalars(const struct zcl_command_request *req,
