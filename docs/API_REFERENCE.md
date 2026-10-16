@@ -74,11 +74,11 @@ z23 discover schema <path> --side=input|output
 
 | Catalog fact | Count |
 |---|---|
-| Registry entries (branches + leaves) | 961 |
+| Registry entries (branches + leaves) | 962 |
 | Top-level roots | 15 |
 | Branches | 209 |
-| Leaves (dispatchable command paths) | 752 |
-| … `ready` (live handler in this build) | 659 |
+| Leaves (dispatchable command paths) | 753 |
+| … `ready` (live handler in this build) | 660 |
 | … `compat` (metadata only, names a fallback) | 63 |
 | … `planned` (fail-closed BLOCKED, exit 3) | 30 |
 | … dev-gated 🔧 (`ready` only in `z23-dev`) | 62 |
@@ -91,7 +91,7 @@ Per source file:
 | `.def` file | Entries | Branches | Leaves |
 |---|---|---|---|
 | `engine/composition/commands/root.def` | 10 | 5 | 5 |
-| `engine/composition/commands/core.def` | 123 | 29 | 94 |
+| `engine/composition/commands/core.def` | 124 | 29 | 95 |
 | `engine/composition/commands/apps.def` | 20 | 4 | 16 |
 | `engine/composition/commands/app_features.def` | 75 | 20 | 55 |
 | `engine/composition/commands/store.def` | 19 | 0 | 19 |
@@ -284,6 +284,7 @@ represented by its children's sections.
 |---|---|---|---|---|---|---|
 | `core consensus utxo commitment` | ready | read / read / public · foreground/moderate | none | `zcl.utxo_commitment.v1` | `z23 core consensus utxo commitment` | SHA3 commitment over the UTXO set |
 | `core consensus utxo audit` | ready | read / read / operator · foreground/moderate | none | `zcl.utxo_audit.v1` | `z23 core consensus utxo audit` | Audit the UTXO set for drift |
+| `core consensus utxo compare offline` | ready | read / read / operator · foreground/high | `artifact_file`, `projection_file`, `projection_sha3_256`, `producer_byte_order`, `capture_manifest_file`, `accepted_manifest_sha3_256`, `example_limit` | `zcl.utxo_compare_offline.v1` | `z23 core consensus utxo compare offline --input='<exact standalone copy inputs>'` | Compare admitted standalone artifact and node.db mirror copies |
 
 #### `core.consensus.block` — Invalidate or reconsider a block
 
