@@ -88,7 +88,7 @@ struct zcl_result consensus_state_artifact_evidence_open(
 void consensus_state_artifact_evidence_free(
     struct consensus_state_artifact_evidence *evidence)
 {
-    (void)evidence;
+    (void)consensus_state_artifact_evidence_close(&evidence);
 }
 
 bool consensus_state_artifact_evidence_manifest_copy(
@@ -179,6 +179,7 @@ struct consensus_state_artifact_evidence {
     int artifact_fd; /* Borrowed alias; artifact_file owns this descriptor. */
     sqlite3 *bundle_db;
     bool coins_iterator_active;
+    unsigned candidate_leases;
     struct stat identity;
     struct consensus_state_bundle_manifest manifest;
     uint8_t file_digest[32];
@@ -364,31 +365,46 @@ static bool open_bundle_descriptor(
     return true;
 }
 
-static void artifact_evidence_discard(
-    struct consensus_state_artifact_evidence *evidence)
+static bool artifact_evidence_close_checked(
+    struct consensus_state_artifact_evidence **owner)
 {
-    if (!evidence)
-        return;
+    if (!owner) return false;
+    struct consensus_state_artifact_evidence *evidence = *owner;
+    if (!evidence) return true;
     zcl_mutex_lock(&evidence->mutex);
-    if (evidence->coins_iterator_active) {
-        LOG_WARN(INSTALL_SUBSYS, "bundle evidence retained: coin iterator active");
+    if (evidence->coins_iterator_active || evidence->candidate_leases) {
+        LOG_WARN(INSTALL_SUBSYS, "bundle evidence retained: consumer lease active");
         zcl_mutex_unlock(&evidence->mutex);
-        return;
+        return false;
     }
-    /* sqlite3_close rolls back the read transaction only after confirming
-     * it can close. A BUSY refusal must preserve the live transaction too. */
+    /* sqlite3_close rolls back only after confirming it can close; BUSY
+     * retains the transaction, readiness and borrowed positioned-file owner. */
     if (evidence->reader && !sqlite_pinned_reader_close(&evidence->reader)) {
-        LOG_WARN(INSTALL_SUBSYS,
-                 "bundle evidence retained: SQLite close busy or failed");
+        LOG_WARN(INSTALL_SUBSYS, "bundle evidence retained: SQLite close busy or failed");
         zcl_mutex_unlock(&evidence->mutex);
-        return;
+        return false;
     }
     evidence->bundle_db = NULL;
-    platform_positioned_file_close(&evidence->artifact_file);
+    /* Positioned-file close is void. Use the exact retained native descriptor
+     * for a checked POSIX close; never retry an ambiguous EINTR by fd/name. */
+    intptr_t native = platform_positioned_file_native_fd(&evidence->artifact_file);
+    bool closed = native < 0 || (native <= INT_MAX && close((int)native) == 0);
+    platform_positioned_file_init(&evidence->artifact_file);
     evidence->artifact_fd = -1;
     zcl_mutex_unlock(&evidence->mutex);
     zcl_mutex_destroy(&evidence->mutex);
-    free(evidence);
+    free(evidence); *owner = NULL;
+    if (!closed) LOG_WARN(INSTALL_SUBSYS, "bundle evidence native close failed");
+    return closed;
+}
+
+/* Preserve the legacy constructor cleanup contract. Exceptional retained
+ * failed-open ownership remains a known limitation; it is not exposed as
+ * usable evidence and is not solved by the successful-admission close API. */
+static void artifact_evidence_discard(
+    struct consensus_state_artifact_evidence *evidence)
+{
+    (void)artifact_evidence_close_checked(&evidence);
 }
 
 static struct zcl_result artifact_evidence_open_impl(
@@ -515,7 +531,7 @@ struct zcl_result consensus_state_artifact_evidence_open(
 void consensus_state_artifact_evidence_free(
     struct consensus_state_artifact_evidence *evidence)
 {
-    artifact_evidence_discard(evidence);
+    (void)consensus_state_artifact_evidence_close(&evidence);
 }
 
 bool consensus_state_artifact_evidence_manifest_copy(
@@ -599,13 +615,14 @@ bool consensus_state_artifact_evidence_candidate_lease_begin(
         return false;
     *db = NULL;
     zcl_mutex_lock((zcl_mutex_t *)&evidence->mutex);
-    if (!evidence->bundle_db ||
+    if (evidence->candidate_leases == UINT_MAX || !evidence->bundle_db ||
         !consensus_state_artifact_evidence_revalidate(evidence)) {
         LOG_WARN(INSTALL_SUBSYS,
                  "artifact evidence lease refused: stale evidence");
         zcl_mutex_unlock((zcl_mutex_t *)&evidence->mutex);
         return false;
     }
+    ((struct consensus_state_artifact_evidence *)evidence)->candidate_leases++;
     *manifest = evidence->manifest;
     memcpy(receipt_digest, evidence->receipt_digest, 32);
     *db = evidence->bundle_db;
@@ -615,8 +632,13 @@ bool consensus_state_artifact_evidence_candidate_lease_begin(
 void consensus_state_artifact_evidence_candidate_lease_end(
     const struct consensus_state_artifact_evidence *evidence)
 {
-    if (evidence)
-        zcl_mutex_unlock((zcl_mutex_t *)&evidence->mutex);
+    if (evidence) {
+        /* Successful begin holds this recursive mutex until its paired end. */
+        struct consensus_state_artifact_evidence *owner =
+            (struct consensus_state_artifact_evidence *)evidence;
+        if (owner->candidate_leases) owner->candidate_leases--;
+        zcl_mutex_unlock(&owner->mutex);
+    }
 }
 
 /* One iterator borrows the evidence's already-pinned read transaction. Its
@@ -901,6 +923,19 @@ bool consensus_state_snapshot_install(
 }
 
 #endif
+
+/* One explicit public definition; platform policy stays inside the body.
+ * Windows never admits evidence. POSIX retains the checked owner on BUSY or
+ * active consumers and preserves terminal native-close failure semantics. */
+bool consensus_state_artifact_evidence_close(
+    struct consensus_state_artifact_evidence **owner)
+{
+#ifdef _WIN32
+    return owner && !*owner;
+#else
+    return artifact_evidence_close_checked(owner);
+#endif
+}
 
 bool consensus_state_artifact_coins_begin(
     const struct consensus_state_artifact_evidence *evidence,

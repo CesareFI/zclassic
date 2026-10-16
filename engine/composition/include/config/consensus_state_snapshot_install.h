@@ -132,9 +132,21 @@ struct consensus_state_candidate_result {
 struct zcl_result consensus_state_artifact_evidence_open(
     const char *bundle_path, int receipt_datadir_fd,
     struct consensus_state_artifact_evidence **out);
+/* Additive checked ownership release. Quiesce callers/waiters first; paired
+ * private leases must end on their acquiring thread. Active leases/iterators
+ * or a BUSY SQLite close return false and preserve *owner for cleanup retry.
+ * Successful release nulls *owner. A native file-close failure returns false
+ * with *owner NULL: cleanup failed, resources must not be retried by fd/name,
+ * and a subsequent close(NULL-owner) cannot erase that failed witness.
+ * NULL owner argument refuses; already-NULL *owner is a no-op success.
+ * No input-validity, capture or publication authority is established. */
+bool consensus_state_artifact_evidence_close(
+    struct consensus_state_artifact_evidence **owner);
 /* Quiesce all consumers and finalize their borrowed SQLite statements before
  * free. Active iterators or a busy SQLite close retain the evidence and file;
- * release the consumer/statement and retry free on the same evidence pointer. */
+ * release the consumer/statement and retry free on the same evidence pointer.
+ * Legacy void interface cannot witness checked cleanup; new reporting callers
+ * must use close(&owner). It delegates without forcing BUSY/active release. */
 void consensus_state_artifact_evidence_free(
     struct consensus_state_artifact_evidence *evidence);
 bool consensus_state_artifact_evidence_manifest_copy(

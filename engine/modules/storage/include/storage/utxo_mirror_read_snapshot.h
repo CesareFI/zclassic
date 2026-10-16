@@ -15,6 +15,10 @@ enum utxo_mirror_byte_order {
  * exact declared types/nullability/PK order and no hidden columns. */
 enum utxo_mirror_schema_profile { UTXO_MIRROR_SCHEMA_V1 = 1 };
 struct utxo_mirror_read_attestation {
+    /* Admitted cursor from this pinned transaction, not a caller assertion. */
+    int32_t next_height;
+    /* Decoder order accepted by this reader, not proof of producer hardware. */
+    enum utxo_mirror_byte_order producer_order;
     struct platform_positioned_file_snapshot file;
     uint8_t file_sha3[32];
     enum utxo_mirror_schema_profile schema_profile;

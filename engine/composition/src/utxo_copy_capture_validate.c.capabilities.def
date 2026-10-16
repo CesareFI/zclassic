@@ -1,0 +1,8 @@
+/* Copyright 2026 Rhett Creighton. SPDX-License-Identifier: Apache-2.0
+ * Purpose: declare the capture validator's checked-allocation diagnostic reach. */
+ZCL_MODULE_CAPABILITY("engine/composition/src/utxo_copy_capture_validate.c",
+    CAP_FS_WRITE,
+    "Checked allocation failure diagnostics reach stderr through fprintf, "
+    "conservatively classified FS_WRITE as an arbitrary-stream printer. "
+    "The validator admits caller-supplied bytes and read-only evidence; "
+    "this declaration does not authorize writes to supplied input files.")

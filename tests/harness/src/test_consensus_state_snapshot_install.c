@@ -2216,6 +2216,154 @@ static int artifact_substitution_open(sqlite3_vfs *vfs, const char *name,
     }
     return artifact_original_open(vfs, name, file, flags, out);
 }
+/* Checked evidence cleanup uses only admitted offline fixtures and real
+ * SQLite BUSY; no borrowed descriptor is artificially closed. CSI_CHECK
+ * never jumps over statement/iterator/paired-lease cleanup. */
+static int artifact_checked_close_normal(const char *path)
+{
+    int failures = 0;
+    struct consensus_state_artifact_evidence *none = NULL, *ev = NULL;
+    CSI_CHECK("checked close rejects absent owner argument",
+        !consensus_state_artifact_evidence_close(NULL));
+    CSI_CHECK("checked close of already empty owner is a no-op",
+        consensus_state_artifact_evidence_close(&none) && none == NULL);
+    struct zcl_result opened = consensus_state_artifact_evidence_open(path, -1, &ev);
+    CSI_CHECK("checked close normal fixture admitted", opened.ok && ev);
+    if (ev) CSI_CHECK("checked close releases and nulls admitted evidence",
+        consensus_state_artifact_evidence_close(&ev) && ev == NULL);
+    if (ev) CSI_CHECK("checked close normal retry releases owner",
+        consensus_state_artifact_evidence_close(&ev) && ev == NULL);
+    return failures;
+}
+static int artifact_checked_close_iterator(const char *path)
+{
+    int failures = 0;
+    struct consensus_state_artifact_evidence *ev = NULL;
+    struct zcl_result opened = consensus_state_artifact_evidence_open(path, -1, &ev);
+    CSI_CHECK("checked close iterator fixture admitted", opened.ok && ev);
+    if (!opened.ok || !ev) return failures;
+    struct consensus_state_artifact_coins *it = NULL;
+    bool began = consensus_state_artifact_coins_begin(ev, &it);
+    CSI_CHECK("checked close obtains active coin iterator", began && it);
+    if (began) {
+        struct consensus_state_artifact_evidence *identity = ev;
+        bool closed = consensus_state_artifact_evidence_close(&ev);
+        CSI_CHECK("checked close retains exact owner while iterator active",
+            !closed && ev == identity);
+        /* If a faulty close consumed the owner, do not dereference stale it. */
+        if (!ev) return failures;
+        consensus_state_artifact_evidence_free(ev);
+        struct consensus_state_bundle_manifest manifest;
+        bool observed = consensus_state_artifact_evidence_manifest_copy(ev, &manifest);
+        CSI_CHECK("legacy void free preserves active iterator evidence", observed);
+        uint64_t count = 0;
+        struct coins_kv_read_snapshot_row row;
+        enum coins_kv_read_snapshot_step step;
+        do {
+            step = consensus_state_artifact_coins_next(it, &row);
+            if (step == COINS_KV_READ_SNAPSHOT_ROW) count++;
+        } while (step == COINS_KV_READ_SNAPSHOT_ROW);
+        bool finished = consensus_state_artifact_coins_finish(it);
+        it = NULL;
+        CSI_CHECK("iterator continues through DONE and checked finish after refused close",
+            observed && step == COINS_KV_READ_SNAPSHOT_DONE && finished && count == manifest.utxo_count);
+    }
+    if (it) consensus_state_artifact_coins_abort(it);
+    CSI_CHECK("checked close succeeds after iterator cleanup",
+        consensus_state_artifact_evidence_close(&ev) && ev == NULL);
+    return failures;
+}
+static int artifact_checked_close_leased_iterator(
+    struct consensus_state_artifact_evidence *ev, bool second)
+{
+    int failures = 0;
+    struct consensus_state_artifact_coins *it = NULL, *reentrant = NULL;
+    bool began = second && consensus_state_artifact_coins_begin(ev, &it);
+    CSI_CHECK("checked close coin iterator may compose under private lease", began && it);
+    if (began) {
+        bool repeated = consensus_state_artifact_coins_begin(ev, &reentrant);
+        CSI_CHECK("checked close rejected reentrant begin preserves original lease",
+            !repeated && reentrant == NULL);
+    }
+    if (reentrant) consensus_state_artifact_coins_abort(reentrant);
+    if (it) consensus_state_artifact_coins_abort(it);
+    return failures;
+}
+static int artifact_checked_close_leases(const char *path)
+{
+    int failures = 0;
+    struct consensus_state_artifact_evidence *ev = NULL;
+    struct zcl_result opened = consensus_state_artifact_evidence_open(path, -1, &ev);
+    CSI_CHECK("checked close nested lease fixture admitted", opened.ok && ev);
+    if (!opened.ok || !ev) return failures;
+    struct consensus_state_bundle_manifest manifest;
+    uint8_t receipt[32]; sqlite3 *db = NULL;
+    bool first = consensus_state_artifact_evidence_candidate_lease_begin(ev, &manifest, receipt, &db);
+    bool second = first && consensus_state_artifact_evidence_candidate_lease_begin(ev, &manifest, receipt, &db);
+    CSI_CHECK("checked close nested private leases acquired", first && second && db);
+    failures += artifact_checked_close_leased_iterator(ev, second);
+    if (second) consensus_state_artifact_evidence_candidate_lease_end(ev);
+    if (first) {
+        struct consensus_state_artifact_evidence *identity = ev;
+        bool closed = consensus_state_artifact_evidence_close(&ev);
+        CSI_CHECK("checked close refuses one remaining statement-free private lease",
+            !closed && ev == identity);
+        if (!ev) return failures; /* faulty close: no stale lease-end access */
+        CSI_CHECK("refused private-lease close keeps read transaction usable",
+            sqlite3_get_autocommit(db) == 0 &&
+            consensus_state_artifact_evidence_revalidate(ev));
+        consensus_state_artifact_evidence_candidate_lease_end(ev);
+    }
+    CSI_CHECK("checked close releases after final paired private lease end",
+        consensus_state_artifact_evidence_close(&ev) && ev == NULL);
+    return failures;
+}
+static bool artifact_checked_close_busy_usable(
+    sqlite3 *db, sqlite3_stmt *stmt, uint64_t count)
+{
+    return sqlite3_get_autocommit(db) == 0 && sqlite3_step(stmt) == SQLITE_ROW &&
+        sqlite3_column_int64(stmt, 0) == (sqlite3_int64)count &&
+        sqlite3_step(stmt) == SQLITE_DONE;
+}
+static int artifact_checked_close_busy(const char *path)
+{
+    int failures = 0;
+    struct consensus_state_artifact_evidence *ev = NULL;
+    struct zcl_result opened = consensus_state_artifact_evidence_open(path, -1, &ev);
+    CSI_CHECK("checked close BUSY fixture admitted", opened.ok && ev);
+    if (!opened.ok || !ev) return failures;
+    struct consensus_state_bundle_manifest manifest;
+    uint8_t receipt[32]; sqlite3 *db = NULL;
+    bool leased = consensus_state_artifact_evidence_candidate_lease_begin(ev, &manifest, receipt, &db);
+    sqlite3_stmt *stmt = NULL;
+    int prepared = leased ? sqlite3_prepare_v2(db, "SELECT count(*) FROM coins", -1, &stmt, NULL) : SQLITE_ERROR;
+    if (leased) consensus_state_artifact_evidence_candidate_lease_end(ev);
+    CSI_CHECK("checked close BUSY fixture prepares statement and releases private lease",
+        leased && prepared == SQLITE_OK && stmt);
+    if (prepared == SQLITE_OK && stmt) {
+        struct consensus_state_artifact_evidence *identity = ev;
+        bool closed = consensus_state_artifact_evidence_close(&ev);
+        CSI_CHECK("real SQLite BUSY preserves exact evidence owner",
+            !closed && ev == identity);
+        if (!ev) return failures; /* fault: do not step against consumed DB */
+        bool usable = artifact_checked_close_busy_usable(db, stmt, manifest.utxo_count);
+        CSI_CHECK("BUSY close preserves statement and pinned transaction", usable);
+    }
+    int finalized = sqlite3_finalize(stmt);
+    CSI_CHECK("checked close BUSY fixture statement cleanup succeeds", finalized == SQLITE_OK);
+    CSI_CHECK("checked close retries successfully after real BUSY clears",
+        consensus_state_artifact_evidence_close(&ev) && ev == NULL);
+    return failures;
+}
+static int artifact_checked_close_tests(const char *path)
+{
+    int failures = artifact_checked_close_normal(path);
+    failures += artifact_checked_close_iterator(path);
+    failures += artifact_checked_close_leases(path);
+    failures += artifact_checked_close_busy(path);
+    return failures;
+}
+
 static int artifact_busy_free_test(struct consensus_state_artifact_evidence *evidence)
 {
     int failures = 0;
@@ -2309,6 +2457,8 @@ static int artifact_pinned_substitution_tests(const char *root)
     TEST_DISCARD(rmdir(retained));
     return failures;
 }
+
+#include "utxo_copy_compare_selftests.h"
 
 static int test_consensus_state_snapshot_install_platform_arm(void)
 {
@@ -2405,6 +2555,8 @@ static int test_consensus_state_snapshot_install_platform_arm(void)
      * SQLite BLOB through admission, candidate copy, and activation. */
     b.coins[1].script_len = 0;
     CSI_CHECK("generation B final bundle writes",write_bundle(&b,CSI_VALID));
+    failures += artifact_checked_close_tests(b.path);
+    failures += csi_compare_cases(dir, &b);
     struct consensus_state_artifact_evidence *artifact = NULL;
     struct zcl_result artifact_opened =
         consensus_state_artifact_evidence_open(b.path, -1, &artifact);

@@ -33,6 +33,7 @@ struct utxo_mirror_read_snapshot {
     uint8_t expected[32], last_txid[32];
     uint32_t last_vout;
     int32_t next_height;
+    enum utxo_mirror_byte_order producer_order;
     uint64_t count;
     struct sha3_256_ctx root;
     bool transaction, have_last, exhausted, failed, cleanup_failed;
@@ -248,6 +249,8 @@ static bool umrs_attestation_posix(
         s->failed = true;
         return false;
     }
+    out->next_height = s->next_height;
+    out->producer_order = s->producer_order;
     out->file = s->identity;
     memcpy(out->file_sha3, s->expected, 32);
     out->schema_profile = UTXO_MIRROR_SCHEMA_V1;
@@ -338,6 +341,7 @@ static bool umrs_open_posix(
     struct utxo_mirror_read_snapshot *s = zcl_calloc(1, sizeof(*s), "utxo mirror reader");
     if (!s) return false;
     platform_positioned_file_init(&s->file); s->parent_fd = -1;
+    s->producer_order = order;
     memcpy(s->expected, expected, 32);
     bool ok = umrs_prepare_rows(s, path, order);
     if (!ok) {
