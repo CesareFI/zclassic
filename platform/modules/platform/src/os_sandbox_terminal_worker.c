@@ -13,13 +13,47 @@
 #include <stdint.h>
 #include <sys/syscall.h>
 
+/* Kernel ABI numbers for syscalls an older libc header set may lack (the same
+ * fallbacks os_sandbox_plugin.c carries; 425..427 and 424/434/438 are identical
+ * on x86_64 and the generic table). */
+#ifdef __NR_io_uring_setup
+#define TW_NR_URING_SETUP __NR_io_uring_setup
+#define TW_NR_URING_ENTER __NR_io_uring_enter
+#define TW_NR_URING_REGISTER __NR_io_uring_register
+#else
+#define TW_NR_URING_SETUP 425
+#define TW_NR_URING_ENTER 426
+#define TW_NR_URING_REGISTER 427
+#endif
+#ifdef __NR_pidfd_open
+#define TW_NR_PIDFD_OPEN __NR_pidfd_open
+#else
+#define TW_NR_PIDFD_OPEN 434
+#endif
+#ifdef __NR_pidfd_send_signal
+#define TW_NR_PIDFD_SEND __NR_pidfd_send_signal
+#else
+#define TW_NR_PIDFD_SEND 424
+#endif
+#ifdef __NR_pidfd_getfd
+#define TW_NR_PIDFD_GETFD __NR_pidfd_getfd
+#else
+#define TW_NR_PIDFD_GETFD 438
+#endif
+
 /* The terminal worker's deny-set: the session set with the code execution /
  * process creation family (execve/execveat/clone/clone3/fork/vfork) REMOVED —
  * the confined shell must fork/exec its own children, and Landlock bounds
  * what execve can reach. Everything else stays: the socket family (the
  * worker talks to the node ONLY through its pre-opened PTY fds), ptrace /
  * process_vm_*, mount/namespace escape, kernel surface, keyrings, and
- * open_by_handle_at. */
+ * open_by_handle_at. Added beyond the session set (the plugin profile denies
+ * the same, os_sandbox_plugin.c): io_uring (IORING_OP_SOCKET/CONNECT carry a
+ * socket past the socket deny), signals aimed at other processes by thread
+ * or queue (tkill/tgkill/rt_*sigqueueinfo), the pidfd family (signal or steal
+ * a descriptor from the node), and memfd_create (an anonymous executable
+ * payload). Plain kill(2) stays for job control but is guarded by a second
+ * filter, see os_sandbox_seccomp_guard_signals. */
 static const int g_terminal_worker_denied[] = {
     /* the socket family */
     __NR_socket,
@@ -40,6 +74,15 @@ static const int g_terminal_worker_denied[] = {
     __NR_add_key, __NR_request_key, __NR_keyctl,
     /* handle-based open bypass */
     __NR_open_by_handle_at,
+    /* io_uring: socket/connect with no syscall for seccomp to see */
+    TW_NR_URING_SETUP, TW_NR_URING_ENTER, TW_NR_URING_REGISTER,
+    /* signalling by thread/queue, and the pidfd family */
+    __NR_tkill, __NR_tgkill, __NR_rt_sigqueueinfo, __NR_rt_tgsigqueueinfo,
+    TW_NR_PIDFD_OPEN, TW_NR_PIDFD_SEND, TW_NR_PIDFD_GETFD,
+    /* anonymous in-memory file for an executable payload */
+#ifdef __NR_memfd_create
+    __NR_memfd_create,
+#endif
 };
 
 const int *os_sandbox_terminal_worker_denied_syscalls(size_t *count_out)
@@ -87,5 +130,6 @@ struct os_sandbox_profile os_sandbox_terminal_worker_profile(
         .denied_syscalls = denied,
         .n_denied = n_denied,
         .seccomp_deny_exec_mmap = true,
+        .seccomp_guard_signals = true,
     };
 }

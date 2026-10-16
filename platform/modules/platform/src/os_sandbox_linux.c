@@ -1484,9 +1484,9 @@ struct zcl_result os_sandbox_enter(const struct os_sandbox_profile *p)
             ZCL_CHECK(os_sandbox_seccomp_allow(p->allowed_syscalls,
                                                p->n_allowed));
         else
-            ZCL_CHECK(os_sandbox_seccomp_deny_ext(
-                                              p->denied_syscalls, p->n_denied, p->seccomp_deny_exec_mmap,
-                                              p->enosys_syscalls, p->n_enosys, p->seccomp_clone_threads_only));
+            ZCL_CHECK(os_sandbox_seccomp_deny_ext(p->denied_syscalls, p->n_denied, p->seccomp_deny_exec_mmap,
+                p->enosys_syscalls, p->n_enosys, p->seccomp_clone_threads_only));
+        if (p->seccomp_guard_signals) ZCL_CHECK(os_sandbox_seccomp_guard_signals());
     }
 
     g_sandbox_active = true;

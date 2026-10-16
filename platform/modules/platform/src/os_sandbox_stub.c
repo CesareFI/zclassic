@@ -400,6 +400,15 @@ struct zcl_result os_sandbox_seccomp_deny_ext(
     return os_sandbox_seccomp_deny(denied, n_denied, deny_exec_mmap);
 }
 
+struct zcl_result os_sandbox_seccomp_guard_signals(void)
+{
+#if defined(_WIN32)
+    return unavailable("seccomp");
+#else
+    return ZCL_OK;
+#endif
+}
+
 struct zcl_result os_sandbox_seccomp_deny(const int *calls, size_t count,
                                           bool deny_exec_mmap)
 {

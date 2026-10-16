@@ -232,6 +232,7 @@ struct os_sandbox_profile {
     const int *enosys_syscalls;                 /* fail ENOSYS, not KILL      */
     size_t n_enosys;
     bool seccomp_clone_threads_only;            /* clone only with CLONE_THREAD */
+    bool seccomp_guard_signals;                 /* stacked kill(2) guard: EPERM for pid 0, -1 and the supervisor */
 
     /* seccomp ALLOW-list mode (the -confine profile). When true, the seccomp
      * step installs an ALLOW-list instead of a deny-list: default action is
@@ -378,6 +379,14 @@ struct zcl_result os_sandbox_seccomp_deny(const int *denied, size_t n_denied,
 struct zcl_result os_sandbox_seccomp_deny_ext(
     const int *denied, size_t n_denied, enum os_sandbox_wx deny_exec_mmap,
     const int *enosys, size_t n_enosys, bool clone_threads_only);
+/* Stacked second filter for profiles that keep kill(2) for job control: kill
+ * of pid 0 (own group), pid -1 (everything), and the supervisor (the caller's
+ * parent) and its process group, as either pid or -pgid, fails EPERM. Every
+ * other kill, including of a negative own-job pgid, passes. Installed with
+ * the same TSYNC/prctl rules as the deny filter; os_sandbox_enter() calls it
+ * when the profile sets seccomp_guard_signals. Positive pids of unrelated
+ * same-uid processes are NOT covered (seccomp cannot tell them apart). */
+struct zcl_result os_sandbox_seccomp_guard_signals(void);
 
 /* The RESIDENT NODE's -confine ALLOW-list: the empirically-derived steady-state
  * syscall set a booted node needs for status RPC, SELECT-only storage queries,

@@ -53,6 +53,25 @@ static int test_terminal_worker_sandbox_platform_arm(void)
 
 #define FBSH_BIN "build/bin/fbsh"
 
+#ifdef __NR_io_uring_setup
+#define TW_NR_URING_SETUP_T __NR_io_uring_setup
+#define TW_NR_URING_ENTER_T __NR_io_uring_enter
+#define TW_NR_URING_REGISTER_T __NR_io_uring_register
+#else
+#define TW_NR_URING_SETUP_T 425
+#define TW_NR_URING_ENTER_T 426
+#define TW_NR_URING_REGISTER_T 427
+#endif
+#ifdef __NR_pidfd_send_signal
+#define TW_NR_PIDFD_SEND_T __NR_pidfd_send_signal
+#define TW_NR_PIDFD_OPEN_T __NR_pidfd_open
+#define TW_NR_PIDFD_GETFD_T __NR_pidfd_getfd
+#else
+#define TW_NR_PIDFD_SEND_T 424
+#define TW_NR_PIDFD_OPEN_T 434
+#define TW_NR_PIDFD_GETFD_T 438
+#endif
+
 static char g_tw_dir[160];
 /* Absolutized once at runner start: Landlock rules resolve against the
  * cwd at enter() time, and the fbsh children chdir into the grant before
@@ -334,12 +353,119 @@ static int c_tw_nofile_budget(void)
     return 11; /* 128 opens succeeded — NOFILE was not enforced */
 }
 
+/* io_uring would carry socket/connect past the socket deny: killed. */
+static int c_tw_io_uring_killed(void)
+{
+    if (tw_enter(false) != 0) return 70;
+    syscall(TW_NR_URING_SETUP_T, 1, NULL);
+    return 13; /* reached only if io_uring_setup was not denied */
+}
+
+static int c_tw_memfd_killed(void)
+{
+    if (tw_enter(false) != 0) return 70;
+    syscall(__NR_memfd_create, "p", 0);
+    return 14;
+}
+
+static int c_tw_tgkill_killed(void)
+{
+    if (tw_enter(false) != 0) return 70;
+    syscall(__NR_tgkill, getppid(), getppid(), 0);
+    return 15;
+}
+
+static int c_tw_pidfd_send_killed(void)
+{
+    if (tw_enter(false) != 0) return 70;
+    syscall(TW_NR_PIDFD_SEND_T, -1, 0, NULL, 0);
+    return 16;
+}
+
+/* kill(2) stays for job control: a child of the cage is signalled, but pid 0,
+ * pid -1 and the supervisor (the parent) answer EPERM. Signal 0 throughout, so
+ * a regression cannot hurt the host. */
+static int c_tw_kill_guarded(void)
+{
+    if (tw_enter(false) != 0) return 70;
+    pid_t c = fork();
+    if (c < 0) return 71;
+    if (c == 0) { pause(); _exit(0); }
+    int rc = 0;
+    if (kill(c, 0) != 0) rc = 72;                       /* own child: job control */
+    else if (kill(0, 0) == 0 || errno != EPERM) rc = 73;
+    else if (kill(-1, 0) == 0 || errno != EPERM) rc = 74;
+    else if (kill(getppid(), 0) == 0 || errno != EPERM) rc = 75;
+    else if (kill(-getpgid(getppid()), 0) == 0 || errno != EPERM) rc = 76;
+    kill(c, SIGKILL);
+    waitpid(c, NULL, 0);
+    return rc;
+}
+
 /* The debug surface stays denied: attaching to the parent must SIGSYS. */
 static int c_tw_ptrace_killed(void)
 {
     if (tw_enter(false) != 0) return 70;
     ptrace(PTRACE_ATTACH, getppid(), NULL, NULL);
     return 12; /* reached only if ptrace was not denied */
+}
+
+/* Structural pin: the worker deny-set is the session set minus the fork/exec
+ * family, plus the declared additions — no syscall leaves the session set
+ * except the spawn family, and nothing appears that is not declared. */
+static bool tw_deny_pin_ok(const int *tw, size_t n_tw)
+{
+    size_t n_sess = 0;
+    const int *sess = os_sandbox_session_denied_syscalls(&n_sess);
+    static const int spawn_family[] = {
+#ifdef __NR_fork
+        __NR_fork,
+#endif
+#ifdef __NR_vfork
+        __NR_vfork,
+#endif
+#ifdef __NR_clone
+        __NR_clone,
+#endif
+#ifdef __NR_clone3
+        __NR_clone3,
+#endif
+#ifdef __NR_execve
+        __NR_execve,
+#endif
+#ifdef __NR_execveat
+        __NR_execveat,
+#endif
+    };
+    /* The deliberate additions beyond the session set (the plugin
+     * profile's io_uring / signal / pidfd denials, plus memfd_create). */
+    static const int worker_extra[] = {
+        TW_NR_URING_SETUP_T, TW_NR_URING_ENTER_T, TW_NR_URING_REGISTER_T,
+        __NR_tkill, __NR_tgkill, __NR_rt_sigqueueinfo, __NR_rt_tgsigqueueinfo,
+        TW_NR_PIDFD_OPEN_T, TW_NR_PIDFD_SEND_T, TW_NR_PIDFD_GETFD_T,
+#ifdef __NR_memfd_create
+        __NR_memfd_create,
+#endif
+    };
+    const size_t n_extra = sizeof worker_extra / sizeof worker_extra[0];
+    bool pin_ok = true;
+    for (size_t i = 0; i < n_tw && pin_ok; i++)
+        if (!denyset_contains(sess, n_sess, tw[i]) &&
+            !denyset_contains(worker_extra, n_extra, tw[i]))
+            pin_ok = false; /* neither a session denial nor a declared addition */
+    for (size_t i = 0; i < n_extra && pin_ok; i++)
+        if (!denyset_contains(tw, n_tw, worker_extra[i]))
+            pin_ok = false; /* a declared addition is missing */
+    for (size_t i = 0; i < n_sess && pin_ok; i++) {
+        bool in_spawn_family = false;
+        for (size_t j = 0; j < sizeof(spawn_family) / sizeof(spawn_family[0]);
+             j++)
+            if (sess[i] == spawn_family[j]) in_spawn_family = true;
+        if (in_spawn_family) continue;
+        if (!denyset_contains(tw, n_tw, sess[i]))
+            pin_ok = false; /* a session denial silently dropped */
+    }
+    return pin_ok;
 }
 
 static int test_terminal_worker_sandbox_platform_arm(void)
@@ -380,47 +506,11 @@ static int test_terminal_worker_sandbox_platform_arm(void)
         printf("%s\n", lim_ok ? "OK" : "FAIL");
         if (!lim_ok) failures++;
 
-        /* Structural pin: the worker deny-set is EXACTLY the session set
-         * minus the fork/exec family — no syscall leaves the session set
-         * except those, and nothing new appears. */
-        size_t n_tw = 0, n_sess = 0;
+        size_t n_tw = 0;
         const int *tw = os_sandbox_terminal_worker_denied_syscalls(&n_tw);
-        const int *sess = os_sandbox_session_denied_syscalls(&n_sess);
-        static const int spawn_family[] = {
-#ifdef __NR_fork
-            __NR_fork,
-#endif
-#ifdef __NR_vfork
-            __NR_vfork,
-#endif
-#ifdef __NR_clone
-            __NR_clone,
-#endif
-#ifdef __NR_clone3
-            __NR_clone3,
-#endif
-#ifdef __NR_execve
-            __NR_execve,
-#endif
-#ifdef __NR_execveat
-            __NR_execveat,
-#endif
-        };
-        bool pin_ok = true;
-        for (size_t i = 0; i < n_tw && pin_ok; i++)
-            if (!denyset_contains(sess, n_sess, tw[i]))
-                pin_ok = false; /* a syscall the session set never denied */
-        for (size_t i = 0; i < n_sess && pin_ok; i++) {
-            bool in_spawn_family = false;
-            for (size_t j = 0; j < sizeof(spawn_family) / sizeof(spawn_family[0]);
-                 j++)
-                if (sess[i] == spawn_family[j]) in_spawn_family = true;
-            if (in_spawn_family) continue;
-            if (!denyset_contains(tw, n_tw, sess[i]))
-                pin_ok = false; /* a session denial silently dropped */
-        }
+        bool pin_ok = tw_deny_pin_ok(tw, n_tw);
         printf("terminal_worker_sandbox: deny-set == session set minus "
-               "fork/exec family... %s\n", pin_ok ? "OK" : "FAIL");
+               "fork/exec family plus the declared additions... %s\n", pin_ok ? "OK" : "FAIL");
         if (!pin_ok) failures++;
 
         printf("terminal_worker_sandbox: socket family denied, spawn family "
@@ -480,6 +570,16 @@ static int test_terminal_worker_sandbox_platform_arm(void)
                           c_tw_nofile_budget, e_zero);
     failures += tw_attack("ptrace(parent) -> SIGSYS",
                           c_tw_ptrace_killed, e_sigsys);
+    failures += tw_attack("io_uring_setup -> SIGSYS",
+                          c_tw_io_uring_killed, e_sigsys);
+    failures += tw_attack("memfd_create -> SIGSYS",
+                          c_tw_memfd_killed, e_sigsys);
+    failures += tw_attack("tgkill(parent) -> SIGSYS",
+                          c_tw_tgkill_killed, e_sigsys);
+    failures += tw_attack("pidfd_send_signal -> SIGSYS",
+                          c_tw_pidfd_send_killed, e_sigsys);
+    failures += tw_attack("kill: own child ok; pid 0, -1 and parent EPERM",
+                          c_tw_kill_guarded, e_zero);
 
     /* ── the granted shell works — and its own attacks fail ─────────── */
     if (!fbsh_available()) {
