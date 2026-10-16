@@ -16,7 +16,7 @@
 #include "lintc_proc.h"
 #include "lintc_sig.h"
 
-enum { CGS_CASES = 15, CGS_FILLER = 500 };
+enum { CGS_CASES = 21, CGS_FILLER = 500 };
 
 static const char k_fx0[] = "build/dev-obj/epochs/fx0";
 
@@ -122,6 +122,12 @@ static int cgs_unit(const struct ccs_fx *fx, const char *dir, const char *src, c
     snprintf(s, sizeof s, "%s/%s", dir, src);
     snprintf(o, sizeof o, "%s/%s/%.*s.o", dir, k_fx0, (int)(strlen(src) - 2), src);
     return ccs_put(fx, s, code) == 0 && cgs_cc(fx, s, o, flag) == 0 ? 0 : -1;
+}
+
+static int cgs_is(const struct ccd_map *m, const char *key)
+{
+    const char *v = ccd_map_get(m, key);
+    return v && strcmp(v, "CAP_NETWORK") == 0;
 }
 
 /* A pre-formatted module row. */
@@ -287,6 +293,31 @@ static int cgs_case_g(const struct ccs_fx *fx)
                      "G: a coverage baseline held above the true (improved) unobserved count is a VIOLATION, exit 1, not silently tolerated");
 }
 
+/* H. a drive-letter colon is not the record delimiter of an nm line. */
+static int cgs_case_h(void)
+{
+    struct ccd_nm nm = { 0 };
+    int ok = ccd_parse_nm("C:/work/epoch/core/modules/net/dialer.o:         U connect\n", 0, &nm) == 0 && nm.n == 1
+             && strcmp(nm.row[0].path, "C:/work/epoch/core/modules/net/dialer.o") == 0
+             && strcmp(nm.row[0].type, "U") == 0 && strcmp(nm.row[0].name, "connect") == 0;
+    ccd_nm_free(&nm);
+    return ccs_say(ok, "H: Windows drive-letter nm records preserve the full object path");
+}
+
+/* I. COFF import pointers and MinGW wrappers are spellings of a reviewed entry. */
+static int cgs_case_i(const struct ccs_fx *fx)
+{
+    char file[CCD_PATH];
+    struct ccd_map m = { 0 };
+    size_t n = 0;
+    int ok = ccs_put(fx, "i/capability_symbols.def", "ZCL_CAPABILITY_SYMBOL(\"connect\", CAP_NETWORK, \"\")\n") == 0;
+    ccs_path(fx, "i/capability_symbols.def", file);
+    ok = ok && ccd_symbols_load(file, 1, &m, &n) == 0;
+    ok = ok && cgs_is(&m, "__imp_connect") && cgs_is(&m, "__imp__connect") && cgs_is(&m, "__mingw_connect");
+    ccd_map_free(&m);
+    return ccs_say(ok, "I: MinGW import and wrapper decorations inherit the base symbol class");
+}
+
 /* J. a Windows exact override replaces the portable row, CAP_NONE included, and
  * the platform skips apply to the named Linux arm only. */
 static int cgs_case_j(const struct ccs_fx *fx)
@@ -319,6 +350,26 @@ static int cgs_case_k(const struct ccs_fx *fx)
                    cgs_row(row, sizeof row, "fixture_src/platform_user.c", "CAP_NONE")) != 0)
         return ccs_say(0, "K: fixture");
     return cgs_check(fx, "k", &cfg, 0, NULL, "K: Linux exact CAP_NONE override replaces portable cross-target reach");
+}
+
+/* L. coverage grades the exact host-selected graph while the two standalone
+ * rows stay applicable everywhere. */
+static int cgs_case_l(void)
+{
+    static const char *const stub = "platform/modules/platform/src/os_sandbox_stub.c";
+    static const char *const pkg = "platform/modules/platform/src/os_sandbox_package_linux.c";
+    int linux_ok = !ccd_coverage_applicable(CCD_LINUX, stub)
+                   && ccd_coverage_applicable(CCD_LINUX, "tests/harness/src/test_thread_qos.c")
+                   && ccd_coverage_applicable(CCD_LINUX, "tools/dev/wallet_gui_load.c")
+                   && ccd_coverage_applicable(CCD_LINUX, "tools/rebuild_recent.c");
+    int darwin_ok = !ccd_coverage_applicable(CCD_DARWIN, k_arm) && !ccd_coverage_applicable(CCD_DARWIN, pkg)
+                    && !ccd_coverage_applicable(CCD_DARWIN, "platform/modules/util/src/self_backtrace.c")
+                    && !ccd_coverage_applicable(CCD_DARWIN, "tools/dev/wallet_gui_load.c");
+    int windows_ok = !ccd_coverage_applicable(CCD_WINDOWS, k_arm) && !ccd_coverage_applicable(CCD_WINDOWS, pkg)
+                     && !ccd_coverage_applicable(CCD_WINDOWS, "contexts/commons/modules/vcs/src/vcs_devloop.c")
+                     && !ccd_coverage_applicable(CCD_WINDOWS, "tools/package_verify.c");
+    return ccs_say(linux_ok && darwin_ok && windows_ok,
+                   "L: coverage follows exact host-source selection and retains the two standalone rows");
 }
 
 /* M. a valid object with no symbols is still compiled evidence: nm prints no
@@ -416,14 +467,40 @@ static int cgs_case_o(const struct ccs_fx *fx)
     return ccs_say(ok, "O: flags load once per check and changed flags still reject overdeclaration");
 }
 
-/* Q. the raw syscall ban reports a source that has no object in this epoch. */
+/* P. a source-owned declaration removes the central row edit without weakening
+ * closure; a misplaced one and a duplicate of a central row refuse. */
+static int cgs_case_p(const struct ccs_fx *fx)
+{
+    static const char sc[] = "p/contexts/commons/modules/vcs/src/owned.c.capabilities.def";
+    static const char own[] = "contexts/commons/modules/vcs/src/owned.c";
+    struct ccg_cfg cfg;
+    char row[CCD_PATH], other[CCD_PATH];
+    const char *const bad[] = { "invalid source-owned", NULL }, *const dup[] = { "duplicate central row", NULL };
+    int f;
+    cgs_cfg(&cfg);
+    if (cgs_base(fx, "p", "") != 0 || cgs_unit(fx, "p", own, k_use, NULL) != 0)
+        return ccs_say(0, "P: fixture");
+    cgs_row(row, sizeof row, own, "CAP_NETWORK");
+    cgs_row(other, sizeof other, "contexts/commons/modules/vcs/src/other.c", "CAP_NETWORK");
+    f = ccs_put(fx, sc, row) != 0;
+    f += cgs_check(fx, "p", &cfg, 0, NULL, "P1: source-owned declaration closes the compiled object");
+    f += ccs_put(fx, sc, other) != 0;
+    f += cgs_check(fx, "p", &cfg, -1, bad, "P2: misplaced source-owned declaration refuses");
+    f += ccs_put(fx, sc, row) != 0;
+    f += ccs_put(fx, "p/engine/composition/module_capabilities.def", row) != 0;
+    return f + cgs_check(fx, "p", &cfg, -1, dup, "P3: central and source-owned duplicate refuses");
+}
+
+/* Q. the raw syscall ban reports a source that has no object in this epoch. The
+ * fixture text is split so that this file does not itself trip the ban. */
 static int cgs_case_q(const struct ccs_fx *fx)
 {
     struct ccg_cfg cfg;
     const char *const need[] = { "raw syscall", NULL };
     cgs_cfg(&cfg);
     if (cgs_base(fx, "q", "") != 0
-        || ccs_put(fx, "q/fixture_src/raw_user.c", "extern long syscall(long, ...);\nlong raw_use(void) { return syscall(0); }\n") != 0)
+        || ccs_put(fx, "q/fixture_src/raw_user.c", "extern long sys" "call(long, ...);\n"
+                                                  "long raw_use(void) { return sys" "call(0); }\n") != 0)
         return ccs_say(0, "Q: fixture");
     return cgs_check(fx, "q", &cfg, -1, need, "Q: raw syscall in an uncompiled source still refuses");
 }
@@ -444,8 +521,9 @@ static int cgs_case_r(const struct ccs_fx *fx)
 static int cgs_cases(const struct ccs_fx *fx)
 {
     return cgs_case_a(fx) + cgs_case_b(fx) + cgs_case_c(fx) + cgs_case_d(fx) + cgs_case_e(fx) + cgs_case_f(fx) +
-           cgs_case_g(fx) + cgs_case_j(fx) + cgs_case_k(fx) + cgs_case_m(fx) + cgs_case_n1(fx) + cgs_case_n2(fx) +
-           cgs_case_o(fx) + cgs_case_q(fx) + cgs_case_r(fx);
+           cgs_case_g(fx) + cgs_case_h() + cgs_case_i(fx) + cgs_case_j(fx) + cgs_case_k(fx) + cgs_case_l() +
+           cgs_case_m(fx) + cgs_case_n1(fx) + cgs_case_n2(fx) + cgs_case_o(fx) + cgs_case_p(fx) + cgs_case_q(fx) +
+           cgs_case_r(fx);
 }
 
 int check_capability_closure_selftest(void)

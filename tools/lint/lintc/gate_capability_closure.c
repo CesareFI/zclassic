@@ -670,12 +670,6 @@ int ccg_check_root(const struct ccg_cfg *cfg, const char *root)
     return rc;
 }
 
-static const char *ccg_env(const char *name, const char *fallback)
-{
-    const char *v = getenv(name);
-    return v && v[0] ? v : fallback;
-}
-
 static enum ccd_os ccg_host_os(void)
 {
     struct utsname u;
@@ -699,10 +693,10 @@ void ccg_host_cfg(struct ccg_cfg *cfg)
     snprintf(base, sizeof base, "%d", CCG_HOST_BASELINE);
     cfg->os = ccg_host_os();
     cfg->strip = cfg->os == CCD_DARWIN;
-    cfg->symmetry = strcmp(ccg_env("ZCL_CAP_CLOSURE_ENFORCE_SYMMETRY", cfg->os == CCD_DARWIN ? "0" : "1"), "1") == 0;
-    cfg->baseline = strtol(ccg_env("ZCL_CAP_CLOSURE_COVERAGE_BASELINE", base), NULL, 10);
+    cfg->symmetry = strcmp(env_or("ZCL_CAP_CLOSURE_ENFORCE_SYMMETRY", cfg->os == CCD_DARWIN ? "0" : "1"), "1") == 0;
+    cfg->baseline = strtol(env_or("ZCL_CAP_CLOSURE_COVERAGE_BASELINE", base), NULL, 10);
     cfg->cflags = getenv("CAP_CLOSURE_CFLAGS_OVERRIDE");
-    cfg->record = ccg_env("ZCL_CAP_CLOSURE_SOURCE_RECORD", NULL);
+    cfg->record = env_or("ZCL_CAP_CLOSURE_SOURCE_RECORD", NULL);
     cfg->out = stdout;
     cfg->err = stderr;
 }

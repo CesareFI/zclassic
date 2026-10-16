@@ -3,8 +3,8 @@
  * purpose: data layer of the capability-closure gate in C23. Epoch discovery,
  * the nm record parser and batched runner, the capability_symbols.def and
  * module_capabilities.def loaders with source-owned sidecars, and the
- * capability-set helpers. Output strings and table semantics follow
- * tools/lint/check_capability_closure.sh lines 181-462.
+ * capability-set helpers. Output strings and table semantics are those of the
+ * shell gate this replaced.
  */
 #define _XOPEN_SOURCE 700
 #include <ctype.h>

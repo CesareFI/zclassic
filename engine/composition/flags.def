@@ -337,9 +337,9 @@ Z23_FLAG("ZCL_CANARY_SELFTEST_NODE_BIN", "env_build", "-", "-",
 Z23_FLAG("ZCL_CANARY_VERDICT_DIR", "env_runtime", "-", "-",
           "undocumented; first use engine/services/src/canary_sentinel_watch.c:auto")
 Z23_FLAG("ZCL_CAP_CLOSURE_COVERAGE_BASELINE", "env_build", "-", "-",
-          "undocumented; first use tools/lint/check_capability_closure.sh:auto")
+          "undocumented; first use tools/lint/lintc/gate_capability_closure.c:auto")
 Z23_FLAG("ZCL_CAP_CLOSURE_ENFORCE_SYMMETRY", "env_build", "-", "-",
-          "undocumented; first use tools/lint/check_capability_closure.sh:auto")
+          "undocumented; first use tools/lint/lintc/gate_capability_closure.c:auto")
 Z23_FLAG("ZCL_CAP_CLOSURE_SOURCE_RECORD", "env_build", "-", "-",
           "Reuse the parent Make source record for the same checkout's read-only compiler flag query")
 Z23_FLAG("ZCL_CC", "env_build", "clang", "-",

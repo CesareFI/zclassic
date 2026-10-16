@@ -96,7 +96,7 @@
  * the toolchain, the dependencies, or any wish to execute a stranger's recipe
  * before deciding whether to trust it. That choice costs precision, and the
  * cost is stated here rather than discovered later. Against the nm-based gate
- * in tools/lint/check_capability_closure.sh, this scan is BLIND to:
+ * in tools/lint/lintc/gate_capability_closure.c, this scan is BLIND to:
  *
  *   - A CALL THROUGH A FUNCTION POINTER. `int (*f)(int, const struct
  *     sockaddr *, socklen_t) = resolve("conn" "ect"); f(...)` reaches the

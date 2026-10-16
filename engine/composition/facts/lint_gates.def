@@ -75,9 +75,9 @@ ZCL_FACT("lint.gates", "driver_serial_prologue",
          "tools/lint/run_lint.sh",
          "check-git-hooks-installed")
 ZCL_FACT("lint.gates", "scan_floor_capability_closure",
-         "check_capability_closure.sh enforces an anti-hollow floor of 500 scanned objects via CAP_CLOSURE_MIN_OBJECTS_SCANNED.",
-         "tools/lint/check_capability_closure.sh",
-         "CAP_CLOSURE_MIN_OBJECTS_SCANNED=500")
+         "The check-capability-closure gate enforces an anti-hollow floor of 500 scanned objects via CCG_MIN_OBJECTS.",
+         "tools/lint/lintc/gate_capability_closure.c",
+         "CCG_MIN_OBJECTS = 500")
 ZCL_FACT("lint.gates", "scan_floor_clang_portability",
          "check_clang_portability.sh sets a known source floor of 900 translation units so a broken Makefile parse cannot silently pass.",
          "tools/lint/check_clang_portability.sh",

@@ -1380,7 +1380,7 @@ ZCL_CAPABILITY_SYMBOL("__vsnprintf_chk", CAP_HARMLESS,
     "Formats into a caller supplied buffer and touches no descriptor.")
 
 /* ---- Darwin / Apple framework boundary ----
- * Mach-O prefixes are normalized by check_capability_closure.sh; these are
+ * Mach-O prefixes are normalized by the check-capability-closure gate; these are
  * the source-level names left after that ABI decoration is removed. */
 ZCL_CAPABILITY_SYMBOL("arc4random_buf", CAP_RANDOM, "Darwin kernel-backed random bytes.")
 ZCL_CAPABILITY_SYMBOL("CFBundleCopyResourcesDirectoryURL", CAP_FS_READ, "Resolves the running bundle resource directory.")
@@ -1475,7 +1475,7 @@ ZCL_CAPABILITY_SYMBOL("vm_deallocate", CAP_HARMLESS, "")
 /* ---- WINDOWS COFF CAP_NETWORK ----
  * These are the WinSock and IP Helper spellings of the already-classified
  * POSIX socket boundary. MinGW's __imp_ pointer decoration is normalized by
- * check_capability_closure; this table records the API once. */
+ * check-capability-closure; this table records the API once. */
 ZCL_CAPABILITY_SYMBOL("closesocket", CAP_NETWORK, "WinSock close family.")
 ZCL_CAPABILITY_SYMBOL("FreeAddrInfoW", CAP_NETWORK, "WinSock resolver family.")
 ZCL_CAPABILITY_SYMBOL("GetAddrInfoW", CAP_NETWORK, "WinSock resolver family.")

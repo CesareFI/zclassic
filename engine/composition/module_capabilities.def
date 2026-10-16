@@ -11,7 +11,8 @@
  *
  * A source file with NO row here declares the empty set — the maximally
  * restrictive answer, enforced positively by
- * tools/lint/check_capability_closure.sh: if an undeclared file references
+ * the check-capability-closure gate (tools/lint/lintc/gate_capability_closure.c):
+ * if an undeclared file references
  * any symbol classified (to something other than CAP_HARMLESS) in
  * engine/composition/capability_symbols.def, the build fails. A row is therefore the
  * minority case: the file names only what it actually reaches for.
@@ -37,7 +38,7 @@
  * reference (measured: 18 occurrences across this tree, including
  * ed25519_secret_key_from_seed and five other dynhost_*/tor_*/hs_* entry
  * points), which would have let a WALLET- or NETWORK-reaching weak symbol
- * sail past this table unseen. tools/lint/check_capability_closure.sh makes
+ * sail past this table unseen. The check-capability-closure gate makes
  * the same U+w extraction and carries a selftest that regresses on it.
  *
  * This records the cross-target portable union. Exact Linux and Windows

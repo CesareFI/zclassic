@@ -1,8 +1,8 @@
 /* Copyright 2026 Rhett Creighton - Apache License 2.0
  *
  * purpose: data layer of the capability-closure gate. Declarations shared by
- * the table loaders, the nm parser and runner, and their selftest, and reused
- * by the gate core and its selftest port that follow.
+ * the table loaders, the nm parser and runner, and their selftest, and used by
+ * the gate core, its guards and their selftest.
  */
 #ifndef GATE_CAPABILITY_CLOSURE_PRIV_H
 #define GATE_CAPABILITY_CLOSURE_PRIV_H
