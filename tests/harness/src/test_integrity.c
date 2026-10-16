@@ -11,6 +11,7 @@
 #include "coins/utxo_commitment.h"
 #include "chain/checkpoints.h"
 #include "services/authority_projection_audit.h"
+#include "services/authority_projection_pair.h"
 #include "services/bg_validation_service.h"
 #include "services/bg_hash_verification_service.h"
 #include "sync/sync_planner.h"
@@ -838,6 +839,101 @@ static int test_integrity_ap_audit_match_no_fire(void)
     return failures;
 }
 
+/* ── authority_projection_pair: pure pair-identity contract ─────────── */
+
+static struct ap_pair_identity pair_id(int64_t h, uint8_t hash_byte, uint64_t gen)
+{
+    struct ap_pair_identity id = { .applied_height = h, .generation = gen,
+                                   .read_ok = true };
+    if (hash_byte != 0) {
+        id.has_tip_hash = true;
+        memset(id.tip_hash, hash_byte, sizeof id.tip_hash);
+    }
+    return id;
+}
+
+struct pair_case {
+    const char *name;
+    struct ap_pair_identity id[4]; /* auth_before, proj_before, auth_after, proj_after */
+    int null_idx;                  /* -1: none, else the argument passed as NULL */
+    enum ap_pair_verdict want;
+};
+
+static int test_integrity_ap_pair_check_table(void)
+{
+    int failures = 0;
+    struct ap_pair_identity a = pair_id(100, 0xAA, 7);
+    struct ap_pair_identity bad = a;
+    bad.read_ok = false;
+    struct ap_pair_identity ovl = a;
+    ovl.overlay_active = true;
+    struct ap_pair_identity aba = pair_id(100, 0xBB, 7);   /* same height+gen, new hash */
+    struct ap_pair_identity gen = pair_id(100, 0xAA, 8);
+    struct ap_pair_identity mov = pair_id(101, 0xAA, 7);
+    struct ap_pair_identity h99 = pair_id(99, 0xAA, 7);
+    struct ap_pair_identity nohash = pair_id(100, 0, 7);
+    struct ap_pair_identity reorg = pair_id(100, 0xCC, 7);
+    struct ap_pair_identity h99nohash = pair_id(99, 0, 7);
+    const struct pair_case cases[] = {
+        { "all equal with hashes", {a, a, a, a}, -1, AP_PAIR_COMPARABLE },
+        { "read_ok false auth_before", {bad, a, a, a}, -1, AP_PAIR_READ_ERROR },
+        { "read_ok false proj_before", {a, bad, a, a}, -1, AP_PAIR_READ_ERROR },
+        { "read_ok false auth_after", {a, a, bad, a}, -1, AP_PAIR_READ_ERROR },
+        { "read_ok false proj_after", {a, a, a, bad}, -1, AP_PAIR_READ_ERROR },
+        { "NULL auth_before", {a, a, a, a}, 0, AP_PAIR_READ_ERROR },
+        { "NULL proj_before", {a, a, a, a}, 1, AP_PAIR_READ_ERROR },
+        { "NULL auth_after", {a, a, a, a}, 2, AP_PAIR_READ_ERROR },
+        { "NULL proj_after", {a, a, a, a}, 3, AP_PAIR_READ_ERROR },
+        { "overlay active", {a, ovl, a, a}, -1, AP_PAIR_OVERLAY_ACTIVE },
+        { "ABA tip hash changed", {a, a, aba, a}, -1, AP_PAIR_MOVED },
+        { "ABA on projection", {a, a, a, aba}, -1, AP_PAIR_MOVED },
+        { "generation bump", {a, a, a, gen}, -1, AP_PAIR_MOVED },
+        { "height moved", {a, a, mov, a}, -1, AP_PAIR_MOVED },
+        { "hash appeared mid-window", {a, nohash, a, a}, -1, AP_PAIR_MOVED },
+        { "height mismatch", {a, h99, a, h99}, -1, AP_PAIR_HEIGHT_MISMATCH },
+        { "projection lacks hash", {a, nohash, a, nohash}, -1, AP_PAIR_BRANCH_UNKNOWN },
+        { "authority lacks hash", {nohash, a, nohash, a}, -1, AP_PAIR_BRANCH_UNKNOWN },
+        { "equal height different hash", {a, reorg, a, reorg}, -1, AP_PAIR_BRANCH_MISMATCH },
+        { "overlay beats height mismatch", {ovl, h99, ovl, h99}, -1, AP_PAIR_OVERLAY_ACTIVE },
+        { "read error beats overlay", {bad, ovl, a, a}, -1, AP_PAIR_READ_ERROR },
+        { "moved beats branch unknown", {a, nohash, aba, nohash}, -1, AP_PAIR_MOVED },
+        { "moved beats height mismatch", {a, h99, mov, h99}, -1, AP_PAIR_MOVED },
+        { "height mismatch beats branch unknown", {a, h99nohash, a, h99nohash}, -1,
+          AP_PAIR_HEIGHT_MISMATCH },
+    };
+
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        const struct pair_case *c = &cases[i];
+        TEST(c->name) {
+            const struct ap_pair_identity *p[4];
+            for (int k = 0; k < 4; k++)
+                p[k] = (k == c->null_idx) ? NULL : &c->id[k];
+            enum ap_pair_verdict got = ap_pair_check(p[0], p[1], p[2], p[3]);
+            ASSERT_EQ((int)got, (int)c->want);
+            PASS();
+        } _test_next:;
+    }
+    return failures;
+}
+
+static int test_integrity_ap_pair_verdict_names(void)
+{
+    int failures = 0;
+    TEST("integrity: ap-pair verdict names") {
+        ASSERT_STR_EQ(ap_pair_verdict_name(AP_PAIR_COMPARABLE), "comparable");
+        ASSERT_STR_EQ(ap_pair_verdict_name(AP_PAIR_READ_ERROR), "read_error");
+        ASSERT_STR_EQ(ap_pair_verdict_name(AP_PAIR_OVERLAY_ACTIVE), "overlay_active");
+        ASSERT_STR_EQ(ap_pair_verdict_name(AP_PAIR_HEIGHT_MISMATCH), "height_mismatch");
+        ASSERT_STR_EQ(ap_pair_verdict_name(AP_PAIR_BRANCH_UNKNOWN), "branch_unknown");
+        ASSERT_STR_EQ(ap_pair_verdict_name(AP_PAIR_BRANCH_MISMATCH), "branch_mismatch");
+        ASSERT_STR_EQ(ap_pair_verdict_name(AP_PAIR_MOVED), "moved");
+        ASSERT_STR_EQ(ap_pair_verdict_name((enum ap_pair_verdict)99), "unknown");
+        ASSERT_STR_EQ(ap_pair_verdict_name((enum ap_pair_verdict)-1), "unknown");
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_integrity_ap_audit_divergence_fires(void)
 {
     int failures = 0;
@@ -942,6 +1038,8 @@ int test_integrity(void)
     /* Redundant authority(coins)-vs-projection(utxos) cross-check */
     failures += test_integrity_ap_audit_match_no_fire();
     failures += test_integrity_ap_audit_divergence_fires();
+    failures += test_integrity_ap_pair_check_table();
+    failures += test_integrity_ap_pair_verdict_names();
 
     /* Stall recovery and sync integrity */
     failures += test_integrity_stall_recovery_plan();
