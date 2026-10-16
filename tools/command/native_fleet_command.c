@@ -533,7 +533,7 @@ void zcl_fleet_host_snapshot(const char *datadir, int64_t v[ZCL_FLEET_HOST_N],
     struct os_proc_mem mem = { .rss_bytes = -1, .sys_total_bytes = -1,
                                .sys_avail_bytes = -1 };
     bool mem_ok = os_proc_mem_read(&mem);
-    int64_t up = os_proc_uptime_seconds();
+    int64_t up = os_proc_system_uptime_seconds();
     uint64_t d_avail = 0, d_total = 0;
     bool disk = datadir && platform_disk_space(datadir, &d_avail, &d_total);
     int64_t load_ceil = load >= 0 ? (load + 99) / 100 : 0;

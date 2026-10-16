@@ -47,6 +47,7 @@
 #include "platform/private_file.h"
 #include "platform/time_compat.h"
 #include "platform/clock.h"
+#include "platform/os_proc.h"
 #include "sha3/sha3.h"
 #include "vcs/zcode_dht_identity.h"
 
@@ -999,6 +1000,25 @@ int test_fleet_ledger(void)
     uint8_t sample_box[32], sample_signer[32];
     ASSERT(fl_provision(sample_dd, sample_box, sample_signer));
     zcl_native_bridge_bind_rpc(sample_dd, 0);
+
+    TEST("fleet vitals snapshot: box uptime follows the machine clock") {
+        /* Bracket the production snapshot rather than assuming how long the
+         * machine or this collector has been running. Process age is a
+         * different clock and cannot stand in for the boot-relative fact. */
+        int64_t before = os_proc_system_uptime_seconds();
+        int64_t values[ZCL_FLEET_HOST_N];
+        bool present[ZCL_FLEET_HOST_N];
+        zcl_fleet_host_snapshot(sample_dd, values, present);
+        int64_t after = os_proc_system_uptime_seconds();
+        if (before >= 0 && after >= 0) {
+            ASSERT(present[7]);
+            ASSERT(values[7] >= before);
+            ASSERT(values[7] <= after);
+        } else if (before < 0 && after < 0) {
+            ASSERT(!present[7]);
+        }
+        PASS();
+    }
 
     TEST("fleet vitals sample: catalog ids measured-or-ABSENT; unknown id "
          "refuses by name; second sample appends a new seq") {
