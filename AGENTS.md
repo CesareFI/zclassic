@@ -101,6 +101,9 @@ custody, needs one reviewer who is not its author, of any model. Run full
 `make lint` once at the exact candidate tip before `dev land submit`; any
 lead may submit and drive its own reviewed work. Native C23 commands are
 the target; small POSIX sh operator scripts are acceptable as interim tooling.
+Commits are signed and authored by the repository owner; a commit an AI
+model wrote ends with its `Co-Authored-By:` trailer naming that model
+(owner ruling R12).
 
 **VERIFY, DON'T TRUST.** Any agent may propose and any node may compute.
 Receivers independently verify exact objects, signatures, roots and evidence
