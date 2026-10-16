@@ -4885,7 +4885,8 @@ endif
 # Make already captured this exact record before dispatching lint. Pass it to
 # the read-only CFLAGS query so that query does not walk the source tree again.
 check-capability-closure lint lint-preflight: export ZCL_CAP_CLOSURE_SOURCE_RECORD := $(BUILD_SOURCE_RECORD)
-check-capability-closure:
+check-capability-closure: $(LINTC_TOOL)
+	@./build/bin/z23-lint capability-closure-data --selftest
 	@./tools/lint/check_capability_closure.sh --selftest
 	@./tools/lint/check_capability_closure.sh
 print-zcode-monolith-lib-sources:
@@ -6553,6 +6554,8 @@ LINTC_SRCS = $(LINTC_LIVE_DATADIR_SRCS) tools/lint/lintc/lib.c tools/lint/lintc/
     tools/lint/lintc/gate_cookbook.c \
     tools/lint/lintc/gate_cookbook_parse.c \
     tools/lint/lintc/gate_cookbook_selftest.c \
+    tools/lint/lintc/gate_capability_closure_data.c \
+    tools/lint/lintc/gate_capability_closure_selftest.c \
     tools/lint/lintc/gate_promotion_receipt_chain.c \
     tools/lint/lintc/gate_promotion_receipt_chain_checks.c \
     tools/lint/lintc/gate_promotion_receipt_chain_git.c \
