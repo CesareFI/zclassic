@@ -6500,7 +6500,9 @@ LINTC_SRCS = $(LINTC_LIVE_DATADIR_SRCS) tools/lint/lintc/lib.c tools/lint/lintc/
     tools/lint/lintc/gate_verification_coverage.c \
     tools/lint/lintc/gate_hosted_suite_verdict.c \
     tools/lint/lintc/gate_hosted_suite_verdict_selftest.c \
+    tools/lint/lintc/gate_command_input_keys.c \
     tools/lint/lintc/gate_command_input_keys_defs.c \
+    tools/lint/lintc/gate_command_input_keys_diff.c \
     tools/lint/lintc/gate_command_input_keys_extract.c \
     tools/lint/lintc/gate_command_input_keys_index.c \
     tools/lint/lintc/gate_command_input_keys_support.c \
