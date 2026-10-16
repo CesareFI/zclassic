@@ -405,23 +405,38 @@ static bool raw_is_host_path(int argc, char **argv)
         !strcmp(argv[3], "device") && !strcmp(argv[4], "host");
 }
 
-static const char *raw_selected_path(int argc, char **argv, size_t *consumed)
+enum host_command { HOST_NONE, HOST_CLIENT, HOST_RECEIVER, HOST_PACKAGE, HOST_SHELL, HOST_COMMAND_COUNT };
+
+static const char *const host_command_path[HOST_COMMAND_COUNT] = {
+    [HOST_CLIENT] = "ops.mesh.device.host.client", [HOST_RECEIVER] = "ops.mesh.device.host.receiver",
+    [HOST_PACKAGE] = "ops.mesh.device.host.package.run", [HOST_SHELL] = "ops.mesh.device.host.shell",
+};
+
+static enum host_command raw_selected_full(const char *name)
 {
-    static const char client[] = "ops.mesh.device.host.client", receiver[] = "ops.mesh.device.host.receiver";
-    static const char package[] = "ops.mesh.device.host.package.run", shell[] = "ops.mesh.device.host.shell";
-    if (argc >= 2 && (!strcmp(argv[1], client) || !strcmp(argv[1], receiver) || !strcmp(argv[1], package) ||
-        !strcmp(argv[1], shell))) {
-        *consumed = 1; return argv[1];
-    }
-    if (!raw_is_host_path(argc, argv)) return NULL;
+    for (enum host_command kind = HOST_CLIENT; kind < HOST_COMMAND_COUNT; kind++)
+        if (!strcmp(name, host_command_path[kind])) return kind;
+    return HOST_NONE;
+}
+
+static enum host_command raw_selected_words(int argc, char **argv, size_t *consumed)
+{
+    if (!raw_is_host_path(argc, argv)) return HOST_NONE;
     *consumed = 5;
-    if (!strcmp(argv[5], "client")) return client;
-    if (!strcmp(argv[5], "receiver")) return receiver;
-    if (!strcmp(argv[5], "shell")) return shell;
+    if (!strcmp(argv[5], "client")) return HOST_CLIENT;
+    if (!strcmp(argv[5], "receiver")) return HOST_RECEIVER;
+    if (!strcmp(argv[5], "shell")) return HOST_SHELL;
     if (argc >= 7 && !strcmp(argv[5], "package") && !strcmp(argv[6], "run")) {
-        *consumed = 6; return package;
+        *consumed = 6; return HOST_PACKAGE;
     }
-    return NULL;
+    return HOST_NONE;
+}
+
+static enum host_command raw_selected_command(int argc, char **argv, size_t *consumed)
+{
+    enum host_command kind = argc >= 2 ? raw_selected_full(argv[1]) : HOST_NONE;
+    if (kind != HOST_NONE) { *consumed = 1; return kind; }
+    return raw_selected_words(argc, argv, consumed);
 }
 
 static bool raw_input_read(int argc, char **argv, size_t consumed,
@@ -446,21 +461,22 @@ static bool raw_input_read(int argc, char **argv, size_t consumed,
 }
 void zcl_native_device_host_runtime_exit_if_requested(int argc, char **argv)
 {
-    size_t consumed = 0; const char *path = raw_selected_path(argc, argv, &consumed);
-    if (!path) return;
+    size_t consumed = 0; enum host_command command = raw_selected_command(argc, argv, &consumed);
+    if (command == HOST_NONE) return;
+    const char *path = host_command_path[command];
     int result = ZCL_COMMAND_EXIT_INVALID;
     const struct zcl_command_spec *spec = zcl_command_registry_find(zcl_command_catalog(), path, NULL);
     struct json_value input = {0};
-    bool package = !strcmp(path, "ops.mesh.device.host.package.run");
+    bool package = command == HOST_PACKAGE;
     bool valid = raw_input_read(argc, argv, consumed, spec, package, &input);
 #if defined(__linux__)
     if (valid) {
         if (package) result = installed_run(&input);
-        else if (!strcmp(path, "ops.mesh.device.host.shell")) result = zcl_native_device_host_shell_run(&input);
+        else if (command == HOST_SHELL) result = zcl_native_device_host_shell_run(&input);
         else {
             enum device_host_runtime_entry_exit status = DEVICE_HOST_ENTRY_INVALID;
             struct zcl_result ran = device_host_runtime_entry_run(&input,
-                !strcmp(path, "ops.mesh.device.host.receiver"), &status);
+                command == HOST_RECEIVER, &status);
             result = (int)status;
             if (!ran.ok && result == DEVICE_HOST_ENTRY_OK) result = DEVICE_HOST_ENTRY_FAILED;
         }
