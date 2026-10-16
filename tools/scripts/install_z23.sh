@@ -743,7 +743,7 @@ MACOS_ACTIVE_PREFIX=""
 MACOS_ACTIVATION_PENDING=0
 
 install_payload_macos_generation() {
-    local stage="$1" prefix="$2" root generations name helper target
+    local stage="$1" prefix="$2" root generations name helper
     root="$prefix/lib/z23"
     generations="$root/generations"
     MACOS_GENERATIONS="$generations"
@@ -793,11 +793,10 @@ install_payload_macos_generation() {
     atomic_relative_link z23 "$prefix/bin/zclassic23" \
         || die "could not link the current macOS node alias"
     for helper in package-verify acme; do
-        # A generation laid down before the rename holds the helper only
-        # under its zclassic23- name; point the primary at whichever exists.
-        target="z23-$helper"
-        [ -e "$MACOS_GENERATION/$target" ] || target="zclassic23-$helper"
-        atomic_relative_link "../lib/z23/current/$target" \
+        # The legacy generation member exists in BOTH layouts. Resolve
+        # through that stable name while current still selects the previous
+        # generation, after activation, and after any rollback.
+        atomic_relative_link "../lib/z23/current/zclassic23-$helper" \
             "$prefix/bin/z23-$helper" \
             || die "could not link the current macOS z23-$helper"
         atomic_relative_link "z23-$helper" "$prefix/bin/zclassic23-$helper" \
@@ -1994,6 +1993,17 @@ selftest_local_manifest_refusals() {
         || die "selftest: a negative install path leaked its staging directory"
 }
 
+selftest_macos_helper_bytes() {
+    local prefix="$1" release="$2" helper
+    for helper in package-verify acme; do
+        [ -x "$prefix/bin/z23-$helper" ] && \
+        [ -x "$prefix/bin/zclassic23-$helper" ] && \
+        cmp -s "$release/zclassic23-$helper" "$prefix/bin/z23-$helper" && \
+        cmp -s "$release/zclassic23-$helper" "$prefix/bin/zclassic23-$helper" \
+            || die "selftest: selected generation's $helper is unavailable or changed"
+    done
+}
+
 selftest_macos_transaction() {
     local tmp="$SELFTEST_TMP" mac="$SELFTEST_TMP/macos"
     local prefix="$mac/prefix & native" launchd="$mac/LaunchAgents"
@@ -2020,7 +2030,12 @@ EOF
 # Distinct candidate bytes: readiness stays the same, identity does not.
 case "${1:-} ${2:-} ${3:-}" in
     '-version  ') printf 'tor: full\n' ;;
-    'core node bootwait') [ "${Z23_INSTALL_TEST_READY_FAIL:-0}" != 1 ] ;;
+    'core node bootwait')
+        if [ "${Z23_INSTALL_TEST_SIGNAL_PARENT:-0}" = 1 ]; then
+            kill -TERM "$PPID"
+            exit 1
+        fi
+        [ "${Z23_INSTALL_TEST_READY_FAIL:-0}" != 1 ] ;;
     *) exit 2 ;;
 esac
 EOF
@@ -2193,6 +2208,35 @@ EOF
             || die "selftest: Apple's plutil rejected the launchd plist"
     fi
 
+    # Reproduce the actual pre-rename installed generation, not merely a
+    # legacy manifest installed by this new installer: ONLY legacy helper
+    # members exist inside it. Keep it immutable after fixture preparation.
+    local old_generation="$prefix/lib/z23/generations/$v1_id" helper
+    chmod u+w "$old_generation"
+    for helper in package-verify acme; do
+        rm -f -- "$old_generation/zclassic23-$helper"
+        mv -- "$old_generation/z23-$helper" "$old_generation/zclassic23-$helper"
+        [ ! -e "$old_generation/z23-$helper" ] \
+            || die "selftest: historical generation unexpectedly contains primary helper"
+        rm -f -- "$prefix/bin/z23-$helper"
+        atomic_relative_link "../lib/z23/current/zclassic23-$helper" \
+            "$prefix/bin/zclassic23-$helper" \
+            || die "selftest: could not seed historical public helper link"
+        cmp -s "$mac/v1/zclassic23-$helper" "$prefix/bin/zclassic23-$helper" \
+            || die "selftest: historical public helper does not resolve"
+    done
+    rm -f -- "$old_generation/SHA256SUMS"
+    (cd "$old_generation" && sha256sum $RELEASE_MEMBERS_LEGACY >SHA256SUMS)
+    chmod 444 "$old_generation/SHA256SUMS"
+    chmod 555 "$old_generation"
+    # Staging changes public links before current changes. Both names must
+    # continue to resolve to the historical generation throughout that gap.
+    (install_payload_macos_generation "$mac/v2" "$prefix") \
+        || die "selftest: candidate staging failed"
+    [ "$(readlink "$prefix/lib/z23/current")" = "generations/$v1_id" ] \
+        || die "selftest: staging changed the selected generation"
+    selftest_macos_helper_bytes "$prefix" "$mac/v1"
+
     # Readiness can succeed while launchd is still running other bytes. The
     # exact txt-vnode digest must catch that and restore v1 automatically.
     rc=0
@@ -2259,6 +2303,24 @@ EOF
         || die "selftest: unready Mac generation did not reach rollback"
     [ "$(readlink "$prefix/lib/z23/current")" = "generations/$v1_id" ] \
         || die "selftest: unready Mac generation did not restore v1"
+    selftest_macos_helper_bytes "$prefix" "$mac/v1"
+
+    # Deliver TERM deterministically from the candidate's bootwait child
+    # while activation is pending. The installer's existing trap must restore
+    # both the old node selection and working helpers, without a sleep race.
+    rc=0
+    PATH="$mock:$PATH" Z23_INSTALL_TEST_PLATFORM=Darwin \
+        Z23_SKIP_SYSTEMD=0 Z23_INSTALL_PREFIX="$prefix" \
+        Z23_LAUNCHD_DIR="$launchd" Z23_DATADIR="$datadir" \
+        Z23_INSTALL_TEST_SIGNAL_PARENT=1 \
+        Z23_INSTALL_TEST_LAUNCHCTL_LOG="$mac/launchctl.log" \
+        Z23_INSTALL_TEST_LAUNCHD_STATE="$mac/launchd.state" \
+        "$SCRIPT_DIR/install_z23.sh" --source="$mac/v2" \
+        >/dev/null 2>"$mac/signal-rollback.err" || rc=$?
+    [ "$rc" -eq 143 ] || die "selftest: pending activation TERM must exit 143"
+    [ "$(readlink "$prefix/lib/z23/current")" = "generations/$v1_id" ] \
+        || die "selftest: pending activation TERM did not restore v1"
+    selftest_macos_helper_bytes "$prefix" "$mac/v1"
 
     out="$(PATH="$mock:$PATH" Z23_INSTALL_TEST_PLATFORM=Darwin \
         Z23_SKIP_SYSTEMD=0 Z23_INSTALL_PREFIX="$prefix" \
