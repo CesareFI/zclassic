@@ -155,7 +155,7 @@ bool rpc_agent_interface(const struct json_value *params, bool help,
     json_push_kv_str(result, "capabilities_schema",
                      "zcl.agent_capability.v2");
     json_push_kv_str(result, "summary",
-                     "Use typed native zclassic23 commands for AI, scripts, and humans; REST is public read-only.");
+                     "Use typed native z23 commands for AI, scripts, and humans; REST is public read-only.");
 
     json_init(&transports);
     json_set_array(&transports);
