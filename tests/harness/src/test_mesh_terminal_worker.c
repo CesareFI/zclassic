@@ -975,6 +975,7 @@ static int live_signal_boundary(void)
     int failures = 0;
     for (int fault = TW_SIGNAL_OK; fault <= TW_SIGNAL_PARENT_RESTORE; ++fault)
         failures += live_signal_boundary_case((enum tw_signal_fault)fault);
+    return failures;
 }
 
 
