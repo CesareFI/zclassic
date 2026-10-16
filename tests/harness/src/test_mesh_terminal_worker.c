@@ -43,6 +43,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -979,6 +980,24 @@ static int live_signal_boundary(void)
 }
 
 
+/* Raises the soft descriptor limit above `want` for one case and reports
+ * whether it is in effect; `saved` holds the limit to restore. A hard limit
+ * at or below `want` cannot be raised by an unprivileged test. */
+static bool tw_nofile_above(rlim_t want, struct rlimit *saved)
+{
+    if (getrlimit(RLIMIT_NOFILE, saved) != 0)
+        return false;
+    if (saved->rlim_cur > want)
+        return true;
+    if (saved->rlim_max != RLIM_INFINITY && saved->rlim_max <= want)
+        return false;
+    struct rlimit raised = *saved;
+    raised.rlim_cur = want + 16;
+    if (raised.rlim_max != RLIM_INFINITY && raised.rlim_cur > raised.rlim_max)
+        raised.rlim_cur = raised.rlim_max;
+    return setrlimit(RLIMIT_NOFILE, &raised) == 0;
+}
+
 /* Real terminal spawn executes the trusted C fdwrite fixture: EBADF tests the
  * descriptor itself, independently of whether Landlock permits proc paths. */
 static int live_high_inherited_fd_closed(bool fallback)
@@ -986,13 +1005,23 @@ static int live_high_inherited_fd_closed(bool fallback)
     char image[600], fdarg[32];
     if (!test_abs_path("build/fixtures/rcc_child", image, sizeof image))
         return check(0, false, "high inherited fd: resolve trusted fixture");
+    struct rlimit saved;
+    if (!tw_nofile_above(70000, &saved)) {
+        printf("mesh_terminal_worker: high inherited fd... UNOBSERVED "
+               "(descriptor hard limit is not above 70000)\n");
+        return 0;
+    }
     int source = open("/dev/null", O_WRONLY);
     int high = source >= 0 ? fcntl(source, F_DUPFD, 70000) : -1;
     if (source >= 0) close(source);
-    if (high < 0) return check(0, false, "high inherited fd: plant above 65536");
+    if (high < 0) {
+        (void)setrlimit(RLIMIT_NOFILE, &saved);
+        return check(0, false, "high inherited fd: plant above 65536");
+    }
     int used = snprintf(fdarg, sizeof fdarg, "%d", high);
     if (used < 0 || (size_t)used >= sizeof fdarg) {
         close(high);
+        (void)setrlimit(RLIMIT_NOFILE, &saved);
         return check(0, false, "high inherited fd: encode descriptor");
     }
     const char *const run[] = {image, "fdwrite", fdarg, NULL};
@@ -1006,6 +1035,7 @@ static int live_high_inherited_fd_closed(bool fallback)
         &cfg, (int64_t)platform_time_wall_time_t(), &w);
     tw_force_fd_fallback = false;
     close(high);
+    (void)setrlimit(RLIMIT_NOFILE, &saved);
     int failures = check(0, result.ok, "high inherited fd: real terminal spawn");
     if (result.ok)
         failures = check(failures, wait_exit(&w, 5) &&
