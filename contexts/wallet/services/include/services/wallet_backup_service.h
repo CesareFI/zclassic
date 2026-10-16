@@ -158,6 +158,7 @@ struct wallet_backup_status {
 
 void wallet_backup_status_snapshot(struct wallet_backup_status *out);
 
+#ifdef ZCL_TESTING
 /* Test-only: seed the latest verified ENCRYPTED backup authority with `path`
  * (must end in ".enc"), stamped at `run_unix` and covering `key_count` keys.
  * tables_verified is set to the current wallet table count. Never called in
@@ -165,6 +166,7 @@ void wallet_backup_status_snapshot(struct wallet_backup_status *out);
 void wallet_backup_seed_encrypted_authority_for_test(const char *path,
                                                      int64_t run_unix,
                                                      int64_t key_count);
+#endif
 
 /* See CLAUDE.md "Adding state introspection". Reentrant-safe. */
 struct json_value;

@@ -127,10 +127,12 @@ void wallet_lock_status_json(struct json_value *out);
  * production call sites. */
 void wallet_lock_reset_for_test(void);
 
+#ifdef ZCL_TESTING
 /* Test-only: after `n` further wallet_lock_is_unlocked() calls, the wallet is
  * forced locked. 0 (the production state) disables it; reset by
  * wallet_lock_reset_for_test(). Not for production call sites. */
 void wallet_lock_flip_after_unlock_checks_for_test(uint32_t n);
+#endif
 
 #ifdef __cplusplus
 }
