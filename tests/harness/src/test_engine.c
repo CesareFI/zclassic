@@ -2723,6 +2723,40 @@ static int case_receipt_absent_attempt(const char *chain, bool have_chain)
     return failures;
 }
 
+/* Reads the non-negative integer value of "key": from a receipt. A null,
+ * negative or absent value returns false. */
+static bool engine_receipt_uint(const char *text, const char *key,
+                                long long *out)
+{
+    char pat[64];
+    (void)snprintf(pat, sizeof(pat), "\"%s\":", key);
+    const char *p = strstr(text, pat);
+    if (!p)
+        return false;
+    p += strlen(pat);
+    if (*p < '0' || *p > '9')
+        return false;
+    *out = strtoll(p, NULL, 10);
+    return true;
+}
+
+/* The fixture's HTTP usage (prompt 10, completion 4) must yield tokens_used
+ * 14, and every one-run receipt must carry an integer wall_ms. */
+static int case_receipt_tokens_and_wall(const char *receipt, bool have_receipt)
+{
+    int failures = 0;
+    long long tokens_used = -1, wall_ms = -1;
+    EN_CHECK("one-run receipt states tokens_used = input + output (10 + 4)",
+             have_receipt
+             && engine_receipt_uint(receipt, "tokens_used", &tokens_used)
+             && tokens_used == 14);
+    EN_CHECK("one-run receipt states wall_ms as a non-negative integer",
+             have_receipt
+             && engine_receipt_uint(receipt, "wall_ms", &wall_ms)
+             && wall_ms >= 0);
+    return failures;
+}
+
 static int case_engine_unit_state_e2e(void)
 {
     int failures = 0;
@@ -2844,6 +2878,7 @@ static int case_engine_unit_state_e2e(void)
              strstr(receipt,"\"cache_read_input_tokens\":6") &&
              strstr(receipt,"\"reasoning_tokens\":2") &&
              strstr(receipt,"\"cache_creation_input_tokens\":null"));
+    failures += case_receipt_tokens_and_wall(receipt, have_receipt);
     EN_CHECK("both repair dispatches reach one authoritative chain receipt",
              have_chain &&
              strstr(chain, "\"ordinal\":1,\"phase\":\"turn\"") &&

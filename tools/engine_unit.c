@@ -1969,6 +1969,45 @@ static enum engine_verdict unit_turn_verdict(
                                     group_required);
 }
 
+/* tokens_used is input + output for this dispatch, pushed only when both are
+ * known. Non-additive totals stay unstated rather than summed. */
+static bool receipt_push_tokens_used(struct json_value *doc,
+                                     const struct engine_usage *usage,
+                                     const struct engine_cli_observation *observation,
+                                     bool totals_ambiguous)
+{
+    int64_t input = 0;
+    int64_t output = 0;
+    if (observation && observation->known) {
+        if (totals_ambiguous)
+            return true;
+        input = observation->input_tokens;
+        output = observation->output_tokens;
+    } else {
+        if (!usage->prompt_tokens_known || !usage->completion_tokens_known)
+            return true;
+        input = usage->prompt_tokens;
+        output = usage->completion_tokens;
+    }
+    if (input < 0 || output < 0 || input > INT64_MAX - output)
+        return true;
+    return json_push_kv_int(doc, "tokens_used", input + output);
+}
+
+/* Compactions, wall time and tokens_used share one operand so write_receipt
+ * keeps its decision count (its complexity pin may not rise). */
+static bool receipt_push_run_totals(struct json_value *doc, int compactions,
+                                    const char *template_hex, int attempts,
+                                    int64_t wall_ms,
+                                    const struct engine_usage *usage,
+                                    const struct engine_cli_observation *observation,
+                                    bool totals_ambiguous)
+{
+    return receipt_push_compactions(doc, compactions, template_hex, attempts) &&
+           json_push_kv_int(doc, "wall_ms", wall_ms) &&
+           receipt_push_tokens_used(doc, usage, observation, totals_ambiguous);
+}
+
 static void write_receipt(const struct unit_opts *o,
                           const struct engine_vendor *v,
                           const struct engine_usage *usage,
@@ -1979,6 +2018,7 @@ static void write_receipt(const struct unit_opts *o,
                           int attempts,
                           int64_t dispatch_latency_ms,
                           int64_t proof_latency_ms,
+                          int64_t wall_ms,
                           enum engine_verdict verdict,
                           size_t state_bytes, bool state_updated,
                           int compactions, bool needs_operator,
@@ -2035,7 +2075,8 @@ static void write_receipt(const struct unit_opts *o,
         json_push_kv_str(&doc, "verdict", engine_verdict_name(verdict)) &&
         json_push_kv_int(&doc, "state_bytes", (int64_t)state_bytes) &&
         json_push_kv_bool(&doc, "state_updated", state_updated) &&
-        receipt_push_compactions(&doc, compactions, template_hex, attempts);
+        receipt_push_run_totals(&doc, compactions, template_hex, attempts,
+                                wall_ms, usage, observation, totals_ambiguous);
     if (ok)
         ok = receipt_push_counter(&doc,"prompt_tokens",
                                   usage->prompt_tokens_known,
@@ -3419,6 +3460,7 @@ int main(int argc, char **argv)
     write_receipt(&o, v, &dr.reply.usage, &dr.cli_observation, dr.reply.model,
                   &gate, changed, changed_known,
                   dr.attempts, dr.dispatch_latency_ms, proof_latency_ms,
+                  unit_elapsed_ms,
                   verdict, have_turn_state ? strlen(turn_state) : 0,
                   state_updated_last, compactions, needs_operator,
                   invocations.totals_ambiguous);
