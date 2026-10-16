@@ -84,4 +84,30 @@ enum plugin_status plugin_verify_generation_manifest(const char *root,
                                                      const char *generation,
                                                      struct plugin_manifest *out);
 
+/* Read the trust file once, no-follow and owner-only, into a heap buffer the
+ * caller frees. Failures map as plugin_verify_manifest maps them. */
+enum plugin_status plugin_trust_load(const char *path, char **bytes, size_t *len);
+
+/* As plugin_verify_manifest, against trust bytes the caller already holds, so
+ * the decision and anything the caller remembers about it share one read. */
+enum plugin_status plugin_verify_manifest_trust(const char *manifest, size_t manifest_len,
+                                                const char *sig, size_t sig_len,
+                                                const char *trust, size_t trust_len,
+                                                struct plugin_manifest *out);
+
+/* The store root, the plugin directory, its generations directory and the
+ * generation directory must each be a real directory owned by the user and
+ * closed to group and others. Needs no trust set and reads no file. */
+enum plugin_status plugin_check_generation_dirs(const char *root, const char *name,
+                                                const char *generation);
+
+/* As plugin_verify_generation_manifest, verifying under trust bytes the caller
+ * already read with plugin_trust_load. */
+enum plugin_status plugin_verify_generation_manifest_trust(const char *root,
+                                                           const char *name,
+                                                           const char *generation,
+                                                           const char *trust,
+                                                           size_t trust_len,
+                                                           struct plugin_manifest *out);
+
 #endif

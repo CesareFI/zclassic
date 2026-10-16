@@ -568,6 +568,81 @@ static int prt_case_cached_exe_hash(void)
     return failures;
 }
 
+/* Race the verification: the trust set is A (signer absent) when it is read,
+ * B (signer present) while the verifier could open it, and A again before the
+ * result is remembered. */
+static void prt_aba_hook(int point, void *ctx)
+{
+    const struct prt_env *e = ctx;
+    (void)prt_set_trust(e, point == PLUGIN_RUN_TEST_AFTER_TRUST, PRT_OTHER_KEY);
+}
+
+static int prt_case_trust_aba(void)
+{
+    int failures = 0;
+    struct prt_env e;
+    struct plugin_run *run = NULL, *again = NULL;
+    bool ready = prt_env_open(&e);
+    TEST_CASE("a trust set swapped to B and back to A during verify authorizes nothing") {
+        char gen[PRT_HEX];
+        struct plugin_run_options o;
+        enum plugin_status store = PLUGIN_OK;
+        ASSERT(ready);
+        ASSERT(prt_install(&e, "ab", "normal", "a1", PRT_FS, gen));
+        ASSERT(prt_set_trust(&e, false, PRT_OTHER_KEY));
+        o = prt_options(&e, "ab");
+        plugin_run_test_set_hook(prt_aba_hook, &e);
+        ASSERT_EQ(plugin_run_open(&o, &run, &store), PLUGIN_RUN_ERR_STORE);
+        plugin_run_test_set_hook(NULL, NULL);
+        ASSERT_EQ(store, PLUGIN_ERR_KEY_UNTRUSTED);
+        ASSERT(run == NULL);
+        /* nothing may have been remembered under A either */
+        store = PLUGIN_OK;
+        ASSERT(prt_set_trust(&e, false, PRT_OTHER_KEY));
+        ASSERT_EQ(plugin_run_open(&o, &again, &store), PLUGIN_RUN_ERR_STORE);
+        ASSERT_EQ(store, PLUGIN_ERR_KEY_UNTRUSTED);
+    } TEST_END
+    plugin_run_test_set_hook(NULL, NULL);
+    plugin_run_close(run);
+    plugin_run_close(again);
+    prt_env_close(&e);
+    return failures;
+}
+
+/* Make one level of the generation chain group-writable after a restart
+ * verified and remembered the generation: the next restart must refuse. */
+static int prt_case_cached_unsafe_dir(const char *title, const char *name, bool whole_gens)
+{
+    int failures = 0;
+    struct prt_env e;
+    struct plugin_run *run = NULL;
+    bool ready = prt_env_open(&e);
+    TEST_CASE(title) {
+        char gen[PRT_HEX], dir[PATH_MAX];
+        struct plugin_run_info info;
+        ASSERT(ready);
+        ASSERT(prt_install(&e, name, "normal", "u1", PRT_FS, gen));
+        run = prt_open(&e, name);
+        ASSERT(run != NULL);
+        ASSERT(prt_wait(&run, 1, 0, prt_healthy, NULL, 5000));
+        ASSERT(prt_restart_once(&run));
+        ASSERT(prt_wait(&run, 1, 0, prt_healthy, NULL, 5000));
+        snprintf(dir, sizeof(dir), "%s/%s/generations%s%s", e.root, name,
+                 whole_gens ? "" : "/", whole_gens ? "" : gen);
+        ASSERT_EQ(chmod(dir, 0777), 0);
+        plugin_run_info_get(run, &info);
+        ASSERT_EQ(kill((pid_t)info.pid, SIGKILL), 0);
+        ASSERT(prt_wait(&run, 1, 0, prt_failed, NULL, 5000));
+        plugin_run_info_get(run, &info);
+        ASSERT_EQ(info.pid, 0u);
+        ASSERT(strstr(info.detail, "plugin store refused") != NULL);
+        ASSERT(strstr(info.detail, "PLUGIN_TRUST_INSECURE") != NULL);
+    } TEST_END
+    plugin_run_close(run);
+    prt_env_close(&e);
+    return failures;
+}
+
 static int prt_case_hung_ping(void)
 {
     int failures = 0;
@@ -1286,6 +1361,9 @@ int test_plugin_run(void)
     failures += prt_case_kill_backoff();
     failures += prt_case_verify_cache();
     failures += prt_case_cached_exe_hash();
+    failures += prt_case_trust_aba();
+    failures += prt_case_cached_unsafe_dir("a remembered generation is refused once its directory is group-writable", "udg", false);
+    failures += prt_case_cached_unsafe_dir("a remembered generation is refused once the generations directory is group-writable", "udd", true);
     failures += prt_case_hung_ping();
     failures += prt_case_reload();
     failures += prt_case_crash_loop();

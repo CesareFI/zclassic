@@ -48,10 +48,27 @@ unsigned plugin_run_test_verify_count(void)
     return g_prs_verify_count;
 }
 
+static void (*g_prs_hook)(int point, void *ctx);
+static void *g_prs_hook_ctx;
+
+void plugin_run_test_set_hook(void (*fn)(int point, void *ctx), void *ctx)
+{
+    g_prs_hook = fn;
+    g_prs_hook_ctx = ctx;
+}
+
+static void prs_hook(int point)
+{
+    if (g_prs_hook)
+        g_prs_hook(point, g_prs_hook_ctx);
+}
+
 void plugin_run_test_corrupt_signed_hash(bool on)
 {
     g_prs_corrupt_hash = on;
 }
+#else
+#define prs_hook(point) ((void)0)
 #endif
 
 static void prs_detail(struct plugin_run *run, const char *what, const char *why)
@@ -82,52 +99,71 @@ static bool prs_caps_supported(struct plugin_run *run)
     return true;
 }
 
-/* SHA3-256 of the trusted_keys bytes, read with the same no-follow, owner-only
- * rules the verifier applies. False when it cannot be read: the caller then
- * verifies in full, and the verifier reports the real refusal. */
-static bool prs_trust_digest(const struct plugin_run *run, unsigned char out[32])
+/* Read trusted_keys once, with the same no-follow, owner-only rules the
+ * verifier applies, and digest those bytes. The same buffer is what a full
+ * verification runs under, so what is remembered is exactly what was judged.
+ * False when it cannot be read: the caller then verifies in full from the
+ * file, remembers nothing, and the verifier reports the real refusal. */
+static bool prs_trust_snapshot(const struct plugin_run *run, char **keys, size_t *len,
+                               unsigned char digest[32])
 {
-    char path[PLUGIN_PATH_MAX], *keys = NULL;
-    size_t len = 0;
+    char path[PLUGIN_PATH_MAX];
     if (!plugin_join(path, sizeof(path), run->opt.root, "trusted_keys", NULL, NULL) ||
-        !plugin_read_file(path, PLUGIN_FILE_MAX, PLUGIN_OPEN_NOFOLLOW | PLUGIN_OPEN_OWNER_ONLY,
-                          &keys, &len))
+        plugin_trust_load(path, keys, len) != PLUGIN_OK)
         return false;
     struct sha3_256_ctx c;
     sha3_256_init(&c);
-    sha3_256_write(&c, (const unsigned char *)keys, len);
-    sha3_256_finalize(&c, out);
-    free(keys);
+    sha3_256_write(&c, (const unsigned char *)*keys, *len);
+    sha3_256_finalize(&c, digest);
     return true;
 }
 
+static bool prs_entry_matches(const struct plugin_run *run, const char *generation,
+                              const unsigned char digest[32])
+{
+    return run->verified_generation[0] && strcmp(run->verified_generation, generation) == 0 &&
+           memcmp(run->verified_trust, digest, 32) == 0;
+}
+
 /* Verify the generation, reusing the one entry that already passed under the
- * same generation id and the same trusted_keys bytes. The executable is not
+ * same generation id and the same trusted_keys bytes. A reuse still checks the
+ * whole directory chain down to the generation, since those are what the full
+ * path checks and a permission change there must refuse. The executable is not
  * part of this: prs_accept hashes it on every launch. A failure clears the
- * entry. The entry is stored only if trusted_keys did not change meanwhile. */
+ * entry. */
 static enum plugin_status prs_verify(struct plugin_run *run, const char *generation,
                                      struct plugin_manifest *m)
 {
-    unsigned char before[32], after[32];
-    bool keyed = prs_trust_digest(run, before);
-    if (keyed && run->verified_generation[0] &&
-        strcmp(run->verified_generation, generation) == 0 &&
-        memcmp(run->verified_trust, before, sizeof(before)) == 0) {
-        *m = run->verified_manifest;
-        return PLUGIN_OK;
+    unsigned char digest[32];
+    char *keys = NULL;
+    size_t keys_len = 0;
+    bool keyed = prs_trust_snapshot(run, &keys, &keys_len, digest);
+    enum plugin_status st;
+    prs_hook(PLUGIN_RUN_TEST_AFTER_TRUST);
+    if (keyed && prs_entry_matches(run, generation, digest)) {
+        st = plugin_check_generation_dirs(run->opt.root, run->opt.name, generation);
+        if (st == PLUGIN_OK)
+            *m = run->verified_manifest;
+        else
+            run->verified_generation[0] = '\0';
+        free(keys);
+        return st;
     }
     run->verified_generation[0] = '\0';
 #ifdef ZCL_TESTING
     g_prs_verify_count++;
 #endif
-    enum plugin_status st = plugin_verify_generation_manifest(run->opt.root, run->opt.name,
-                                                              generation, m);
-    if (st == PLUGIN_OK && keyed && prs_trust_digest(run, after) &&
-        memcmp(before, after, sizeof(before)) == 0) {
+    st = keyed ? plugin_verify_generation_manifest_trust(run->opt.root, run->opt.name,
+                                                         generation, keys, keys_len, m)
+               : plugin_verify_generation_manifest(run->opt.root, run->opt.name,
+                                                   generation, m);
+    prs_hook(PLUGIN_RUN_TEST_AFTER_VERIFY);
+    if (st == PLUGIN_OK && keyed) {
         snprintf(run->verified_generation, sizeof(run->verified_generation), "%s", generation);
-        memcpy(run->verified_trust, before, sizeof(before));
+        memcpy(run->verified_trust, digest, sizeof(digest));
         run->verified_manifest = *m;
     }
+    free(keys);
     return st;
 }
 

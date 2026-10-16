@@ -267,3 +267,25 @@ bool plugin_link_generation(const char *dir, const char *link,
     memcpy(hex, target + sizeof(prefix) - 1, PLUGIN_HEX_SHA3_512 + 1);
     return true;
 }
+
+enum plugin_status plugin_trust_load(const char *path, char **bytes, size_t *len)
+{
+    if (path && plugin_read_file(path, PLUGIN_FILE_MAX,
+                                 PLUGIN_OPEN_NOFOLLOW | PLUGIN_OPEN_OWNER_ONLY, bytes, len))
+        return PLUGIN_OK;
+    if (!path)
+        return PLUGIN_ERR_NO_TRUST;
+    switch (errno) {
+    case EPERM:
+    case ELOOP:
+        return PLUGIN_ERR_TRUST_INSECURE;
+    case EFBIG:
+        return PLUGIN_ERR_TRUST_MALFORMED;
+    case EIO:
+    case ENOMEM:
+        return PLUGIN_ERR_IO;
+    default:
+        return PLUGIN_ERR_NO_TRUST;
+    }
+}
+

@@ -11,6 +11,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
 
@@ -258,14 +259,25 @@ static enum plugin_status pm_sig_parse(const char *bytes, size_t len,
     return st;
 }
 
-static enum plugin_status pm_trust_scan(FILE *f, const uint8_t pk[32])
+/* One trusted key per line. The scan reads the bytes it is given, so the
+ * caller decides which snapshot of the trust set a verification runs under. */
+static enum plugin_status pm_trust_scan(const char *bytes, size_t len, const uint8_t pk[32])
 {
     char line[256];
     bool any = false, found = false;
-    while (fgets(line, sizeof(line), f)) {
-        size_t n = strlen(line);
-        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'))
-            line[--n] = '\0';
+    size_t pos = 0;
+    while (pos < len) {
+        size_t end = pos;
+        while (end < len && bytes[end] != '\n')
+            end++;
+        size_t n = end - pos;
+        while (n > 0 && bytes[pos + n - 1] == '\r')
+            n--;
+        if (n >= sizeof(line))
+            return PLUGIN_ERR_TRUST_MALFORMED;
+        memcpy(line, bytes + pos, n);
+        line[n] = '\0';
+        pos = end + 1;
         if (n == 0)
             continue;
         uint8_t key[32];
@@ -279,20 +291,6 @@ static enum plugin_status pm_trust_scan(FILE *f, const uint8_t pk[32])
     return found ? PLUGIN_OK : PLUGIN_ERR_KEY_UNTRUSTED;
 }
 
-static enum plugin_status pm_trust_open(const char *path, FILE **out)
-{
-    int fd = path ? plugin_open_read(path, PLUGIN_OPEN_NOFOLLOW | PLUGIN_OPEN_OWNER_ONLY) : -1;
-    if (fd < 0)
-        return path && (errno == EPERM || errno == ELOOP)
-                   ? PLUGIN_ERR_TRUST_INSECURE : PLUGIN_ERR_NO_TRUST;
-    *out = fdopen(fd, "r");
-    if (!*out) {
-        close(fd);
-        return PLUGIN_ERR_IO;
-    }
-    return PLUGIN_OK;
-}
-
 void plugin_manifest_digest(const char *manifest, size_t len,
                                uint8_t digest[PLUGIN_DIGEST_BYTES])
 {
@@ -304,22 +302,17 @@ void plugin_manifest_digest(const char *manifest, size_t len,
     sha3_512_finalize(&ctx, digest);
 }
 
-enum plugin_status plugin_verify_manifest(const char *manifest, size_t manifest_len,
-                                          const char *sig, size_t sig_len,
-                                          const char *trust_path,
-                                          struct plugin_manifest *out)
+enum plugin_status plugin_verify_manifest_trust(const char *manifest, size_t manifest_len,
+                                                const char *sig, size_t sig_len,
+                                                const char *trust, size_t trust_len,
+                                                struct plugin_manifest *out)
 {
     uint8_t pk[32], sg[64], digest[PLUGIN_DIGEST_BYTES];
-    FILE *trust = NULL;
-    enum plugin_status st = pm_trust_open(trust_path, &trust);
-    if (st != PLUGIN_OK)
-        return st;
-    st = plugin_manifest_parse(manifest, manifest_len, out);
+    enum plugin_status st = plugin_manifest_parse(manifest, manifest_len, out);
     if (st == PLUGIN_OK)
         st = pm_sig_parse(sig, sig_len, pk, sg);
     if (st == PLUGIN_OK)
-        st = pm_trust_scan(trust, pk);
-    fclose(trust);
+        st = pm_trust_scan(trust, trust_len, pk);
     if (st != PLUGIN_OK)
         return st;
     plugin_manifest_digest(manifest, manifest_len, digest);
@@ -329,4 +322,20 @@ enum plugin_status plugin_verify_manifest(const char *manifest, size_t manifest_
      * names the grant, not just the bytes. */
     zcl_hex_encode(digest, sizeof(digest), out->generation);
     return PLUGIN_OK;
+}
+
+enum plugin_status plugin_verify_manifest(const char *manifest, size_t manifest_len,
+                                          const char *sig, size_t sig_len,
+                                          const char *trust_path,
+                                          struct plugin_manifest *out)
+{
+    char *trust = NULL;
+    size_t trust_len = 0;
+    enum plugin_status st = plugin_trust_load(trust_path, &trust, &trust_len);
+    if (st != PLUGIN_OK)
+        return st;
+    st = plugin_verify_manifest_trust(manifest, manifest_len, sig, sig_len, trust,
+                                      trust_len, out);
+    free(trust);
+    return st;
 }

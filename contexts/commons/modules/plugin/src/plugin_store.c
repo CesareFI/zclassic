@@ -42,7 +42,8 @@ static enum plugin_status ps_read_error(enum plugin_status missing,
 
 /* Verify one manifest, signature and executable set end to end. */
 static enum plugin_status ps_verify_set(const struct ps_paths *p,
-                                        const char *trust, unsigned flags,
+                                        const char *trust, const char *trust_bytes,
+                                        size_t trust_len, unsigned flags,
                                         struct plugin_manifest *out)
 {
     char *mf = NULL, *sg = NULL;
@@ -55,7 +56,10 @@ static enum plugin_status ps_verify_set(const struct ps_paths *p,
     if (!plugin_read_file(p->sig, PLUGIN_FILE_MAX, flags, &sg, &sg_len))
         st = ps_read_error(PLUGIN_ERR_SIG_MISSING, PLUGIN_ERR_SIG_INVALID);
     if (st == PLUGIN_OK)
-        st = plugin_verify_manifest(mf, mf_len, sg, sg_len, trust, out);
+        st = trust_bytes
+                 ? plugin_verify_manifest_trust(mf, mf_len, sg, sg_len, trust_bytes,
+                                                trust_len, out)
+                 : plugin_verify_manifest(mf, mf_len, sg, sg_len, trust, out);
     if (st == PLUGIN_OK)
         st = plugin_hash_path(p->exe, flags, hex);
     if (st == PLUGIN_OK && strcmp(hex, out->exe_sha3) != 0)
@@ -103,29 +107,35 @@ static enum plugin_status ps_check_chain(const char *root, const char *plugdir)
     return st;
 }
 
-enum plugin_status plugin_verify_generation_manifest(const char *root,
-                                                     const char *name,
-                                                     const char *generation,
-                                                     struct plugin_manifest *out)
+enum plugin_status plugin_check_generation_dirs(const char *root, const char *name,
+                                                const char *generation)
 {
-    struct ps_paths p;
-    char trust[PLUGIN_PATH_MAX], dir[PLUGIN_PATH_MAX];
+    char dir[PLUGIN_PATH_MAX], gen_dir[PLUGIN_PATH_MAX];
     if (!plugin_name_valid(name) ||
         !plugin_hex_valid(generation, PLUGIN_HEX_SHA3_512) ||
-        !ps_trust_path(root, trust, sizeof(trust)) ||
-        !ps_generation_paths(root, name, generation, &p) ||
-        !plugin_join(dir, sizeof(dir), root, name, NULL, NULL))
+        !plugin_join(dir, sizeof(dir), root, name, NULL, NULL) ||
+        !plugin_join(gen_dir, sizeof(gen_dir), dir, "generations", generation, NULL))
         return PLUGIN_ERR_ARGUMENT;
     enum plugin_status st = ps_check_chain(root, dir);
     if (st != PLUGIN_OK)
         return st;
-    char gen_dir[PLUGIN_PATH_MAX];
-    if (!plugin_join(gen_dir, sizeof(gen_dir), dir, "generations", generation, NULL))
-        return PLUGIN_ERR_ARGUMENT;
     st = plugin_check_dir(gen_dir);
+    return st == PLUGIN_ERR_NOT_INSTALLED ? PLUGIN_ERR_NO_GENERATION : st;
+}
+
+/* Trust comes from the file at trust, or from trust_bytes when given. */
+static enum plugin_status ps_verify_generation(const char *root, const char *name,
+                                               const char *generation, const char *trust,
+                                               const char *trust_bytes, size_t trust_len,
+                                               struct plugin_manifest *out)
+{
+    struct ps_paths p;
+    if (!ps_generation_paths(root, name, generation, &p))
+        return PLUGIN_ERR_ARGUMENT;
+    enum plugin_status st = plugin_check_generation_dirs(root, name, generation);
     if (st != PLUGIN_OK)
-        return st == PLUGIN_ERR_NOT_INSTALLED ? PLUGIN_ERR_NO_GENERATION : st;
-    st = ps_verify_set(&p, trust, PLUGIN_OPEN_NOFOLLOW, out);
+        return st;
+    st = ps_verify_set(&p, trust, trust_bytes, trust_len, PLUGIN_OPEN_NOFOLLOW, out);
     if (st == PLUGIN_OK &&
         (strcmp(out->name, name) != 0 ||
          (strcmp(out->generation, generation) != 0 &&
@@ -133,6 +143,27 @@ enum plugin_status plugin_verify_generation_manifest(const char *root,
           strcmp(out->exe_sha3, generation) != 0)))
         st = PLUGIN_ERR_MANIFEST_INVALID;
     return st;
+}
+
+enum plugin_status plugin_verify_generation_manifest(const char *root,
+                                                     const char *name,
+                                                     const char *generation,
+                                                     struct plugin_manifest *out)
+{
+    char trust[PLUGIN_PATH_MAX];
+    if (!ps_trust_path(root, trust, sizeof(trust)))
+        return PLUGIN_ERR_ARGUMENT;
+    return ps_verify_generation(root, name, generation, trust, NULL, 0, out);
+}
+
+enum plugin_status plugin_verify_generation_manifest_trust(const char *root,
+                                                           const char *name,
+                                                           const char *generation,
+                                                           const char *trust,
+                                                           size_t trust_len,
+                                                           struct plugin_manifest *out)
+{
+    return ps_verify_generation(root, name, generation, NULL, trust, trust_len, out);
 }
 
 enum plugin_status plugin_verify_generation(const char *root, const char *name,
@@ -191,7 +222,7 @@ static enum plugin_status ps_stage(const struct ps_paths *src, const char *name,
         st = plugin_copy_file(src->manifest, dst.manifest, 0444, hex);
     if (st == PLUGIN_OK)
         st = plugin_copy_file(src->sig, dst.sig, 0444, hex);
-    return st == PLUGIN_OK ? ps_verify_set(&dst, trust, PLUGIN_OPEN_NOFOLLOW, m)
+    return st == PLUGIN_OK ? ps_verify_set(&dst, trust, NULL, 0, PLUGIN_OPEN_NOFOLLOW, m)
                            : st;
 }
 
@@ -264,7 +295,7 @@ enum plugin_status plugin_store_install(const char *root,
         return PLUGIN_ERR_ARGUMENT;
     if (plugin_check_dir(root) == PLUGIN_ERR_TRUST_INSECURE)
         return PLUGIN_ERR_TRUST_INSECURE;
-    st = ps_verify_set(&src, trust, 0, out);
+    st = ps_verify_set(&src, trust, NULL, 0, 0, out);
     if (st == PLUGIN_OK && strcmp(out->name, stem) != 0)
         st = PLUGIN_ERR_MANIFEST_INVALID;
     if (st != PLUGIN_OK)
