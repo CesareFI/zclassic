@@ -7,6 +7,7 @@
 #define GATE_API_REFERENCE_GENERATED_PRIV_H
 
 #include <stddef.h>
+#include <limits.h>
 #include <stdio.h>
 
 enum { ARG_DEF_MAX = 256, ARG_DEF_PATH = 160 };
@@ -22,6 +23,13 @@ struct arg_io {
     FILE *err;
 };
 
+struct arg_scratch {
+    char dir[PATH_MAX];
+    char bin[PATH_MAX + 32];
+    char expected[PATH_MAX + 32];
+    char entries[24];
+};
+
 extern const char arg_gen_src[];
 extern const char arg_template[];
 extern const char arg_doc[];
@@ -29,6 +37,8 @@ extern const char arg_tmp_default[];
 
 /* The .def files tools/gen_api_reference.c includes; 0 or a nonzero exit code. */
 int arg_def_list(struct arg_defs *d);
+/* Creates the scratch directory under TMPDIR; 0, or -1 with s->dir empty. */
+int arg_open_scratch(struct arg_scratch *s);
 /* The gate over the current directory: 0 clean, 1 drift, 2 fatal. */
 int arg_gate(const struct arg_io *io);
 /* Writes up to limit lines of data (0: all), each indented four spaces. */

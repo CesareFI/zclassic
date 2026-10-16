@@ -49,13 +49,6 @@ static const char arg_def_pattern[] =
     "^[[:space:]]*#include[[:space:]]+\"\\.\\./"
     "(engine/composition/commands/[A-Za-z0-9_/]+\\.def)\"";
 
-struct arg_scratch {
-    char dir[PATH_MAX];
-    char bin[PATH_MAX + 32];
-    char expected[PATH_MAX + 32];
-    char entries[24];
-};
-
 static int arg_cmp(const void *a, const void *b)
 {
     return strcmp(a, b);
@@ -156,12 +149,14 @@ static int arg_exec(char *const *argv, enum lcp_mode mode, struct lcp_buf *out,
     return rc < 0 ? 2 : rc;
 }
 
-static int arg_open_scratch(struct arg_scratch *s)
+int arg_open_scratch(struct arg_scratch *s)
 {
     const char *tmp = env_or("TMPDIR", arg_tmp_default);
-    if (snprintf(s->dir, sizeof s->dir, "%s/zcl-apiref.XXXXXX", tmp) >= (int)sizeof s->dir
-        || !mkdtemp(s->dir))
+    int n = snprintf(s->dir, sizeof s->dir, "%s/zcl-apiref.XXXXXX", tmp);
+    if (n < 0 || (size_t)n >= sizeof s->dir || !mkdtemp(s->dir)) {
+        s->dir[0] = '\0';
         return -1;
+    }
     snprintf(s->bin, sizeof s->bin, "%s/gen_api_reference", s->dir);
     snprintf(s->expected, sizeof s->expected, "%s/expected.md", s->dir);
     return 0;
@@ -240,20 +235,34 @@ static int arg_generate(const struct arg_io *io, struct arg_scratch *s)
     return rc;
 }
 
-static int arg_same_bytes(const char *a, const char *b)
+/* 0 when both streams reach EOF together, 1 on a differing byte, 2 on a read error. */
+static int arg_compare_streams(FILE *fa, FILE *fb)
 {
-    FILE *fa = fopen(a, "rb"), *fb = fopen(b, "rb");
-    int same = fa && fb, ca = 0, cb = 0;
-    while (same && ca != EOF && cb != EOF) {
+    int ca = 0, cb = 0;
+    while (ca == cb && ca != EOF) {
         ca = fgetc(fa);
         cb = fgetc(fb);
-        same = ca == cb;
+    }
+    if (ferror(fa) || ferror(fb))
+        return 2;
+    return ca == cb ? 0 : 1;
+}
+
+/* Like arg_compare_streams; *bad names the file that could not be read. */
+static int arg_compare(const char *a, const char *b, const char **bad)
+{
+    FILE *fa = fopen(a, "rb"), *fb = fopen(b, "rb");
+    int rc = 2;
+    *bad = fa ? b : a;
+    if (fa && fb) {
+        rc = arg_compare_streams(fa, fb);
+        *bad = ferror(fa) ? a : b;
     }
     if (fa)
         fclose(fa);
     if (fb)
         fclose(fb);
-    return same;
+    return rc;
 }
 
 static int arg_drift(const struct arg_io *io, const struct arg_scratch *s)
@@ -285,7 +294,13 @@ static int arg_steps(const struct arg_io *io, struct arg_scratch *s, size_t ndef
         rc = arg_generate(io, s);
     if (rc != 0 || lsc_pending())
         return rc ? rc : 1;
-    if (!arg_same_bytes(arg_doc, s->expected))
+    const char *bad = arg_doc;
+    int cmp = arg_compare(arg_doc, s->expected, &bad);
+    if (cmp == 2) {
+        fprintf(io->err, "%s: FATAL — cannot read %s\n", arg_name, bad);
+        return 2;
+    }
+    if (cmp == 1)
         return arg_drift(io, s);
     fprintf(io->out, "%s: clean — %s matches the generator over %zu .def catalog(s) / %s entries\n",
             arg_name, arg_doc, ndefs, s->entries);
@@ -296,13 +311,16 @@ int arg_gate(const struct arg_io *io)
 {
     struct arg_defs defs;
     struct arg_scratch s = { .dir = "" };
-    int rc = arg_preflight(io, &defs);
-    if (rc == 0 && arg_open_scratch(&s) != 0)
-        rc = die("z23-lint: cannot create a scratch directory under %s\n",
-                 env_or("TMPDIR", arg_tmp_default));
-    if (rc == 0)
+    int rc = arg_preflight(io, &defs), owned = 0;
+    if (rc == 0 && arg_open_scratch(&s) != 0) {
+        fprintf(io->err, "z23-lint: cannot create a scratch directory under %s\n",
+                env_or("TMPDIR", arg_tmp_default));
+        rc = 2;
+    } else if (rc == 0) {
+        owned = 1;
         rc = arg_steps(io, &s, defs.n);
-    if (s.dir[0] != '\0')
+    }
+    if (owned)
         (void)rap_rm_rf(s.dir);
     return rc;
 }

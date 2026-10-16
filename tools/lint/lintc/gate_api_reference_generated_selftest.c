@@ -3,7 +3,10 @@
  * purpose: selftest of check-api-reference-generated. Copies exactly what the
  * gate reads into a scratch tree, proves the gate passes on it, then flips
  * one availability cell of the copied reference and proves the gate fails and
- * names docs/API_REFERENCE.md, so the gate cannot decay into a no-op.
+ * names docs/API_REFERENCE.md, so the gate cannot decay into a no-op. It also
+ * proves that an unreadable reference is fatal and that a scratch directory
+ * which cannot be created (overlong or unwritable TMPDIR) removes nothing.
+ * Every fixture lives under a private directory this selftest creates.
  */
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
@@ -12,12 +15,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include "gate_api_reference_generated_priv.h"
 #include "lintc.h"
 #include "lintc_sig.h"
 
-enum { ARS_LOG = 65536 };
+enum { ARS_LOG = 65536, ARS_SEG_STEP = 100, ARS_SEG_SLACK = 101 };
 
 static const char ars_planted_from[] = "| planned |";
 static const char ars_planted_to[] = "| ready |";
@@ -43,11 +47,13 @@ static int ars_copy(const char *root, const char *rel)
     rc = csr_mkdirs(dst);
     *slash = '/';
     FILE *out = rc ? NULL : fopen(dst, "wb");
-    while (out && (n = fread(buf, 1, sizeof buf, in)) > 0)
+    while (out && rc == 0 && (n = fread(buf, 1, sizeof buf, in)) > 0)
         if (fwrite(buf, 1, n, out) != n)
             rc = die("z23-lint: write failed: %s\n", dst);
     if (!out && rc == 0)
         rc = die("z23-lint: cannot open %s\n", dst);
+    if (rc == 0 && ferror(in))
+        rc = die("z23-lint: read failed: %s\n", rel);
     if (out && fclose(out) != 0 && rc == 0)
         rc = die("z23-lint: write failed: %s\n", dst);
     fclose(in);
@@ -124,16 +130,23 @@ static int ars_flip(const char *root)
     return 0;
 }
 
-static int ars_expect(const char *root, const char *home, int tampered)
+/* The gate's exit code with its captured output in text; 2 when the capture fails. */
+static int ars_gate_text(const char *root, const char *home, char *text, size_t cap)
 {
     FILE *log = tmpfile();
     if (!log)
         return die("z23-lint: cannot create a temporary file\n", "");
-    char text[ARS_LOG];
     int rc = ars_run(root, home, log);
-    if (csr_slurp(log, text, sizeof text) != 0)
+    if (csr_slurp(log, text, cap) != 0)
         text[0] = '\0';
     fclose(log);
+    return rc;
+}
+
+static int ars_expect(const char *root, const char *home, int tampered)
+{
+    char text[ARS_LOG];
+    int rc = ars_gate_text(root, home, text, sizeof text);
     int bad = tampered ? (rc == 0 || !strstr(text, arg_doc)) : rc != 0;
     if (bad) {
         fprintf(stderr, tampered ? (rc == 0 ? "%s: FAIL — a hand edit to\n  %s did NOT trip the gate. The gate is hollow.\n"
@@ -146,7 +159,97 @@ static int ars_expect(const char *root, const char *home, int tampered)
     return bad;
 }
 
-static int ars_cases(const char *root, const char *home)
+/* A reference that cannot be read must end the gate with a fatal naming it. */
+static int ars_read_error(const char *root, const char *home)
+{
+    char path[PATH_MAX + 64], text[ARS_LOG];
+    snprintf(path, sizeof path, "%s/%s", root, arg_doc);
+    if (unlink(path) != 0 || mkdir(path, 0700) != 0)
+        return die("z23-lint: cannot stage an unreadable reference\n", "");
+    int rc = ars_gate_text(root, home, text, sizeof text);
+    int bad = rc != 2 || !strstr(text, "FATAL") || !strstr(text, arg_doc);
+    if (bad) {
+        fprintf(stderr, "%s: FAIL — an unreadable reference did not end the gate with a\n"
+                "  fatal naming %s (exit %d):\n", ars_name, arg_doc, rc);
+        arg_indent(stderr, text, 0);
+    }
+    return bad;
+}
+
+static int ars_is_dir(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+/* With TMPDIR at tmp the scratch directory cannot be created: the gate must exit 2,
+ * leave no half-built name behind, and not remove the directory at victim. */
+static int ars_scratch_refused(const char *root, const char *home, const char *tmp,
+                               const char *victim, const char *what)
+{
+    char text[ARS_LOG], saved[PATH_MAX];
+    struct arg_scratch s;
+    const char *prev = getenv("TMPDIR");
+    snprintf(saved, sizeof saved, "%s", prev ? prev : "");
+    setenv("TMPDIR", tmp, 1);
+    int opened = arg_open_scratch(&s);
+    int rc = ars_gate_text(root, home, text, sizeof text);
+    if (prev)
+        setenv("TMPDIR", saved, 1);
+    else
+        unsetenv("TMPDIR");
+    int bad = opened == 0 || s.dir[0] != '\0' || rc != 2 || !ars_is_dir(victim);
+    if (bad)
+        fprintf(stderr, "%s: FAIL — %s: scratch directory not refused cleanly (open %d,\n"
+                "  leftover name length %zu, exit %d, sibling kept %d)\n", ars_name, what, opened,
+                strlen(s.dir), rc, ars_is_dir(victim));
+    return bad;
+}
+
+/* Extends path with directories of at most 200 characters until it is target long. */
+static int ars_mkdeep(char *path, size_t target)
+{
+    size_t len = strlen(path);
+    while (len < target) {
+        size_t seg = target - len > ARS_SEG_STEP + ARS_SEG_SLACK ? ARS_SEG_STEP : target - len - 1;
+        path[len] = '/';
+        memset(path + len + 1, 'd', seg);
+        len += seg + 1;
+        path[len] = '\0';
+        if (mkdir(path, 0700) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+/* An overlong TMPDIR truncates the scratch name to a directory that exists. */
+static int ars_truncation(const char *priv, const char *root, const char *home)
+{
+    char tmp[PATH_MAX + 64], victim[PATH_MAX + 128];
+    static const char name[] = "/zcl-apiref.XXXXXX";
+    snprintf(tmp, sizeof tmp, "%s/long", priv);
+    if (mkdir(tmp, 0700) != 0 || ars_mkdeep(tmp, PATH_MAX - (sizeof name - 1)) != 0)
+        return die("z23-lint: cannot stage an overlong TMPDIR\n", "");
+    snprintf(victim, sizeof victim, "%s%.*s", tmp, (int)sizeof name - 2, name);
+    if (mkdir(victim, 0700) != 0)
+        return die("z23-lint: cannot stage the truncated name\n", "");
+    return ars_scratch_refused(root, home, tmp, victim, "overlong TMPDIR");
+}
+
+/* An unwritable TMPDIR makes mkdtemp fail. */
+static int ars_denied(const char *priv, const char *root, const char *home)
+{
+    char tmp[PATH_MAX + 64], victim[PATH_MAX + 128];
+    snprintf(tmp, sizeof tmp, "%s/denied", priv);
+    snprintf(victim, sizeof victim, "%s/keep", tmp);
+    if (mkdir(tmp, 0700) != 0 || mkdir(victim, 0700) != 0 || chmod(tmp, 0500) != 0)
+        return die("z23-lint: cannot stage an unwritable TMPDIR\n", "");
+    int bad = ars_scratch_refused(root, home, tmp, victim, "unwritable TMPDIR");
+    (void)chmod(tmp, 0700);
+    return bad;
+}
+
+static int ars_cases(const char *priv, const char *root, const char *home)
 {
     if (ars_populate(root) != 0)
         return 1;
@@ -154,7 +257,8 @@ static int ars_cases(const char *root, const char *home)
         return 1;
     if (ars_flip(root) != 0)
         return 1;
-    return ars_expect(root, home, 1);
+    return ars_expect(root, home, 1) || ars_truncation(priv, root, home)
+        || ars_denied(priv, root, home) || ars_read_error(root, home);
 }
 
 int check_api_reference_generated_selftest(void)
@@ -166,13 +270,14 @@ int check_api_reference_generated_selftest(void)
                  env_or("TMPDIR", arg_tmp_default)) >= (int)sizeof root || !mkdtemp(root))
         return die("z23-lint: cannot create a scratch directory\n", "");
     snprintf(sandbox, sizeof sandbox, "%s/repo", root);
-    int rc = csr_mkdirs(sandbox) != 0 ? 1 : ars_cases(sandbox, home);
+    int rc = csr_mkdirs(sandbox) != 0 ? 1 : ars_cases(root, sandbox, home);
     int sig = lsc_pending();
     (void)rap_rm_rf(root);
     if (sig)
         lsc_finish(sig);
     if (rc == 0)
-        printf("%s: PASS — clean tree passes, a planted hand edit fails and names %s\n",
+        printf("%s: PASS — clean tree passes, a planted hand edit fails and names %s,\n"
+               "  an unreadable reference is fatal, a refused scratch directory removes nothing\n",
                ars_name, arg_doc);
     return rc;
 }
