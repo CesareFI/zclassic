@@ -3332,9 +3332,12 @@ TEST_PARALLEL_FAST_SRCS = $(TEST_SRCS_NO_MAIN) tests/harness/src/test_parallel.c
 # production: where a POSIX capability genuinely does not exist the shim
 # fails the call (ENOSYS) instead of faking success.
 ZCL_TEST_WINDOWS_COMPAT_FLAGS = $(if $(ZCL_HOST_WINDOWS),-include test/windows_compat.h,)
+# Test profiles drop -Werror, but a non-void function that can fall off its
+# end is never correct and makes a test result undefined, so it stays fatal.
+ZCL_TEST_RETURN_TYPE_GATE = -Werror=return-type
 TEST_FAST_CFLAGS = $(filter-out -O3 $(ZCL_LTO_FLAG) -Werror,$(CACHED_CFLAGS)) -O1 -g -DZCL_TESTING \
 	-Wno-deprecated-declarations -Wno-format-truncation $(ZCL_WARN_MAYBE_UNINITIALIZED) \
-	$(ZCL_TEST_WINDOWS_COMPAT_FLAGS)
+	$(ZCL_TEST_WINDOWS_COMPAT_FLAGS) $(ZCL_TEST_RETURN_TYPE_GATE)
 TEST_FAST_LDFLAGS = $(filter-out $(ZCL_LTO_FLAG),$(LDFLAGS)) $(ZCL_DEV_LINKER) $(C3_TIP_LINK)
 TEST_FAST_EPOCH_COMPILE_FLAGS := $(strip $(TEST_FAST_CFLAGS) $(ZCL_EPOCH_DEPFILE_ID))
 TEST_FAST_EPOCH_LINK_FLAGS := $(strip $(TEST_FAST_LDFLAGS) $(TOR_LIBS) $(LIBS) $(GTK_LIBS) $(WEBKIT_LIBS) cxx=$(CXX))
@@ -3460,7 +3463,7 @@ TEST_ASAN_BIN = $(BIN_DIR)/test-asan
 TEST_ASAN_SRCS = $(TEST_PARALLEL_FAST_SRCS)
 TEST_ASAN_CFLAGS = $(filter-out -O3 $(ZCL_LTO_FLAG) -Werror,$(CACHED_CFLAGS)) -O1 -g -DZCL_TESTING \
 	$(ASAN_COMMON_SAN_FLAGS) \
-	-Wno-deprecated-declarations -Wno-format-truncation $(ZCL_WARN_MAYBE_UNINITIALIZED)
+	-Wno-deprecated-declarations -Wno-format-truncation $(ZCL_WARN_MAYBE_UNINITIALIZED) $(ZCL_TEST_RETURN_TYPE_GATE)
 TEST_ASAN_LDFLAGS = $(filter-out $(ZCL_LTO_FLAG),$(LDFLAGS)) $(ZCL_DEV_LINKER) $(ASAN_COMMON_SAN_FLAGS)
 TEST_ASAN_EPOCH_COMPILE_FLAGS := $(strip $(TEST_ASAN_CFLAGS) \
 	adx-exception=$(ASAN_ADX_FRAME_POINTER_EXCEPTION_SRCS):$(ASAN_ADX_FRAME_POINTER_EXCEPTION_FLAGS) \
@@ -3514,7 +3517,7 @@ TEST_TSAN_BIN = $(BIN_DIR)/test-tsan
 TEST_TSAN_SRCS = $(TEST_PARALLEL_FAST_SRCS)
 TEST_TSAN_CFLAGS = $(filter-out -O3 $(ZCL_LTO_FLAG) -Werror,$(CACHED_CFLAGS)) -O1 -g -DZCL_TESTING \
 	$(TSAN_COMMON_SAN_FLAGS) \
-	-Wno-deprecated-declarations -Wno-format-truncation $(ZCL_WARN_MAYBE_UNINITIALIZED)
+	-Wno-deprecated-declarations -Wno-format-truncation $(ZCL_WARN_MAYBE_UNINITIALIZED) $(ZCL_TEST_RETURN_TYPE_GATE)
 TEST_TSAN_LDFLAGS = $(filter-out $(ZCL_LTO_FLAG),$(LDFLAGS)) $(ZCL_DEV_LINKER) $(TSAN_COMMON_SAN_FLAGS)
 TEST_TSAN_EPOCH_COMPILE_FLAGS := $(strip $(TEST_TSAN_CFLAGS) $(ZCL_EPOCH_DEPFILE_ID))
 TEST_TSAN_EPOCH_LINK_FLAGS := $(strip $(TEST_TSAN_LDFLAGS) $(TOR_LIBS) $(LIBS) $(GTK_LIBS) $(WEBKIT_LIBS) cxx=$(CXX))
