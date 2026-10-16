@@ -635,6 +635,48 @@ static int test_wallet_lock_register(void)
     return failures;
 }
 
+/* The unlock-timer arm must be fail-closed: every arm failure path
+ * (range rejection, timer allocation failure — and, pre-existing, the
+ * spawn failure) leaves the wallet LOCKED with the passphrase scrubbed.
+ * The raw walletunlock RPC handler unlocks first and arms second; before
+ * this contract, an out-of-range timeout returned an error while the
+ * wallet silently stayed unlocked with no timer. */
+static int test_wallet_lock_arm_failure_relocks(void)
+{
+    int failures = 0;
+    TEST("wallet_lock: arm timeout failure re-locks (fail-closed)") {
+        wallet_lock_reset_for_test();
+        wallet_lock_note_encrypted_at_rest();
+        ASSERT(!wallet_lock_is_unlocked());
+
+        ASSERT(wallet_lock_unlock(NULL, NULL, k_passphrase).ok);
+        ASSERT(wallet_lock_is_unlocked());
+        ASSERT(!wallet_lock_arm_timeout(NULL, 0).ok);
+        ASSERT(wallet_lock_arm_timeout(NULL, 0).code == WLK_TIMEOUT_RANGE);
+        ASSERT(!wallet_lock_is_unlocked());
+        ASSERT(wallet_lock_effective_passphrase() == NULL);
+        ASSERT(!wallet_lock_spend_guard().ok);
+
+        ASSERT(wallet_lock_unlock(NULL, NULL, k_passphrase).ok);
+        ASSERT(!wallet_lock_arm_timeout(NULL, 3601).ok);
+        ASSERT(wallet_lock_arm_timeout(NULL, 3601).code == WLK_TIMEOUT_RANGE);
+        ASSERT(!wallet_lock_is_unlocked());
+        ASSERT(wallet_lock_effective_passphrase() == NULL);
+
+        /* A valid arm still unlocks normally; lock manually rather than
+         * wait out the timer. */
+        ASSERT(wallet_lock_unlock(NULL, NULL, k_passphrase).ok);
+        ASSERT(wallet_lock_arm_timeout(NULL, 30).ok);
+        ASSERT(wallet_lock_is_unlocked());
+        wallet_lock_lock(NULL);
+        ASSERT(!wallet_lock_is_unlocked());
+        PASS();
+    } _test_next:;
+
+    wallet_lock_reset_for_test();
+    return failures;
+}
+
 static int test_wallet_lock_boot_credential(void)
 {
     int failures = 0;
@@ -751,6 +793,7 @@ int test_wallet_keystore(void)
     failures += test_encrypt_length_bounds();
     failures += test_decrypt_length_bounds();
     failures += test_wallet_lock_register();
+    failures += test_wallet_lock_arm_failure_relocks();
     failures += test_wallet_lock_boot_credential();
     failures += test_keystore_secure_erase();
 

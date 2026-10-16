@@ -294,13 +294,20 @@ struct zcl_result wallet_lock_register_boot_credential(void)
 struct zcl_result wallet_lock_arm_timeout(struct wallet *w,
                                           uint32_t timeout_seconds)
 {
-    if (timeout_seconds < 1 || timeout_seconds > 3600)
+    /* Every failure path re-locks before refusing: callers such as the
+     * walletunlock RPC handler arm after unlocking, so an unarmed
+     * refusal must never leave the wallet unlocked with no timer. */
+    if (timeout_seconds < 1 || timeout_seconds > 3600) {
+        wallet_lock_lock(w);
         return ZCL_ERR(WLK_TIMEOUT_RANGE,
                        "unlock timeout must be between 1 and 3600 seconds");
+    }
     struct wallet_lock_timer *timer =
         zcl_malloc(sizeof(*timer), "wallet_lock_timer");
-    if (!timer)
+    if (!timer) {
+        wallet_lock_lock(w);
         return ZCL_ERR(WLK_TIMER_FAIL, "unlock timer allocation failed");
+    }
 
     pthread_mutex_lock(&g_mu);
     timer->wallet = w;
