@@ -170,7 +170,6 @@ tools/githooks/pre-commit
 tools/githooks/pre-push
 tools/harvest_checkpoints.sh
 tools/lint/check_accel_oracle_pinned.sh
-tools/lint/check_api_reference_generated.sh
 tools/lint/check_app_bundle_reproducible.sh
 tools/lint/check_blocker_handoff_declared.sh
 tools/lint/check_capability_closure.sh

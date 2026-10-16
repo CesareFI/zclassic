@@ -3,7 +3,7 @@
      Template (editorial prose): docs/API_REFERENCE.md.in
      Generator: tools/gen_api_reference.c
      Regenerate: make docs-api-reference
-     Gate: tools/lint/check_api_reference_generated.sh (check-api-reference-generated) -->
+     Gate: tools/lint/lintc/gate_api_reference_generated.c (check-api-reference-generated) -->
 # API_REFERENCE.md — the native command tree, leaf by leaf
 
 This is a **reference table**, not a spec. For the grammar, envelope shapes,
@@ -56,7 +56,7 @@ make lint                    # check-api-reference-generated fails on any drift
 ```
 
 The drift gate is
-[`tools/lint/check_api_reference_generated.sh`](../tools/lint/check_api_reference_generated.sh):
+[`tools/lint/lintc/gate_api_reference_generated.c`](../tools/lint/lintc/gate_api_reference_generated.c):
 it regenerates into a temporary file and fails if the checked-in page differs.
 Editing this page instead of the `.def` file it came from is therefore a lint
 failure, not a silent lie.
@@ -2139,7 +2139,7 @@ stop does not reach that process.
 
 | Invariant | Test |
 |---|---|
-| This page matches `engine/composition/commands/*.def` byte for byte | `tools/lint/check_api_reference_generated.sh` (lint gate `check-api-reference-generated`) |
+| This page matches `engine/composition/commands/*.def` byte for byte | `tools/lint/lintc/gate_api_reference_generated.c` (lint gate `check-api-reference-generated`) |
 | Catalog well-formed, every leaf has schemas/example, ready⇒handler, planned⇒no handler | `test_command_registry_catalog.c::test_catalog_wellformed`, `test_ready_leaves_bound`, `test_planned_fail_closed` |
 | Root menu stays in budget; branch menus stay shallow | `test_command_registry_catalog.c::test_root_menu_budget`, `test_branch_menus_shallow` |
 | **Every** branch menu lists only its own immediate children, fixed 5-field shape | `test_native_api_contract.c::test_every_branch_menu_lists_only_own_children` |

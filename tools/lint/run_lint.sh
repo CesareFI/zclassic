@@ -272,7 +272,7 @@ gate_command() {
         check-no-uncited-victory)          echo './tools/scripts/check_no_uncited_victory.sh' ;;
         check-doc-claims)                  echo './tools/lint/check_doc_claims.sh' ;;
         check-error-doc-refs)              echo './build/bin/z23-lint check-error-doc-refs' ;;
-        check-api-reference-generated)     echo './tools/lint/check_api_reference_generated.sh' ;;
+        check-api-reference-generated)     echo './build/bin/z23-lint check-api-reference-generated --selftest && ./build/bin/z23-lint check-api-reference-generated' ;;
         check-capability-inventory-generated) echo './tools/lint/check_capability_inventory_generated.sh --selftest' ;;
         check-generated-artifact-contradictions) echo './build/bin/z23-lint check-generated-artifact-contradictions --selftest && ./build/bin/z23-lint check-generated-artifact-contradictions' ;;
         check-describe-budget)             echo './tools/lint/check_describe_budget.sh --selftest && ./tools/lint/check_describe_budget.sh' ;;

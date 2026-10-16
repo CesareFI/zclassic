@@ -6424,6 +6424,8 @@ LINTC_SRCS = $(LINTC_LIVE_DATADIR_SRCS) tools/lint/lintc/lib.c tools/lint/lintc/
     tools/lint/lintc/gate_pattern_guard.c \
     tools/lint/lintc/gate_describe_budget.c \
     tools/lint/lintc/gate_catalog_rooms.c \
+    tools/lint/lintc/gate_api_reference_generated.c \
+    tools/lint/lintc/gate_api_reference_generated_selftest.c \
     tools/lint/lintc/gate_state_hygiene_fences.c \
     tools/lint/lintc/gate_supervisor_domain.c \
     tools/lint/lintc/gate_supervisor_domain_scan.c \
@@ -14798,9 +14800,10 @@ check-error-doc-refs: $(LINTC_TOOL)
 # and the reference can never disagree. Fix a failure with
 # `make docs-api-reference`, never by editing the generated page.
 # Has --selftest (plants a hand edit, proves the gate trips).
-check-api-reference-generated:
+check-api-reference-generated: $(LINTC_TOOL)
 	@echo "══ LINT: docs/API_REFERENCE.md is generated, not hand-edited ══"
-	@./tools/lint/check_api_reference_generated.sh
+	@./build/bin/z23-lint check-api-reference-generated --selftest
+	@./build/bin/z23-lint check-api-reference-generated
 
 # Gate — every leaf's `discover describe` document must FIT its byte budget.
 # `discover describe` is the only surface that renders a leaf's long-form

@@ -1,0 +1,37 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ *
+ * purpose: private declarations shared by the check-api-reference-generated
+ * gate and its selftest.
+ */
+#ifndef GATE_API_REFERENCE_GENERATED_PRIV_H
+#define GATE_API_REFERENCE_GENERATED_PRIV_H
+
+#include <stddef.h>
+#include <stdio.h>
+
+enum { ARG_DEF_MAX = 256, ARG_DEF_PATH = 160 };
+
+struct arg_defs {
+    char path[ARG_DEF_MAX][ARG_DEF_PATH]; /* sorted, unique */
+    size_t n;
+};
+
+/* Both streams may be the same FILE. */
+struct arg_io {
+    FILE *out;
+    FILE *err;
+};
+
+extern const char arg_gen_src[];
+extern const char arg_template[];
+extern const char arg_doc[];
+extern const char arg_tmp_default[];
+
+/* The .def files tools/gen_api_reference.c includes; 0 or a nonzero exit code. */
+int arg_def_list(struct arg_defs *d);
+/* The gate over the current directory: 0 clean, 1 drift, 2 fatal. */
+int arg_gate(const struct arg_io *io);
+/* Writes up to limit lines of data (0: all), each indented four spaces. */
+void arg_indent(FILE *out, const char *data, size_t limit);
+
+#endif

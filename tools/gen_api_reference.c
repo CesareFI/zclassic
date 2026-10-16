@@ -1013,7 +1013,7 @@ int main(int argc, char **argv)
           "     Template (editorial prose): docs/API_REFERENCE.md.in\n"
           "     Generator: tools/gen_api_reference.c\n"
           "     Regenerate: make docs-api-reference\n"
-          "     Gate: tools/lint/check_api_reference_generated.sh "
+          "     Gate: tools/lint/lintc/gate_api_reference_generated.c "
           "(check-api-reference-generated) -->\n",
           out);
 
