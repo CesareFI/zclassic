@@ -1806,6 +1806,7 @@ int test_transaction_intent(void)
 
         wallet_lock_reset_for_test();
         wallet_free(lock_wallet); free(lock_wallet);
+        wallet_sqlite_close(&lock_ws);
         node_db_close(&lock_db);
         reducer_frontier_provable_tip_reset();
         progress_store_close();
