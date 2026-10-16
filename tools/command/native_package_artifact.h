@@ -7,7 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Inert public wires only. Exactly one inline hex or file+expected SHA3
+/* Inert bounded artifact bytes only. Exactly one inline hex or file+expected SHA3
  * representation; fresh outputs become NULL/zero on every refusal. Trusted
  * ancestor ownership is a caller prerequisite, not general path confinement.
  * File reads pin one no-link regular descriptor, require bounded exact EOF,

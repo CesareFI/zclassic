@@ -3232,6 +3232,12 @@ void zcl_ms_test_fds(int in_fd, int out_fd);
 void zcl_ms_test_input_on_stdin(bool on);
 #endif
 
+/* Inert release artifact preparation and local CAS admission. */
+void zcl_native_handle_zcode_release_artifact_prepare(
+    const struct zcl_command_request *request, struct zcl_command_reply *reply);
+void zcl_native_handle_zcode_release_artifact_admit(
+    const struct zcl_command_request *request, struct zcl_command_reply *reply);
+
 #ifdef __cplusplus
 }
 #endif

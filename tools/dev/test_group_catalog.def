@@ -1704,3 +1704,4 @@ ZCL_TEST_GROUP(plugin_store)
 ZCL_TEST_GROUP(plugin_run)
 
 ZCL_TEST_GROUP(plugin_package)
+ZCL_TEST_GROUP(zcode_release_artifact)

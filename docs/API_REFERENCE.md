@@ -74,15 +74,15 @@ z23 discover schema <path> --side=input|output
 
 | Catalog fact | Count |
 |---|---|
-| Registry entries (branches + leaves) | 956 |
+| Registry entries (branches + leaves) | 959 |
 | Top-level roots | 15 |
-| Branches | 208 |
-| Leaves (dispatchable command paths) | 748 |
-| … `ready` (live handler in this build) | 655 |
+| Branches | 209 |
+| Leaves (dispatchable command paths) | 750 |
+| … `ready` (live handler in this build) | 657 |
 | … `compat` (metadata only, names a fallback) | 63 |
 | … `planned` (fail-closed BLOCKED, exit 3) | 30 |
 | … dev-gated 🔧 (`ready` only in `z23-dev`) | 62 |
-| Leaves with `effect=mutate` | 286 |
+| Leaves with `effect=mutate` | 287 |
 | Leaves with `effect=destructive` | 6 |
 | Leaves requiring **owner** authority | 151 |
 
@@ -100,7 +100,7 @@ Per source file:
 | `engine/composition/commands/code.def` | 34 | 4 | 30 |
 | `engine/composition/commands/accounts.def` | 11 | 2 | 9 |
 | `engine/composition/commands/vault.def` | 24 | 4 | 20 |
-| `engine/composition/commands/zcode.def` | 254 | 59 | 195 |
+| `engine/composition/commands/zcode.def` | 257 | 60 | 197 |
 | `engine/composition/commands/zcode_science.def` | 25 | 7 | 18 |
 | `engine/composition/commands/metaverse.def` | 30 | 7 | 23 |
 | `engine/composition/commands/yardsale.def` | 7 | 2 | 5 |
@@ -1706,6 +1706,13 @@ represented by its children's sections.
 |---|---|---|---|---|---|---|
 | `zcode package policy limits` | ready | read / read / public · instant/tiny | `tier`, `earned_score`, `uploaded_bytes`, `downloaded_bytes` | `zcl.zcode_package_policy_limits.v1` | `z23 zcode package policy limits --input='{"earned_score":600}'` | Show the frozen local P2P policy limits for one contributor tier |
 
+#### `zcode.release.artifact` — Inert release artifacts
+
+| Command | Avail | Policy | Input keys (**required**) | Output schema | Example | Summary |
+|---|---|---|---|---|---|---|
+| `zcode release artifact prepare` | ready | read / read / operator · foreground/moderate | **`name`**, **`version`**, **`os`**, **`arch`**, **`abi`**, **`isa`**, **`program_file`**, **`program_sha3_256`**, **`license_file`**, **`license_sha3_256`** | `zcl.zcode_release_artifact.v1` | `z23 zcode release artifact prepare --input=- < release-input.json` | Prepare an exact inert binary carrier without storing it |
+| `zcode release artifact admit` | ready | mutate / app-write / operator · foreground/moderate | **`datadir`**, **`name`**, **`version`**, **`os`**, **`arch`**, **`abi`**, **`isa`**, **`program_file`**, **`program_sha3_256`**, **`license_file`**, **`license_sha3_256`** | `zcl.zcode_release_artifact.v1` | `z23 zcode release artifact admit --input=- < release-input.json` | Store and read back an exact inert binary carrier |
+
 #### `zcode.science` — Scientific evidence
 
 | Command | Avail | Policy | Input keys (**required**) | Output schema | Example | Summary |
@@ -2082,6 +2089,7 @@ promise the same document shape.
 | `zcl.zcode_publish_plan.v1` | `zcode.package.dev.publish.plan`, `zcode.package.publish.plan` |
 | `zcl.zcode_publish_commit.v1` | `zcode.package.dev.publish.commit`, `zcode.package.publish.commit` |
 | `zcl.zcode_leaderboard.v1` | `zcode.leaderboard.daily`, `zcode.leaderboard.weekly`, `zcode.leaderboard.monthly`, `zcode.leaderboard.all` |
+| `zcl.zcode_release_artifact.v1` | `zcode.release.artifact.prepare`, `zcode.release.artifact.admit` |
 | `zcl.zcode_science_plan.v1` | `zcode.science.study.plan`, `zcode.science.findings.plan`, `zcode.science.work.plan` |
 | `zcl.zcode_science_commit.v1` | `zcode.science.study.commit`, `zcode.science.findings.commit`, `zcode.science.work.commit` |
 | `zcl.zcode_science_work.v1` | `zcode.science.work.status`, `zcode.science.work.receipt` |

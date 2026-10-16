@@ -5163,3 +5163,53 @@ ZCL_COMMAND_READY_READ(
     ZCL_COMMAND_CAP_NONE,
     ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT,
     ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_bridge_command)
+
+/* Inert binary carriers remain separate from signed release records. */
+ZCL_COMMAND_BRANCH("zcode.release.artifact", "zcode.release",
+                   "Inert release artifacts", ZCL_COMMAND_LAYER_APP)
+
+ZCL_COMMAND_READY_READ(
+    "zcode.release.artifact.prepare", "zcode.release.artifact", "",
+    "Prepare an exact inert binary carrier without storing it",
+    "Reads bounded stable program_file and license_file snapshots against their "
+    "expected SHA3-256 digests. Derives the existing content.v2 manifest root "
+    "and canonical metadata binding name, version, declared os/arch/abi/isa, "
+    "program size and whole-program SHA3-256. Returns manifest_root, "
+    "manifest_hex and metadata. Target labels declare intent, not compatibility. "
+    "Creates no datadir or CAS and never signs, announces, installs or executes.",
+    ZCL_COMMAND_LIST_BUDGET,
+    "zcode,release,artifact,prepare,binary,manifest,sha3,inert",
+    "zcl.zcode_release_artifact_prepare.input.v1", "zcl.zcode_release_artifact.v1",
+    "name,version,os,arch,abi,isa,program_file,program_sha3_256,license_file,license_sha3_256",
+    "name,version,os,arch,abi,isa,program_file,program_sha3_256,license_file,license_sha3_256",
+    "z23 zcode release artifact prepare --input=- < release-input.json",
+    ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_LATENCY_FOREGROUND, ZCL_COMMAND_COST_MODERATE,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_zcode_release_artifact_prepare)
+
+ZCL_COMMAND_READY_COMMAND(
+    "zcode.release.artifact.admit", "zcode.release.artifact", "",
+    "Store and read back an exact inert binary carrier",
+    "Prepares the same manifest and metadata as artifact prepare, then admits "
+    "manifest and coordinate-verified chunks into the explicit datadir CAS. "
+    "Returns admitted only after exact verified program readback. Exact "
+    "redelivery is idempotent; a refusal after store opening may leave "
+    "directories or resumable staging and reports mutated. Completeness and "
+    "pins grant no public serving authority. No signing, announcement, "
+    "installation or execution occurs; private transport is separately authorized.",
+    ZCL_COMMAND_LIST_BUDGET,
+    "zcode,release,artifact,admit,binary,cas,sha3,inert",
+    "zcl.zcode_release_artifact_admit.input.v1", "zcl.zcode_release_artifact.v1",
+    "datadir,name,version,os,arch,abi,isa,program_file,program_sha3_256,license_file,license_sha3_256",
+    "datadir,name,version,os,arch,abi,isa,program_file,program_sha3_256,license_file,license_sha3_256",
+    "z23 zcode release artifact admit --input=- < release-input.json",
+    ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_NODE,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FOREGROUND, ZCL_COMMAND_COST_MODERATE,
+    ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    zcl_native_handle_zcode_release_artifact_admit)

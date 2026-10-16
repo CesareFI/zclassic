@@ -1399,3 +1399,7 @@ ZCL_MODULE_CAPABILITY("tools/command/native_package_artifact.c", CAP_FS_WRITE, "
 ZCL_MODULE_CAPABILITY("tools/command/native_device_host_runtime.c", CAP_FS_READ|CAP_FS_WRITE|CAP_PROCESS, "validates foreground stdio and owner signals, starts exact accepted installed images through the supervisor and reports public diagnostics")
 ZCL_MODULE_CAPABILITY("tools/command/native_device_psk_command.c", CAP_FS_READ|CAP_FS_WRITE, "exclusively creates one owner-private 0600 HOST PSK file beneath a validated 0700 parent and replies with its public fingerprint only")
 ZCL_MODULE_CAPABILITY("tools/command/native_device_host_shell.c", CAP_FS_READ|CAP_FS_WRITE|CAP_PROCESS, "opens /dev/null read-write for the ssh -Q kex probe child stdio, resolves ssh once from absolute PATH entries (stat/access), then execv()s that path with one fixed charset-validated argv whose ProxyCommand is this binary's raw HOST client")
+
+/* Inert release artifact byte handling. */
+ZCL_MODULE_CAPABILITY("contexts/commons/modules/vcs/src/release_artifact.c", CAP_FS_WRITE, "checked-allocation failure diagnostics reach fprintf; package writes use the existing store APIs")
+ZCL_MODULE_CAPABILITY("tools/command/native_zcode_release_artifact_command.c", CAP_FS_WRITE, "checked-allocation failure diagnostics reach fprintf; snapshot reads and CAS operations use existing typed APIs")
