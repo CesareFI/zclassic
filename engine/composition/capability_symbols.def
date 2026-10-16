@@ -363,6 +363,7 @@ ZCL_CAPABILITY_SYMBOL("nftw", CAP_FS_WRITE,
     "Walks a directory tree to delete it; the callback this tree passes "
     "unlinks and rmdirs, both already CAP_FS_WRITE on their own.")
 ZCL_CAPABILITY_SYMBOL("pwrite", CAP_FS_WRITE, "")
+ZCL_CAPABILITY_SYMBOL("pwritev2", CAP_FS_WRITE, "")
 ZCL_CAPABILITY_SYMBOL("remove", CAP_FS_WRITE, "")
 ZCL_CAPABILITY_SYMBOL("renameat2", CAP_FS_WRITE, "")
 ZCL_CAPABILITY_SYMBOL("rmdir", CAP_FS_WRITE, "")

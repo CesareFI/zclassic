@@ -10,6 +10,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 #include "session/mesh_terminal_hub.h"
 
@@ -25,27 +26,39 @@ enum hub_wait { HUB_WAIT_FRAME, HUB_WAIT_TIMEOUT, HUB_WAIT_CLOSED, HUB_WAIT_BAD 
  * or a send timeout. Never raises SIGPIPE. */
 bool hub_io_send(int fd, const uint8_t *frame, size_t total);
 
-/* A write end that cannot block: O_NONBLOCK is set on the descriptor (shared
- * with whoever else holds it) and its flags put back at close. Opened once by
- * the single owner of the descriptor (the supervisor for the audit sink, the
- * client for the screen), never per concurrent child, so no holder restores
- * the flag under another. Regular files and already non-blocking descriptors
- * are left alone. */
+/* A write end that cannot block, without touching the descriptor's flags:
+ * O_NONBLOCK lives on the open file description, which a tty, stdout or
+ * stderr shares with other holders, and it would outlive us if we were
+ * SIGKILLed. So every attempt is non-blocking by itself: send(MSG_DONTWAIT)
+ * on a socket; pwritev2(RWF_NOWAIT) on a pipe (the kernel refuses to wait
+ * for room, however many writers share it); and where the file does not take
+ * RWF_NOWAIT (a tty), poll(POLLOUT, 0) followed by a chunk of at most
+ * PIPE_BUF, the amount a ready descriptor is guaranteed to take. Regular
+ * files are plain writes. */
+enum hub_wfd_mode { HUB_WFD_NOWAIT, HUB_WFD_SOCKET, HUB_WFD_POLLED, HUB_WFD_PLAIN };
 struct hub_wfd {
     int fd;
-    int restore;   /* flags to put back, -1 none */
+    enum hub_wfd_mode mode;
 };
 void hub_wfd_open(struct hub_wfd *w, int fd);
-void hub_wfd_close(struct hub_wfd *w);
 
-/* Called right before each write attempt; a no-op outside ZCL_TESTING, where
- * a test can put another writer exactly between "ready" and "write". */
+/* One non-blocking attempt: bytes written, or -1 with errno (EAGAIN: no room
+ * right now). */
+ssize_t hub_wfd_try(struct hub_wfd *w, const void *buf, size_t n);
+
+/* Called right before each write attempt (inside hub_wfd_try); it compiles
+ * to nothing outside ZCL_TESTING, where a test can put another writer
+ * exactly between "ready" and "write". */
+#if defined(ZCL_TESTING)
 void hub_io_before_write(int fd);
+#else
+static inline void hub_io_before_write(int fd) { (void)fd; }
+#endif
 
 /* All n bytes written, or false at the absolute monotonic deadline (or a
  * hard error). Loops write / EAGAIN / poll, so another writer consuming the
  * readiness can never leave it blocked past the deadline. */
-bool hub_wfd_write(const struct hub_wfd *w, const void *buf, size_t n, int64_t deadline_ms);
+bool hub_wfd_write(struct hub_wfd *w, const void *buf, size_t n, int64_t deadline_ms);
 
 /* Copies payload behind a header into a small stack frame and sends it. For
  * control frames only: the hot paths seal a frame in place instead. */

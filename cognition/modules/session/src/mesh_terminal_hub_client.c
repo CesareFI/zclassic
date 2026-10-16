@@ -46,7 +46,7 @@ struct hub_cl {
     const struct mesh_terminal_hub_client_cfg *cfg;
     struct mesh_terminal_hub_client_result *res;
     struct hub_rx rx;
-    struct hub_wfd wfd;           /* the screen, never blocking */
+    struct hub_wfd wfd;           /* the screen; every write attempt is non-blocking */
     uint8_t in[MESH_TERMINAL_HUB_FRAME_MAX];
     bool in_eof;
     bool wrote;
@@ -87,27 +87,29 @@ static int hub_cl_wait_out(struct hub_cl *c, bool watch, int64_t deadline)
     return pfd[0].revents ? 1 : 0;
 }
 
-/* Screen bytes out, on a non-blocking descriptor. EAGAIN (another writer took
- * the readiness, or the reader stopped draining) goes back to the wait, which
- * also watches the event pipe, so a termination signal is always served. The
- * closing newline has one absolute deadline. False when the output failed or
- * the session ended while waiting (c->done tells which). */
+/* Screen bytes out. The write is tried first; only on EAGAIN (another writer
+ * took the room, or the reader stopped draining) does it go to the wait,
+ * which also watches the event pipe, so a termination signal is always
+ * served. The closing newline has one absolute deadline, taken at its first
+ * wait. False when the output failed or the session ended while waiting
+ * (c->done tells which). */
 static bool hub_cl_write_out(struct hub_cl *c, const uint8_t *p, size_t n, bool watch)
 {
-    int64_t deadline = platform_time_monotonic_ms() + HUB_CLIENT_TAIL_MS;
+    int64_t deadline = 0;
     while (n) {
-        int st = hub_cl_wait_out(c, watch, deadline);
-        if (st < 0)
-            return false;
-        if (st == 0)
-            continue;
-        hub_io_before_write(c->wfd.fd);
-        ssize_t w = write(c->wfd.fd, p, n);
+        ssize_t w = hub_wfd_try(&c->wfd, p, n);
         if (w > 0) {
             p += w;
             n -= (size_t)w;
-        } else if (w < 0 && errno != EINTR && errno != EAGAIN) {
+            continue;
+        }
+        if (w < 0 && errno != EINTR && errno != EAGAIN)
             return false;
+        if (w < 0 && errno == EAGAIN) {
+            if (!deadline)
+                deadline = platform_time_monotonic_ms() + HUB_CLIENT_TAIL_MS;
+            if (hub_cl_wait_out(c, watch, deadline) < 0)
+                return false;
         }
     }
     return true;
@@ -352,7 +354,6 @@ static void hub_client_run_arm(
     if (c.wrote && c.last_out != '\n')
         (void)hub_cl_write_out(&c, (const uint8_t *)"\r\n" + (cfg->quiet ? 1 : 0),
                                cfg->quiet ? 1u : 2u, false);
-    hub_wfd_close(&c.wfd);
 }
 
 #endif /* __linux__ */

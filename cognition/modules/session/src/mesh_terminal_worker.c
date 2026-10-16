@@ -441,6 +441,8 @@ static struct zcl_result mesh_terminal_worker_spawn_platform_arm(
      * execed (the pipe closed with the exec), one byte names the stage
      * that failed. */
     close(stage_pipe[1]);
+    /* Residual window: a stop before this store sees slot 0 and skips the killpg;
+     * the session's SIGKILL then hangs the worker up (see hub_server.c). */
     tw_slot(cfg->pgid_slot, pid);
     uint8_t stage = 0;
     for (;;) {

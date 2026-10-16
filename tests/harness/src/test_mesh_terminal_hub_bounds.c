@@ -23,6 +23,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/ptrace.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -210,6 +211,57 @@ static void hook_fill_second(int fd)
         hook_fill(fd);
 }
 
+/* ── supervisor rigs shared by the stop and count cases ───────────────── */
+
+/* Forks a supervisor on a fresh loopback listener; `prep` runs in the child
+ * first (test seams). -1 when there is no listener or no fork. */
+static pid_t sup_start(const struct mesh_terminal_hub_listen_cfg *cfg, uint16_t *port, void (*prep)(void))
+{
+    int listener = mesh_terminal_hub_listen(0, port);
+    pid_t sup = listener < 0 ? -1 : fork();
+    if (sup == 0) {
+        if (prep)
+            prep();
+        _exit(mesh_terminal_hub_listen_run(listener, cfg));
+    }
+    if (listener >= 0)
+        close(listener);
+    return sup;
+}
+
+static void prep_wedged(void)
+{
+    mesh_terminal_hub_testing_children_ignore_term(true); /* a wedged session */
+}
+
+/* The worker leader's group id, announced on the screen as PGID=<n>. */
+static bool read_pgid(struct cl *c, int *leader)
+{
+    char screen[256];
+    return read_until(c->screen_r, "\n", screen, sizeof screen, 8000) && strstr(screen, "PGID=") &&
+           sscanf(strstr(screen, "PGID="), "PGID=%d", leader) == 1;
+}
+
+#define HUP_TRAP_RUN "trap '' HUP; echo PGID=$$; (while :; do :; done)"
+
+static void rig_end(struct cl *c, bool up, int net, int audit_fd)
+{
+    if (up)
+        cl_end(c);
+    if (net >= 0)
+        close(net);
+    close(audit_fd);
+}
+
+/* True once the group has no running member (the kernel finishes a kill
+ * asynchronously, so it is polled). */
+static bool group_gone(pid_t pgid)
+{
+    for (int i = 0; i < 150 && group_running(pgid); i++)
+        poll(NULL, 0, 20); /* real-clock: no seam */
+    return group_running(pgid) == 0;
+}
+
 /* ── a stopped supervisor leaves no worker group ──────────────────────── */
 
 static int stop_orphan_case(void)
@@ -217,26 +269,17 @@ static int stop_orphan_case(void)
     int failures = 0, status = 0, leader = 0;
     struct mesh_terminal_hub_listen_cfg cfg;
     struct cl c;
-    char screen[256];
     uint16_t port = 0;
-    const char *const run[] = { "/bin/sh", "-c",
-        "trap '' HUP; echo PGID=$$; (while :; do :; done)", NULL };
+    const char *const run[] = { "/bin/sh", "-c", HUP_TRAP_RUN, NULL };
     memset(&cfg, 0, sizeof cfg);
     base_cfg(&cfg.serve);
     cfg.max_active = 1;
     cfg.stop_grace_ms = 300;
     cfg.audit_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
-    int listener = cfg.audit_fd < 0 ? -1 : mesh_terminal_hub_listen(0, &port);
-    pid_t sup = listener < 0 ? -1 : fork();
-    if (sup == 0) {
-        mesh_terminal_hub_testing_children_ignore_term(true); /* a wedged session */
-        _exit(mesh_terminal_hub_listen_run(listener, &cfg));
-    }
-    close(listener);
+    pid_t sup = cfg.audit_fd < 0 ? -1 : sup_start(&cfg, &port, prep_wedged);
     int net = sup > 0 ? tcp_connect(port) : -1;
     bool up = net >= 0 && cl_start(&c, net, -1, run);
-    bool said = up && read_until(c.screen_r, "\n", screen, sizeof screen, 8000) && strstr(screen, "PGID=") &&
-                sscanf(strstr(screen, "PGID="), "PGID=%d", &leader) == 1;
+    bool said = up && read_pgid(&c, &leader);
     failures = check(failures, said && group_running(leader) >= 2,
                      "worker stop: the worker group (a HUP-ignoring leader and its child) is running");
     if (sup > 0)
@@ -244,17 +287,11 @@ static int stop_orphan_case(void)
     bool stopped = sup > 0 && exits_within(sup, 5000, &status);
     failures = check(failures, stopped && WIFEXITED(status) && WEXITSTATUS(status) == 0,
                      "worker stop: SIGTERM ends the supervisor although the session ignores it");
-    for (int i = 0; said && i < 150 && group_running(leader); i++)
-        poll(NULL, 0, 20); /* real-clock: the kernel finishes the kill asynchronously; no seam */
-    bool gone = said && group_running(leader) == 0;
+    bool gone = said && group_gone(leader);
     failures = check(failures, gone, "worker stop: the WORKER group is gone, not only the supervisor");
     if (said && !gone)
         kill(-leader, SIGKILL);
-    if (up)
-        cl_end(&c);
-    if (net >= 0)
-        close(net);
-    close(cfg.audit_fd);
+    rig_end(&c, up, net, cfg.audit_fd);
     return failures;
 }
 
@@ -399,11 +436,7 @@ static int busy_count_case(void)
     cfg.max_active = 1;
     cfg.max_sessions = 2;
     cfg.audit_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
-    int listener = cfg.audit_fd < 0 ? -1 : mesh_terminal_hub_listen(0, &port);
-    pid_t sup = listener < 0 ? -1 : fork();
-    if (sup == 0)
-        _exit(mesh_terminal_hub_listen_run(listener, &cfg));
-    close(listener);
+    pid_t sup = cfg.audit_fd < 0 ? -1 : sup_start(&cfg, &port, NULL);
     int a = sup > 0 ? tcp_connect(port) : -1;
     bool up = a >= 0 && cl_start(&c, a, -1, run) && read_until(c.screen_r, "UP", screen, sizeof screen, 8000);
     int b = up ? tcp_connect(port) : -1;
@@ -416,13 +449,221 @@ static int busy_count_case(void)
     bool stopped = sup > 0 && exits_within(sup, 8000, &status);
     failures = check(failures, stopped && WIFEXITED(status) && WEXITSTATUS(status) == 0,
                      "max_sessions: a busy refusal counts, so the supervisor stops by itself after two connections");
-    if (up)
-        cl_end(&c);
     if (b >= 0)
         close(b);
-    if (a >= 0)
-        close(a);
+    rig_end(&c, up, a, cfg.audit_fd);
+    return failures;
+}
+
+/* ── a session ended from outside leaves no stale-slot kill ───────────── */
+
+/* Runs in the supervisor right after the stop grace: ends every session from
+ * outside and waits until each is a zombie, so the slot of its worker group
+ * is stale (the group id may by now belong to someone else). */
+static void hook_end_sessions(const pid_t *kids, unsigned n)
+{
+    for (unsigned i = 0; i < n; i++) {
+        siginfo_t si = { 0 };
+        if (kids[i] <= 0)
+            continue;
+        kill(kids[i], SIGKILL);
+        waitid(P_PID, (id_t)kids[i], &si, WEXITED | WNOWAIT);
+    }
+}
+
+static void prep_stale(void)
+{
+    mesh_terminal_hub_testing_children_ignore_term(true);
+    mesh_terminal_hub_testing_before_freeze(hook_end_sessions);
+}
+
+static int stale_slot_case(void)
+{
+    int failures = 0, status = 0, leader = 0;
+    struct mesh_terminal_hub_listen_cfg cfg;
+    struct cl c;
+    uint16_t port = 0;
+    const char *const run[] = { "/bin/sh", "-c", HUP_TRAP_RUN, NULL };
+    memset(&cfg, 0, sizeof cfg);
+    base_cfg(&cfg.serve);
+    cfg.max_active = 1;
+    cfg.stop_grace_ms = 200;
+    cfg.audit_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    pid_t sup = cfg.audit_fd < 0 ? -1 : sup_start(&cfg, &port, prep_stale);
+    int net = sup > 0 ? tcp_connect(port) : -1;
+    bool up = net >= 0 && cl_start(&c, net, -1, run);
+    bool said = up && read_pgid(&c, &leader);
+    if (sup > 0)
+        kill(sup, SIGTERM);
+    bool stopped = sup > 0 && exits_within(sup, 5000, &status);
+    failures = check(failures, stopped && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                     "stale slot: the supervisor still stops when a session died from outside");
+    failures = check(failures, said && group_running(leader) >= 1,
+                     "stale slot: a group named only by a dead session's slot is not killed");
+    if (said)
+        kill(-leader, SIGKILL);
+    rig_end(&c, up, net, cfg.audit_fd);
+    return failures;
+}
+
+/* ── N wedged sessions cost one freeze deadline, not N ────────────────── */
+
+#define WEDGED_N 4
+
+/* Direct children of `parent`, from /proc. */
+static unsigned children_of(pid_t parent, pid_t *out, unsigned cap)
+{
+    unsigned n = 0;
+    DIR *proc = opendir("/proc");
+    struct dirent *ent;
+    while (proc && (ent = readdir(proc)) != NULL && n < cap) {
+        char path[64], buf[512];
+        long pid = strtol(ent->d_name, NULL, 10);
+        if (pid <= 0)
+            continue;
+        snprintf(path, sizeof path, "/proc/%ld/stat", pid);
+        int fd = open(path, O_RDONLY);
+        ssize_t r = fd < 0 ? -1 : read(fd, buf, sizeof buf - 1);
+        if (fd >= 0)
+            close(fd);
+        const char *after = r > 0 ? (buf[r] = '\0', strrchr(buf, ')')) : NULL;
+        char state = 0;
+        long ppid = 0;
+        if (after && sscanf(after + 1, " %c %ld", &state, &ppid) == 2 && ppid == parent)
+            out[n++] = (pid_t)pid;
+    }
+    if (proc)
+        closedir(proc);
+    return n;
+}
+
+static int64_t now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* A session that is traced and never resumed does not report SIGSTOP to its
+ * parent (the stop goes to the tracer), which is how a session that cannot be
+ * frozen in time looks to the supervisor. */
+struct wedged {
+    pid_t sup;
+    struct cl c[WEDGED_N];
+    int net[WEDGED_N];
+    pid_t kids[WEDGED_N + 2];
+    unsigned nk, seized;
+    int started;
+};
+
+static void wedged_up(struct wedged *w, uint16_t port)
+{
+    char screen[64];
+    const char *const run[] = { "/bin/sh", "-c", "echo UP; read x", NULL };
+    for (int i = 0; w->sup > 0 && i < WEDGED_N; i++) {
+        w->net[i] = tcp_connect(port);
+        if (w->net[i] >= 0 && cl_start(&w->c[i], w->net[i], -1, run) &&
+            read_until(w->c[i].screen_r, "UP", screen, sizeof screen, 8000))
+            w->started++;
+    }
+    w->nk = w->started == WEDGED_N ? children_of(w->sup, w->kids, WEDGED_N + 2) : 0;
+    for (unsigned i = 0; i < w->nk; i++)
+        w->seized += ptrace(PTRACE_SEIZE, w->kids[i], 0, 0) == 0;
+}
+
+/* SIGTERM to the supervisor, then the tracer drains the tracees' events
+ * without resuming them (so the killed ones can still be reaped) until the
+ * supervisor exits. Returns the elapsed ms, -1 if it never did. */
+static int64_t wedged_stop(const struct wedged *w, int *status)
+{
+    int64_t t0 = now_ms();
+    kill(w->sup, SIGTERM);
+    while (now_ms() - t0 < 6000) {
+        for (unsigned i = 0; i < w->nk; i++)
+            waitpid(w->kids[i], status, WNOHANG | __WALL);
+        if (waitpid(w->sup, status, WNOHANG) == w->sup)
+            return now_ms() - t0;
+        poll(NULL, 0, 5); /* real-clock: the supervisor is another process; there is no seam */
+    }
+    return -1;
+}
+
+static int wedged_stop_case(void)
+{
+    int failures = 0, status = 0;
+    struct mesh_terminal_hub_listen_cfg cfg;
+    struct wedged w = { 0 };
+    uint16_t port = 0;
+    memset(&cfg, 0, sizeof cfg);
+    base_cfg(&cfg.serve);
+    cfg.max_active = WEDGED_N;
+    cfg.stop_grace_ms = 300;
+    cfg.audit_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    w.sup = cfg.audit_fd < 0 ? -1 : sup_start(&cfg, &port, prep_wedged);
+    wedged_up(&w, port);
+    failures = check(failures, w.nk == WEDGED_N && w.seized == WEDGED_N,
+                     "wedged stop: four sessions are up and held by a tracer");
+    int64_t took = w.sup > 0 ? wedged_stop(&w, &status) : -1;
+    failures = check(failures, took >= 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                     "wedged stop: the supervisor ends although no session can be frozen");
+    /* grace 300 + ONE 200 ms freeze deadline + the kills; N serial freezes
+     * would add at least 3 x 200 ms more. */
+    failures = check(failures, took >= 0 && took < 800,
+                     "wedged stop: four unfreezable sessions cost one freeze deadline, not four");
+    if (took < 0 && w.sup > 0) {
+        kill(w.sup, SIGKILL);
+        waitpid(w.sup, &status, 0);
+    }
+    for (int i = 0; i < w.started; i++)
+        cl_end(&w.c[i]);
+    for (int i = 0; i < WEDGED_N; i++)
+        if (w.net[i] >= 0)
+            close(w.net[i]);
     close(cfg.audit_fd);
+    return failures;
+}
+
+/* ── a natural stop at max_sessions=1, and the sink's flags untouched ─── */
+
+static int natural_stop_case(void)
+{
+    int failures = 0, status = 0, sink[2];
+    struct mesh_terminal_hub_listen_cfg cfg;
+    struct cl c;
+    char screen[64], audit[512] = "";
+    uint16_t port = 0;
+    const char *const run[] = { "/bin/sh", "-c", "echo UP; read x", NULL };
+    memset(&cfg, 0, sizeof cfg);
+    base_cfg(&cfg.serve);
+    cfg.max_active = 1;
+    cfg.max_sessions = 1;
+    if (pipe2(sink, O_CLOEXEC) != 0)
+        return check(failures, false, "natural stop setup");
+    cfg.audit_fd = sink[1];
+    int listener = mesh_terminal_hub_listen(0, &port);
+    pid_t sup = listener < 0 ? -1 : fork();
+    if (sup == 0)
+        _exit(mesh_terminal_hub_listen_run(listener, &cfg));
+    close(listener);
+    int net = sup > 0 ? tcp_connect(port) : -1;
+    bool up = net >= 0 && cl_start(&c, net, -1, run) && read_until(c.screen_r, "UP", screen, sizeof screen, 8000);
+    ssize_t w = up ? write(c.keys_w, "\n", 1) : 0;
+    (void)w;
+    bool stopped = sup > 0 && exits_within(sup, 8000, &status);
+    failures = check(failures, stopped && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                     "max_sessions=1: one admitted session ends and the supervisor exits by itself");
+    ssize_t n = read(sink[0], audit, sizeof audit - 1);
+    failures = check(failures, n > 0, "max_sessions=1: the session's audit line reached the sink");
+    /* the sink's open file description is shared with whoever else holds it:
+     * a hub that flipped it to O_NONBLOCK must not leave it so */
+    failures = check(failures, n > 0 && !(fcntl(sink[1], F_GETFL) & O_NONBLOCK),
+                     "max_sessions=1: the shared audit sink is left with its own flags");
+    if (up)
+        cl_end(&c);
+    if (net >= 0)
+        close(net);
+    close(sink[0]);
+    close(sink[1]);
     return failures;
 }
 
@@ -432,7 +673,8 @@ int test_mesh_terminal_hub_bounds(const char *fbsh, const char *dir)
     g_dir = dir;
     signal(SIGPIPE, SIG_IGN);
     return stop_orphan_case() + audit_race_case() + client_stop_case() +
-           client_tail_case() + busy_count_case();
+           client_tail_case() + busy_count_case() +
+           stale_slot_case() + wedged_stop_case() + natural_stop_case();
 }
 
 #else /* __linux__ */

@@ -12,7 +12,9 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <string.h>
+#include <limits.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -45,41 +47,61 @@ void mesh_terminal_hub_testing_before_write(void (*hook)(int fd))
 {
     g_before_write = hook;
 }
-#endif
 
 void hub_io_before_write(int fd)
 {
-#if defined(ZCL_TESTING)
     if (g_before_write)
         g_before_write(fd);
-#else
-    (void)fd;
-#endif
 }
+#endif
 
 void hub_wfd_open(struct hub_wfd *w, int fd)
 {
     struct stat st;
-    int fl = fcntl(fd, F_GETFL);
-    *w = (struct hub_wfd){ .fd = fd, .restore = -1 };
-    if (fl < 0 || (fl & O_NONBLOCK) || fstat(fd, &st) != 0 || S_ISREG(st.st_mode))
+    *w = (struct hub_wfd){ .fd = fd, .mode = HUB_WFD_NOWAIT };
+    if (fstat(fd, &st) != 0)
         return;
-    if (fcntl(fd, F_SETFL, fl | O_NONBLOCK) == 0)
-        w->restore = fl;
+    if (S_ISSOCK(st.st_mode))
+        w->mode = HUB_WFD_SOCKET;
+    else if (S_ISREG(st.st_mode))
+        w->mode = HUB_WFD_PLAIN;
 }
 
-void hub_wfd_close(struct hub_wfd *w)
+/* poll(POLLOUT, 0) then at most PIPE_BUF: the room a ready descriptor is
+ * guaranteed to take. A second writer can still win the readiness on a file
+ * that has no RWF_NOWAIT; the audit sink and the screen are pipes, which do. */
+static ssize_t hub_wfd_try_polled(const struct hub_wfd *w, const void *buf, size_t n)
 {
-    if (w->restore >= 0)
-        (void)fcntl(w->fd, F_SETFL, w->restore);
+    struct pollfd pfd = { .fd = w->fd, .events = POLLOUT };
+    if (poll(&pfd, 1, 0) <= 0 || !pfd.revents) { /* an error revent falls through: write reports it */
+        errno = EAGAIN;
+        return -1;
+    }
+    return write(w->fd, buf, n < PIPE_BUF ? n : PIPE_BUF);
 }
 
-bool hub_wfd_write(const struct hub_wfd *w, const void *buf, size_t n, int64_t deadline_ms)
+ssize_t hub_wfd_try(struct hub_wfd *w, const void *buf, size_t n)
+{
+    hub_io_before_write(w->fd);
+    if (w->mode == HUB_WFD_SOCKET)
+        return send(w->fd, buf, n, MSG_DONTWAIT | MSG_NOSIGNAL);
+    if (w->mode == HUB_WFD_PLAIN)
+        return write(w->fd, buf, n);
+    if (w->mode == HUB_WFD_NOWAIT) {
+        struct iovec iov = { .iov_base = (void *)buf, .iov_len = n };
+        ssize_t k = pwritev2(w->fd, &iov, 1, -1, RWF_NOWAIT);
+        if (k >= 0 || (errno != EOPNOTSUPP && errno != EINVAL && errno != ENOSYS))
+            return k;
+        w->mode = HUB_WFD_POLLED; /* this file takes no RWF_NOWAIT */
+    }
+    return hub_wfd_try_polled(w, buf, n);
+}
+
+bool hub_wfd_write(struct hub_wfd *w, const void *buf, size_t n, int64_t deadline_ms)
 {
     const uint8_t *p = buf;
     while (n) {
-        hub_io_before_write(w->fd);
-        ssize_t k = write(w->fd, p, n);
+        ssize_t k = hub_wfd_try(w, p, n);
         if (k > 0) {
             p += k;
             n -= (size_t)k;
