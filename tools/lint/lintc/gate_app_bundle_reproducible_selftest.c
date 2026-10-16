@@ -186,7 +186,7 @@ static int abr_unit_mode(void)
 
 #ifdef ZCL_TESTING
 /* Redirects stderr into file for the duration of one call; abr_err_read
- * restores it and returns the captured text (caller frees). */
+ * restores it and copies the captured text into out. */
 static int abr_err_redirect(const char *file, int *saved)
 {
     int fd = open(file, O_WRONLY | O_CREAT | O_TRUNC, 0600);
@@ -199,25 +199,24 @@ static int abr_err_redirect(const char *file, int *saved)
     return *saved >= 0 ? ABR_OK : abr_fatal("cannot capture diagnostics");
 }
 
-static char *abr_err_read(const char *file, int saved)
+static void abr_err_read(const char *file, int saved, char out[ABR_PATH])
 {
-    char *text = calloc(1, ABR_PATH);
+    size_t n = 0;
     FILE *f;
     fflush(stderr);
     dup2(saved, STDERR_FILENO);
     close(saved);
-    f = text ? fopen(file, "r") : NULL;
+    f = fopen(file, "r");
     if (f) {
-        size_t n = fread(text, 1, ABR_PATH - 1, f);
-        text[n] = '\0';
+        n = fread(out, 1, ABR_PATH - 1, f);
         fclose(f);
     }
-    return text;
+    out[n] = '\0';
 }
 
 /* Walks root with the seam armed; the diagnostics land in *msg. */
 static int abr_unit_walk(const char *root, const char *tmp, const char *tag, struct abr_seam arm,
-                         char **msg)
+                         char msg[ABR_PATH])
 {
     char log[ABR_PATH];
     int saved, lines, rc = abr_pathf(log, "%s/walk.log", tmp);
@@ -226,7 +225,7 @@ static int abr_unit_walk(const char *root, const char *tmp, const char *tag, str
         return rc;
     abr_seam = arm;
     rc = abr_manifest_tree(root, tmp, tag, &lines, sha);
-    *msg = abr_err_read(log, saved);
+    abr_err_read(log, saved, msg);
     return rc;
 }
 
@@ -263,22 +262,20 @@ static int abr_unit_walk_tree(const char *tmp, char root[ABR_PATH])
  * and leave no manifest; one that succeeds with errno left set must not. */
 static int abr_unit_readdir(const char *tmp)
 {
-    char root[ABR_PATH], *msg = NULL;
+    char root[ABR_PATH], msg[ABR_PATH];
     int rc = abr_unit_walk_tree(tmp, root);
     if (rc)
         return rc;
-    rc = abr_unit_walk(root, tmp, "e", (struct abr_seam){ .fail_at = 2 }, &msg);
+    rc = abr_unit_walk(root, tmp, "e", (struct abr_seam){ .fail_at = 2 }, msg);
     if (rc != ABR_FATAL)
         rc = abr_st_fail("a readdir error mid-listing did not refuse the walk");
-    else if (!msg || !strstr(msg, root))
+    else if (!strstr(msg, root))
         rc = abr_st_fail("the readdir refusal does not name the directory");
     else if (!(rc = abr_unit_no_manifest(tmp, "e")))
         rc = abr_unit_balanced();
-    free(msg);
     if (rc)
         return rc;
-    rc = abr_unit_walk(root, tmp, "s", (struct abr_seam){ .dirty_at = 1 }, &msg);
-    free(msg);
+    rc = abr_unit_walk(root, tmp, "s", (struct abr_seam){ .dirty_at = 1 }, msg);
     if (rc != ABR_OK)
         return abr_st_fail("a stale errno at the end of a listing refused a good walk");
     return abr_unit_balanced();
@@ -303,12 +300,11 @@ static int abr_unit_chain(const char *root, int levels)
 /* Past ABR_DEPTH the walk refuses before opening a directory. */
 static int abr_unit_depth(const char *tmp)
 {
-    char root[ABR_PATH], *msg = NULL;
+    char root[ABR_PATH], msg[ABR_PATH];
     int rc = abr_pathf(root, "%s/deep", tmp);
     if (rc || mkdir(root, 0777) != 0 || (rc = abr_unit_chain(root, ABR_DEPTH + 2)))
         return rc ? rc : abr_fatal("cannot create %s", root);
-    rc = abr_unit_walk(root, tmp, "d", (struct abr_seam){ 0 }, &msg);
-    free(msg);
+    rc = abr_unit_walk(root, tmp, "d", (struct abr_seam){ 0 }, msg);
     if (rc != ABR_FATAL)
         return abr_st_fail("a tree nested past the depth limit was not refused");
     if (abr_seam.opened != ABR_DEPTH + 1)
