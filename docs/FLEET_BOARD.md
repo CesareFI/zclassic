@@ -122,8 +122,9 @@ proven under the same root and chain state is not checked again), and only
 one thread rebuilds at a time. A read of the store that fails is
 **unverifiable**, never "no roster".
 
-The gate has three states. With no fleet root, or no sealed row yet, it is
-**unarmed** and fleet carriage is exactly what it was. With a root and at
+The gate has three states. With no fleet root, or no sealed row yet while the
+root is ACTIVE or never anchored, it is **unarmed** and fleet carriage is
+exactly what it was. With a root and at
 least one sealed row it is **armed**: the paired board stream answers only a
 roster member, asks only a roster member, and the stream and ordinary P2P
 POST ingress accept a fleet-scope post only from a roster member. If the root

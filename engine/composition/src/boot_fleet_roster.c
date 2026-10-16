@@ -431,6 +431,16 @@ static enum snap_state scan_fold(const struct db_fleet_board_post *rows, int n,
     acc->next.state = rv->state;
     acc->next.require = rv->require;
     g_memo = acc->next;
+    if (rv->state == ZCL_FLEET_ROOT_REVOKED ||
+        rv->state == ZCL_FLEET_ROOT_ROTATED ||
+        rv->state == ZCL_FLEET_ROOT_UNREADABLE) {
+        LOG_WARN(ROSTER_LOG, "the fleet root is %s on chain: no fleet-scope "
+                 "relay, whatever roster notes are held",
+                 rv->state == ZCL_FLEET_ROOT_REVOKED ? "revoked"
+                 : rv->state == ZCL_FLEET_ROOT_ROTATED ? "rotated"
+                                                       : "unreadable");
+        return SNAP_UNVERIFIABLE;
+    }
     if (acc->refused)
         return SNAP_UNVERIFIABLE;
     if (acc->sealed == 0)

@@ -6469,6 +6469,90 @@ static int test_fleet_board_roster_root_standing(void)
     return failures;
 }
 
+/* Corrupt a saved anchor's status to a value the reader does not know, so the
+ * real read path maps it to UNREADABLE. The status column is TEXT NOT NULL
+ * with no CHECK constraint, so the raw UPDATE is accepted. */
+static bool fbr_corrupt_status(struct node_db *db, uint8_t root_id)
+{
+    uint8_t seed[32], pub[32];
+    char sql[192];
+    fbr_root_pub(root_id, seed, pub);
+    memset(seed, 0, sizeof seed);
+    size_t off = (size_t)snprintf(sql, sizeof sql, "%s",
+        "UPDATE zid_identities SET status='bogus' WHERE master_pubkey=X'");
+    for (int i = 0; i < 32; i++)
+        off += (size_t)snprintf(sql + off, sizeof sql - off, "%02x", pub[i]);
+    (void)snprintf(sql + off, sizeof sql - off, "'");
+    boot_fleet_roster_invalidate();
+    return node_db_exec(db, sql);
+}
+
+/* A root rotated, revoked or unreadable on chain refuses fleet-scope relay
+ * even when no roster note is live: an empty roster and a roster whose only
+ * note has expired are both refused, never UNARMED. An active root with an
+ * empty roster stays unarmed, and public scope is never consulted here. */
+static int test_fleet_board_roster_refused_root_no_notes(void)
+{
+    int failures = 0;
+    TEST("fleet roster: a rotated, revoked or unreadable root refuses fleet "
+         "relay with no live roster note (empty, or only expired); an active "
+         "root with no notes stays unarmed; public scope is admitted") {
+        struct node_db db;
+        uint8_t member[32];
+        const int64_t now = 900000;
+        /* Index 2 is saved ACTIVE and then corrupted to an unknown status:
+         * UNREADABLE. */
+        static const char *const bad[] = {
+            ZID_IDENTITY_STATUS_REVOKED, ZID_IDENTITY_STATUS_ROTATED,
+            ZID_IDENTITY_STATUS_ACTIVE };
+        fbr_key(FBR_MEMBER, member);
+        for (int s = 0; s < 3; s++) {
+            for (int expired = 0; expired < 2; expired++) {
+                memset(&db, 0, sizeof db);
+                ASSERT(node_db_open(&db, ":memory:"));
+                fbr_install(FBR_ROOT, false);
+                if (expired) {
+                    char line[FLEET_ENROL_MACHINE_TEXT_MAX];
+                    ASSERT(fbr_line(FBR_ROOT, "m5", FBR_MEMBER, line,
+                                    sizeof line));
+                    ASSERT(fbr_store_row(&db, 1, line, now, 60));
+                }
+                ASSERT(fbr_anchor(&db, FBR_ROOT, bad[s]));
+                if (s == 2)
+                    ASSERT(fbr_corrupt_status(&db, FBR_ROOT));
+                struct boot_fleet_roster_counts before, after;
+                boot_fleet_roster_counts(&before);
+                ASSERT_EQ(boot_fleet_roster_check(&db, member, now + 600),
+                          BOOT_FLEET_ROSTER_UNVERIFIABLE);
+                ASSERT(!boot_fleet_roster_admits_peer(&db, member, now + 600));
+                boot_fleet_roster_counts(&after);
+                ASSERT(after.unverifiable > before.unverifiable);
+                fbr_uninstall();
+                node_db_close(&db);
+            }
+        }
+        /* An active root with no notes is still unarmed, and admits. */
+        memset(&db, 0, sizeof db);
+        ASSERT(node_db_open(&db, ":memory:"));
+        fbr_install(FBR_ROOT, false);
+        ASSERT(fbr_anchor(&db, FBR_ROOT, ZID_IDENTITY_STATUS_ACTIVE));
+        ASSERT_EQ(boot_fleet_roster_check(&db, member, now),
+                  BOOT_FLEET_ROSTER_UNARMED);
+        ASSERT(boot_fleet_roster_admits_peer(&db, member, now));
+        /* Public scope never reaches the roster: a revoked root still admits
+         * a public post. */
+        ASSERT(fbr_anchor(&db, FBR_ROOT, ZID_IDENTITY_STATUS_REVOKED));
+        struct fleet_board_post pub;
+        memset(&pub, 0, sizeof pub);
+        pub.scope = FLEET_BOARD_SCOPE_PUBLIC;
+        ASSERT(boot_fleet_roster_admits_post(&db, &pub, now));
+        fbr_uninstall();
+        node_db_close(&db);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_fleet_board_roster_lifetime(void)
 {
     int failures = 0;
@@ -7384,6 +7468,7 @@ int test_fleet_board(void)
     failures += test_fleet_board_fleet_quota();
     failures += test_fleet_board_roster_membership();
     failures += test_fleet_board_roster_root_standing();
+    failures += test_fleet_board_roster_refused_root_no_notes();
     failures += test_fleet_board_roster_lifetime();
     failures += test_fleet_board_roster_bounds();
     failures += test_fleet_board_roster_row_is_an_old_row();

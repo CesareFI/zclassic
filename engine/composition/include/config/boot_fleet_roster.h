@@ -36,7 +36,9 @@
  * THE GATE has three states, and only one of them changes behaviour today:
  *
  *   UNARMED        this box trusts no fleet root, or no row sealed by it has
- *                  arrived. Fleet-scope carriage is exactly what it was
+ *                  arrived while the root is ACTIVE or never anchored (a
+ *                  rotated, revoked or unreadable root is UNVERIFIABLE even
+ *                  with no live row). Fleet-scope carriage is exactly what it was
  *                  before this step: paired, current and holding the read
  *                  role. Never "relay to all".
  *   MEMBER /       a root is trusted and at least one sealed row is held:
