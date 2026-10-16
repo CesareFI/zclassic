@@ -123,6 +123,23 @@ static void cik_accessor_pattern(const char *code, struct cik_buf *re)
     cik_buf_puts(re, ")([^A-Za-z_0-9][^,()\"]*)?,[ ]*\"[^\"]*\"");
 }
 
+/* regexec on a compiled pattern: true on a match, false on REG_NOMATCH.
+ * Anything else (REG_ESPACE) is FATAL, never a quiet "no more matches". */
+static bool cik_rx_next(const regex_t *rx, const char *s, regmatch_t *m)
+{
+    int r = regexec(rx, s, 1, m, 0);
+    if (r == 0)
+        return true;
+    if (r != REG_NOMATCH) {
+        char msg[128];
+        (void)regerror(r, rx, msg, sizeof msg);
+        fprintf(stderr, "check_command_input_keys: FATAL — regexec failed"
+                " (%s); refusing to report a verdict.\n", msg);
+        exit(2);
+    }
+    return false;
+}
+
 static void cik_scan_accessors(struct cik_index *x, struct cik_fn *fn,
                                const char *body, const char *code)
 {
@@ -137,7 +154,7 @@ static void cik_scan_accessors(struct cik_index *x, struct cik_fn *fn,
               " pattern; refusing to report a verdict.\n", stderr);
         exit(2);
     }
-    while (regexec(&rx, body, 1, &m, 0) == 0 && m.rm_eo > m.rm_so) {
+    while (cik_rx_next(&rx, body, &m) && m.rm_eo > m.rm_so) {
         const char *hit = body + m.rm_so;
         size_t n = (size_t)(m.rm_eo - m.rm_so);
         const char *q = memchr(hit, '"', n);
@@ -166,7 +183,7 @@ static void cik_scan_arrays(struct cik_index *x, struct cik_fn *fn,
                             const char *body, const char *code)
 {
     regmatch_t m;
-    while (regexec(&x->arr_re, body, 1, &m, 0) == 0) {
+    while (cik_rx_next(&x->arr_re, body, &m)) {
         const char *hit = body + m.rm_so, *end = body + m.rm_eo;
         const char *name = hit + sizeof "const char *const " - 1;
         const char *p = (const char *)memchr(hit, '{', (size_t)(end - hit)) + 1;

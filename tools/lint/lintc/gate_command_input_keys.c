@@ -212,10 +212,12 @@ static bool cik_print_findings(struct cik_run *r)
         cik_print_divergent(r);
     if (r->rep.nstale > 0)
         cik_print_stale(r);
-    if (r->rep.unresolved > 0)
+    if (r->rep.unresolved > 0) {
         fprintf(r->out, "check_command_input_keys: note — %ld bound handler"
                 " symbol(s) were not found in the scanned C (not gated):\n\n",
                 r->rep.unresolved);
+        fputs(cik_buf_str(&r->rep.unres), r->out);
+    }
     if (r->rep.nunread > 0 && strcmp(r->cfg->verbose, "1") == 0)
         fprintf(r->out, "check_command_input_keys: declared-but-not-read"
                 " (WARN, not gated):\n%s", cik_buf_str(&r->rep.unread));

@@ -91,7 +91,7 @@ void cik_extract(struct cik_index *x, const char *name, const char *body,
 /* Counts and the text of each finding class, in the order found. */
 struct cik_report {
     long resolved, unresolved, nmiss, nunread, ngrand, nstale, nshared, ndiv;
-    struct cik_buf miss, divg, stale, unread;
+    struct cik_buf miss, divg, stale, unread, unres;
 };
 /* Closes the call graph and judges every leaf against the baseline file.
  * Returns 0, 1 when the baseline cannot be created, 3 when the call closure

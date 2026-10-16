@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "gate_command_input_keys_priv.h"
+#include "lintc.h"
 
 enum { CIK_ROUNDS = 64 };
 
@@ -97,26 +98,34 @@ static void cik_pin_line(struct cik_ctx *c, char *line)
                                           cik_dup(tok[1], strlen(tok[1])), false };
 }
 
+static int cik_pin_cb(void *vctx, const char *line, size_t len)
+{
+    char *copy = cik_dup(line, len);
+    cik_pin_line(vctx, copy);
+    free(copy);
+    return 0;
+}
+
 /* Loads the baseline; a missing file is created empty, as the script's touch
- * did, and an unreadable one reads as empty. */
+ * did. Any other open error or a read error is FATAL (2): an unreadable
+ * baseline must never read as "no pins". */
 static int cik_pins_load(struct cik_ctx *c, const char *path, FILE *err)
 {
-    FILE *f = fopen(path, "r");
-    char *line = NULL;
-    size_t cap = 0;
-    if (!f && errno == ENOENT) {
-        f = fopen(path, "a");
+    int rc = lc_each_line(path, cik_pin_cb, c, 1);
+    if (rc == 2) {
+        fprintf(err, "check_command_input_keys: FATAL — cannot read baseline"
+                " %s: %s\n", path, strerror(errno));
+        return 2;
+    }
+    if (rc == 1) {
+        FILE *f = fopen(path, "a");
         if (!f) {
             fprintf(err, "touch: cannot touch '%s': %s\n", path,
                     strerror(errno));
             return 1;
         }
-    }
-    while (f && getline(&line, &cap, f) >= 0)
-        cik_pin_line(c, line);
-    free(line);
-    if (f)
         fclose(f);
+    }
     return 0;
 }
 
@@ -244,6 +253,8 @@ static void cik_leaves(struct cik_ctx *c, const struct cik_defs *d)
         const struct cik_fn *fn = cik_index_find(c->x, l->hid);
         if (!fn) {
             c->r->unresolved++;
+            cik_put_fmt(&c->r->unres, "    %s -> %s\n", l->path,
+                        l->handler);
             continue;
         }
         c->r->resolved++;
@@ -295,5 +306,6 @@ void cik_report_free(struct cik_report *r)
     cik_buf_free(&r->divg);
     cik_buf_free(&r->stale);
     cik_buf_free(&r->unread);
+    cik_buf_free(&r->unres);
     *r = (struct cik_report){ 0 };
 }

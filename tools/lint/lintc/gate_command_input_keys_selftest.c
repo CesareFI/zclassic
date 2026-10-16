@@ -51,7 +51,10 @@ struct cks_case {
     const char *name, *leaves, *base, *mode, *verbose, *leaf_floor;
     int nargs, rc;
     const char *out, *err;
+    int fault; /* CKS_F_*: baseline made unreadable after it is written */
 };
+
+enum { CKS_F_NONE, CKS_F_CHMOD, CKS_F_DIR, CKS_F_ABSENT };
 
 #define CKS_A "p.a|S|O|alpha,beta,delta,zeta|gamma|h_alpha"
 #define CKS_NOD "p.a|S|O|alpha,beta|gamma|h_alpha"
@@ -60,27 +63,33 @@ static const struct cks_case k_cks_cases[] = {
     { "clean", CKS_A, "", "FAIL", "0", "1", 22, 0,
       "PASS (1 leaf handler(s) resolved over 6 function(s); every key they"
       " read is declared; 0 leaf(s) on a shared dispatcher not attributable;"
-      " 1 declared-but-unread", NULL },
+      " 1 declared-but-unread", NULL, CKS_F_NONE },
     { "undeclared", CKS_NOD, "", "FAIL", "0", "1", 22, 1,
-      "reads \"delta\" (handler h_alpha)", NULL },
+      "reads \"delta\" (handler h_alpha)", NULL, CKS_F_NONE },
     { "pinned", CKS_NOD, "p.a delta  # reason\n", "FAIL", "0", "1", 22, 0,
-      "; 1 grandfathered;", NULL },
+      "; 1 grandfathered;", NULL, CKS_F_NONE },
     { "stale pin", CKS_A, "p.a zzz\n", "FAIL", "0", "1", 22, 1,
-      "1 STALE baseline entry(ies)", NULL },
+      "1 STALE baseline entry(ies)", NULL, CKS_F_NONE },
     { "warn mode", CKS_NOD, "", "WARN", "0", "1", 22, 0,
-      "READ by a handler but NOT declared", NULL },
+      "READ by a handler but NOT declared", NULL, CKS_F_NONE },
     { "divergent", CKS_A ";p.b|S|O|alpha|gamma|h_alpha", "", "FAIL", "0", "1",
-      22, 1, "(handler h_alpha, input schema S)", NULL },
+      22, 1, "(handler h_alpha, input schema S)", NULL, CKS_F_NONE },
     { "shared agree", CKS_A ";p.b|S|O|gamma,alpha|beta,delta,zeta|h_alpha",
-      "", "FAIL", "0", "1", 22, 0, "2 leaf(s) on a shared dispatcher", NULL },
+      "", "FAIL", "0", "1", 22, 0, "2 leaf(s) on a shared dispatcher", NULL, CKS_F_NONE },
     { "grammar drift", CKS_A, "", "FAIL", "0", "1", 21, 2, NULL,
-      "macro grammar drift: expected 22 arguments, parsed 21" },
+      "macro grammar drift: expected 22 arguments, parsed 21", CKS_F_NONE },
     { "leaf floor", CKS_A, "", "FAIL", "0", "99", 22, 2, NULL,
-      "leaf population collapsed under floor (parsed 1)" },
+      "leaf population collapsed under floor (parsed 1)", CKS_F_NONE },
     { "unresolved", CKS_A ";p.c|S|O|||h_missing", "", "FAIL", "0", "1", 22, 0,
-      "note — 1 bound handler symbol(s) were not found", NULL },
+      "(not gated):\n\n    p.c -> h_missing\n", NULL, CKS_F_NONE },
+    { "unreadable baseline", CKS_A, "", "FAIL", "0", "1", 22, 2, NULL,
+      "baseline.txt: Permission denied", CKS_F_CHMOD },
+    { "baseline read error", CKS_A, "", "FAIL", "0", "1", 22, 2, NULL,
+      "baseline.txt: Is a directory", CKS_F_DIR },
+    { "absent baseline is created", CKS_A, "", "FAIL", "0", "1", 22, 0,
+      "PASS (1 leaf handler(s)", NULL, CKS_F_ABSENT },
     { "verbose", CKS_A, "", "FAIL", "1", "1", 22, 0,
-      "(WARN, not gated):\n    p.a: zeta (handler h_alpha)", NULL }
+      "(WARN, not gated):\n    p.a: zeta (handler h_alpha)", NULL, CKS_F_NONE }
 };
 
 static int cks_put(const char *name, const char *text)
@@ -164,6 +173,28 @@ static int cks_grade(const struct cks_case *c, int rc, const char *out,
     return 0;
 }
 
+/* Makes the written baseline unreadable (or absent); 0 on success. */
+static int cks_fault_on(int fault, const char *base)
+{
+    if (fault == CKS_F_CHMOD)
+        return chmod(base, 0);
+    if (fault == CKS_F_ABSENT)
+        return unlink(base);
+    if (fault == CKS_F_DIR)
+        return unlink(base) != 0 ? -1 : mkdir(base, 0755);
+    return 0;
+}
+
+static void cks_fault_off(int fault, const char *base)
+{
+    if (fault == CKS_F_CHMOD)
+        (void)chmod(base, 0644);
+    else if (fault == CKS_F_DIR)
+        (void)rmdir(base);
+    else if (fault == CKS_F_ABSENT)
+        (void)unlink(base);
+}
+
 static int cks_run_case(const struct cks_case *c, const struct cik_list *srcs)
 {
     char def[CKS_FILE], base[CKS_FILE], *out = NULL, *err = NULL;
@@ -171,10 +202,16 @@ static int cks_run_case(const struct cks_case *c, const struct cik_list *srcs)
     struct cik_list defs = { 0 };
     FILE *fo, *fe;
     int rc;
+    if (c->fault == CKS_F_CHMOD && geteuid() == 0) {
+        fprintf(stderr, "SELFTEST SKIP: %s: running as root, chmod 000 does not deny the read\n", c->name);
+        return 0;
+    }
     snprintf(def, sizeof def, "%s/case.def", g_cks_dir);
     snprintf(base, sizeof base, "%s/baseline.txt", g_cks_dir);
     if (cks_write_defs(c) != 0 || cks_put("baseline.txt", c->base) != 0)
         return cks_fail(c->name, "cannot write the case files");
+    if (cks_fault_on(c->fault, base) != 0)
+        return cks_fail(c->name, "cannot make the baseline unreadable");
     cik_list_add(&defs, def, strlen(def));
     fo = open_memstream(&out, &olen);
     fe = open_memstream(&err, &elen);
@@ -186,6 +223,7 @@ static int cks_run_case(const struct cks_case *c, const struct cik_list *srcs)
         fclose(fo);
     if (fe)
         fclose(fe);
+    cks_fault_off(c->fault, base);
     cik_list_free(&defs);
     rc = rc == -2 ? cks_fail(c->name, "cannot capture output")
                   : cks_grade(c, rc, out ? out : "", err ? err : "");
@@ -213,8 +251,8 @@ static int cks_cases(void)
 {
     struct cik_list srcs = { 0 };
     int rc = cks_write_sources(&srcs) ? cks_fail("setup", "cannot write sources") : 0;
-    for (size_t i = 0; rc == 0 && i < sizeof k_cks_cases / sizeof k_cks_cases[0]; i++)
-        rc = cks_run_case(&k_cks_cases[i], &srcs);
+    for (size_t i = 0; i < sizeof k_cks_cases / sizeof k_cks_cases[0]; i++)
+        rc |= cks_run_case(&k_cks_cases[i], &srcs);
     cik_list_free(&srcs);
     return rc;
 }
