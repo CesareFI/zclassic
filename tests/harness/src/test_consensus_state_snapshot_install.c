@@ -2193,6 +2193,123 @@ static int artifact_coin_changed_object_test(
     return failures;
 }
 
+struct artifact_swap_context {
+    const char *current;
+    const char *retained;
+    const char *replacement;
+    bool swapped;
+};
+static struct artifact_swap_context *artifact_swap;
+static int (*artifact_original_open)(sqlite3_vfs *, const char *,
+                                     sqlite3_file *, int, int *);
+/* This runs after installer descriptor admission/hash, before SQLite's first
+ * read. Renaming ancestors does not change the pinned regular-file inode. */
+static int artifact_substitution_open(sqlite3_vfs *vfs, const char *name,
+    sqlite3_file *file, int flags, int *out)
+{
+    if (artifact_swap && !artifact_swap->swapped) {
+        if (rename(artifact_swap->current, artifact_swap->retained) != 0)
+            return SQLITE_CANTOPEN;
+        if (rename(artifact_swap->replacement, artifact_swap->current) != 0)
+            return SQLITE_CANTOPEN;
+        artifact_swap->swapped = true;
+    }
+    return artifact_original_open(vfs, name, file, flags, out);
+}
+static int artifact_busy_free_test(struct consensus_state_artifact_evidence *evidence)
+{
+    int failures = 0;
+    struct consensus_state_bundle_manifest manifest;
+    uint8_t receipt[32];
+    sqlite3 *db = NULL;
+    bool leased = consensus_state_artifact_evidence_candidate_lease_begin(
+        evidence, &manifest, receipt, &db);
+    CSI_CHECK("busy evidence fixture gets borrowed connection", leased);
+    if (!leased) return failures;
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, "SELECT count(*) FROM coins", -1, &stmt, NULL);
+    consensus_state_artifact_evidence_candidate_lease_end(evidence);
+    CSI_CHECK("busy evidence fixture prepares live statement", rc == SQLITE_OK);
+    if (rc == SQLITE_OK) {
+        consensus_state_artifact_evidence_free(evidence);
+        CSI_CHECK("busy free retains live statement and read transaction",
+            sqlite3_get_autocommit(db) == 0 && sqlite3_step(stmt) == SQLITE_ROW &&
+            sqlite3_column_int64(stmt, 0) == (sqlite3_int64)manifest.utxo_count);
+    }
+    int finalized = sqlite3_finalize(stmt);
+    CSI_CHECK("busy evidence statement cleanup succeeds", finalized == SQLITE_OK);
+    return failures;
+}
+static bool artifact_substitution_setup(struct csi_fixture *a,
+    struct csi_fixture *b, const char *current, const char *replacement)
+{
+    return mkdir(current, 0700) == 0 && mkdir(replacement, 0700) == 0 &&
+        fixture_init(a, current, "input", 0x20, 90, true) &&
+        fixture_init(b, replacement, "input", 0x50, 100, true) &&
+        write_bundle(a, CSI_VALID) && write_bundle(b, CSI_VALID);
+}
+static bool artifact_substitution_sql(
+    const struct consensus_state_artifact_evidence *evidence,
+    const struct csi_fixture *a)
+{
+    struct consensus_state_bundle_manifest manifest;
+    return consensus_state_artifact_evidence_manifest_copy(evidence, &manifest) &&
+        manifest.height == a->height &&
+        memcmp(manifest.utxo_root, a->utxo_root, 32) == 0;
+}
+static bool artifact_substitution_digest(
+    const struct consensus_state_artifact_evidence *evidence,
+    const char *replacement_path, const uint8_t expected[32])
+{
+    uint8_t actual[32], replacement[32];
+    return consensus_state_artifact_evidence_file_digest(evidence, actual) &&
+        memcmp(actual, expected, 32) == 0 &&
+        candidate_file_digest(replacement_path, replacement) &&
+        memcmp(actual, replacement, 32) != 0;
+}
+static int artifact_pinned_substitution_tests(const char *root)
+{
+    int failures = 0;
+    char current[PATH_MAX], replacement[PATH_MAX], retained[PATH_MAX];
+    char retained_file[PATH_MAX];
+    snprintf(current, sizeof(current), "%s/pinned-current", root);
+    snprintf(replacement, sizeof(replacement), "%s/pinned-replacement", root);
+    snprintf(retained, sizeof(retained), "%s/pinned-retained", root);
+    snprintf(retained_file, sizeof(retained_file),
+             "%s/pinned-retained/input.bundle-v1.db", root);
+    struct csi_fixture a = {0}, b = {0};
+    bool setup = artifact_substitution_setup(&a, &b, current, replacement);
+    CSI_CHECK("pinned installer creates distinct valid bundles", setup);
+    struct consensus_state_artifact_evidence *evidence = NULL;
+    uint8_t expected[32] = {0};
+    bool hashed = setup && candidate_file_digest(a.path, expected);
+    sqlite3_vfs *vfs = sqlite3_vfs_find("zcl-pinned-reader-v1");
+    CSI_CHECK("pinned installer has registered adapter and expected digest", hashed && vfs);
+    if (hashed && vfs) {
+        struct artifact_swap_context swap = {current, retained, replacement, false};
+        artifact_swap = &swap;
+        artifact_original_open = vfs->xOpen;
+        vfs->xOpen = artifact_substitution_open;
+        struct zcl_result opened = consensus_state_artifact_evidence_open(
+            a.path, -1, &evidence);
+        vfs->xOpen = artifact_original_open;
+        artifact_swap = NULL;
+        CSI_CHECK("installer SQL admits pinned A after ancestor substitution",
+            opened.ok && evidence && swap.swapped &&
+            artifact_substitution_sql(evidence, &a));
+        CSI_CHECK("installer digest uses same retained A rather than replacement B",
+            artifact_substitution_digest(evidence, a.path, expected));
+        if (evidence) failures += artifact_busy_free_test(evidence);
+    }
+    consensus_state_artifact_evidence_free(evidence);
+    fixture_free(&a); fixture_free(&b);
+    TEST_DISCARD(unlink(a.path)); TEST_DISCARD(unlink(b.path));
+    TEST_DISCARD(unlink(retained_file));
+    TEST_DISCARD(rmdir(current)); TEST_DISCARD(rmdir(replacement));
+    TEST_DISCARD(rmdir(retained));
+    return failures;
+}
+
 static int test_consensus_state_snapshot_install_platform_arm(void)
 {
     printf("\n=== consensus_state_snapshot_install ===\n");
@@ -2305,6 +2422,7 @@ static int test_consensus_state_snapshot_install_platform_arm(void)
                   artifact, admitted_digest) &&
               memcmp(admitted_digest, b.artifact, 32) == 0);
 
+    failures += artifact_pinned_substitution_tests(dir);
     failures += artifact_coin_iterator_tests(artifact);
     failures += artifact_coin_interruption_tests(artifact);
     struct consensus_state_artifact_coins *changed_iterator = NULL;

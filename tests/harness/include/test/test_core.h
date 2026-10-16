@@ -873,6 +873,7 @@ int test_replay_verify(void);
 int test_utxo_snapshot_inmem(void);
 int test_snapshot_apply_coins_kv(void);
 int test_consensus_state_snapshot_install(void);
+int test_sqlite_pinned_reader(void);
 int test_checkpoint_rom_authority(void);
 int test_consensus_state_install_runtime(void);
 int test_boot_bundle_fetch(void);

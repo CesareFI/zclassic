@@ -11,7 +11,8 @@
 #include "core/amount.h"
 #include "coins/utxo_commitment.h"
 #include "script/script.h"
-#include "platform/fd_path.h"
+#include "platform/positioned_file.h"
+#include "storage/sqlite_pinned_reader.h"
 #include "crypto/sha3.h"
 #include "services/sync_benchmark_service.h"
 #include "util/log_macros.h"
@@ -172,7 +173,10 @@ bool consensus_state_snapshot_install(
 
 struct consensus_state_artifact_evidence {
     zcl_mutex_t mutex;
-    int artifact_fd;
+    struct platform_positioned_file artifact_file;
+    struct platform_positioned_file_snapshot artifact_snapshot;
+    struct sqlite_pinned_reader *reader;
+    int artifact_fd; /* Borrowed alias; artifact_file owns this descriptor. */
     sqlite3 *bundle_db;
     bool coins_iterator_active;
     struct stat identity;
@@ -257,31 +261,34 @@ static bool install_fail(struct consensus_state_install_result *result,
     return false;
 }
 
-static bool immutable_regular_file_open(const char *path, int *out_fd,
-                                        struct stat *identity)
+static bool immutable_regular_file_open(
+    const char *path, struct platform_positioned_file *file,
+    int *out_fd, struct stat *identity,
+    struct platform_positioned_file_snapshot *snapshot)
 {
-    if (out_fd)
-        *out_fd = -1;
-    if (!path || !path[0] || !out_fd || !identity) {
-        LOG_WARN(INSTALL_SUBSYS, "bundle path/output is missing");
+    *out_fd = -1;
+    if (!path || !path[0] || !platform_positioned_file_open(file, path)) {
+        LOG_WARN(INSTALL_SUBSYS, "bundle retained-file open failed");
         return false;
     }
-    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) {
-        LOG_WARN(INSTALL_SUBSYS, "bundle descriptor open failed: %s",
-                 strerror(errno));
+    intptr_t native = platform_positioned_file_native_fd(file);
+    if (native < 0 || native > INT_MAX) {
+        LOG_WARN(INSTALL_SUBSYS, "bundle retained descriptor is invalid");
         return false;
     }
+    int fd = (int)native;
     struct stat st;
     if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
         LOG_WARN(INSTALL_SUBSYS, "bundle descriptor is not a regular file");
-        close(fd);
         return false;
     }
     if ((st.st_mode & (S_IWUSR | S_IWGRP | S_IWOTH)) != 0) {
         LOG_WARN(INSTALL_SUBSYS,
                  "bundle is writable; immutable admission refused path=%s", path);
-        close(fd);
+        return false;
+    }
+    if (!platform_positioned_file_snapshot(file, snapshot)) {
+        LOG_WARN(INSTALL_SUBSYS, "bundle retained snapshot failed");
         return false;
     }
     *identity = st;
@@ -323,28 +330,17 @@ static bool sidecars_absent(const char *path)
     return true;
 }
 
-static bool open_bundle_descriptor(int artifact_fd, sqlite3 **bundle_db)
+static bool open_bundle_descriptor(
+    struct consensus_state_artifact_evidence *evidence)
 {
-    /* Name the pinned descriptor through the one fd-naming shim. */
-    char fd_name[64];
-    if (!platform_fd_path(fd_name, sizeof(fd_name), artifact_fd, NULL)) {
-        LOG_FAIL(INSTALL_SUBSYS, "bundle fd cannot be named");
+    if (!sqlite_pinned_reader_open(&evidence->artifact_file,
+                                   &evidence->artifact_snapshot,
+                                   &evidence->reader)) {
+        LOG_WARN(INSTALL_SUBSYS, "bundle retained-object SQLite open failed");
         return false;
     }
-    char uri[128];
-    int n = snprintf(uri, sizeof(uri),
-                     "file:%s?mode=ro&immutable=1", fd_name);
-    if (n <= 0 || (size_t)n >= sizeof(uri))
-        LOG_FAIL(INSTALL_SUBSYS, "bundle URI too long");
-    int rc = sqlite3_open_v2(uri, bundle_db,
-                             SQLITE_OPEN_READONLY | SQLITE_OPEN_URI |
-                                 SQLITE_OPEN_NOMUTEX,
-                             NULL);
-    if (rc != SQLITE_OK)
-        LOG_WARN(INSTALL_SUBSYS, "bundle open failed: %s",
-                 *bundle_db ? sqlite3_errmsg(*bundle_db) : "no handle");
-    if (rc != SQLITE_OK)
-        return false;
+    sqlite3 **bundle_db = &evidence->bundle_db;
+    *bundle_db = sqlite_pinned_reader_db(evidence->reader);
     int defensive = 0;
     int trusted = 1;
     if (sqlite3_db_config(*bundle_db, SQLITE_DBCONFIG_DEFENSIVE, 1,
@@ -374,14 +370,22 @@ static void artifact_evidence_discard(
     if (!evidence)
         return;
     zcl_mutex_lock(&evidence->mutex);
-    if (evidence->bundle_db) {
-        (void)sqlite3_exec(evidence->bundle_db, "ROLLBACK", NULL, NULL, NULL);
-        if (sqlite3_close(evidence->bundle_db) != SQLITE_OK)
-            LOG_WARN(INSTALL_SUBSYS, "bundle evidence close failed");
+    if (evidence->coins_iterator_active) {
+        LOG_WARN(INSTALL_SUBSYS, "bundle evidence retained: coin iterator active");
+        zcl_mutex_unlock(&evidence->mutex);
+        return;
     }
-    if (evidence->artifact_fd >= 0 && close(evidence->artifact_fd) != 0)
-        LOG_WARN(INSTALL_SUBSYS, "bundle evidence descriptor close failed: %s",
-                 strerror(errno));
+    /* sqlite3_close rolls back the read transaction only after confirming
+     * it can close. A BUSY refusal must preserve the live transaction too. */
+    if (evidence->reader && !sqlite_pinned_reader_close(&evidence->reader)) {
+        LOG_WARN(INSTALL_SUBSYS,
+                 "bundle evidence retained: SQLite close busy or failed");
+        zcl_mutex_unlock(&evidence->mutex);
+        return;
+    }
+    evidence->bundle_db = NULL;
+    platform_positioned_file_close(&evidence->artifact_file);
+    evidence->artifact_fd = -1;
     zcl_mutex_unlock(&evidence->mutex);
     zcl_mutex_destroy(&evidence->mutex);
     free(evidence);
@@ -409,9 +413,11 @@ static struct zcl_result artifact_evidence_open_impl(
     memset(evidence, 0, sizeof(*evidence));
     zcl_mutex_init(&evidence->mutex);
     evidence->artifact_fd = -1;
+    platform_positioned_file_init(&evidence->artifact_file);
 
-    if (!immutable_regular_file_open(bundle_path, &evidence->artifact_fd,
-                                     &evidence->identity) ||
+    if (!immutable_regular_file_open(bundle_path, &evidence->artifact_file,
+                                     &evidence->artifact_fd, &evidence->identity,
+                                     &evidence->artifact_snapshot) ||
         !sidecars_absent(bundle_path)) {
         artifact_evidence_discard(evidence);
         return ZCL_ERR(-4, "artifact evidence: bundle is not immutable/finalized");
@@ -446,8 +452,7 @@ static struct zcl_result artifact_evidence_open_impl(
         }
     }
 
-    if (!open_bundle_descriptor(evidence->artifact_fd,
-                                &evidence->bundle_db)) {
+    if (!open_bundle_descriptor(evidence)) {
         artifact_evidence_discard(evidence);
         return ZCL_ERR(-6, "artifact evidence: immutable SQLite open failed");
     }

@@ -132,6 +132,9 @@ struct consensus_state_candidate_result {
 struct zcl_result consensus_state_artifact_evidence_open(
     const char *bundle_path, int receipt_datadir_fd,
     struct consensus_state_artifact_evidence **out);
+/* Quiesce all consumers and finalize their borrowed SQLite statements before
+ * free. Active iterators or a busy SQLite close retain the evidence and file;
+ * release the consumer/statement and retry free on the same evidence pointer. */
 void consensus_state_artifact_evidence_free(
     struct consensus_state_artifact_evidence *evidence);
 bool consensus_state_artifact_evidence_manifest_copy(

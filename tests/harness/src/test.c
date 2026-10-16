@@ -1190,6 +1190,7 @@ int main(int argc, char **argv)
       failures += test_utxo_snapshot_loader(); }
     failures += test_snapshot_apply_coins_kv();
     failures += test_consensus_state_snapshot_install();
+    failures += test_sqlite_pinned_reader();
     failures += test_checkpoint_rom_authority();
     failures += test_consensus_state_install_runtime();
     failures += test_consensus_state_snapshot_export();
