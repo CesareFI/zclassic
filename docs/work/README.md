@@ -41,6 +41,7 @@ citation, `git log --follow -- docs/work/<name>.md` recovers older intent.
 | File | Authority | Purpose |
 |---|---|---|
 | [`FORWARD_PLAN.md`](./FORWARD_PLAN.md) | PLAN | THE ordered execution plan (autonomous / owner-gated / operational) |
+| [`FLEET_SCORECARD.md`](./FLEET_SCORECARD.md) | LIVE | owner-adopted fleet A+ scorecard; sets the fleet priority order with the P0 safety rules in `AGENTS.md` |
 | [`TRI_PLATFORM_PLAN.md`](./TRI_PLATFORM_PLAN.md) | DESIGN | Linux, macOS, and Windows acceptance gaps and their platform-local closure order |
 | [`self-verified-tip-plan.md`](./self-verified-tip-plan.md) | DESIGN | the `G-SOV` sovereignty-gate design + open hardening items; `G-SOV` is the active gate in `sovereignty_controller.c` |
 | [`SOVEREIGN-NETWORK-ROADMAP.md`](./SOVEREIGN-NETWORK-ROADMAP.md) | FOUNDATION | durable Phase 0–6 hierarchy and promotion gates, subordinate to `FORWARD_PLAN.md` |

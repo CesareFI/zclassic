@@ -69,22 +69,37 @@ view, not a hand-maintained ownership catalog.
 
 ## Priority and evidence
 
-1. **P0:** consensus, wallet/custody and public-node correctness.
-2. **P1:** public-node V1 acceptance and reliability under
-   [MVP.md](docs/MVP.md), criteria C1–C8.
-3. **P2:** decentralized C23 Commons acceptance: content-addressed,
-   independently verifiable, bounded and locally accepted.
-4. **P3:** development machinery only when it advances P1 or P2.
-5. **P4:** simulation economics, marketplace expansion and speculative work.
+Owner reset of 2026-10-16, agreed by every fleet lead on board ref
+fleet-priorities-20261016. It supersedes earlier session rulings. The
+numbered owner rulings (R1, R2, ...) live on the fleet wiki page
+`fleet-rules`, read with `z23-dev fleet.wiki.read --slug=fleet-rules`; when
+an older doc or note conflicts with that ledger, the ledger wins. Cite
+rulings by number.
 
-C1–C8 are necessary for platform v1, not the complete application journey.
-The release demonstration and current continuation queue live in
-[FORWARD_PLAN.md](docs/work/FORWARD_PLAN.md). No other plan, handoff,
-scorecard, skill or old session note may reorder that mission.
+1. **P0 (always first):** consensus, wallet/custody and public-node
+   correctness, and canonical node health. The blockchain wins resource
+   and authority contention. Builds, telemetry, package traffic and AI
+   workers may not delay chain advancement, block processing, transaction
+   relay, synchronization, peer health or wallet custody.
+2. **The fleet A+ scorecard** ([FLEET_SCORECARD.md](docs/work/FLEET_SCORECARD.md))
+   orders all other work. Fleet tooling is first-class product.
+   - Tier 1, the unblockers: G9 landing throughput, G13 agent
+     productivity and review, G7 MCP harness, G4 wiki.
+   - Tier 2, the sovereign fleet core: G11 zero spend, G1 post-quantum
+     tunnel, G3 remote shell, G5 plugins and binary swarm, G6 seamless updates.
+   - Tier 3: G2 post-quantum release signing, G8 telemetry, G12 Mac parity.
+   Within a tier, the work closest to its A+ bar goes first. Public-node V1
+   acceptance under [MVP.md](docs/MVP.md) C1–C8 and the product priorities in
+   [FORWARD_PLAN.md](docs/work/FORWARD_PLAN.md) remain acceptance context.
+3. **Zero spend.** No fleet feature may require ZCL, an anchored ZID or a fee.
+   Work that needs a spend (such as the 1 ZCL payment rerun) waits for an
+   explicit owner authorization.
 
-The blockchain wins resource and authority contention. Builds, telemetry,
-package traffic and AI workers may not delay chain advancement, block
-processing, transaction relay, synchronization, peer health or wallet custody.
+Review and landing: every unit, including core, crypto, consensus and
+custody, needs one reviewer who is not its author, of any model. Run full
+`make lint` once at the exact candidate tip before `dev land submit`; any
+lead may submit and drive its own reviewed work. Native C23 commands are
+the target; small POSIX sh operator scripts are acceptable as interim tooling.
 
 **VERIFY, DON'T TRUST.** Any agent may propose and any node may compute.
 Receivers independently verify exact objects, signatures, roots and evidence

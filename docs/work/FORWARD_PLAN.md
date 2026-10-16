@@ -11,9 +11,9 @@ assignment. Do not copy live heights, process state, or benchmark anecdotes here
 This file owns the active scope and the ordered queue. Passing all of MVP.md's
 C1–C8 is necessary for platform v1 but not sufficient: platform v1 is the
 release demonstration under *Acceptance and performance* below, together with
-the existing acceptance targets. Open (◐) MVP criteria are P1 work under
-`AGENTS.md`. When an authorized loop for one of them is ready, it outranks the
-P3 development machinery in this queue. Each ◐ cell names its own remaining
+the existing acceptance targets. Open (◐) MVP criteria remain acceptance
+context under `AGENTS.md`; work that needs a ZCL spend waits for an owner
+authorization. Each ◐ cell names its own remaining
 condition or owner decision; recheck it against its ledger before starting.
 
 Acceptance for the current mission lives in
@@ -53,10 +53,13 @@ Codex accounting, qualified cost routing and durable executor recovery for this
 mission. Its delivery sequence does not reorder the continuation queue below;
 automatic dispatch and publication retain their explicit qualification gates.
 
+Work after P0 is ordered by the owner-adopted [fleet A+
+scorecard](FLEET_SCORECARD.md): thirteen goals, each with a probe-based A+ bar.
+
 ## Invariants and authority
 
 P0 consensus, wallet custody and public-node correctness retain absolute
-priority; the durable P1–P4 ordering in `AGENTS.md` still applies. Insight,
+priority; after P0, the fleet A+ scorecard order in `AGENTS.md` applies. Insight,
 Control and development machinery advance public-node reliability and C23
 Commons acceptance. Telemetry, indexing, builds, transfers and application
 operations may not delay chain advancement, synchronization or peer health.
