@@ -27,7 +27,7 @@ A+ means a live probe passes and keeps passing with nobody babysitting it. Each 
 - Pinned identity (zero-spend trust) unblocks goals 3, 4 (sync at 0 ZCL), 5 (D3) and 11.
 - Confined shell repairs (process-group custody, bounded writes, W^X) unblock goal 3.
 - wiki list/find paging and non-expiring pinned pages unblock goal 4.
-- The Haiku-to-Sonnet funnel with token receipts lets goal 7 measure tokens per landed commit.
+- Bounded delegated tasks through the tiered funnel (Haiku or Luna extracts, Sonnet or Sol implements, a non-author of any model reviews) carry task-level token receipts. Counting implementation, rejected packets, repair and review lets goal 7 measure tokens per accepted landed change across model mixes. The model a task requested is not evidence of the model that ran.
 
 ## Using this scorecard
 
