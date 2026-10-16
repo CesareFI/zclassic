@@ -14964,6 +14964,14 @@ build/lintc-obj/gate_app_bundle_reproducible.o \
 build/lintc-obj/gate_app_bundle_reproducible_proof.o: \
     tools/lint/lintc/gate_app_bundle_reproducible_priv.h
 
+# Capability-closure census faults exist only in its selftest-bearing objects.
+build/lintc-obj/gate_capability_closure_data.o \
+build/lintc-obj/gate_capability_closure_selftest.o: \
+    LINTC_CFLAGS += -DZCL_TESTING
+build/lintc-obj/gate_capability_closure_data.o \
+build/lintc-obj/gate_capability_closure_selftest.o: \
+    tools/lint/lintc/gate_capability_closure_priv.h
+
 build/lintc-obj/%.o: tools/lint/lintc/%.c tools/lint/lintc/lintc.h
 	@mkdir -p $(dir $@)
 	$(CC) $(LINTC_CFLAGS) -c -o $@ $<

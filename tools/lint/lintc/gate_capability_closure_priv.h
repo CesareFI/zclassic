@@ -62,6 +62,18 @@ struct ccd_mods {
     size_t count, platform_count;
     char error[CCD_ERR];
 };
+#ifdef ZCL_TESTING
+/* Local census fault seam, like the app-bundle walk seam. path is borrowed
+ * for one synchronous selftest call; zero state never injects a fault. */
+enum ccd_scan_fault { CCD_SCAN_NONE, CCD_SCAN_OPEN, CCD_SCAN_READ,
+    CCD_SCAN_STAT, CCD_SCAN_LSTAT, CCD_SCAN_CLOSE, CCD_SCAN_DIRTY };
+struct ccd_scan_test {
+    enum ccd_scan_fault fault;
+    const char *path;
+    size_t opened, closed;
+};
+extern struct ccd_scan_test ccd_scan_test;
+#endif
 int ccd_modules_load(const char *file, const char *platform_file, const char *root, struct ccd_mods *m);
 void ccd_mods_free(struct ccd_mods *m);
 

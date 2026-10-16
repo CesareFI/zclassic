@@ -252,6 +252,58 @@ static int ccs_case_long_class(const struct ccs_fx *fx)
     return failures;
 }
 
+#ifdef ZCL_TESTING
+/* All faults hit real owned tools paths, independent of uid/permissions. */
+static int ccs_scan_case(const char *cent, const char *root, const char *tools,
+                         const char *leaf, enum ccd_scan_fault fault)
+{
+    struct ccd_mods m = {0};
+    ccd_scan_test = (struct ccd_scan_test){.fault = fault,
+        .path = fault == CCD_SCAN_LSTAT ? leaf : tools};
+    int rc = ccd_modules_load(cent, NULL, root, &m);
+    int accepts = fault == CCD_SCAN_NONE || fault == CCD_SCAN_DIRTY;
+    int ok = accepts ? rc == 0 && m.count == 1 && ccs_eq(&m.raw, "tools/owned.c", "CAP_NETWORK") :
+                      rc != 0 && m.raw.n == 0 && m.count == 0;
+    ok = ok && ccd_scan_test.opened == ccd_scan_test.closed;
+    ccd_scan_test = (struct ccd_scan_test){0};
+    ccd_mods_free(&m);
+    return ccs_say(ok, accepts ? "census: complete scan and cleared stale errno retain sidecar" :
+                                "census: injected I/O refuses partial rows and closes directories");
+}
+
+static int ccs_case_scan(const struct ccs_fx *fx)
+{
+    char cent[CCD_PATH], root[CCD_PATH], tools[CCD_PATH], leaf[CCD_PATH];
+    ccs_path(fx, "w/engine/composition/module_capabilities.def", cent);
+    ccs_path(fx, "w", root);
+    ccs_path(fx, "w/tools", tools);
+    ccs_path(fx, "w/tools/owned.c.capabilities.def", leaf);
+    int made = ccs_put(fx, "w/core", "non-directory optional root\n") == 0 &&
+        ccs_put(fx, "w/engine/composition/module_capabilities.def", "") == 0 &&
+        ccs_put(fx, "w/tools/owned.c.capabilities.def",
+            "ZCL_MODULE_CAPABILITY(\"tools/owned.c\", CAP_NETWORK, \"fixture\")\n") == 0;
+    if (!made) return ccs_say(0, "census: create owned fixture");
+    int failures = 0;
+    for (int fault = CCD_SCAN_NONE; fault <= CCD_SCAN_DIRTY; ++fault)
+        failures += ccs_scan_case(cent, root, tools, leaf, (enum ccd_scan_fault)fault);
+    char overlong[CCD_PATH + 32];
+    memset(overlong, 'x', sizeof overlong - 1);
+    overlong[sizeof overlong - 1] = '\0';
+    struct ccd_mods m = {0};
+    int rc = ccd_modules_load(cent, NULL, overlong, &m);
+    failures += ccs_say(rc != 0 && m.raw.n == 0 && m.count == 0,
+                        "census: root path overflow refuses without accepting partial map");
+    ccd_mods_free(&m);
+    return failures;
+}
+#else
+static int ccs_case_scan(const struct ccs_fx *fx)
+{
+    (void)fx;
+    return ccs_say(0, "census: missing ZCL_TESTING fault seam");
+}
+#endif
+
 static int ccs_case_sets(void)
 {
     char *u1 = ccd_union_caps("CAP_A", "CAP_B|CAP_A|CAP_NONE||CAP_C"), *u2 = ccd_union_caps("", "CAP_NONE|CAP_X");
@@ -309,7 +361,7 @@ int capability_closure_data_selftest(void)
         return 2;
     }
     int fails = ccs_case_parse() + ccs_case_nm(&fx) + ccs_case_symbols(&fx) + ccs_case_platform(&fx)
-              + ccs_case_sidecar(&fx) + ccs_case_long_class(&fx) + ccs_case_sets() + ccs_case_coverage() + ccs_case_epoch(&fx);
+              + ccs_case_scan(&fx) + ccs_case_sidecar(&fx) + ccs_case_long_class(&fx) + ccs_case_sets() + ccs_case_coverage() + ccs_case_epoch(&fx);
     lsc_unblock();
     rap_rm_rf(fx.base);
     puts(fails == 0 ? "== selftest: PASS ==" : "== selftest: FAIL ==");

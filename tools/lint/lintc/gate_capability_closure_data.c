@@ -9,6 +9,7 @@
 #define _XOPEN_SOURCE 700
 #include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
 #include <regex.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -585,22 +586,88 @@ static int ccd_is_sidecar_name(const char *name)
     return nl >= sizeof k_name - 1 && strcmp(name + nl - (sizeof k_name - 1), k_name) == 0;
 }
 
-static int ccd_walk(const char *dir, struct ccd_list *l)
+#ifdef ZCL_TESTING
+struct ccd_scan_test ccd_scan_test;
+
+/* Inject only at the named owned fixture directory or leaf. */
+static int ccd_scan_fault(enum ccd_scan_fault fault, const char *path)
 {
+    return ccd_scan_test.fault == fault && ccd_scan_test.path &&
+        strcmp(ccd_scan_test.path, path) == 0;
+}
+
+static DIR *ccd_scan_open(const char *path)
+{
+    if (ccd_scan_fault(CCD_SCAN_OPEN, path)) { errno = EACCES; return NULL; }
+    DIR *d = opendir(path);
+    ccd_scan_test.opened += d != NULL;
+    return d;
+}
+
+static struct dirent *ccd_scan_read(DIR *d, const char *path)
+{
+    struct dirent *entry = readdir(d);
+    if (!entry && !errno && ccd_scan_fault(CCD_SCAN_READ, path)) errno = EIO;
+    if (entry && ccd_scan_fault(CCD_SCAN_DIRTY, path)) errno = ENOENT;
+    return entry;
+}
+
+static int ccd_scan_close(DIR *d, const char *path)
+{
+    int result = closedir(d);
+    ccd_scan_test.closed++;
+    if (result == 0 && ccd_scan_fault(CCD_SCAN_CLOSE, path)) { errno = EIO; return -1; }
+    return result;
+}
+
+static int ccd_scan_stat(const char *path, struct stat *st)
+{
+    if (ccd_scan_fault(CCD_SCAN_STAT, path)) { errno = EIO; return -1; }
+    return stat(path, st);
+}
+
+static int ccd_scan_lstat(const char *path, struct stat *st)
+{
+    if (ccd_scan_fault(CCD_SCAN_LSTAT, path)) { errno = EIO; return -1; }
+    return lstat(path, st);
+}
+#else
+#define ccd_scan_open opendir
+#define ccd_scan_read(d, path) readdir(d)
+#define ccd_scan_close(d, path) closedir(d)
+#define ccd_scan_stat stat
+#define ccd_scan_lstat lstat
+#endif
+
+static int ccd_walk(const char *dir, struct ccd_list *l);
+
+/* Every non-dot entry must have a complete path and a readable file type. */
+static int ccd_walk_entry(const char *dir, const char *name, struct ccd_list *l)
+{
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return 0;
     char path[CCD_PATH];
     struct stat st;
-    DIR *d = opendir(dir);
+    int n = snprintf(path, sizeof path, "%s/%s", dir, name);
+    if (n < 0 || n >= (int)sizeof path || ccd_scan_lstat(path, &st) != 0) return 1;
+    int rc = ccd_is_sidecar_name(name) ? ccd_list_add(l, path) : 0;
+    if (rc == 0 && S_ISDIR(st.st_mode)) rc = ccd_walk(path, l);
+    return rc;
+}
+
+/* Errors never stand for EOF or an empty optional root. Close every opened
+ * directory even after recursion, allocation or enumeration refuses. */
+static int ccd_walk(const char *dir, struct ccd_list *l)
+{
+    DIR *d = ccd_scan_open(dir);
+    if (!d) return 1;
     int rc = 0;
-    for (struct dirent *e; d && rc == 0 && (e = readdir(d));) {
-        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0
-            || snprintf(path, sizeof path, "%s/%s", dir, e->d_name) >= (int)sizeof path)
-            continue;
-        rc = ccd_is_sidecar_name(e->d_name) ? ccd_list_add(l, path) : 0;
-        if (rc == 0 && lstat(path, &st) == 0 && S_ISDIR(st.st_mode))
-            rc = ccd_walk(path, l);
+    while (rc == 0) {
+        errno = 0;
+        struct dirent *entry = ccd_scan_read(d, dir);
+        if (!entry) { rc = errno ? 1 : 0; break; }
+        rc = ccd_walk_entry(dir, entry->d_name, l);
     }
-    if (d)
-        closedir(d);
+    if (ccd_scan_close(d, dir) != 0 && rc == 0) rc = 1;
     return rc;
 }
 
@@ -616,10 +683,18 @@ static int ccd_sidecars(struct ccd_mods *m, const char *root)
     struct stat st;
     char dir[CCD_PATH];
     int rc = 0;
-    for (size_t i = 0; rc == 0 && i < 6; i++)
-        if (snprintf(dir, sizeof dir, "%s/%s", root, dirs[i]) < (int)sizeof dir && stat(dir, &st) == 0 && S_ISDIR(st.st_mode))
-            rc = ccd_walk(dir, &l);
-    qsort(l.s, l.n, sizeof *l.s, ccd_cmp);
+    for (size_t i = 0; rc == 0 && i < 6; i++) {
+        int n = snprintf(dir, sizeof dir, "%s/%s", root, dirs[i]);
+        if (n < 0 || n >= (int)sizeof dir) { rc = 1; break; }
+        if (ccd_scan_stat(dir, &st) != 0) {
+            if (errno == ENOENT) continue; /* an optional source root is absent */
+            rc = 1;
+            break;
+        }
+        /* Preserve the shell's intentional -d filter for non-directories. */
+        if (S_ISDIR(st.st_mode)) rc = ccd_walk(dir, &l);
+    }
+    if (rc == 0 && l.n > 1) qsort(l.s, l.n, sizeof *l.s, ccd_cmp);
     for (size_t i = 0; i < l.n; i++) {
         rc = rc == 0 ? ccd_sidecar(m, root, l.s[i]) : rc;
         free(l.s[i]);
