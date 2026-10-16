@@ -4397,10 +4397,79 @@ static bool nc_main_prepare_input(struct nc_main_state *st, int *rc)
 
 /* The caller provides this leaf's declared bounded envelope; the registry
  * still enforces the contract and any smaller caller-requested budget. */
+static bool nc_compare_leaf(const struct zcl_command_spec *spec)
+{
+    return spec && strcmp(spec->path, "core.consensus.utxo.compare.offline") == 0;
+}
+
+/* Read only the built-in catalog. Preserve ordinary preload-before-resolve
+ * ordering; only this exact built-in leaf refuses extensions before loading. */
+static bool nc_compare_preflight(const char *root, const char *const *args, int nargs)
+{
+    char split[4096]; const char *words[NC_MAX_WORDS]; size_t count = 0;
+    if (strlen(root) >= sizeof(split)) return false;
+    memcpy(split, root, strlen(root) + 1u);
+    char *segment = split;
+    while (segment && *segment && count < NC_MAX_WORDS) {
+        char *dot = strchr(segment, '.');
+        if (dot) *dot = 0;
+        words[count++] = segment; segment = dot ? dot + 1 : NULL;
+    }
+    for (int i = 0; i < nargs && count < NC_MAX_WORDS; i++) words[count++] = args[i];
+    size_t consumed = 0; bool alias = false; char invoked[ZCL_COMMAND_MAX_PATH];
+    return nc_compare_leaf(zcl_command_registry_resolve_words(catalog(), words,
+        count, &consumed, &alias, invoked, sizeof(invoked)));
+}
+
+static bool nc_compare_begin(struct nc_main_state *st,
+    const struct zcl_native_standalone_runtime *runtime,
+    struct zcl_command_invocation_runtime *invocation,
+    struct zcl_command_context *ctx, int *rc)
+{
+        if (!runtime || !runtime->begin || !runtime->end || !runtime->cancelled ||
+            !runtime->reserve_cleanup || !runtime->cleanup) {
+            json_free(&st->input);
+            nc_print_error(st->spec->path, "CANCELLATION_UNAVAILABLE", "dispatch",
+                "comparison requires an entry-owned cancellation scope", "", "", "", "");
+            *rc = ZCL_COMMAND_EXIT_BLOCKED; return false;
+        }
+        if (!runtime->begin(runtime->context)) {
+            bool restored = runtime->end(runtime->context);
+            json_free(&st->input);
+            nc_print_error(st->spec->path, "CANCELLATION_SETUP_FAILED", "dispatch",
+                restored ? "signal scope refused" : "signal restoration failed", "", "", "", "");
+            *rc = ZCL_COMMAND_EXIT_INTERNAL; return false;
+        }
+        invocation->cancelled = runtime->cancelled; invocation->cancel_context = runtime->context;
+        invocation->reserve_cleanup = runtime->reserve_cleanup; invocation->cleanup_context = runtime->context;
+        ctx->invocation = invocation;
+
+    return true;
+}
+
+static bool nc_compare_end(struct nc_main_state *st,
+    const struct zcl_native_standalone_runtime *runtime, char *out, size_t capacity, int *rc)
+{
+        bool cleaned = runtime->cleanup(runtime->context);
+        bool restored = runtime->end(runtime->context);
+        bool cancelled = runtime->cancelled(runtime->context);
+        if (!cleaned || !restored || cancelled) {
+            memset(out, 0, capacity); json_free(&st->input);
+            nc_print_error(st->spec->path,
+                !cleaned ? "COMPARISON_CLEANUP_FAILED" :
+                restored ? "COMPARISON_CANCELLED" : "CANCELLATION_RESTORE_FAILED",
+                "cleanup", "completed output withheld", "", "", "", "");
+            g_native_input_from_stdin = false;
+            *rc = ZCL_COMMAND_EXIT_INTERNAL; return false;
+        }
+    return true;
+}
+
 static bool nc_main_execute(struct nc_main_state *st,
                             const struct zcl_command_registry *reg, char *out,
                             size_t out_cap, size_t *n_out,
-                            enum zcl_command_exit *exit_code_out, int *rc)
+                            enum zcl_command_exit *exit_code_out, int *rc,
+                            const struct zcl_native_standalone_runtime *runtime)
 {
     const char *operator_lane = getenv("ZCL_OPERATOR_LANE");
 #ifdef ZCL_DEV_BUILD
@@ -4439,11 +4508,16 @@ static bool nc_main_execute(struct nc_main_state *st,
 #endif
     };
 
+    struct zcl_command_invocation_runtime invocation = {0};
+    bool scoped = nc_compare_leaf(st->spec);
+    if (scoped && !nc_compare_begin(st, runtime, &invocation, &ctx, rc)) return false;
+
     enum zcl_command_exit exit_code = ZCL_COMMAND_EXIT_INTERNAL;
     g_native_envelope_on_stderr = false;
     size_t n = zcl_command_registry_execute_json(
         reg, st->spec, &ctx, &st->input, st->was_alias, st->invoked, st->view,
         st->budget, st->max_items, st->cursor, out, out_cap, &exit_code);
+    if (scoped && !nc_compare_end(st, runtime, out, out_cap, rc)) return false;
     g_native_input_from_stdin = false;
     json_free(&st->input);
     if (n == 0) {
@@ -4576,13 +4650,30 @@ static size_t nc_main_response_capacity(const struct zcl_command_spec *spec)
     return budget + 1;
 }
 
-int zcl_native_command_main(const char *root_word, const char *const *args,
-                            int nargs, const char *datadir, int rpc_port,
-                            enum chain_network network,
-                            bool datadir_explicit)
+/* Refuse invalid roots and comparison preload before bootstrap activation. */
+static int nc_main_standalone_preflight(const char *root_word,
+    const char *const *args, int nargs)
 {
     if (!root_word || !root_word[0])
         return ZCL_COMMAND_EXIT_INVALID;
+
+    const char *preload = getenv("ZCL_HOTSWAP_PRELOAD");
+    if (preload && preload[0] && nc_compare_preflight(root_word, args, nargs)) {
+        nc_print_error(root_word, "COMPARISON_PRELOAD_REFUSED", "startup",
+            "offline comparison requires the built-in standalone reader", "", "", "", "");
+        return ZCL_COMMAND_EXIT_BLOCKED;
+    }
+    return NC_MAIN_CONTINUE;
+}
+
+int zcl_native_command_main_standalone(const char *root_word, const char *const *args,
+                            int nargs, const char *datadir, int rpc_port,
+                            enum chain_network network,
+                            bool datadir_explicit,
+                            const struct zcl_native_standalone_runtime *runtime)
+{
+    int preflight = nc_main_standalone_preflight(root_word, args, nargs);
+    if (preflight != NC_MAIN_CONTINUE) return preflight;
 
     const struct zcl_command_registry *reg = NULL;
     int boot_rc = nc_main_bootstrap(root_word, datadir, rpc_port, network,
@@ -4626,7 +4717,7 @@ int zcl_native_command_main(const char *root_word, const char *const *args,
     }
     size_t n = 0;
     enum zcl_command_exit exit_code = ZCL_COMMAND_EXIT_INTERNAL;
-    if (!nc_main_execute(&st, reg, out, out_cap, &n, &exit_code, &rc)) {
+    if (!nc_main_execute(&st, reg, out, out_cap, &n, &exit_code, &rc, runtime)) {
         free(out);
         return rc;
     }
@@ -4646,4 +4737,12 @@ int zcl_native_command_main(const char *root_word, const char *const *args,
     nc_print_doc(out, st.spec->path);
     free(out);
     return (int)exit_code;
+}
+
+int zcl_native_command_main(const char *root_word, const char *const *args,
+    int nargs, const char *datadir, int rpc_port, enum chain_network network,
+    bool datadir_explicit)
+{
+    return zcl_native_command_main_standalone(root_word, args, nargs, datadir,
+        rpc_port, network, datadir_explicit, NULL);
 }

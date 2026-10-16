@@ -1051,9 +1051,11 @@ COMMAND_SRCS += $(GUEST_KERNEL_GEN)
 COMMAND_CATALOG_DEFS = $(wildcard engine/composition/commands/*.def) \
 	$(wildcard engine/composition/commands/*/*.def) \
 	tools/command/native_dev_machine_boot_internal.h \
+	engine/entry/cli_compare_runtime.h \
 	contexts/commons/packages/zbase64/include/zbase64/zbase64.h
 
-NODE_ENTRY_SRCS = engine/entry/main.c engine/entry/main_cli_modes.c
+NODE_ENTRY_SRCS = engine/entry/main.c engine/entry/main_cli_modes.c \
+	engine/entry/cli_compare_runtime.c
 # The per-node mind. Release-visible for the same reason COMMAND_SRCS is:
 # the node renders its own mind row into the signed mesh-status capsule, and
 # a node that could not say what index it holds could not be asked.
@@ -6144,6 +6146,22 @@ hotswap-module-so: $(VIEW_GEN_HEADERS) $(HOTSWAP_ACTION_PLAN)
 	trap - EXIT HUP INT TERM; \
 	echo "hotswap-module-so: linked multi-leaf module candidate $$so ($$src)" >&2; \
 	echo "$$so"
+
+# Exact-source real policy module for the offline guard's positive control.
+# Keep the source-addressed producer authoritative; this fixed test input is
+# an identical read-only copy whose bytes enter the native BUILD-need receipt.
+.PHONY: test-offline-policy-preload
+test-offline-policy-preload:
+	@$(MAKE) --no-print-directory hotswap-module-so FILE=engine/controllers/src/policy_native_handlers.c
+	@set -eu; \
+	src="$(HOTSWAP_SO_DIR)/engine_controllers_src_policy_native_handlers.c-$(BUILD_SOURCE_ID).so"; \
+	dst="$(HOTSWAP_SO_DIR)/zcl_offline_policy_preload.so"; \
+	[ -f "$$src" ] && [ ! -L "$$src" ] && [ ! -w "$$src" ] || { echo "offline-policy-preload: invalid native module input" >&2; exit 3; }; \
+	tmp="$$(mktemp "$(HOTSWAP_SO_DIR)/.offline-policy.XXXXXX")"; \
+	trap 'rm -f "$$tmp"' EXIT HUP INT TERM; \
+	cp -- "$$src" "$$tmp"; cmp -s "$$src" "$$tmp"; chmod a-w "$$tmp"; \
+	tools/dev/source-identity.sh verify-record "$(BUILD_SOURCE_ID)" "$(BUILD_CLEAN)" "$(BUILD_MUTATION)" >/dev/null; \
+	mv -f -- "$$tmp" "$$dst"; trap - EXIT HUP INT TERM
 
 .PHONY: hotswap-verify
 # make hotswap-verify                  (every row of hotswap_swappable.def)

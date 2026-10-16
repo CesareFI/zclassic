@@ -1344,3 +1344,7 @@ REMOTE_COMMAND_CLASS("fleet.vitals.read", REMOTE_CLASS_NEVER, "")
 /* fleet.vitals.table: readonly-local-v1 fixes this leaf to never remote. */
 REMOTE_COMMAND_CLASS("fleet.vitals.table", REMOTE_CLASS_NEVER, "")
 /* z23-toolgen:end remote-classes */
+
+/* Offline comparison consumes operator-authorized local copied paths and an
+ * externally accepted capture digest; remote invocation has no such authority. */
+REMOTE_COMMAND_CLASS("core.consensus.utxo.compare.offline", REMOTE_CLASS_NEVER, "")

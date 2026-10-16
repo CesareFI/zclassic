@@ -241,6 +241,25 @@ enum zcl_command_transport {
 struct zcl_command_spec;
 struct zcl_command_registry;
 
+/* Caller-owned bounded cleanup storage outlives dispatch and every retained
+ * owner. release uses checked ** ownership: false may retain or consume it.
+ * release_failed is sticky; later retry cannot validate an earlier result. */
+#define ZCL_COMMAND_CLEANUP_SLOTS_MAX 2u
+struct zcl_command_cleanup_slot {
+    void *owner;
+    bool (*release)(void **owner);
+    bool release_failed;
+};
+struct zcl_command_invocation_runtime {
+    bool (*cancelled)(void *context);
+    void *cancel_context;
+    /* Reserve initialized exclusive empty slots before input reads. Caller
+     * retains them through cleanup retry; no replacement of occupied slots. */
+    bool (*reserve_cleanup)(void *context, unsigned count,
+                            struct zcl_command_cleanup_slot **slots);
+    void *cleanup_context;
+};
+
 struct zcl_command_context {
     const struct zcl_command_registry *registry;
     const char *source_root;
@@ -259,6 +278,7 @@ struct zcl_command_context {
      * zero-initialized default) is the local operator and is explicitly
      * exempt — a zero-init context is unaffected. */
     const char *agent_session;
+    const struct zcl_command_invocation_runtime *invocation;
     bool dev_build;
 };
 

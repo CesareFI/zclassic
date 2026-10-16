@@ -584,6 +584,17 @@ static const struct cr_int_bound *cr_device_host_bound(const char *path,
         if (strcmp(key, bounds[i].key) == 0) return &bounds[i];
     return NULL;
 }
+/* A descriptor owns both discovery and validation for these leaf-scoped
+ * integers. Unrelated leaves retain the ordinary string default. */
+static const struct cr_int_bound *cr_leaf_int_bound(const char *path,
+                                                   const char *key)
+{
+    static const struct cr_int_bound examples = { "example_limit", 0, 32 };
+    if (strcmp(path, "core.consensus.utxo.compare.offline") == 0 &&
+        strcmp(key, examples.key) == 0) return &examples;
+    const struct cr_int_bound *bound = cr_device_host_bound(path, key);
+    return bound ? bound : cr_device_package_bound(path, key);
+}
 static bool cr_match_path_special(const struct zcl_command_spec *spec,
                                   const char *key,
                                   const struct json_value *value,
@@ -739,8 +750,7 @@ bool zcl_command_registry_input_descriptor(
     memset(out, 0, sizeof(*out));
     if (!spec || !spec->path || !key || !cr_csv_has(spec->input_keys, key))
         return false;
-    const struct cr_int_bound *host_bound = cr_device_host_bound(spec->path, key);
-    if (!host_bound) host_bound = cr_device_package_bound(spec->path, key);
+    const struct cr_int_bound *host_bound = cr_leaf_int_bound(spec->path, key);
     if (host_bound) {
         out->type = JSON_INT;
         out->minimum = host_bound->lo;

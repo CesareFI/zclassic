@@ -499,6 +499,21 @@ ZCL_COMMAND_READY_READ(
     ZCL_COMMAND_CAP_CHAIN_READ, ZCL_COMMAND_TRAIT_IDEMPOTENT,
     ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_bridge_command)
 ZCL_COMMAND_READY_READ(
+    "core.consensus.utxo.compare.offline", "core.consensus.utxo", "",
+    "Compare admitted standalone artifact and node.db mirror copies",
+    "Scans exact readonly input copies and externally accepted raw capture manifest; "
+    "completed totals require both scans and checked outer cleanup. External capture "
+    "acceptance is not a mechanical coherence proof; paths require trusted copy provenance. "
+    "No canonical datadir, node RPC, repair, capture or activation access.", 32768,
+    "utxo,compare,offline,copy,diagnostic",
+    "zcl.utxo_compare_offline.input.v1", "zcl.utxo_compare_offline.v1",
+    "artifact_file,projection_file,projection_sha3_256,producer_byte_order,capture_manifest_file,accepted_manifest_sha3_256,example_limit", "",
+    "z23 core consensus utxo compare offline --input='<exact standalone copy inputs>'",
+    ZCL_COMMAND_LAYER_CORE, ZCL_COMMAND_SCOPE_OFFLINE_COPY, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_LATENCY_FOREGROUND, ZCL_COMMAND_COST_HIGH, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_CHAIN_READ, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_core_consensus_utxo_compare_offline)
+ZCL_COMMAND_READY_READ(
     "core.consensus.mmb", "core.consensus", "",
     "Merkle Mountain Belt commitment state",
     "Live FlyClient Merkle Mountain Belt commitment state read from "

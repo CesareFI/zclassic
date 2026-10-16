@@ -48,6 +48,24 @@ int zcl_native_command_main(const char *root_word,
                             enum chain_network network,
                             bool datadir_explicit);
 
+/* Actual standalone entry owns signal scope; callable registry/legacy entry
+ * never infer ownership. end must also handle a partially failed begin.
+ * Runtime storage outlives dispatch; scope restoration precedes output. */
+struct zcl_native_standalone_runtime {
+    bool (*begin)(void *);
+    bool (*end)(void *);
+    bool (*cancelled)(void *);
+    bool (*reserve_cleanup)(void *, unsigned, struct zcl_command_cleanup_slot **);
+    bool (*cleanup)(void *);
+    void *context;
+};
+int zcl_native_command_main_standalone(const char *root_word,
+    const char *const *args, int nargs, const char *datadir, int rpc_port,
+    enum chain_network network, bool datadir_explicit,
+    const struct zcl_native_standalone_runtime *runtime);
+void zcl_native_handle_core_consensus_utxo_compare_offline(
+    const struct zcl_command_request *, struct zcl_command_reply *);
+
 /* Network selected by the current one-shot native invocation. Direct
  * in-process callers default to mainnet until command_main selects another
  * network. */

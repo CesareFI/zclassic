@@ -2459,6 +2459,7 @@ static int artifact_pinned_substitution_tests(const char *root)
 }
 
 #include "utxo_copy_compare_selftests.h"
+#include "utxo_compare_command_selftests.h"
 
 static int test_consensus_state_snapshot_install_platform_arm(void)
 {
@@ -2557,6 +2558,7 @@ static int test_consensus_state_snapshot_install_platform_arm(void)
     CSI_CHECK("generation B final bundle writes",write_bundle(&b,CSI_VALID));
     failures += artifact_checked_close_tests(b.path);
     failures += csi_compare_cases(dir, &b);
+    failures += csi_compare_command_cases(dir, &b);
     struct consensus_state_artifact_evidence *artifact = NULL;
     struct zcl_result artifact_opened =
         consensus_state_artifact_evidence_open(b.path, -1, &artifact);

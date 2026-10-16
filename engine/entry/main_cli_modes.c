@@ -15,6 +15,7 @@
  */
 #if !defined(ZCL_TESTING) || !defined(ZCL_RPC_COMPOSER_TEST)
 #include "main_cli_modes.h"
+#include "cli_compare_runtime.h"
 #include "config/boot.h"
 #include "config/boot_cold_start.h"     /* -cold-start staged driver */
 #include "hotswap/hotswap_module.h"
@@ -2354,6 +2355,33 @@ static bool cli_compose_rpc_params(const char *method, const char **params,
 }
 
 #if !defined(ZCL_TESTING) || !defined(ZCL_RPC_COMPOSER_TEST)
+/* Own a fresh single-invocation runtime only on the standalone POSIX entry. */
+static int cli_native_registry_dispatch(const char *method,
+    const char *const *params_storage, int nparams, const char *datadir,
+    int cli_port, bool regtest_set, bool testnet_set, bool datadir_set)
+{
+#if !defined(_WIN32)
+        struct cli_compare_signals signals = {0};
+        const struct zcl_native_standalone_runtime runtime = {
+            .begin = cli_compare_scope_begin, .end = cli_compare_scope_end,
+            .cancelled = cli_compare_scope_cancelled, .reserve_cleanup = cli_compare_reserve,
+            .cleanup = cli_compare_cleanup, .context = &signals
+        };
+        return zcl_native_command_main_standalone(method,
+            (const char *const *)params_storage, nparams, datadir, cli_port,
+            regtest_set ? CHAIN_REGTEST : testnet_set ? CHAIN_TESTNET : CHAIN_MAIN,
+            datadir_set, &runtime);
+#else
+        return zcl_native_command_main(method,
+                                       (const char *const *)params_storage,
+                                       nparams, datadir, cli_port,
+                                       regtest_set ? CHAIN_REGTEST :
+                                       testnet_set ? CHAIN_TESTNET : CHAIN_MAIN,
+                                       datadir_set);
+
+#endif
+}
+
 int cli_main(int argc, char **argv)
 {
     /* Strict operator-target-flag validation FIRST — before datadir/home
@@ -2570,13 +2598,11 @@ int cli_main(int argc, char **argv)
      * arbitrary RPC-method fallback further down. A typo under a canonical
      * branch returns the structured unknown-command error (exit 2) and never
      * becomes an RPC method. */
-    if (zcl_native_command_is_root(method))
-        return zcl_native_command_main(method,
-                                       (const char *const *)params_storage,
-                                       nparams, datadir, cli_port,
-                                       regtest_set ? CHAIN_REGTEST :
-                                       testnet_set ? CHAIN_TESTNET : CHAIN_MAIN,
-                                       datadir_set);
+    if (zcl_native_command_is_root(method)) {
+        return cli_native_registry_dispatch(method,
+            (const char *const *)params_storage, nparams, datadir, cli_port,
+            regtest_set, testnet_set, datadir_set);
+    }
 
     if (cli_static_agent_method(method)) {
         agent_runtime_availability_reset();

@@ -1293,6 +1293,54 @@ static int t_machine_protected_wrong_types(void)
     return failures;
 }
 
+static int t_offline_compare_limit_bounds(void)
+{
+    int failures = 0;
+    const char *path = "core.consensus.utxo.compare.offline";
+    CIB_CHECK("offline comparison admits zero examples",
+        cib_accepts_int(path, "example_limit", 0));
+    CIB_CHECK("offline comparison admits 32 examples",
+        cib_accepts_int(path, "example_limit", 32));
+    CIB_CHECK("offline comparison refuses negative example limit",
+        !cib_accepts_int(path, "example_limit", -1));
+    CIB_CHECK("offline comparison refuses example limit 33",
+        !cib_accepts_int(path, "example_limit", 33));
+    CIB_CHECK("offline comparison refuses a string example limit",
+        !cib_accepts(path, "example_limit", 1, NULL, 0));
+    return failures;
+}
+static int t_offline_compare_limit_descriptor(void)
+{
+    int failures = 0;
+    const struct zcl_command_spec *spec = zcl_command_registry_find(
+        zcl_command_catalog(), "core.consensus.utxo.compare.offline", NULL);
+    struct zcl_command_input_descriptor descriptor;
+    CIB_CHECK("offline example limit descriptor states integer range zero through 32",
+        spec && zcl_command_registry_input_descriptor(spec, "example_limit", &descriptor) &&
+        descriptor.type == JSON_INT && descriptor.minimum == 0 && descriptor.maximum == 32);
+    return failures;
+}
+static int t_offline_compare_limit_isolation(void)
+{
+    int failures = 0;
+    const struct zcl_command_spec *spec = zcl_command_registry_find(
+        zcl_command_catalog(), "core.consensus.utxo.compare.offline", NULL);
+    CIB_CHECK("offline comparison leaf resolves for isolation fixture", spec != NULL);
+    if (!spec) return failures;
+    struct zcl_command_spec neighbor = *spec;
+    neighbor.path = "core.consensus.utxo.audit";
+    struct json_value input = {0}; json_set_object(&input);
+    bool built = json_push_kv_str(&input, "example_limit", "1");
+    CIB_CHECK("example limit remains an ordinary string on a neighboring leaf",
+        built && zcl_command_registry_input_validate(&neighbor, &input, NULL, 0));
+    json_free(&input); json_set_object(&input);
+    built = json_push_kv_int(&input, "example_limit", 1);
+    CIB_CHECK("integer example limit exception is confined to offline comparison",
+        built && !zcl_command_registry_input_validate(&neighbor, &input, NULL, 0));
+    json_free(&input);
+    return failures;
+}
+
 int test_command_input_bounds(void)
 {
     printf("\n=== command_input_bounds: per-key input length rules ===\n");
@@ -1321,6 +1369,9 @@ int test_command_input_bounds(void)
     failures += t_local_acceptance_boolean();
     failures += t_resident_binding_types();
     failures += t_policy_fact_types();
+    failures += t_offline_compare_limit_bounds();
+    failures += t_offline_compare_limit_descriptor();
+    failures += t_offline_compare_limit_isolation();
     failures += t_execute_json_validates_input();
     printf("=== command_input_bounds complete: %d failure(s) ===\n", failures);
     return failures;
