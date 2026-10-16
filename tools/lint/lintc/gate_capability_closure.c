@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <regex.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -590,9 +591,11 @@ struct ccg_ban {
 static int ccg_ban_line(void *vctx, const char *raw, size_t len)
 {
     struct ccg_ban *b = vctx;
-    char *line = zcl_strdup(raw, "ccg_ban line");
+    char *line = len < SIZE_MAX ? zcl_malloc(len + 1, "ccg_ban line") : NULL;
     if (!line)
         return -1;
+    memcpy(line, raw, len);
+    line[len] = '\0';
     b->no++;
     if (len > 0 && line[len - 1] == '\n')
         line[len - 1] = '\0';
@@ -621,7 +624,6 @@ static int ccg_ban_file(struct ccg_scan *s, const regex_t *re, const char *rel)
     s->c.syscall += b.hit != 0;
     return 0;
 }
-
 
 /* Tracked C sources outside vendor/; a tree without a usable index is walked.
  * 1 when a termination signal arrived, -1 when out of memory. */

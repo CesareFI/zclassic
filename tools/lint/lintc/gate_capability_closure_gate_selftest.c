@@ -17,7 +17,7 @@
 #include "lintc_proc.h"
 #include "lintc_sig.h"
 
-enum { CGS_CASES = 21, CGS_FILLER = 500 };
+enum { CGS_CASES = 23, CGS_FILLER = 500 };
 
 static const char k_fx0[] = "build/dev-obj/epochs/fx0";
 
@@ -506,6 +506,25 @@ static int cgs_case_q(const struct ccs_fx *fx)
     return cgs_check(fx, "q", &cfg, -1, need, "Q: raw syscall in an uncompiled source still refuses");
 }
 
+/* V. a source line with an embedded NUL byte is scanned over its full length:
+ * the line after it is still judged and numbered, and the copy stays in bounds. */
+static int cgs_case_v(const struct ccs_fx *fx)
+{
+    static const char src[] = "a\0b\nlong raw_use(void) { return sys" "call(0); }\n";
+    struct ccg_cfg cfg;
+    char path[CCD_PATH];
+    FILE *f;
+    const char *const need[] = { "raw syscall", "    2:long raw_use", NULL };
+    cgs_cfg(&cfg);
+    if (cgs_base(fx, "v", "") != 0 || ccs_put(fx, "v/fixture_src/seed.txt", "x\n") != 0)
+        return ccs_say(0, "V: fixture");
+    ccs_path(fx, "v/fixture_src/nul_user.c", path);
+    f = fopen(path, "wb");
+    if (!f || fwrite(src, 1, sizeof src - 1, f) != sizeof src - 1 || fclose(f) != 0)
+        return ccs_say(0, "V: write");
+    return cgs_check(fx, "v", &cfg, -1, need, "V: a line with an embedded NUL is scanned in bounds");
+}
+
 /* R. the leftover object of a failed candidate has no source in this tree: it is
  * foreign, counted and not graded. Case A is the other half. */
 static int cgs_case_r(const struct ccs_fx *fx)
@@ -605,7 +624,7 @@ static int cgs_cases(const struct ccs_fx *fx)
     return cgs_case_a(fx) + cgs_case_b(fx) + cgs_case_c(fx) + cgs_case_d(fx) + cgs_case_e(fx) + cgs_case_f(fx) +
            cgs_case_g(fx) + cgs_case_h() + cgs_case_i(fx) + cgs_case_j(fx) + cgs_case_k(fx) + cgs_case_l() +
            cgs_case_m(fx) + cgs_case_n1(fx) + cgs_case_n2(fx) + cgs_case_o(fx) + cgs_case_p(fx) + cgs_case_q(fx) +
-           cgs_case_r(fx) + cgs_case_s(fx) + cgs_case_t(fx) + cgs_case_u(fx);
+           cgs_case_r(fx) + cgs_case_s(fx) + cgs_case_t(fx) + cgs_case_u(fx) + cgs_case_v(fx);
 }
 
 int check_capability_closure_selftest(void)
