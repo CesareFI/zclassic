@@ -7,8 +7,8 @@ Read, in order:
 
 1. [`AGENTS.md`](./AGENTS.md) — durable product direction, priorities,
    authority boundaries, first commands, and continuation rules.
-2. [`docs/work/FORWARD_PLAN.md`](./docs/work/FORWARD_PLAN.md) — current ordered
-   development mission.
+2. [`docs/work/FORWARD_PLAN.md`](./docs/work/FORWARD_PLAN.md) — scoped acceptance
+   and implementation context; work order is in `AGENTS.md`.
 3. [`docs/DEVELOPING.md`](./docs/DEVELOPING.md) — detailed repository workflow,
    navigation, feedback, tests, integration, and push procedure.
 4. On the maintainer host only,

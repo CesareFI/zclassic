@@ -2,16 +2,19 @@
 
 # Work directory and parallel-worktree workflow
 
-This directory holds one active plan plus scoped design records, retained
+This directory holds scoped product plans, design records, retained
 rationale, and specialist procedures. It is not itself a priority queue:
 
-1. [`FORWARD_PLAN.md`](./FORWARD_PLAN.md) is the sole ordered execution plan.
+1. [`../../AGENTS.md`](../../AGENTS.md) owns current work order, and
+   [`FLEET_SCORECARD.md`](./FLEET_SCORECARD.md) owns the thirteen A+ completion
+   bars. [`FORWARD_PLAN.md`](./FORWARD_PLAN.md) supplies scoped acceptance and
+   implementation context.
 2. [`../MVP.md`](../MVP.md) owns the v1 acceptance contract.
 3. [`../HANDOFF.md`](../HANDOFF.md) owns maintainer-host live facts only.
 
-The ordered mission is the first open item in
-[`FORWARD_PLAN.md`](./FORWARD_PLAN.md) at the current commit. This index does
-not summarize or promote an older plan back into the queue. Hosted-node facts
+Choose authorized work under the current tiers in `AGENTS.md`, closest to its
+A+ bar within the tier; independent work may proceed in parallel. This index
+does not promote an older plan back into the queue. Hosted-node facts
 belong only in `../HANDOFF.md`; source priorities do not.
 
 Worktrees are dynamic; never infer current workers from a hard-coded path
@@ -22,17 +25,17 @@ before removal; dirty and locked worktrees are preserved.
 
 ## How a worker session starts
 
-Read [`../../AGENTS.md`](../../AGENTS.md), choose the first open item in
-[`FORWARD_PLAN.md`](./FORWARD_PLAN.md), then use `pwd` and `git worktree list
---porcelain` before following the compact [`agent-protocol.md`](./agent-protocol.md).
+Read [`../../AGENTS.md`](../../AGENTS.md), select authorized work under its
+fleet priorities and consult relevant scoped references, then inspect `pwd` and
+`git worktree list --porcelain` before following the compact [`agent-protocol.md`](./agent-protocol.md).
 The assignment owns a disjoint surface and returns an immutable commit
 identity; branch and directory suffixes are optional labels, not evidence or
 permanent inventory.
 
 ## Index — one line per file, annotated
 
-**Authority** column: **PLAN** = the sole ordering authority; **LIVE** =
-describes a shipped mechanism/procedure, reference as needed; **DESIGN** =
+**Authority** column: **PLAN** = scoped product and implementation context;
+**TARGET** = current acceptance target, not completion evidence; **LIVE** = describes a shipped mechanism/procedure, reference as needed; **DESIGN** =
 still-open design record, read before touching the area, not a priority
 queue; **RETAINED** = superseded as a current plan but code/tests/scripts
 cite specific numbered items from it by name — the file stays for that
@@ -40,8 +43,8 @@ citation, `git log --follow -- docs/work/<name>.md` recovers older intent.
 
 | File | Authority | Purpose |
 |---|---|---|
-| [`FORWARD_PLAN.md`](./FORWARD_PLAN.md) | PLAN | THE ordered execution plan (autonomous / owner-gated / operational) |
-| [`FLEET_SCORECARD.md`](./FLEET_SCORECARD.md) | LIVE | owner-adopted fleet A+ scorecard; sets the fleet priority order with the P0 safety rules in `AGENTS.md` |
+| [`FORWARD_PLAN.md`](./FORWARD_PLAN.md) | PLAN | scoped acceptance and implementation context under AGENTS.md and the fleet A+ scorecard |
+| [`FLEET_SCORECARD.md`](./FLEET_SCORECARD.md) | TARGET | thirteen owner-adopted A+ bars; work order lives in `AGENTS.md` |
 | [`TRI_PLATFORM_PLAN.md`](./TRI_PLATFORM_PLAN.md) | DESIGN | Linux, macOS, and Windows acceptance gaps and their platform-local closure order |
 | [`self-verified-tip-plan.md`](./self-verified-tip-plan.md) | DESIGN | the `G-SOV` sovereignty-gate design + open hardening items; `G-SOV` is the active gate in `sovereignty_controller.c` |
 | [`SOVEREIGN-NETWORK-ROADMAP.md`](./SOVEREIGN-NETWORK-ROADMAP.md) | FOUNDATION | durable Phase 0–6 hierarchy and promotion gates, subordinate to `FORWARD_PLAN.md` |
@@ -158,9 +161,10 @@ commit — retiring a doc is not finished until its callers are gone too.
 
 ## Active control documents
 
-- **Current work:** [`FORWARD_PLAN.md`](./FORWARD_PLAN.md) is the sole ordered
-  plan. Other PLAN/LIVE rows below are scoped contracts and runbooks; they do
-  not override its priority order.
+- **Current work:** [`../../AGENTS.md`](../../AGENTS.md) owns work order and
+  [`FLEET_SCORECARD.md`](./FLEET_SCORECARD.md) owns current A+ completion bars.
+  [`FORWARD_PLAN.md`](./FORWARD_PLAN.md) and other PLAN/LIVE records supply
+  scoped context and procedures under that order.
 - **Session entrypoint:** [`../../AGENTS.md`](../../AGENTS.md), then
   [`FORWARD_PLAN.md`](./FORWARD_PLAN.md).
 - **Maintainer-host live state only:** [`../HANDOFF.md`](../HANDOFF.md); never

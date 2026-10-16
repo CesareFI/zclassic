@@ -3,8 +3,8 @@
 # Z23 agent entry point
 
 Read this model-neutral contract before changing the repository. It owns
-durable principles and authority. [FORWARD_PLAN.md](docs/work/FORWARD_PLAN.md)
-owns the ordered mission; [DEVELOPING.md](docs/DEVELOPING.md) owns procedure;
+durable principles, authority and the current work order (see *Priority and
+evidence*); [DEVELOPING.md](docs/DEVELOPING.md) owns procedure;
 [AGENT_FLEET.md](docs/work/AGENT_FLEET.md) owns the fleet operating model.
 [HANDOFF.md](docs/HANDOFF.md) is maintainer-host live-state routing only.
 [CODE_FEARLESSLY.md](docs/CODE_FEARLESSLY.md) explains the operating
@@ -69,7 +69,7 @@ view, not a hand-maintained ownership catalog.
 
 ## Priority and evidence
 
-Owner reset of 2026-10-16, agreed by every fleet lead on board ref
+Owner-adopted reset of 2026-10-16, recorded on board ref
 fleet-priorities-20261016. It supersedes earlier session rulings. The
 numbered owner rulings (R1, R2, ...) live on the fleet wiki page
 `fleet-rules`, read with `z23-dev fleet.wiki.read --slug=fleet-rules`; when
@@ -88,7 +88,8 @@ rulings by number.
    - Tier 2, the sovereign fleet core: G11 zero spend, G1 post-quantum
      tunnel, G3 remote shell, G5 plugins and binary swarm, G6 seamless updates.
    - Tier 3: G2 post-quantum release signing, G8 telemetry, G12 Mac parity.
-   Within a tier, the work closest to its A+ bar goes first. Public-node V1
+   Within a tier, the work closest to its A+ bar goes first; independent work
+   may proceed in parallel. Public-node V1
    acceptance under [MVP.md](docs/MVP.md) C1–C8 and the product priorities in
    [FORWARD_PLAN.md](docs/work/FORWARD_PLAN.md) remain acceptance context.
 3. **Zero spend.** No fleet feature may require ZCL, an anchored ZID or a fee.
@@ -229,7 +230,9 @@ assertion that would need weakening, or genuine mission completion.
 
 - **C23 is canonical. Never use Python:** no `.py` files, Python shebangs,
   invocations, heredocs, fallback or legacy exceptions. Operator/test glue is
-  POSIX or bash shell, or a small in-tree C23 helper such as `sqlq`/`jsonq`.
+  native C23, including small in-tree helpers such as `sqlq`/`jsonq`. Small
+  POSIX sh scripts are acceptable interim tooling; retain the no-new-bash
+  ratchet.
   Extract flat JSON with grep/sed/awk and nested JSON with `build/bin/jsonq`;
   use `build/bin/sqlq` for SQLite inspection.
 - Preserve unrelated dirty work; never reset, overwrite or include it in
@@ -280,8 +283,9 @@ Use native receipt-gated landing under `devbuild --wait`, as specified in
 remote SHA. Evidence applies only to its source, commit/base pair and policy;
 reconcile an unknown push before retrying.
 
-A push is a checkpoint. Fetch current main, integrate safely and continue the
-ordered mission until complete acceptance or a named escalation condition.
+A push is a checkpoint. Fetch current main, integrate safely and continue
+work in the fleet priority order until complete acceptance or a named
+escalation condition.
 A status report does not suspend work. Remove obsolete code/instructions only
 after verifying ownership, callers and replacement acceptance. Update the
 owning document in the same slice and regenerate derived references through

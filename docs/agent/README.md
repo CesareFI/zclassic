@@ -2,9 +2,9 @@
 
 # Agent document index
 
-New to a z23 fleet? Read [START_HERE.md](START_HERE.md) first. Then [AGENTS.md](../../AGENTS.md), then the first open item in
-[FORWARD_PLAN.md](../work/FORWARD_PLAN.md). The development procedure is
-[DEVELOPING.md](../DEVELOPING.md). These adapters do not reorder that mission.
+New to a z23 fleet? Read [START_HERE.md](START_HERE.md) first. Then [AGENTS.md](../../AGENTS.md), then select work under its fleet priorities, using
+[FORWARD_PLAN.md](../work/FORWARD_PLAN.md) for scoped context. The development procedure is
+[DEVELOPING.md](../DEVELOPING.md). These adapters do not reorder that work.
 
 Before editing, read `~/.config/dev-workers/OPERATIONS.md`, run
 `devworker where z23`, inspect dirty work and `git worktree list --porcelain`, and

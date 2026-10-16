@@ -2,13 +2,16 @@
 
 # Z23 current forward plan
 
-This is the current ordered development mission. Durable product direction and
+This file supplies scoped product and implementation context for development.
+Durable product direction and
 agent authority live in [`../../AGENTS.md`](../../AGENTS.md); public-node
 acceptance lives in [`../MVP.md`](../MVP.md). Maintainer-host live state belongs
 only in [`../HANDOFF.md`](../HANDOFF.md), consulted for an explicit host
 assignment. Do not copy live heights, process state, or benchmark anecdotes here.
 
-This file owns the active scope and the ordered queue. Passing all of MVP.md's
+`AGENTS.md` owns work order; `FLEET_SCORECARD.md` owns the thirteen current
+A+ completion bars. The sections below supply scoped acceptance context.
+Passing all of MVP.md's
 C1–C8 is necessary for platform v1 but not sufficient: platform v1 is the
 release demonstration under *Acceptance and performance* below, together with
 the existing acceptance targets. Open (◐) MVP criteria remain acceptance
@@ -16,10 +19,10 @@ context under `AGENTS.md`; work that needs a ZCL spend waits for an owner
 authorization. Each ◐ cell names its own remaining
 condition or owner decision; recheck it against its ledger before starting.
 
-Acceptance for the current mission lives in
-[`DEVELOPMENT_MVP.md`](./DEVELOPMENT_MVP.md): eight milestones (D1–D8) for
-fast, coordinated, low-cost agent development of C23, each with one
-measurement and one threshold. It adds to C1–C8 and replaces none of them.
+[`DEVELOPMENT_MVP.md`](./DEVELOPMENT_MVP.md) retains eight scoped milestones
+(D1–D8) for fast, coordinated, low-cost agent development of C23, each with one
+measurement and one threshold. D1–D8 and C1–C8 remain acceptance context; they
+do not replace the fleet A+ bars or reorder current work.
 
 <!-- claim: file-present docs/work/DEVELOPMENT_MVP.md -->
 
@@ -42,16 +45,17 @@ signed task objects are the first live business sources. Transcripts, Slack,
 email, tickets, CRM, analytics and feedback receive bounded import support;
 direct connectors subsequently reuse the same adapter contract.
 
-Canonical lifecycle convergence is the first milestone. The continuation queue
-below replaces the earlier blanket fleet freeze and temporary P0.5 queue.
-Existing design records supply scoped implementation detail; they do not reorder
-this mission. Requirements below are acceptance targets, not claims of completed
+Canonical lifecycle convergence is one scoped implementation objective below.
+The earlier blanket fleet freeze and temporary P0.5 queue are superseded by
+the owner-adopted fleet priorities in `AGENTS.md`. Existing design records
+supply implementation detail under that order. Requirements below are acceptance
+targets, not claims of completed
 implementation or measured performance.
 
 The [measured fleet development contract](AGENT_FLEET.md) specifies passive
 Codex accounting, qualified cost routing and durable executor recovery for this
-mission. Its delivery sequence does not reorder the continuation queue below;
-automatic dispatch and publication retain their explicit qualification gates.
+mission. Its delivery sequence does not reorder the fleet priorities; automatic
+dispatch and publication retain their explicit qualification gates.
 
 Work after P0 is ordered by the owner-adopted [fleet A+
 scorecard](FLEET_SCORECARD.md): thirteen goals, each with a probe-based A+ bar.
@@ -102,7 +106,9 @@ ledger. Queries identify source generation, policy, coverage, observation age,
 missing information and continuation cursor. Plans bind exact targets,
 artifacts, configuration, schema, authority, preconditions and rollback.
 
-## Five product acceptance priorities
+<a id="five-product-acceptance-priorities"></a>
+
+## Five product acceptance outcomes
 
 **Software made for you, not imposed on you.** Describe a useful change, see
 its real behavior, reproduce it elsewhere, and accept an exact version that
@@ -110,22 +116,24 @@ remains usable after its original agent or publisher disappears. The larger
 vision connects sovereign C23 nodes, reusable software and an optional emulated
 RISC-V FreeBSD environment through independently verified peer routes.
 
-These five outcomes are ordered by product importance. They are acceptance
-priorities, not a second implementation queue: follow the
-[continuation queue](#ordered-continuation-queue) and its dependencies. P0
-correctness and ready, authorized P1 acceptance take precedence. The items
-below describe work to prove, not capabilities declared complete.
+These five outcomes retain product acceptance context. Select work under
+`AGENTS.md` and the fleet A+ scorecard, respecting dependencies and authority.
+The items below describe work to prove, not capabilities declared complete.
 
 1. **Trust the public node and wallet first.** Close the literal
    [C1–C8 criteria](../MVP.md) with evidence bound to the exact candidate.
-   First finish ready payment qualification: a previously uncredited recipient
-   receives **1 ZCL within two blocks**, with real proof verification and no
+   Literal payment qualification requires a previously uncredited recipient
+   to receive **1 ZCL within two blocks**, with real proof verification and no
    double credit. Preserve the full from-genesis parity and uninterrupted
    seven-day soak requirements; a smaller decrypted note or a unit test cannot
-   replace them. Missing prerequisites remain explicit. This outranks the
-   queue's development machinery; synchronization work maps to section 5.
+   replace them. Missing prerequisites remain explicit; synchronization work
+   maps to section 5.
 
-   Next concrete task: record the literal criterion 4 run (1 ZCL received, balance reflected within 2 blocks), because the evidence in its row of [`MVP.md`](../MVP.md) is a 0.02 ZCL note decrypted after mempool entry, and close criteria 6 and 8, both marked partial there.
+   Criterion 4's literal 1 ZCL rerun remains deferred until explicit owner spend
+   authorization. Its [`MVP.md`](../MVP.md) evidence is a 0.02 ZCL note decrypted
+   after mempool entry; that does not close the literal criterion. Criteria 6
+   and 8 retain their recorded acceptance gaps. Follow the fleet work order
+   when selecting authorized work on these gaps.
 
 2. **Qualify protected native and guest access through restart.** Reuse the
    existing `ops.mesh.terminal` Linux confined shell owner; qualify additional
@@ -187,7 +195,12 @@ below describe work to prove, not capabilities declared complete.
 
    Next concrete task: add a registered case in `tests/harness/src/test_zcode_swarm_net.c` where the late joiner finds the surviving holder by announcement. The existing case `zwn_t_redundant_publish_disappear` fetches through `zwn_fetch_package_from_provider`, which calls `vcs_swarm_engine_fetch_from` with an explicit provider handle.
 
-## Ordered continuation queue
+<a id="ordered-continuation-queue"></a>
+
+## Scoped implementation references
+
+Section numbers identify implementation areas; select work using `AGENTS.md`
+and the fleet A+ scorecard rather than section order.
 
 ### 1. Finish the foundation for fast, coordinated work
 
@@ -386,5 +399,6 @@ Fetch current `origin/main`, integrate safely and rerun affected gates. Publish
 through the qualified canonical lifecycle and record the independently observed
 remote SHA; follow the current enforced publication policy while convergence is
 unfinished. Do not describe a local commit or queue receipt as publication.
-Continue with the first unfinished item after every checkpoint until the full
-journey passes. Escalate only under [`../../AGENTS.md`](../../AGENTS.md).
+After every checkpoint, select the next authorized work under `AGENTS.md`
+and the fleet A+ scorecard; retain the scoped journey acceptance requirements.
+Escalate only under [`../../AGENTS.md`](../../AGENTS.md).
