@@ -622,8 +622,8 @@ static int live_dynamic_argv(void)
     for (size_t i = 0; i < sizeof progs / sizeof progs[0]; i++) {
         struct stat st;
         if (stat(progs[i].path, &st) != 0 || (st.st_mode & S_IXUSR) == 0) {
-            printf("mesh_terminal_worker: SKIP dynamic argv %s (absent)\n",
-                   progs[i].path);
+            /* Every supported Linux host carries these: absence is a red. */
+            failures = check(failures, false, "dynamic argv: /usr/bin/true and /usr/bin/false are present");
             continue;
         }
         const char *const run[] = { progs[i].path, NULL };
@@ -680,8 +680,7 @@ static int live_orphan_descendant(void)
     const char *const run[] = { "/bin/sh", "-c", "trap '' HUP; (kill -KILL $$; while :; do :; done)", NULL };
     struct stat st;
     if (stat(run[0], &st) != 0 || !(st.st_mode & S_IXUSR)) {
-        printf("mesh_terminal_worker: SKIP orphan descendant (/bin/sh absent)\n");
-        return 0;
+        return check(0, false, "orphan: /bin/sh is present");
     }
     int failures = 0;
     struct mesh_terminal_worker_config cfg;
@@ -715,8 +714,7 @@ static int live_custody_order(void)
     const char *const run[] = { "/bin/sh", "-c", "trap '' HUP; (kill -KILL $$; while :; do :; done)", NULL };
     struct stat st;
     if (stat(run[0], &st) != 0 || !(st.st_mode & S_IXUSR)) {
-        printf("mesh_terminal_worker: SKIP custody order (/bin/sh absent)\n");
-        return 0;
+        return check(0, false, "custody: /bin/sh is present");
     }
     int failures = 0, status = 0;
     uint32_t killpg_seq = 0, reap_seq = 0;
