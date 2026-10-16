@@ -557,7 +557,7 @@ static bool sbp_row_strings(const struct json_value *row)
 static bool sbp_row_numbers(const struct json_value *row)
 {
     return sbp_integer(row, "retry_count", 0, INT32_MAX) &&
-        sbp_integer(row, "retry_budget", 0, INT32_MAX) &&
+        sbp_integer(row, "retry_budget", -1, INT32_MAX) &&
         sbp_integer(row, "fire_count", 0, UINT32_MAX) &&
         sbp_integer(row, "age_us", INT64_MIN, INT64_MAX) &&
         sbp_integer(row, "deadline_remaining_us", INT64_MIN, INT64_MAX);

@@ -3200,12 +3200,20 @@ static void blocker_page_rows(struct json_value *rows, int total)
         memset(escaped_owner, 1, 39); escaped_owner[39] = 0;
         json_push_kv_str(&row, "id", oversized ? escaped_id : id);
         json_push_kv_str(&row, "owner", oversized ? escaped_owner : "sync");
-        json_push_kv_str(&row, "class", "permanent");
+        json_push_kv_str(&row, "class", g_blocker_page_case == 12 ? "dependency" : "permanent");
         json_push_kv_str(&row, "escape_action", oversized ? escaped_id : "inspect");
         json_push_kv_str(&row, "reason", oversized ? escaped_reason
             : g_blocker_page_case == 10 ? "changed stored reason" : reason);
-        json_push_kv_int(&row, "retry_count", g_blocker_page_case == 3 ? 1 : 0);
-        json_push_kv_int(&row, "retry_budget", 5); json_push_kv_int(&row, "fire_count", 1);
+        json_push_kv_int(&row, "retry_count", g_blocker_page_case == 16 ? -1
+            : g_blocker_page_case == 3 ? 1 : 0);
+        if (g_blocker_page_case == 15)
+            json_push_kv_str(&row, "retry_budget", "-1");
+        else
+            json_push_kv_int(&row, "retry_budget", g_blocker_page_case == 11 ||
+                g_blocker_page_case == 12 ? -1 : g_blocker_page_case == 13 ? -2
+                : g_blocker_page_case == 14 ? INT64_C(2147483648)
+                : g_blocker_page_case == 17 ? 0 : g_blocker_page_case == 18 ? INT32_MAX : 5);
+        json_push_kv_int(&row, "fire_count", 1);
         json_push_kv_int(&row, "age_us", g_blocker_page_case == 1 ? 20 : 10);
         json_push_kv_int(&row, "deadline_remaining_us", 0);
         if (g_blocker_page_case == 5)
@@ -3237,9 +3245,9 @@ static char *blocker_page_rpc(const char *method, const char *params)
     json_push_kv_int(&blockers, "generation", 9);
     int total = g_blocker_page_case == 4 ? 0 : 8;
     json_push_kv_int(&blockers, "active_count", total);
-    json_push_kv_int(&blockers, "permanent_count", total);
+    json_push_kv_int(&blockers, "permanent_count", g_blocker_page_case == 12 ? 0 : total);
     json_push_kv_int(&blockers, "transient_count", 0);
-    json_push_kv_int(&blockers, "dependency_count", 0);
+    json_push_kv_int(&blockers, "dependency_count", g_blocker_page_case == 12 ? total : 0);
     json_push_kv_int(&blockers, "resource_count", 0);
     json_push_kv_int(&blockers, "escape_dispatched_total", 0);
     blocker_page_rows(&rows, total);
@@ -3380,6 +3388,43 @@ static int test_blocker_basic_refusals(void)
         ASSERT(json_get_bool(json_get(page, "page_complete")));
         ASSERT_EQ(json_get_int(json_get(page, "returned_count")), 0);
         json_free(&envelope); PASS();
+    }
+    TEST("blocker valid budget boundaries survive BASIC paging") {
+        const int modes[] = {11, 12, 17, 18};
+        for (size_t m = 0; m < sizeof(modes) / sizeof(modes[0]); m++) {
+            int mode = modes[m];
+            g_blocker_page_case = mode;
+            enum zcl_command_exit code = ZCL_COMMAND_EXIT_INTERNAL;
+            ASSERT(blocker_page_execute(&input, "full", 8192, NULL, out, &code) > 0);
+            ASSERT_EQ(code, ZCL_COMMAND_EXIT_OK);
+            ASSERT(json_read(&envelope, out, strlen(out)));
+            const struct json_value *page = json_get(json_get(&envelope, "data"), "blocker_page");
+            const struct json_value *rows = json_get(page, "rows");
+            ASSERT(rows && rows->type == JSON_ARR && rows->num_children > 0);
+            for (size_t i = 0; i < rows->num_children; i++) {
+                const struct json_value *row = &rows->children[i];
+                ASSERT_STR_EQ(json_get_str(json_get(row, "class")),
+                              mode == 12 ? "dependency" : "permanent");
+                const struct json_value *budget = json_get(row, "retry_budget");
+                ASSERT(budget && budget->type == JSON_INT);
+                ASSERT_EQ(json_get_int(budget), mode == 17 ? 0 : mode == 18 ? INT32_MAX : -1);
+            }
+            json_free(&envelope);
+        }
+        PASS();
+    }
+    TEST("blocker invalid budgets and negative retry counts refuse without a page") {
+        for (int mode = 13; mode <= 16; mode++) {
+            g_blocker_page_case = mode;
+            enum zcl_command_exit code = ZCL_COMMAND_EXIT_INTERNAL;
+            ASSERT(blocker_page_execute(&input, "full", 8192, NULL, out, &code) > 0);
+            ASSERT(code != ZCL_COMMAND_EXIT_OK);
+            ASSERT(strstr(out, "target BASIC blocker snapshot unavailable"));
+            ASSERT(json_read(&envelope, out, strlen(out)));
+            ASSERT(json_get(json_get(&envelope, "data"), "blocker_page") == NULL);
+            json_free(&envelope);
+        }
+        PASS();
     }
     TEST("blocker unknown returned member and escaped oversized row refuse without advance") {
         for (int mode = 5; mode <= 7; mode++) {
