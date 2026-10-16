@@ -37,6 +37,7 @@ struct fake_node {
     int end_at_read;               /* 1-based read that reports "ended"; 0 never */
     const char *evidence_reason;   /* CLOSED receipt evidence, or NULL */
     const char *evidence_extra;    /* extra evidence members, e.g. ,"exit_code":3 */
+    bool status_unreported;        /* worker-exited with no status keys (a legacy node) */
     const char *close_reason;      /* locally named end, no evidence, or NULL */
     int fail_at_read;              /* 1-based read after which the node is gone */
     size_t burst_total;            /* output burst size; ends when drained */
@@ -92,6 +93,18 @@ static const struct json_value *params_obj(const struct json_value *arr)
     return json_at(arr, 0);
 }
 
+/* The evidence members after "reason". A worker-exited report carries the
+ * remote status like a current node's does (a clean exit 0) unless the case
+ * asks for a legacy node that names none. */
+static const char *fake_evidence_extra(const struct fake_node *n)
+{
+    if (n->evidence_extra)
+        return n->evidence_extra;
+    if (!n->status_unreported && !strcmp(n->evidence_reason, "worker-exited"))
+        return ",\"exit_code\":0";
+    return "";
+}
+
 static char *fake_poll(struct fake_node *n)
 {
     char b[512];
@@ -110,7 +123,7 @@ static char *fake_poll(struct fake_node *n)
                  "{\"bytes_in\":%zu,\"bytes_out\":7,\"duration_s\":2,"
                  "\"reason\":\"%s\"%s}}",
                  n->sent_len, n->sent_len, n->evidence_reason,
-                 n->evidence_extra ? n->evidence_extra : "");
+                 fake_evidence_extra(n));
     else if (n->ended && n->close_reason)
         snprintf(b, sizeof(b),
                  "{\"ok\":true,\"state\":\"ended\",\"verdict\":\"closed\","
@@ -388,7 +401,7 @@ static int test_data_both_ways(void)
         ASSERT(sent_is(&n, "ls\n"));
         ASSERT_EQ(t.out_len, (size_t)7);
         ASSERT(memcmp(t.out, "hello\r\n", 7) == 0);
-        ASSERT(strstr(t.err, "reason=worker-exited bytes_in=3 bytes_out=7 "
+        ASSERT(strstr(t.err, "reason=worker-exited exit_code=0 bytes_in=3 bytes_out=7 "
                              "duration_s=2") != NULL);
         ASSERT(n.open_has_geometry);
         ASSERT_EQ(n.open_cols, 100u);
@@ -800,21 +813,32 @@ static int test_remote_end_messages(void)
 static int test_remote_exit_status(void)
 {
     static const struct {
-        const char *extra;
+        const char *extra; /* NULL with legacy: a node that names no status */
+        bool legacy;
         int exit_code;
         const char *words;
     } rows[] = {
-        {",\"exit_code\":3", 3, "exit_code=3"},
-        {",\"exit_code\":255", 255, "exit_code=255"},
-        {",\"exit_code\":0", 0, "exit_code=0"},
-        {",\"signal\":15", 143, "signal=15"},
-        {",\"signal\":9", 137, "signal=9"},
-        {NULL, 0, "reason=worker-exited"}, /* old node: no status */
-        {",\"exit_code\":300", 0, "reason=worker-exited"}, /* out of range */
+        {",\"exit_code\":3", false, 3, "exit_code=3"},
+        {",\"exit_code\":255", false, 255, "exit_code=255"},
+        {",\"exit_code\":0", false, 0, "exit_code=0"},
+        {",\"signal\":15", false, 143, "signal=15"},
+        {",\"signal\":9", false, 137, "signal=9"},
+        /* absent (a legacy node) is "status unknown", never success */
+        {NULL, true, 255, "status=unknown"},
+        /* present but unusable is a distinct typed failure */
+        {",\"exit_code\":300", false, 6, "status=malformed"},
+        {",\"exit_code\":-1", false, 6, "status=malformed"},
+        {",\"exit_code\":\"3\"", false, 6, "status=malformed"},
+        {",\"signal\":0", false, 6, "status=malformed"},
+        {",\"signal\":65", false, 6, "status=malformed"},
+        {",\"signal\":\"9\"", false, 6, "status=malformed"},
+        {",\"exit_code\":3,\"signal\":9", false, 6, "status=malformed"},
+        {",\"status_malformed\":true", false, 6, "status=malformed"},
     };
     int failures = 0;
     TEST("mesh terminal attach: worker-exited carries the remote status "
-         "(N, 128+signal), and a report without one exits 0") {
+         "(N, 128+signal); absent status is unknown, malformed is refused, "
+         "neither is success") {
         for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
             struct fake_node n;
             struct fake_term t;
@@ -822,6 +846,7 @@ static int test_remote_exit_status(void)
             n.end_at_read = 2;
             n.evidence_reason = "worker-exited";
             n.evidence_extra = rows[i].extra;
+            n.status_unreported = rows[i].legacy;
             ASSERT_EQ(run(&n, &t, true, PAIRING), rows[i].exit_code);
             ASSERT(strstr(t.err, rows[i].words) != NULL);
             ASSERT_EQ(t.raw_off_count, 1);
@@ -834,6 +859,11 @@ static int test_remote_exit_status(void)
         n.end_at_read = 2;
         n.evidence_reason = "idle-timeout";
         n.evidence_extra = ",\"exit_code\":9";
+        ASSERT_EQ(run(&n, &t, true, PAIRING), 5);
+        fake_init(&n, &t);
+        n.end_at_read = 2;
+        n.evidence_reason = "idle-timeout";
+        n.evidence_extra = ",\"exit_code\":300";
         ASSERT_EQ(run(&n, &t, true, PAIRING), 5);
         PASS();
     } _test_next:;

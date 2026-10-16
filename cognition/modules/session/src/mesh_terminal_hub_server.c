@@ -67,6 +67,7 @@ static int hub_listen_run_arm(int listener,
 
 #include "mesh_terminal_hub_io.h"
 
+#include "platform/resident_launch.h"
 #include "platform/rng.h"
 #include "platform/time_compat.h"
 #include "session/mesh_terminal_worker.h"
@@ -453,6 +454,43 @@ static void hub_signals_reset(void)
     g_hub_signal_pipe[0] = g_hub_signal_pipe[1] = -1;
 }
 
+#define HUB_AUDIT_WAIT_MS 2000
+#define HUB_STOP_GRACE_MS 5000
+#define HUB_EXIT_AUDIT_DROPPED 3 /* a session child whose audit line was dropped */
+
+#if defined(ZCL_TESTING)
+static bool g_children_ignore_term;
+
+void mesh_terminal_hub_testing_children_ignore_term(bool ignore)
+{
+    g_children_ignore_term = ignore;
+}
+#endif
+
+static int64_t hub_mono_ms(void)
+{
+    return platform_time_monotonic_ms();
+}
+
+/* One audit line, bounded. The sink is shared and may be a pipe nobody
+ * drains, so the line is written only once the sink says it can take it (a
+ * line is far under PIPE_BUF, so a ready pipe takes it whole) and is dropped
+ * when that does not happen within wait_ms. False when dropped. */
+static bool hub_audit_write(int fd, const char *line, size_t n, int wait_ms)
+{
+    int64_t deadline = hub_mono_ms() + (wait_ms > 0 ? wait_ms : HUB_AUDIT_WAIT_MS);
+    struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+    for (;;) {
+        int64_t left = deadline - hub_mono_ms();
+        int ready = left > 0 ? poll(&pfd, 1, (int)left) : 0;
+        if (ready > 0)
+            break;
+        if (ready == 0 || errno != EINTR)
+            return false;
+    }
+    return write(fd, line, n) == (ssize_t)n;
+}
+
 /* A session child: its own stop pipe, so SIGTERM from the supervisor ends
  * the session through the normal path and the worker's group is killed. */
 static void hub_child(int fd, int listener,
@@ -465,11 +503,16 @@ static void hub_child(int fd, int listener,
     hub_signals_reset();
     if (hub_signals_install(false))
         serve.stop_fd = g_hub_signal_pipe[0];
+#if defined(ZCL_TESTING)
+    if (g_children_ignore_term) {
+        signal(SIGTERM, SIG_IGN);
+        serve.stop_fd = -1;
+    }
+#endif
     mesh_terminal_hub_serve_fd(fd, &serve, &report);
     size_t n = mesh_terminal_hub_audit_line(line, sizeof line - 1u, &report);
     line[n++] = '\n';
-    (void)!write(cfg->audit_fd, line, n);
-    _exit(0);
+    _exit(hub_audit_write(cfg->audit_fd, line, n, cfg->audit_wait_ms) ? 0 : HUB_EXIT_AUDIT_DROPPED);
 }
 
 static void hub_busy(int fd)
@@ -479,22 +522,29 @@ static void hub_busy(int fd)
 }
 
 struct hub_sup {
-    unsigned active, started, done;
+    unsigned active, started, done, audit_dropped;
     bool stopping;
     pid_t kids[MESH_TERMINAL_HUB_ACTIVE_MAX];
 };
 
+static void hub_sup_gone(struct hub_sup *sup, pid_t pid, int status)
+{
+    for (unsigned i = 0; i < MESH_TERMINAL_HUB_ACTIVE_MAX; i++)
+        if (sup->kids[i] == pid) {
+            sup->kids[i] = 0;
+            sup->active--;
+            sup->done++;
+            if (WIFEXITED(status) && WEXITSTATUS(status) == HUB_EXIT_AUDIT_DROPPED)
+                sup->audit_dropped++;
+        }
+}
+
 static void hub_sup_reap(struct hub_sup *sup)
 {
     pid_t pid;
-    while ((pid = waitpid(-1, NULL, WNOHANG)) > 0) {
-        for (unsigned i = 0; i < MESH_TERMINAL_HUB_ACTIVE_MAX; i++)
-            if (sup->kids[i] == pid) {
-                sup->kids[i] = 0;
-                sup->active--;
-                sup->done++;
-            }
-    }
+    int status = 0;
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0)
+        hub_sup_gone(sup, pid, status);
 }
 
 static void hub_sup_accept(struct hub_sup *sup, int listener,
@@ -525,19 +575,6 @@ static void hub_sup_accept(struct hub_sup *sup, int listener,
     sup->started++;
 }
 
-static void hub_sup_stop(struct hub_sup *sup)
-{
-    for (unsigned i = 0; i < MESH_TERMINAL_HUB_ACTIVE_MAX; i++)
-        if (sup->kids[i])
-            (void)kill(sup->kids[i], SIGTERM);
-    while (sup->active) {
-        if (waitpid(-1, NULL, 0) > 0)
-            sup->active--;
-        else if (errno != EINTR)
-            break;
-    }
-}
-
 /* A stop request and finished children arrive as bytes on the signal pipe. */
 static void hub_sup_signals(struct hub_sup *sup)
 {
@@ -546,6 +583,32 @@ static void hub_sup_signals(struct hub_sup *sup)
     for (ssize_t i = 0; i < n; i++)
         sup->stopping = sup->stopping || sig[i] == 'T';
     hub_sup_reap(sup);
+}
+
+/* Ends the sessions: SIGTERM lets each close through its normal path, and a
+ * session still running when the grace is up is killed and reaped with the
+ * bounded reap, so a wedged session cannot hold the supervisor forever. */
+static void hub_sup_stop(struct hub_sup *sup, int grace_ms)
+{
+    int64_t deadline = hub_mono_ms() + (grace_ms > 0 ? grace_ms : HUB_STOP_GRACE_MS);
+    for (unsigned i = 0; i < MESH_TERMINAL_HUB_ACTIVE_MAX; i++)
+        if (sup->kids[i])
+            (void)kill(sup->kids[i], SIGTERM);
+    hub_sup_reap(sup);
+    while (sup->active && hub_mono_ms() < deadline) {
+        struct pollfd pfd = { .fd = g_hub_signal_pipe[0], .events = POLLIN };
+        int64_t left = deadline - hub_mono_ms();
+        if (poll(&pfd, 1, (int)(left > 0 ? left : 0)) > 0)
+            hub_sup_signals(sup);
+        else
+            hub_sup_reap(sup);
+    }
+    for (unsigned i = 0; i < MESH_TERMINAL_HUB_ACTIVE_MAX; i++) {
+        pid_t pid = sup->kids[i];
+        int status = 0;
+        if (pid && resident_launch_kill_reap((uint64_t)pid, RESIDENT_REAP_GRACE_MS, &status))
+            hub_sup_gone(sup, pid, status);
+    }
 }
 
 /* One blocking wait: a signal byte or a connection. false on a poll failure. */
@@ -563,6 +626,19 @@ static bool hub_sup_step(struct hub_sup *sup, int listener,
     return true;
 }
 
+/* Audit lines that were dropped for want of a sink are counted, and the count
+ * is the one thing said about them, on stderr and itself time-bounded. */
+static void hub_sup_report_dropped(const struct hub_sup *sup)
+{
+    char line[96];
+    if (!sup->audit_dropped)
+        return;
+    int n = snprintf(line, sizeof line, "event=TERMINAL_HUB_AUDIT_DROPPED count=%u\n",
+                     sup->audit_dropped);
+    if (n > 0)
+        (void)hub_audit_write(STDERR_FILENO, line, (size_t)n, 200);
+}
+
 static int hub_listen_run_arm(int listener,
                                  const struct mesh_terminal_hub_listen_cfg *cfg)
 {
@@ -577,7 +653,8 @@ static int hub_listen_run_arm(int listener,
         if ((full && sup.active == 0) || !hub_sup_step(&sup, listener, cfg, full))
             break;
     }
-    hub_sup_stop(&sup);
+    hub_sup_stop(&sup, cfg->stop_grace_ms);
+    hub_sup_report_dropped(&sup);
     hub_signals_reset();
     close(listener);
     return 0;

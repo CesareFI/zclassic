@@ -28,6 +28,8 @@
 #define MTA_ACTIVE_HOLD_MS 500
 #define MTA_OPEN_POLL_MS 100
 #define MTA_EXIT_INTERRUPTED 130
+#define MTA_EXIT_STATUS_UNKNOWN 255 /* worker-exited with no status: the transport's own verdict, as ssh uses 255 */
+#define MTA_EXIT_STATUS_MALFORMED 6 /* a status key was present but unusable */
 #define MTA_EOT 0x04u
 #define MTA_OPEN_WAIT_DEFAULT_S 35u
 #define MTA_OPEN_WAIT_MAX_S 120u
@@ -51,6 +53,7 @@ struct mta_view {
     bool evidence_has_exit;   /* the node reported an exit_code */
     uint64_t evidence_exit_code; /* 0..255 */
     uint64_t evidence_signal;    /* 1..64, 0 when none */
+    bool evidence_status_malformed; /* a status key was present but unusable */
 };
 
 enum mta_esc { MTA_ESC_BOL, MTA_ESC_TILDE, MTA_ESC_MID };
@@ -266,6 +269,31 @@ static bool mta_open(struct mta *s, uint16_t cols, uint16_t rows)
     return valid;
 }
 
+/* The node's remote status, read strictly: absent keys leave the status
+ * unknown; a key of the wrong type or out of range, both keys, or the node's
+ * own status_malformed mark make it malformed. Never a silent zero. */
+static bool mta_int_in(const struct json_value *v, int64_t lo, int64_t hi, uint64_t *out)
+{
+    if (!v || v->type != JSON_INT || json_get_int(v) < lo || json_get_int(v) > hi)
+        return false;
+    *out = (uint64_t)json_get_int(v);
+    return true;
+}
+
+static void mta_status_parse(const struct json_value *ev, struct mta_view *v)
+{
+    const struct json_value *ec = json_get(ev, "exit_code");
+    const struct json_value *sg = json_get(ev, "signal");
+    bool bad = json_get(ev, "status_malformed") != NULL || (ec && sg);
+    if (!bad && ec) {
+        v->evidence_has_exit = mta_int_in(ec, 0, 255, &v->evidence_exit_code);
+        bad = !v->evidence_has_exit;
+    } else if (!bad && sg) {
+        bad = !mta_int_in(sg, 1, 64, &v->evidence_signal);
+    }
+    v->evidence_status_malformed = bad;
+}
+
 static bool mta_poll(struct mta *s, struct mta_view *v)
 {
     struct json_value body;
@@ -284,13 +312,7 @@ static bool mta_poll(struct mta *s, struct mta_view *v)
         v->evidence_in = mta_u64(ev, "bytes_in");
         v->evidence_out = mta_u64(ev, "bytes_out");
         v->evidence_duration_s = mta_u64(ev, "duration_s");
-        v->evidence_has_exit = json_get(ev, "exit_code") != NULL;
-        v->evidence_exit_code = mta_u64(ev, "exit_code");
-        v->evidence_signal = mta_u64(ev, "signal");
-        if (v->evidence_exit_code > 255)
-            v->evidence_exit_code = 0;
-        if (v->evidence_signal > 64)
-            v->evidence_signal = 0;
+        mta_status_parse(ev, v);
         mta_copy_str(ev, "reason", v->evidence_reason,
                      sizeof(v->evidence_reason));
     }
@@ -589,15 +611,27 @@ static void mta_gloss_suffix(const char *reason, char *dst, size_t cap)
 
 /* The local exit code for a CLOSED report. A worker-exited ending carries
  * the remote shell's status: its exit code N, or 128 + the signal that
- * killed it. A report without a status (a node that predates the fields)
- * keeps the old class, 0. */
+ * killed it. Without one the honest answer is not success: a report from a
+ * node that predates the fields, or carrying none, exits MTA_EXIT_STATUS_UNKNOWN,
+ * and a status that is present but unusable exits MTA_EXIT_STATUS_MALFORMED. */
 static int mta_remote_exit(const struct mta_view *v)
 {
     if (strcmp(v->evidence_reason, "worker-exited") != 0)
         return mta_exit_for(v->evidence_reason);
+    if (v->evidence_status_malformed)
+        return MTA_EXIT_STATUS_MALFORMED;
     if (v->evidence_signal > 0)
         return 128 + (int)v->evidence_signal;
-    return (int)v->evidence_exit_code;
+    return v->evidence_has_exit ? (int)v->evidence_exit_code : MTA_EXIT_STATUS_UNKNOWN;
+}
+
+/* " status=..." for the closed line when worker-exited names no usable status. */
+static const char *mta_status_words(const struct mta_view *v)
+{
+    if (strcmp(v->evidence_reason, "worker-exited") != 0 || v->evidence_has_exit ||
+        v->evidence_signal > 0)
+        return "";
+    return v->evidence_status_malformed ? " status=malformed" : " status=unknown";
 }
 
 static int mta_conclude_remote(struct mta *s)
@@ -614,6 +648,8 @@ static int mta_conclude_remote(struct mta *s)
         else if (v.evidence_has_exit)
             snprintf(status, sizeof(status), " exit_code=%llu",
                      (unsigned long long)v.evidence_exit_code);
+        else
+            snprintf(status, sizeof(status), "%s", mta_status_words(&v));
         mta_gloss_suffix(v.evidence_reason, gloss, sizeof(gloss));
         mta_say(s,
                 "z23: terminal closed: reason=%s%s bytes_in=%llu "
@@ -621,7 +657,13 @@ static int mta_conclude_remote(struct mta *s)
                 v.evidence_reason, status, (unsigned long long)v.evidence_in,
                 (unsigned long long)v.evidence_out,
                 (unsigned long long)v.evidence_duration_s, gloss);
-        return mta_remote_exit(&v);
+        int code = mta_remote_exit(&v);
+        if (mta_status_words(&v)[0])
+            mta_say(s, "z23: ended: %s: %s", v.evidence_status_malformed ? "STATUS_MALFORMED" : "STATUS_UNKNOWN",
+                    v.evidence_status_malformed
+                        ? "the node sent an unusable exit status; treat the remote result as unknown and update the node, then retry"
+                        : "the node reported no exit status (an older node?); check the remote result on the node, or update it");
+        return code;
     }
     /* No signed close report: a stream that ended and was never closed by
      * this client is the peer's doing, whatever the stream layer calls it. */

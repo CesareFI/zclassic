@@ -21,6 +21,7 @@
 #include "test/mesh_stream_fixture.h"
 #include "test/mesh_term_fixture.h"
 #include "base/hex.h"
+#include "json/json.h"
 #include "net/net.h"
 #include "platform/time_compat.h"
 
@@ -665,18 +666,20 @@ int test_mesh_terminal_client(void)
             bool has_exit;
             int exit_code;
             int signal;
+            bool malformed; /* present but unusable: distinct from absent */
         } rows[] = {
-            {"}", false, 0, 0},                       /* old peer */
-            {",\"exit_code\":3}", true, 3, 0},
-            {",\"exit_code\":0}", true, 0, 0},
-            {",\"signal\":15}", false, 0, 15},
-            {",\"exit_code\":256}", false, 0, 0},     /* out of range */
-            {",\"exit_code\":-1}", false, 0, 0},
-            {",\"signal\":0}", false, 0, 0},
-            {",\"signal\":65}", false, 0, 0},
-            {",\"exit_code\":\"3\"}", false, 0, 0},   /* wrong type */
-            {",\"exit_code\":3,\"signal\":9}", false, 0, 0}, /* both */
-            {",\"future_key\":[1,2]}", false, 0, 0},  /* unknown key */
+            {"}", false, 0, 0, false},                       /* old peer: absent */
+            {",\"exit_code\":3}", true, 3, 0, false},
+            {",\"exit_code\":0}", true, 0, 0, false},
+            {",\"signal\":15}", false, 0, 15, false},
+            {",\"exit_code\":256}", false, 0, 0, true},      /* out of range */
+            {",\"exit_code\":-1}", false, 0, 0, true},
+            {",\"signal\":0}", false, 0, 0, true},
+            {",\"signal\":65}", false, 0, 0, true},
+            {",\"exit_code\":\"3\"}", false, 0, 0, true},    /* wrong type */
+            {",\"signal\":\"9\"}", false, 0, 0, true},
+            {",\"exit_code\":3,\"signal\":9}", false, 0, 0, true}, /* both */
+            {",\"future_key\":[1,2]}", false, 0, 0, false},  /* unknown key */
         };
         for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
             char cap[320];
@@ -687,6 +690,14 @@ int test_mesh_terminal_client(void)
             ASSERT_EQ(v.evidence_has_exit, rows[i].has_exit);
             ASSERT_EQ(v.evidence_exit_code, rows[i].exit_code);
             ASSERT_EQ(v.evidence_signal, rows[i].signal);
+            ASSERT_EQ(v.evidence_status_malformed, rows[i].malformed);
+            struct json_value out;
+            json_init(&out);
+            boot_mesh_terminal_client_view_json(&out, MESH_TERMINAL_CLIENT_ENDED, &v);
+            const struct json_value *evj = json_get(&out, "close_evidence");
+            ASSERT(evj != NULL);
+            ASSERT_EQ(json_get(evj, "status_malformed") != NULL, rows[i].malformed);
+            json_free(&out);
         }
         PASS();
     }

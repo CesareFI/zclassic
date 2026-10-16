@@ -155,7 +155,7 @@ static bool hub_equal_ct(const uint8_t *a, const uint8_t *b, size_t n)
 static bool hub_argv_get(struct mesh_terminal_hub_hello *out, const uint8_t *p,
                          size_t at, size_t end)
 {
-    size_t argc, used = 0;
+    size_t argc, used = 0, content = 0;
     if (at >= end)
         return false;
     argc = p[at++];
@@ -167,12 +167,13 @@ static bool hub_argv_get(struct mesh_terminal_hub_hello *out, const uint8_t *p,
             return false;
         n = hub_get16(p + at);
         at += 2;
-        if (n > end - at || used + n > MESH_TERMINAL_HUB_ARGV_BYTES || memchr(p + at, 0, n))
+        if (n > end - at || content + n > MESH_TERMINAL_HUB_ARGV_BYTES || memchr(p + at, 0, n))
             return false;
         out->argv[i] = out->argv_buf + used;
         memcpy(out->argv_buf + used, p + at, n);
         out->argv_buf[used + n] = '\0';
         used += n + 1;
+        content += n;
         at += n;
     }
     out->argv[argc] = NULL;

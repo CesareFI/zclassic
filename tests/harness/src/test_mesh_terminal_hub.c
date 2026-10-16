@@ -20,6 +20,8 @@
 #include "test/test_core.h"
 #include "session/mesh_terminal_hub.h"
 #include "session/mesh_terminal_worker.h"
+#include "command/native_command.h"
+#include "command/native_mesh_terminal_hub.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -33,6 +35,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -1118,6 +1121,343 @@ static int tidy_end_case(void)
     return failures;
 }
 
+/* Exactly 2000 argv content bytes over several arguments round-trips; one more cannot be sent. */
+static int argv_max_cases(void)
+{
+    int failures = 0;
+    uint8_t key[32], nonce[32], hello[MESH_TERMINAL_HUB_PAYLOAD_MAX];
+    struct mesh_terminal_hub_hello h;
+    char a[1001], b[998];
+    test_key(key, 61);
+    memset(nonce, 0x44, sizeof nonce);
+    memset(a, 'a', 1000); a[1000] = '\0';
+    memset(b, 'b', 997);  b[997] = '\0';
+    const char *max3[] = { "/x", a, b, NULL };                 /* 2 + 1000 + 997 = 1999 */
+    const char *max4[] = { "/x", a, b, "c", NULL };            /* exactly 2000 */
+    const char *over[] = { "/x", a, b, "cc", NULL };           /* 2001 */
+    struct mesh_terminal_hub_request rq = { .cols = 80, .rows = 24, .name = "m", .argv = max4 };
+    size_t n = mesh_terminal_hub_hello_build(hello, key, nonce, &rq);
+    failures = check(failures, n && mesh_terminal_hub_hello_verify(&h, hello, n, key, nonce) == MESH_TERMINAL_HUB_HELLO_OK &&
+                     h.argc == 4 && !strcmp(h.argv[1], a) && !strcmp(h.argv[2], b) && !strcmp(h.argv[3], "c"),
+                     "a multi-argument hello of exactly 2000 content bytes round-trips");
+    rq.argv = max3;
+    n = mesh_terminal_hub_hello_build(hello, key, nonce, &rq);
+    failures = check(failures, n && mesh_terminal_hub_hello_verify(&h, hello, n, key, nonce) == MESH_TERMINAL_HUB_HELLO_OK,
+                     "a hello just under the maximum round-trips");
+    rq.argv = over;
+    failures = check(failures, mesh_terminal_hub_hello_build(hello, key, nonce, &rq) == 0,
+                     "2001 content bytes cannot be sent");
+    const char *sixteen[17];
+    char many[125];
+    memset(many, 'm', 124); many[124] = '\0';
+    sixteen[0] = "/";
+    for (int i = 1; i < 16; i++) sixteen[i] = many;
+    sixteen[16] = NULL;                              /* 1 + 15 x 124 = 1861 content bytes */
+    rq.argv = sixteen;
+    n = mesh_terminal_hub_hello_build(hello, key, nonce, &rq);
+    failures = check(failures, n && mesh_terminal_hub_hello_verify(&h, hello, n, key, nonce) == MESH_TERMINAL_HUB_HELLO_OK &&
+                     h.argc == 16, "sixteen arguments round-trip");
+    return failures;
+}
+
+/* The client against a scripted server that sends one EXIT body. */
+static bool client_exit_run(const uint8_t body[4], struct mesh_terminal_hub_client_result *r)
+{
+    int sv[2];
+    struct cl_run c;
+    uint8_t key[32], type, payload[MESH_TERMINAL_HUB_PAYLOAD_MAX], ch[33] = { MESH_TERMINAL_HUB_VERSION };
+    size_t len;
+    char screen[64];
+    test_key(key, 51);
+    memset(ch + 1, 0x24, 32);
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0 || !cl_start(&c, sv[1], key, "exit", sv[0]))
+        return false;
+    close(sv[1]);
+    drv_send(sv[0], MESH_TERMINAL_HUB_CHALLENGE, ch, sizeof ch);
+    drv_frame(sv[0], &type, payload, &len, 3000);
+    drv_send(sv[0], MESH_TERMINAL_HUB_READY, NULL, 0);
+    drv_send(sv[0], MESH_TERMINAL_HUB_EXIT, body, 4);
+    bool fin = cl_finish(&c, r, screen, sizeof screen);
+    close(sv[0]);
+    return fin;
+}
+
+/* An EXIT frame is trusted only in a shape the server can send. Anything else
+ * is a typed protocol refusal, never an exit 0. */
+static int exit_frame_cases(void)
+{
+    static const struct {
+        uint8_t body[4];
+        int exit_code;
+        const char *code;
+        const char *label;
+    } rows[] = {
+        { { MESH_TERMINAL_CLOSE_WORKER_EXITED, 1, 7, 0 }, 7, "", "exit: a code exit carries its code" },
+        { { MESH_TERMINAL_CLOSE_WORKER_EXITED, 1, 0, 0 }, 0, "", "exit: a clean exit is the only exit 0" },
+        { { MESH_TERMINAL_CLOSE_WORKER_EXITED, 2, 0, 15 }, 143, "", "exit: a signal exit is 128 + the signal" },
+        { { MESH_TERMINAL_CLOSE_WORKER_EXITED, 0, 0, 0 }, 1, "PROTOCOL", "exit: worker-exited with neither flag is refused" },
+        { { MESH_TERMINAL_CLOSE_WORKER_EXITED, 3, 4, 9 }, 1, "PROTOCOL", "exit: worker-exited with both flags is refused" },
+        { { MESH_TERMINAL_CLOSE_WORKER_EXITED, 2, 0, 0 }, 1, "PROTOCOL", "exit: signal flag with signal 0 is refused" },
+        { { MESH_TERMINAL_CLOSE_WORKER_EXITED, 2, 0, 65 }, 1, "PROTOCOL", "exit: signal 65 is out of range" },
+        { { MESH_TERMINAL_CLOSE_WORKER_EXITED, 2, 3, 9 }, 1, "PROTOCOL", "exit: a signal exit with a stray code byte is refused" },
+        { { MESH_TERMINAL_CLOSE_WORKER_EXITED, 1, 3, 9 }, 1, "PROTOCOL", "exit: a code exit with a stray signal byte is refused" },
+        { { MESH_TERMINAL_CLOSE_WORKER_EXITED, 4, 0, 0 }, 1, "PROTOCOL", "exit: an unknown flag bit is refused" },
+        { { 42, 0, 0, 0 }, 1, "PROTOCOL", "exit: an unknown reason is refused, not read as success" },
+        { { MESH_TERMINAL_CLOSE_REVOKED, 0, 0, 0 }, 1, "PROTOCOL", "exit: a reason the hub never sends is refused" },
+        { { MESH_TERMINAL_CLOSE_REQUESTED, 0, 0, 0 }, 1, "PROTOCOL", "exit: an unsolicited requested ending is refused" },
+        { { MESH_TERMINAL_CLOSE_IDLE_TIMEOUT, 1, 3, 0 }, 1, "PROTOCOL", "exit: a limit ending that claims a status is refused" },
+        { { MESH_TERMINAL_CLOSE_IDLE_TIMEOUT, 0, 0, 0 }, 5, "IDLE_TIMEOUT", "exit: a limit ending keeps its class" },
+    };
+    int failures = 0;
+    for (size_t i = 0; i < sizeof rows / sizeof rows[0]; i++) {
+        struct mesh_terminal_hub_client_result r;
+        memset(&r, 0xee, sizeof r);
+        bool ok = client_exit_run(rows[i].body, &r);
+        failures = check(failures, ok && r.exit_code == rows[i].exit_code && !strcmp(r.code, rows[i].code),
+                         rows[i].label);
+    }
+    return failures;
+}
+
+/* Output nobody drains must not keep a termination request from being served. */
+static int backpressure_case(void)
+{
+    int failures = 0, sv[2];
+    struct cl_run c;
+    struct mesh_terminal_hub_client_result r;
+    uint8_t key[32], type, payload[MESH_TERMINAL_HUB_PAYLOAD_MAX], ch[33] = { MESH_TERMINAL_HUB_VERSION };
+    uint8_t block[MESH_TERMINAL_HUB_PAYLOAD_MAX];
+    size_t len, sent = 0;
+    char screen[4096];
+    struct timeval tv = { .tv_usec = 300000 };
+    test_key(key, 51);
+    memset(ch + 1, 0x24, 32);
+    memset(block, 'x', sizeof block);
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0 || !cl_start(&c, sv[1], key, "bp", sv[0]))
+        return check(failures, false, "backpressure setup");
+    close(sv[1]);
+    drv_send(sv[0], MESH_TERMINAL_HUB_CHALLENGE, ch, sizeof ch);
+    drv_frame(sv[0], &type, payload, &len, 3000);
+    drv_send(sv[0], MESH_TERMINAL_HUB_READY, NULL, 0);
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    /* Nothing reads the screen pipe: the client wedges, the socket fills, a send times out. */
+    while (sent < (8u << 20) && drv_send(sv[0], MESH_TERMINAL_HUB_DATA, block, sizeof block))
+        sent += sizeof block;
+    failures = check(failures, sent > 0 && sent < (8u << 20), "the unread screen backs the stream up");
+    int64_t t0 = now_us();
+    ssize_t sw = write(c.ev_w, "S", 1);
+    (void)sw;
+    struct pollfd p = { .fd = c.res_r, .events = POLLIN };
+    bool prompt = poll(&p, 1, 4000) > 0;
+    int64_t took = now_us() - t0;
+    if (!prompt)
+        kill(c.pid, SIGKILL);
+    bool fin = cl_finish(&c, &r, screen, sizeof screen);
+    failures = check(failures, prompt && took < 4000000, "a stop request is served while the output is backed up");
+    failures = check(failures, fin && prompt && r.exit_code == 130 && !strcmp(r.code, "INTERRUPTED"),
+                     "the backed-up client ends interrupted (130), not wedged");
+    close(sv[0]);
+    return failures;
+}
+
+/* A SIGHUP-ignoring tunnel child is reaped within a bound (in a helper, so a regression times out). */
+static void reap_victim(int ready_fd)
+{
+    signal(SIGHUP, SIG_IGN);
+    if (write(ready_fd, "r", 1) != 1)
+        _exit(2);
+    for (;;)
+        pause();
+}
+
+/* In the helper process: reap a HUP-ignoring child, report whether it was
+ * reaped, really gone, and quick. */
+static bool reap_helper(int ready[2], bool pidfd_unavailable)
+{
+    char r;
+    zcl_native_hub_testing_pidfd_unavailable(pidfd_unavailable);
+    pid_t victim = fork();
+    if (victim == 0)
+        reap_victim(ready[1]);
+    bool armed = victim > 0 && read(ready[0], &r, 1) == 1;
+    int64_t t0 = now_us();
+    bool reaped = armed && zcl_native_hub_tunnel_reap(victim, 200);
+    bool gone = waitpid(victim, NULL, WNOHANG) < 0 && errno == ECHILD;
+    bool ok = reaped && gone && now_us() - t0 < 5000000;
+    if (!ok && victim > 0)
+        kill(victim, SIGKILL);
+    return ok;
+}
+
+static bool reap_bounded_run(bool pidfd_unavailable)
+{
+    int done[2], ready[2];
+    if (pipe2(done, O_CLOEXEC) || pipe2(ready, O_CLOEXEC))
+        return false;
+    pid_t helper = fork();
+    if (helper == 0)
+        _exit(write(done[1], reap_helper(ready, pidfd_unavailable) ? "y" : "n", 1) == 1 ? 0 : 2);
+    struct pollfd p = { .fd = done[0], .events = POLLIN };
+    char verdict = 'n';
+    bool in_time = helper > 0 && poll(&p, 1, 8000) > 0 && read(done[0], &verdict, 1) == 1;
+    if (!in_time && helper > 0)
+        kill(helper, SIGKILL);
+    if (helper > 0)
+        waitpid(helper, NULL, 0);
+    close(done[0]); close(done[1]); close(ready[0]); close(ready[1]);
+    return in_time && verdict == 'y';
+}
+
+static int edge_cases(void)
+{
+    int failures = 0;
+    failures = check(failures, reap_bounded_run(false),
+                     "tunnel reap: a child that ignores SIGHUP is escalated and reaped within a bound");
+    failures = check(failures, reap_bounded_run(true),
+                     "tunnel reap: with pidfd_open unavailable the child is still reaped within a bound");
+
+    char arg[40], route[2100], keyp[300], fp[32], why[96];
+    failures = check(failures, zcl_native_hub_route_arg("/r.json", arg, sizeof arg) && !strcmp(arg, "--input-file=/r.json"),
+                     "route argument: a short path is built whole");
+    memset(route, 'r', sizeof route - 1); route[sizeof route - 1] = '\0';
+    route[0] = '/';
+    failures = check(failures, !zcl_native_hub_route_arg(route, arg, sizeof arg),
+                     "route argument: a path that does not fit is refused, never cut");
+    failures = check(failures, zcl_native_hub_route_arg("/12345678901234567890123", arg, 38) &&
+                     !zcl_native_hub_route_arg("/12345678901234567890123", arg, 37),
+                     "route argument: the exact boundary fits and one more byte does not");
+    snprintf(keyp, sizeof keyp, "%s/route.key", g_dir);
+    unlink(keyp);
+    struct hub_args a;
+    memset(&a, 0, sizeof a);
+    a.key_file = keyp;
+    a.route_input = route;
+    failures = check(failures, mesh_terminal_hub_key_init(keyp, fp, why, sizeof why) &&
+                     zcl_native_hub_connect(&a) == ZCL_COMMAND_EXIT_INVALID,
+                     "connect: an over-long --route_input is refused as invalid before any spawn");
+
+    const char *const big[] = { "--max_sessions=4294967297" };
+    const char *const edge[] = { "--max_sessions=4294967295" };
+    const char *const huge[] = { "--max_sessions=18446744073709551615" };
+    failures = check(failures, !zcl_native_hub_args_parse(big, 1, 0, &a) &&
+                     !zcl_native_hub_args_parse(huge, 1, 0, &a) &&
+                     zcl_native_hub_args_parse(edge, 1, 0, &a) && a.max_sessions == UINT32_MAX,
+                     "serve: --max_sessions past 32 bits is refused, never wrapped");
+    return failures;
+}
+
+static bool wait_child_within(pid_t pid, int ms, int *status)
+{
+    for (int waited = 0; waited <= ms; waited += 20) {
+        if (waitpid(pid, status, WNOHANG) == pid)
+            return true;
+        usleep(20000); /* real-clock: waits on another process; there is no seam to inject */
+    }
+    kill(pid, SIGKILL);
+    waitpid(pid, status, 0);
+    return false;
+}
+
+static void fill_pipe(int wfd)
+{
+    char chunk[4096];
+    memset(chunk, 'f', sizeof chunk);
+    int fl = fcntl(wfd, F_GETFL);
+    fcntl(wfd, F_SETFL, fl | O_NONBLOCK);
+    while (write(wfd, chunk, sizeof chunk) > 0) {}
+    fcntl(wfd, F_SETFL, fl);
+}
+
+/* A session whose audit sink never drains must not hold the supervisor: the
+ * line is dropped after a bound and the drop is counted. */
+static int audit_wedge_case(void)
+{
+    int failures = 0, status = 0, sink[2];
+    struct mesh_terminal_hub_listen_cfg cfg;
+    struct exit_info ex;
+    char seen[256], errpath[300], errtext[512];
+    uint16_t port = 0;
+    uint8_t key[32];
+    test_key(key, 71);
+    memset(&cfg, 0, sizeof cfg);
+    serve_cfg(&cfg.serve, 71);
+    cfg.max_active = 1;
+    cfg.max_sessions = 1;
+    cfg.audit_wait_ms = 300;
+    snprintf(errpath, sizeof errpath, "%s/wedge-stderr.log", g_dir);
+    if (pipe2(sink, O_CLOEXEC) != 0)
+        return check(failures, false, "audit wedge setup");
+    fill_pipe(sink[1]);
+    cfg.audit_fd = sink[1];
+    int listener = mesh_terminal_hub_listen(0, &port);
+    pid_t sup = listener < 0 ? -1 : fork();
+    if (sup == 0) {
+        int e = open(errpath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (e >= 0)
+            dup2(e, STDERR_FILENO);
+        _exit(mesh_terminal_hub_listen_run(listener, &cfg));
+    }
+    close(listener);
+    int fd = sup > 0 ? tcp_connect(port) : -1;
+    failures = check(failures, fd >= 0 && drv_handshake(fd, key, "wedge", 80, 24, NULL) == MESH_TERMINAL_HUB_READY,
+                     "audit wedge: the session is admitted");
+    if (fd >= 0) {
+        say(fd, "exit 0\n");
+        drv_until(fd, NULL, &ex, 8000, seen, sizeof seen);
+        close(fd);
+    }
+    bool stopped = sup > 0 && wait_child_within(sup, 6000, &status);
+    failures = check(failures, stopped && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                     "audit wedge: the supervisor still stops by itself after its last session");
+    file_read(errpath, errtext, sizeof errtext);
+    failures = check(failures, strstr(errtext, "event=TERMINAL_HUB_AUDIT_DROPPED count=1") != NULL,
+                     "audit wedge: the dropped line is counted, not silent");
+    close(sink[0]);
+    close(sink[1]);
+    return failures;
+}
+
+/* A session that ignores SIGTERM is killed after the grace, not waited for. */
+static int stop_deadline_case(void)
+{
+    int failures = 0, status = 0;
+    struct mesh_terminal_hub_listen_cfg cfg;
+    uint16_t port = 0;
+    uint8_t key[32];
+    test_key(key, 72);
+    memset(&cfg, 0, sizeof cfg);
+    serve_cfg(&cfg.serve, 72);
+    cfg.max_active = 1;
+    cfg.stop_grace_ms = 300;
+    cfg.audit_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    int listener = cfg.audit_fd < 0 ? -1 : mesh_terminal_hub_listen(0, &port);
+    pid_t sup = listener < 0 ? -1 : fork();
+    if (sup == 0) {
+        mesh_terminal_hub_testing_children_ignore_term(true); /* in the supervisor only */
+        _exit(mesh_terminal_hub_listen_run(listener, &cfg));
+    }
+    close(listener);
+    int fd = sup > 0 ? tcp_connect(port) : -1;
+    failures = check(failures, fd >= 0 && drv_handshake(fd, key, "wedged", 80, 24, NULL) == MESH_TERMINAL_HUB_READY,
+                     "stop deadline: a session is open");
+    int64_t t0 = now_us();
+    if (sup > 0)
+        kill(sup, SIGTERM);
+    bool stopped = sup > 0 && wait_child_within(sup, 5000, &status);
+    failures = check(failures, stopped && WIFEXITED(status) && WEXITSTATUS(status) == 0 && now_us() - t0 < 4000000,
+                     "stop deadline: SIGTERM ends the supervisor within a bound although the session ignores it");
+    if (fd >= 0)
+        close(fd);
+    close(cfg.audit_fd);
+    return failures;
+}
+
+static int bound_cases(void)
+{
+    return argv_max_cases() + exit_frame_cases() + backpressure_case() + edge_cases() +
+           audit_wedge_case() + stop_deadline_case();
+}
+
 int test_mesh_terminal_hub(void)
 {
     int failures = 0;
@@ -1142,6 +1482,7 @@ int test_mesh_terminal_hub(void)
         failures += exec_session_cases();
         failures += listener_cases();
         failures += latency_case();
+        failures += bound_cases();
     }
     printf("mesh terminal hub: %d failures\n", failures);
     return failures;

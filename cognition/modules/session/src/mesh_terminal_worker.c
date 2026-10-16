@@ -673,8 +673,14 @@ static void mesh_terminal_worker_kill_platform_arm(struct mesh_terminal_worker *
         close(w->master_fd);
         w->master_fd = -1;
     }
-    if (!w->running)
+    if (!w->running) {
+        /* Leader already reaped: its descendants (a child that ignored HUP)
+         * outlive it. The spawn-time pgid names them while any member lives
+         * and is never reissued then, so the census guard rules out PID reuse. */
+        if (w->pgid > 1 && os_sandbox_process_group_census(w->pgid) > 0)
+            (void)kill(-w->pgid, SIGKILL);
         return;
+    }
 
     /* Whole GROUP first — the session's process subtree dies together,
      * then the shell itself in case the group signal raced. */

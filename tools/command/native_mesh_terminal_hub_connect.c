@@ -21,6 +21,7 @@
 
 #include "json/json.h"
 #include "platform/os_proc.h"
+#include "platform/resident_launch.h"
 #include "session/mesh_terminal_hub.h"
 
 #include <errno.h>
@@ -34,10 +35,14 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <termios.h>
 #include <unistd.h>
 
 #define CONNECT_REAP_MS 3000
+#define CONNECT_ARG_MAX 1100
+#define CONNECT_POLL_STEP_MS 10
+#define CONNECT_NOPIDFD_GRACE_MS 200 /* the graceful wait when no pidfd can watch the child */
 
 static int g_event_write = -1;
 
@@ -131,17 +136,25 @@ struct tunnel {
     int net_fd, err_fd;
 };
 
+/* "--input-file=<route>" for the device-host client; false (nothing written
+ * past cap) when it does not fit, so a cut path is never handed to a spawn. */
+bool zcl_native_hub_route_arg(const char *route, char *out, size_t cap)
+{
+    int n = snprintf(out, cap, "--input-file=%s", route);
+    return n > 0 && (size_t)n < cap;
+}
+
 /* The existing device-host client, byte for byte as ProxyCommand runs it, on
  * one end of a socket pair; this process speaks the hub protocol on the other. */
 static bool tunnel_open(const char *route_input, struct tunnel *t)
 {
-    char self[1024], arg[1100];
+    char self[1024], arg[CONNECT_ARG_MAX];
     int sv[2], errp[2];
     bool have_self = os_proc_exe_path(self, sizeof self);
     struct stat st;
-    if (!have_self || stat(route_input, &st) != 0 || !S_ISREG(st.st_mode))
+    if (!have_self || !zcl_native_hub_route_arg(route_input, arg, sizeof arg) ||
+        stat(route_input, &st) != 0 || !S_ISREG(st.st_mode))
         return false;
-    snprintf(arg, sizeof arg, "--input-file=%s", route_input);
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0)
         return false;
     if (pipe2(errp, O_NONBLOCK | O_CLOEXEC) != 0) {
@@ -181,22 +194,62 @@ static void tunnel_said(const struct tunnel *t, char *out, size_t cap)
     snprintf(out, cap, " (tunnel: %s)", line);
 }
 
+#if defined(ZCL_TESTING)
+static bool g_pidfd_unavailable;
+
+void zcl_native_hub_testing_pidfd_unavailable(bool unavailable)
+{
+    g_pidfd_unavailable = unavailable;
+}
+#endif
+
+static int tunnel_pidfd(pid_t pid)
+{
+#if defined(ZCL_TESTING)
+    if (g_pidfd_unavailable)
+        return -1;
+#endif
+    return (int)syscall(SYS_pidfd_open, pid, 0);
+}
+
+/* Without pidfd_open the graceful wait polls waitpid(WNOHANG) in short steps;
+ * the child stays a zombie until the reap below, so its pid cannot be reused. */
+static void tunnel_wait_exit(pid_t pid, int grace_ms)
+{
+    int waited = 0;
+    for (; waited < grace_ms; waited += CONNECT_POLL_STEP_MS) {
+        siginfo_t si = { 0 };
+        if (waitid(P_PID, (id_t)pid, &si, WEXITED | WNOHANG | WNOWAIT) == 0 && si.si_pid == pid)
+            return;
+        struct timespec nap = { 0, CONNECT_POLL_STEP_MS * 1000000L };
+        nanosleep(&nap, NULL);
+    }
+}
+
+/* The existing bounded reap (resident_launch_kill_reap: SIGKILL, then a
+ * deadline-bound waitpid) ends every path, so no kernel feature is needed
+ * for the bound: SIGHUP is the client's graceful close and gets `grace_ms`
+ * to land when a pidfd can watch for it, and a child that ignores it, or a
+ * host without pidfd_open (a 200 ms wait by waitid), is killed and reaped. */
+bool zcl_native_hub_tunnel_reap(pid_t pid, int grace_ms)
+{
+    (void)kill(pid, SIGHUP);
+    int pidfd = tunnel_pidfd(pid);
+    if (pidfd >= 0) {
+        struct pollfd pfd = { .fd = pidfd, .events = POLLIN };
+        (void)poll(&pfd, 1, grace_ms);
+        close(pidfd);
+    } else {
+        tunnel_wait_exit(pid, grace_ms < CONNECT_NOPIDFD_GRACE_MS ? grace_ms : CONNECT_NOPIDFD_GRACE_MS);
+    }
+    return resident_launch_kill_reap((uint64_t)pid, RESIDENT_REAP_GRACE_MS, NULL);
+}
+
 static void tunnel_close(struct tunnel *t)
 {
     close(t->net_fd);
-    if (t->pid <= 0) {
-        close(t->err_fd);
-        return;
-    }
-    (void)kill(t->pid, SIGHUP); /* the client's graceful close */
-    int pidfd = (int)syscall(SYS_pidfd_open, t->pid, 0);
-    if (pidfd >= 0) {
-        struct pollfd pfd = { .fd = pidfd, .events = POLLIN };
-        if (poll(&pfd, 1, CONNECT_REAP_MS) <= 0)
-            (void)kill(t->pid, SIGKILL);
-        close(pidfd);
-    }
-    while (waitpid(t->pid, NULL, 0) < 0 && errno == EINTR) {}
+    if (t->pid > 0)
+        (void)zcl_native_hub_tunnel_reap(t->pid, CONNECT_REAP_MS);
     close(t->err_fd);
 }
 
@@ -257,6 +310,10 @@ static int connect_prepare(const struct hub_args *a, struct mesh_terminal_hub_cl
     if (!a->key_file || (!a->route_input == !a->have_direct_port) || a->direct_port > UINT16_MAX)
         return connect_fail(ZCL_COMMAND_EXIT_INVALID, "INVALID_ARGUMENTS",
             "usage: z23 ops mesh terminal connect --key_file=<path> (--route_input=<file> | --direct_port=N) [--name=<label>] [--exec='[\"/abs/program\",\"arg\"]']");
+    char probe[CONNECT_ARG_MAX];
+    if (a->route_input && !zcl_native_hub_route_arg(a->route_input, probe, sizeof probe))
+        return connect_fail(ZCL_COMMAND_EXIT_INVALID, "ROUTE_TOO_LONG",
+                            "the --route_input path is too long to hand to the tunnel client");
     if (a->exec && !connect_exec_parse(a->exec, doc, argv))
         return connect_fail(ZCL_COMMAND_EXIT_INVALID, "EXEC_REFUSED",
                             "--exec must be a JSON array of 1 to 16 strings starting with an absolute program path");

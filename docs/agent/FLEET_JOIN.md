@@ -323,8 +323,16 @@ there; there is no option for it yet.
 
 For a fleet machine that has the device-host receiver but no paired node, no
 ZID master and no sshd, `z23 ops mesh terminal serve` and `connect` give the
-same confined shell over the existing post-quantum tunnel (sntrup761x25519
-inside the hash-PSK). The receiver is unchanged: it connects to a loopback
+same confined shell over the existing device-host tunnel. The direct hub
+speaks its own hub frames over the device-host client, whose outer channel is
+a static SHAKE256-Wrap PSK. There is no inner OpenSSH key exchange here, so
+nothing post-quantum or ephemeral is negotiated, and the tunnel has no
+forward secrecy: anyone who later obtains the PSK and a recording of the
+session can read it (see
+[the forward-secrecy design](../TUNNEL_PQ_FORWARD_SECRECY.md)). This is not the
+earlier hybrid SSH trial (`sntrup761x25519-sha512` inside OpenSSH); that
+measurement belongs to the SSH path and says nothing about the hub. The
+receiver is unchanged: it connects to a loopback
 port, and `serve` is what listens there (point the receiver's `target_port` at
 it; the second receiver unit is the hub operator's change, not this one).
 
@@ -358,7 +366,10 @@ file can open a shell: that is the same trust boundary as the PSK store. A
 local process without the key can still occupy a session slot for up to 2 s;
 the slots are `--max_active` (default 4, at most 16, pre-authentication
 connections included), and an over-limit connection is told `busy` before any
-work is done.
+work is done. `--max_sessions` is a connection-attempt limit, not an
+authenticated-session count: it counts every connection the server accepts,
+wrong key included, and `serve` stops once that many have been taken (0 runs
+until signalled; values past 4294967295 are refused as invalid).
 
 What the tunnel gives and what it does not. The tunnel is the confidentiality
 and authenticity layer for the bytes. The hub's frames carry no signed
@@ -405,9 +416,21 @@ one line, `z23: refused|ended: <CODE>: <words>`, with the codes
 `BYTE_LIMIT`, `SERVER_STOPPING`, `INTERRUPTED`; a failed tunnel adds the
 client's own `error=` line in parentheses.
 
+An exit report the server could not have sent (no status, both a code and a
+signal, a signal outside 1 to 64, an unknown ending) is never read as success:
+it is the `PROTOCOL` error, exit `1`. `connect` stays responsive to a
+termination signal while the screen cannot be written (output piped to a
+reader that stopped), and it ends the tunnel child within a few seconds
+whatever the child does. The shell's process group is killed at the end of
+every session, so a program that ignored HUP does not outlive it.
+
 Limits per session (flags on `serve`): `--idle_s` 600, `--lifetime_s` 3600,
 `--max_bytes_in` 16 MiB, `--max_bytes_out` 1 GiB; a session is one forked
-child, so a crash in one cannot touch another.
+child, so a crash in one cannot touch another. On SIGTERM `serve` asks each
+session to end and kills any still running after 5 s. A session's audit line
+waits at most 2 s for the audit sink; if the sink never takes it the line is
+dropped and `serve` says `event=TERMINAL_HUB_AUDIT_DROPPED count=N` on
+stderr when it stops.
 
 Audit. One line per connection on the server, to `--audit_file` (appended) or
 stderr:

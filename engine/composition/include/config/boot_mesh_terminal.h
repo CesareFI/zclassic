@@ -300,6 +300,9 @@ struct boot_mesh_terminal_client_view {
     bool evidence_has_exit;
     int evidence_exit_code;
     int evidence_signal;
+    /* A status key was present but unusable (wrong type, out of range, or both
+     * keys): distinct from absent, which leaves this false and the rest zero. */
+    bool evidence_status_malformed;
 };
 
 const char *boot_mesh_terminal_open_result_string(

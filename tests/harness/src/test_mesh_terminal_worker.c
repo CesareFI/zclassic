@@ -39,6 +39,7 @@
 #include "session/mesh_terminal_worker.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
@@ -47,6 +48,7 @@
 #define FBSH_BIN "build/bin/fbsh"
 
 #if defined(__linux__)
+#include <dirent.h>
 #include <errno.h>
 #include <sys/wait.h>
 #include <fcntl.h>
@@ -642,6 +644,68 @@ static int live_dynamic_argv(void)
     return failures;
 }
 
+/* Members of a process group that are still running (zombies awaiting their
+ * parent do not count: they are already dead). */
+static unsigned group_running(pid_t pgid)
+{
+    unsigned live = 0;
+    DIR *proc = opendir("/proc");
+    struct dirent *ent;
+    while (proc && (ent = readdir(proc)) != NULL) {
+        char path[64], buf[512];
+        long pid = strtol(ent->d_name, NULL, 10);
+        if (pid <= 0)
+            continue;
+        snprintf(path, sizeof path, "/proc/%ld/stat", pid);
+        int fd = open(path, O_RDONLY);
+        ssize_t n = fd < 0 ? -1 : read(fd, buf, sizeof buf - 1);
+        if (fd >= 0)
+            close(fd);
+        const char *after = n > 0 ? (buf[n] = '\0', strrchr(buf, ')')) : NULL;
+        char state = 0;
+        long ppid = 0, pgrp = 0;
+        if (after && sscanf(after + 1, " %c %ld %ld", &state, &ppid, &pgrp) == 3 && pgrp == pgid && state != 'Z')
+            live++;
+    }
+    if (proc)
+        closedir(proc);
+    return live;
+}
+
+/* Live: the leader exits but a child that ignored HUP outlives it. Ending the
+ * session must still take the descendant down with the group. */
+static int live_orphan_descendant(void)
+{
+    const char *const run[] = { "/bin/sh", "-c", "trap '' HUP; (kill -KILL $$; while :; do :; done)", NULL };
+    struct stat st;
+    if (stat(run[0], &st) != 0 || !(st.st_mode & S_IXUSR)) {
+        printf("mesh_terminal_worker: SKIP orphan descendant (/bin/sh absent)\n");
+        return 0;
+    }
+    int failures = 0;
+    struct mesh_terminal_worker_config cfg;
+    struct mesh_terminal_worker w;
+    live_config(&cfg);
+    cfg.argv = run;
+    int64_t t0 = (int64_t)platform_time_wall_time_t();
+    struct zcl_result r = mesh_terminal_worker_spawn(&cfg, t0, &w);
+    failures = check(failures, r.ok, "orphan: spawn");
+    if (!r.ok)
+        return failures;
+    failures = check(failures, wait_exit(&w, 5) && w.term_signal == 9, "orphan: the leader dies while its child runs on");
+    failures = check(failures, group_running(w.pgid) > 0, "orphan: the HUP-ignoring child outlives its leader");
+    mesh_terminal_worker_kill(&w);
+    unsigned left = group_running(w.pgid);
+    for (int i = 0; i < 100 && left; i++) {
+        usleep(20000); /* real-clock: the kernel finishes the kill asynchronously; no seam */
+        left = group_running(w.pgid);
+    }
+    failures = check(failures, left == 0, "orphan: ending the session kills the descendant");
+    if (left)
+        (void)kill(-w.pgid, SIGKILL);
+    return failures;
+}
+
 /* Live: 2 MiB of output under the service byte budget. */
 static int live_two_mib_output(void)
 {
@@ -861,6 +925,7 @@ static int test_mesh_terminal_worker_platform_arm(void)
     failures += live_exit_status();
     failures += live_explicit_argv();
     failures += live_dynamic_argv();
+    failures += live_orphan_descendant();
     failures += live_two_mib_output();
 
     /* ── live: input byte budget ───────────────────────────────────── */

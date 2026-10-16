@@ -65,4 +65,11 @@ void boot_mesh_terminal_client_ended(struct mesh_stream *st,
                                      const uint8_t *payload, size_t len);
 void boot_mesh_terminal_client_release(struct mesh_stream *st);
 
+/* The poll RPC result for one session view (defined in boot_mesh_terminal_rpc.c;
+ * exported so the client group can assert the evidence keys). */
+struct json_value;
+void boot_mesh_terminal_client_view_json(struct json_value *result,
+                                         enum boot_mesh_terminal_client_state state,
+                                         const struct boot_mesh_terminal_client_view *view);
+
 #endif /* ZCL_CONFIG_BOOT_MESH_TERMINAL_INTERNAL_H */

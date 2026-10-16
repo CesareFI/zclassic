@@ -38,6 +38,7 @@ static void hub_client_run_arm(
 
 #define HUB_CLIENT_HANDSHAKE_MS 20000
 #define HUB_EOT 0x04
+#define HUB_CLIENT_TAIL_MS 500 /* the closing newline never waits longer */
 
 struct hub_cl {
     const struct mesh_terminal_hub_client_cfg *cfg;
@@ -59,17 +60,38 @@ static void hub_cl_fail(struct hub_cl *c, int exit_code, const char *code,
     c->done = true;
 }
 
-static bool hub_cl_write_out(int fd, const uint8_t *p, size_t n)
+static void hub_cl_event(struct hub_cl *c);
+
+/* Screen bytes out. The wait is on the output AND the event pipe, and a write
+ * is only issued once the output is writable (frames are at most one pipe
+ * page, so a ready pipe takes the whole piece), so a reader that stops
+ * draining cannot keep a termination signal from being served. False when
+ * the output failed or the session ended while waiting (c->done tells which).
+ * `watch` is false for the closing newline, after the session is over. */
+static bool hub_cl_write_out(struct hub_cl *c, const uint8_t *p, size_t n, bool watch)
 {
+    int fd = c->cfg->out_fd;
     while (n) {
+        struct pollfd pfd[2] = {
+            { .fd = fd, .events = POLLOUT },
+            { .fd = watch ? c->cfg->event_fd : -1, .events = POLLIN },
+        };
+        int ready = poll(pfd, 2, watch ? -1 : HUB_CLIENT_TAIL_MS);
+        if ((ready < 0 && errno != EINTR) || (ready == 0 && !watch))
+            return false;
+        if (pfd[1].revents) {
+            hub_cl_event(c);
+            if (c->done)
+                return false;
+            continue;
+        }
+        if (!pfd[0].revents)
+            continue;
         ssize_t w = write(fd, p, n);
         if (w > 0) {
             p += w;
             n -= (size_t)w;
-        } else if (w < 0 && errno == EAGAIN) {
-            struct pollfd pfd = { .fd = fd, .events = POLLOUT };
-            (void)poll(&pfd, 1, -1);
-        } else if (w < 0 && errno != EINTR) {
+        } else if (w < 0 && errno != EINTR && errno != EAGAIN) {
             return false;
         }
     }
@@ -171,24 +193,40 @@ static const struct {
     { MESH_TERMINAL_CLOSE_INTERNAL, 6, "SERVER_ERROR", "the terminal server hit an internal error" },
 };
 
+/* The EXIT body is reason, flags, exit code, signal. Only these shapes are
+ * meaningful, anything else is a protocol error and never a success:
+ *   worker-exited: HAS_CODE alone (signal byte 0), or HAS_SIGNAL alone
+ *                  (code byte 0, signal 1..64);
+ *   a limit or error ending in hub_ends: no flags, both bytes 0. */
+#define HUB_SIGNAL_MAX 64u
+
+static bool hub_cl_exit_shape(const uint8_t *p)
+{
+    uint8_t flags = p[1];
+    if (p[0] == MESH_TERMINAL_CLOSE_WORKER_EXITED) {
+        if (flags == MESH_TERMINAL_HUB_EXIT_HAS_CODE)
+            return p[3] == 0;
+        return flags == MESH_TERMINAL_HUB_EXIT_HAS_SIGNAL && p[2] == 0 &&
+               p[3] >= 1 && p[3] <= HUB_SIGNAL_MAX;
+    }
+    return flags == 0 && p[2] == 0 && p[3] == 0;
+}
+
 static void hub_cl_exit_frame(struct hub_cl *c, const uint8_t *p, size_t len)
 {
     c->done = true;
-    if (len != 4) {
+    if (len != 4 || !hub_cl_exit_shape(p)) {
         hub_cl_fail(c, 1, "PROTOCOL", "malformed exit frame");
         return;
     }
     if (p[0] == MESH_TERMINAL_CLOSE_WORKER_EXITED) {
-        if (p[1] & MESH_TERMINAL_HUB_EXIT_HAS_CODE)
-            c->res->exit_code = p[2];
-        else
-            c->res->exit_code = (p[1] & MESH_TERMINAL_HUB_EXIT_HAS_SIGNAL) ? 128 + p[3] : 0;
+        c->res->exit_code = (p[1] & MESH_TERMINAL_HUB_EXIT_HAS_CODE) ? p[2] : 128 + p[3];
         return;
     }
     for (size_t i = 0; i < sizeof hub_ends / sizeof hub_ends[0]; i++)
         if (hub_ends[i].reason == p[0])
             { hub_cl_fail(c, hub_ends[i].exit_code, hub_ends[i].code, hub_ends[i].message); return; }
-    c->res->exit_code = 0; /* REQUESTED: we asked */
+    hub_cl_fail(c, 1, "PROTOCOL", "the terminal server sent an unknown ending");
 }
 
 /* Frames already buffered: the server may send READY and the first screen
@@ -206,8 +244,8 @@ static void hub_cl_frames(struct hub_cl *c)
             { hub_cl_fail(c, 1, "PROTOCOL", "the terminal server sent a malformed frame"); return; }
         if (type == MESH_TERMINAL_HUB_DATA && len)
             { c->wrote = true; c->last_out = p[len - 1]; }
-        if (type == MESH_TERMINAL_HUB_DATA && !hub_cl_write_out(c->cfg->out_fd, p, len))
-            { hub_cl_fail(c, 1, "OUTPUT_CLOSED", "cannot write to the terminal"); return; }
+        if (type == MESH_TERMINAL_HUB_DATA && !hub_cl_write_out(c, p, len, true))
+            { if (!c->done) hub_cl_fail(c, 1, "OUTPUT_CLOSED", "cannot write to the terminal"); return; }
         if (type == MESH_TERMINAL_HUB_EXIT)
             { hub_cl_exit_frame(c, p, len); return; }
         hub_rx_consume(&c->rx, len);
@@ -296,8 +334,8 @@ static void hub_client_run_arm(
     /* End the screen on a fresh line: the remote's last bytes are usually a
      * prompt. A raw tty needs the carriage return; a pipe does not. */
     if (c.wrote && c.last_out != '\n')
-        (void)hub_cl_write_out(cfg->out_fd, (const uint8_t *)"\r\n" + (cfg->quiet ? 1 : 0),
-                               cfg->quiet ? 1u : 2u);
+        (void)hub_cl_write_out(&c, (const uint8_t *)"\r\n" + (cfg->quiet ? 1 : 0),
+                               cfg->quiet ? 1u : 2u, false);
 }
 
 #endif /* __linux__ */

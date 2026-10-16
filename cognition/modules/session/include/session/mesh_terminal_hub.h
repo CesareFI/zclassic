@@ -193,8 +193,13 @@ int mesh_terminal_hub_listen(uint16_t port, uint16_t *bound_port);
 struct mesh_terminal_hub_listen_cfg {
     struct mesh_terminal_hub_serve_cfg serve;
     unsigned max_active;     /* concurrent sessions, pre-auth included */
-    unsigned max_sessions;   /* stop after this many; 0 = run until signal */
+    unsigned max_sessions;   /* connection-attempt limit: stop after this many accepted
+                              * connections, authenticated or not; 0 = run until signal */
     int audit_fd;            /* one line per session, O_APPEND or stderr */
+    int audit_wait_ms;       /* longest a session waits for audit_fd to take its line,
+                              * then the line is dropped and counted; 0 = 2000 */
+    int stop_grace_ms;       /* after SIGTERM, how long sessions get to end before
+                              * they are killed; 0 = 5000 */
 };
 
 /* Accepts on `listener` (closed on return), one forked child per session so
@@ -202,6 +207,11 @@ struct mesh_terminal_hub_listen_cfg {
  * clean stop (max_sessions reached or SIGTERM/SIGINT), non-zero on error. */
 int mesh_terminal_hub_listen_run(int listener,
                                  const struct mesh_terminal_hub_listen_cfg *cfg);
+
+#if defined(ZCL_TESTING)
+/* Test seam: session children ignore SIGTERM (a wedged session). */
+void mesh_terminal_hub_testing_children_ignore_term(bool ignore);
+#endif
 
 /* Formats the audit line for a finished session (without a trailing
  * newline); returns its length. */

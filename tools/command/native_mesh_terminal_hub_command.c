@@ -40,6 +40,7 @@ static const struct {
     { "--listen_port=", offsetof(struct hub_args, listen_port), true },
     { "--direct_port=", offsetof(struct hub_args, direct_port), true },
     { "--max_active=", offsetof(struct hub_args, max_active), true },
+    /* a connection-attempt limit: counted at accept, before authentication */
     { "--max_sessions=", offsetof(struct hub_args, max_sessions), true },
     { "--idle_s=", offsetof(struct hub_args, idle_s), true },
     { "--lifetime_s=", offsetof(struct hub_args, lifetime_s), true },
@@ -94,6 +95,11 @@ bool zcl_native_hub_args_parse(const char *const *words, size_t count,
                     words[i] ? words[i] : "(null)");
             return false;
         }
+    }
+    if (out->max_sessions > UINT32_MAX) { /* it is cast to unsigned for the listener */
+        fprintf(stderr, "z23: refused: INVALID_ARGUMENTS: --max_sessions (a connection-attempt limit) must be at most %lu\n",
+                (unsigned long)UINT32_MAX);
+        return false;
     }
     return true;
 }

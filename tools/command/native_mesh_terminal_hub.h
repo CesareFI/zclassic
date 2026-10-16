@@ -27,4 +27,19 @@ bool zcl_native_mesh_terminal_hub_try(const char *const *words, size_t count,
 
 int zcl_native_hub_connect(const struct hub_args *args);
 
+#if !defined(_WIN32)
+#include <sys/types.h>
+/* "--input-file=<route>" into out; false when it does not fit in cap. */
+bool zcl_native_hub_route_arg(const char *route, char *out, size_t cap);
+
+/* Ends the tunnel client child: SIGHUP, up to grace_ms for it to leave, then
+ * SIGKILL and a deadline-bound reap. false when it was not reaped. */
+bool zcl_native_hub_tunnel_reap(pid_t pid, int grace_ms);
+#endif
+
+#if defined(ZCL_TESTING)
+/* Test seam: make pidfd_open report unavailable. */
+void zcl_native_hub_testing_pidfd_unavailable(bool unavailable);
+#endif
+
 #endif

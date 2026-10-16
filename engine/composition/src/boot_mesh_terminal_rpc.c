@@ -143,7 +143,7 @@ static bool rpc_mesh_terminal_open(const struct json_value *params, bool help,
  * exists (a CLOSED receipt's reason lives in its evidence capsule on the
  * responder). The receipt reached this point only after signature,
  * open-binding, session-binding, and responder-identity verification. */
-static void client_view_json(struct json_value *result,
+void boot_mesh_terminal_client_view_json(struct json_value *result,
                              enum boot_mesh_terminal_client_state state,
                              const struct boot_mesh_terminal_client_view
                                  *view)
@@ -180,6 +180,8 @@ static void client_view_json(struct json_value *result,
         if (view->evidence_has_exit)
             json_push_kv_int(&evidence, "exit_code",
                              (int64_t)view->evidence_exit_code);
+        if (view->evidence_status_malformed)
+            json_push_kv_bool(&evidence, "status_malformed", true);
         if (view->evidence_signal > 0)
             json_push_kv_int(&evidence, "signal",
                              (int64_t)view->evidence_signal);
@@ -213,7 +215,7 @@ static bool rpc_mesh_terminal_poll(const struct json_value *params, bool help,
                   "terminal_id is unknown or from a previous run");
         return true;
     default:
-        client_view_json(result, state, &view);
+        boot_mesh_terminal_client_view_json(result, state, &view);
         return true;
     }
 }
