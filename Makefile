@@ -6554,7 +6554,9 @@ LINTC_SRCS = $(LINTC_LIVE_DATADIR_SRCS) tools/lint/lintc/lib.c tools/lint/lintc/
     tools/lint/lintc/gate_cookbook.c \
     tools/lint/lintc/gate_cookbook_parse.c \
     tools/lint/lintc/gate_cookbook_selftest.c \
+    tools/lint/lintc/gate_capability_closure.c \
     tools/lint/lintc/gate_capability_closure_data.c \
+    tools/lint/lintc/gate_capability_closure_gate_selftest.c \
     tools/lint/lintc/gate_capability_closure_selftest.c \
     tools/lint/lintc/gate_promotion_receipt_chain.c \
     tools/lint/lintc/gate_promotion_receipt_chain_checks.c \

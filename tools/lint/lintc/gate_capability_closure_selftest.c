@@ -19,12 +19,10 @@
 #include "lintc_proc.h"
 #include "lintc_sig.h"
 
-struct ccs_fx { char base[1024]; };
-
 static const char k_own[] = "contexts/commons/modules/vcs/src/owned.c";
 static const char k_arm[] = "platform/modules/platform/src/os_sandbox_linux.c";
 
-static int ccs_say(int ok, const char *name)
+int ccs_say(int ok, const char *name)
 {
     printf(ok ? "  selftest ok: %s\n" : "SELFTEST FAIL: %s\n", name);
     return ok ? 0 : 1;
@@ -70,7 +68,7 @@ static int ccs_case_parse(void)
     return f;
 }
 
-static int ccs_scratch(struct ccs_fx *fx)
+int ccs_scratch(struct ccs_fx *fx)
 {
     const char *tmp = getenv("TMPDIR");
     char parent[512];
@@ -83,12 +81,12 @@ static int ccs_scratch(struct ccs_fx *fx)
     return mkdtemp(fx->base) ? 0 : -1;
 }
 
-static void ccs_path(const struct ccs_fx *fx, const char *rel, char *out)
+void ccs_path(const struct ccs_fx *fx, const char *rel, char *out)
 {
     snprintf(out, CCD_PATH, "%s/%.1024s", fx->base, rel);
 }
 
-static int ccs_put(const struct ccs_fx *fx, const char *rel, const char *text)
+int ccs_put(const struct ccs_fx *fx, const char *rel, const char *text)
 {
     char path[CCD_PATH];
     ccs_path(fx, rel, path);

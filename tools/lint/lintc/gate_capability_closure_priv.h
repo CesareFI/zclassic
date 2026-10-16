@@ -8,6 +8,7 @@
 #define GATE_CAPABILITY_CLOSURE_PRIV_H
 
 #include <stddef.h>
+#include <stdio.h>
 
 enum { CCD_PATH = 4096, CCD_ERR = CCD_PATH + 256, CCD_NM_BATCH = 512,
        CCD_NM_BYTES = 96 * 1024, CCD_GRACE_MS = 5000 };
@@ -68,5 +69,27 @@ void ccd_mods_free(struct ccd_mods *m);
  * grants tests whole-token membership. */
 char *ccd_union_caps(const char *out, const char *add);
 int ccd_grants(const char *raw, const char *want);
+
+/* Gate configuration. Production derives it from the host and the
+ * environment; the selftest builds its own per fixture. */
+struct ccg_cfg {
+    enum ccd_os os;       /* host class: target selection and coverage exclusions */
+    int strip;            /* Mach-O underscore and $VARIANT decoration in nm names */
+    long baseline;        /* shrink-only count of declared rows with no compiled object */
+    FILE *out, *err;      /* the report, and the sidecar diagnostic */
+};
+
+/* Collects the evidence of one tree: 0 when the object and coverage floors hold,
+ * 2 when the scan is unproven. Needs lsc_install(). */
+int ccg_check_root(const struct ccg_cfg *cfg, const char *root);
+/* The host's class and the environment's settings, writing to stdout and stderr. */
+void ccg_host_cfg(struct ccg_cfg *cfg);
+
+/* Fixture helpers of the data-layer selftest, shared with the gate selftest. */
+struct ccs_fx { char base[1024]; };
+int ccs_say(int ok, const char *name);
+int ccs_scratch(struct ccs_fx *fx);
+void ccs_path(const struct ccs_fx *fx, const char *rel, char *out);
+int ccs_put(const struct ccs_fx *fx, const char *rel, const char *text);
 
 #endif

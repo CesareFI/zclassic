@@ -496,5 +496,7 @@ int check_promotion_receipt_chain_run(int argc, char **argv);
 int check_promotion_receipt_chain_selftest(void);
 int capability_closure_data_run(int argc, char **argv);
 int capability_closure_data_selftest(void);
+int check_capability_closure_run(int argc, char **argv);
+int check_capability_closure_selftest(void);
 
 #endif

@@ -299,6 +299,8 @@ static const struct lint_gate k_gates[] = {
       check_sqlite_cursor_lifetime_selftest },
     { "capability-closure-data", capability_closure_data_run,
       capability_closure_data_selftest },
+    { "check-capability-closure", check_capability_closure_run,
+      check_capability_closure_selftest },
 };
 
 /* Premise-selection subcommands; they are tools, not gates, so --list and
