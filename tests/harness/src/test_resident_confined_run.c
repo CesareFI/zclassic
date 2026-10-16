@@ -574,20 +574,55 @@ static int rcr_count_fds(void)
 
 /* Review fixes: (c) runs in a forked helper so lowering RLIMIT_NOFILE never
  * touches the harness process. */
+static int rcr_high_fd_prepare(void)
+{
+    struct rlimit saved;
+    if (getrlimit(RLIMIT_NOFILE, &saved) != 0) {
+        fprintf(stderr, "resident nofile: getrlimit setup: %s\n", strerror(errno));
+        return 90;
+    }
+    if (saved.rlim_max != RLIM_INFINITY && saved.rlim_max <= 70000) {
+        fprintf(stderr, "resident nofile: hard limit %llu cannot plant FD 70000\n",
+                (unsigned long long)saved.rlim_max);
+        return 77;
+    }
+    if (saved.rlim_cur > 70000) return 0;
+    struct rlimit raised = saved;
+    raised.rlim_cur = 70001;
+    if (setrlimit(RLIMIT_NOFILE, &raised) == 0) return 0;
+    fprintf(stderr, "resident nofile: raise soft limit: %s\n", strerror(errno));
+    return 90;
+}
+
 static int rcr_lowered_limit_child(const char *image,
                                    const struct package_resident_manifest *m)
 {
+    int setup = rcr_high_fd_prepare();
+    if (setup != 0) return setup;
     int low = open("/dev/null", O_WRONLY);
     struct rlimit lim = {.rlim_cur = 64, .rlim_max = 64};
     int high = low >= 0 ? fcntl(low, F_DUPFD, 70000) : -1;
-    if (high < 0) { if (low >= 0) close(low); return 90; }
+    if (high < 0) {
+        fprintf(stderr, "resident nofile: open/duplicate FD 70000: %s\n", strerror(errno));
+        if (low >= 0) close(low);
+        return 90;
+    }
     char fdarg[32];
     int used = snprintf(fdarg, sizeof(fdarg), "%d", high);
-    if (used < 0 || (size_t)used >= sizeof(fdarg)) return 90;
     close(low);
-    if (setrlimit(RLIMIT_NOFILE, &lim) != 0) return 91; /* high FD remains open above both 65536 and the hard limit */
+    if (used < 0 || (size_t)used >= sizeof(fdarg)) {
+        fprintf(stderr, "resident nofile: encode descriptor failed\n");
+        close(high);
+        return 90;
+    }
+    if (setrlimit(RLIMIT_NOFILE, &lim) != 0) {
+        fprintf(stderr, "resident nofile: lower hard/soft limit: %s\n", strerror(errno));
+        close(high);
+        return 91;
+    } /* high FD remains open above both 65536 and the hard limit */
     struct rcr_opts o = {.manifest = m, .no_close_range = true};
     struct rcr_outcome out = rcr_run_opts(image, &o, "fdwrite", fdarg);
+    close(high);
     return out.spawned && out.exited && out.code == EBADF ? 0 : 1;
 }
 
@@ -615,16 +650,31 @@ static int rcr_hardening_clock(const char *image, const struct package_resident_
     return failures;
 }
 
-static int rcr_hardening_nofile(const char *image, const struct package_resident_manifest *m)
+static int rcr_nofile_helper_result(pid_t pid, pid_t waited, int st)
 {
     int failures = 0;
+    bool reaped = pid > 0 && waited == pid && WIFEXITED(st);
+    if (reaped && WEXITSTATUS(st) == 77) {
+        printf("resident nofile: high FD closure... UNOBSERVED (descriptor hard limit)\n");
+        return failures;
+    }
+    if (!reaped || WEXITSTATUS(st) != 0)
+        fprintf(stderr, "resident nofile: helper pid=%ld waited=%ld status=%d errno=%d\n",
+                (long)pid, (long)waited, st, errno);
+    RCR_CHECK("without close_range, a descriptor above a lowered hard limit is EBADF in the child",
+        reaped && WEXITSTATUS(st) == 0);
+    return failures;
+}
+
+static int rcr_hardening_nofile(const char *image, const struct package_resident_manifest *m)
+{
     int st = 0;
     pid_t pid = fork();
     if (pid == 0) _exit(rcr_lowered_limit_child(image, m));
-    while (pid > 0 && waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
-    RCR_CHECK("without close_range, a descriptor above a lowered hard limit is EBADF in the child",
-        pid > 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0);
-    return failures;
+    pid_t waited = -1;
+    if (pid > 0)
+        do { waited = waitpid(pid, &st, 0); } while (waited < 0 && errno == EINTR);
+    return rcr_nofile_helper_result(pid, waited, st);
 }
 
 static int rcr_hardening_grants(const char *image, const struct package_resident_manifest *m)

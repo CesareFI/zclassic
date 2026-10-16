@@ -147,6 +147,25 @@ static void os_proc_close_if_open(int fd)
     if (fd >= 0) (void)close(fd);
 }
 
+static int os_proc_report_limit_prepare(rlim_t want, struct rlimit *saved)
+{
+    if (getrlimit(RLIMIT_NOFILE, saved) != 0) {
+        fprintf(stderr, "os_proc: getrlimit fixture setup: %s\n", strerror(errno));
+        return 1;
+    }
+    if (saved->rlim_max != RLIM_INFINITY && saved->rlim_max <= want) {
+        printf("os_proc: high FD scrub... UNOBSERVED (hard limit %llu <= %llu)\n",
+               (unsigned long long)saved->rlim_max, (unsigned long long)want);
+        return 77;
+    }
+    struct rlimit raised = *saved;
+    if (raised.rlim_cur > want) return 0;
+    raised.rlim_cur = want + 1;
+    if (setrlimit(RLIMIT_NOFILE, &raised) == 0) return 0;
+    fprintf(stderr, "os_proc: raise fixture soft limit: %s\n", strerror(errno));
+    return 1;
+}
+
 static void os_proc_preserved_report_child(int report[2], int high)
 {
     (void)close(report[0]);
@@ -178,6 +197,9 @@ static int os_proc_preserved_report_parent(int report[2], int secret[2],
     os_proc_close_if_open(report[0]);
     int status = 0;
     pid_t waited = child > 0 ? waitpid(child, &status, 0) : -1;
+    if (child <= 0 || waited != child || got != 1 || result != 'Y')
+        fprintf(stderr, "os_proc: scrub witness child=%ld waited=%ld bytes=%ld result=%d status=%d\n",
+                (long)child, (long)waited, (long)got, (int)result, status);
     OSPROC_CHECK("scrub preserves report and closes inherited high FD",
                  child > 0 && waited == child && got == 1 && result == 'Y' &&
                  WIFEXITED(status) && WEXITSTATUS(status) == 0);
@@ -194,14 +216,26 @@ static int os_proc_preserved_report_fd_checks(void)
     int report[2] = {-1, -1}, secret[2] = {-1, -1};
     int high = -1;
     pid_t child = -1;
-    bool ready = pipe(report) == 0 && pipe(secret) == 0;
 #if defined(__linux__)
-    if (ready) high = fcntl(secret[0], F_DUPFD, 70000);
+    const int want = 70000;
 #else
-    if (ready) high = fcntl(secret[0], F_DUPFD, 200);
+    const int want = 200;
 #endif
+    struct rlimit saved;
+    int setup = os_proc_report_limit_prepare((rlim_t)want, &saved);
+    if (setup != 0) return setup == 77 ? 0 : 1;
+    bool ready = pipe(report) == 0 && pipe(secret) == 0;
+    if (ready) high = fcntl(secret[0], F_DUPFD, want);
+    if (!ready || high < 0)
+        fprintf(stderr, "os_proc: pipe/high FD fixture setup: %s\n", strerror(errno));
     if (ready && high >= 0) child = fork();
     if (child == 0) os_proc_preserved_report_child(report, high);
+    if (ready && high >= 0 && child < 0)
+        fprintf(stderr, "os_proc: fork scrub fixture: %s\n", strerror(errno));
+    bool restored = setrlimit(RLIMIT_NOFILE, &saved) == 0;
+    if (!restored)
+        fprintf(stderr, "os_proc: restore fixture soft limit: %s\n", strerror(errno));
+    OSPROC_CHECK("restore caller descriptor limit", restored);
     failures += os_proc_preserved_report_parent(report, secret, high, child);
     OSPROC_CHECK("invalid report FD refuses before closing anything",
                  !os_proc_close_inherited_fds_except(-1) && errno == EINVAL);
