@@ -587,7 +587,17 @@ struct ccg_ban {
     int hit;
 };
 
-/* lc_each_line callback: one source line, newline stripped, against the ban. */
+/* The first NUL-separated piece of the len bytes at line that the ban matches. */
+static const char *ccg_ban_piece(const regex_t *re, const char *line, size_t len)
+{
+    for (const char *p = line; p < line + len; p += strlen(p) + 1)
+        if (regexec(re, p, 0, NULL, 0) == 0)
+            return p;
+    return NULL;
+}
+
+/* lc_each_line callback: one source line, newline stripped, against the ban;
+ * each piece between embedded NUL bytes is judged. */
 static int ccg_ban_line(void *vctx, const char *raw, size_t len)
 {
     struct ccg_ban *b = vctx;
@@ -599,11 +609,12 @@ static int ccg_ban_line(void *vctx, const char *raw, size_t len)
     b->no++;
     if (len > 0 && line[len - 1] == '\n')
         line[len - 1] = '\0';
-    if (regexec(b->re, line, 0, NULL, 0) == 0) {
+    const char *hit = ccg_ban_piece(b->re, line, len);
+    if (hit) {
         if (!b->hit++)
             ccg_say(b->s, "check_capability_closure: VIOLATION " CCG_DASH " %s reaches the kernel through a\n"
                           "  raw syscall or inline-asm trap with no CAP_PRIVILEGE declaration:\n", b->rel);
-        ccg_say(b->s, "    %zu:%s\n", b->no, line);
+        ccg_say(b->s, "    %zu:%s\n", b->no, hit);
     }
     free(line);
     return 0;

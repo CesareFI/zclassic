@@ -506,15 +506,15 @@ static int cgs_case_q(const struct ccs_fx *fx)
     return cgs_check(fx, "q", &cfg, -1, need, "Q: raw syscall in an uncompiled source still refuses");
 }
 
-/* V. a source line with an embedded NUL byte is scanned over its full length:
- * the line after it is still judged and numbered, and the copy stays in bounds. */
+/* V. a source with embedded NUL bytes is scanned in bounds: a ban hit after the NUL on
+ * the same line is found (line 1), and the line after it is still numbered (line 2). */
 static int cgs_case_v(const struct ccs_fx *fx)
 {
-    static const char src[] = "a\0b\nlong raw_use(void) { return sys" "call(0); }\n";
+    static const char src[] = "a\0 sys" "call(0);\nlong raw_use(void) { return sys" "call(0); }\n";
     struct ccg_cfg cfg;
     char path[CCD_PATH];
     FILE *f;
-    const char *const need[] = { "raw syscall", "    2:long raw_use", NULL };
+    const char *const need[] = { "raw syscall", "    1: sys" "call(0);", "    2:long raw_use", NULL };
     cgs_cfg(&cfg);
     if (cgs_base(fx, "v", "") != 0 || ccs_put(fx, "v/fixture_src/seed.txt", "x\n") != 0)
         return ccs_say(0, "V: fixture");
@@ -522,7 +522,7 @@ static int cgs_case_v(const struct ccs_fx *fx)
     f = fopen(path, "wb");
     if (!f || fwrite(src, 1, sizeof src - 1, f) != sizeof src - 1 || fclose(f) != 0)
         return ccs_say(0, "V: write");
-    return cgs_check(fx, "v", &cfg, -1, need, "V: a line with an embedded NUL is scanned in bounds");
+    return cgs_check(fx, "v", &cfg, -1, need, "V: a ban hit after an embedded NUL is found, later lines are numbered");
 }
 
 /* R. the leftover object of a failed candidate has no source in this tree: it is
