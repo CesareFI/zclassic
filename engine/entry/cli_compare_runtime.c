@@ -1,6 +1,7 @@
 /* Copyright 2026 Rhett Creighton. SPDX-License-Identifier: Apache-2.0
  * Purpose: bracket standalone comparisons with checked signal ownership. */
 #include "cli_compare_runtime.h"
+#include "command/native_command.h"
 #include <string.h>
 
 #if !defined(_WIN32)
@@ -102,5 +103,32 @@ bool cli_compare_scope_cancelled(void *context)
     (void)context; return cli_compare_cancelled != 0;
 #else
     (void)context; return true;
+#endif
+}
+
+/* Own a fresh single-invocation runtime only on the standalone POSIX entry. */
+int cli_native_registry_dispatch(const char *method,
+    const char *const *params_storage, int nparams, const char *datadir,
+    int cli_port, bool regtest_set, bool testnet_set, bool datadir_set)
+{
+#if !defined(_WIN32)
+        struct cli_compare_signals signals = {0};
+        const struct zcl_native_standalone_runtime runtime = {
+            .begin = cli_compare_scope_begin, .end = cli_compare_scope_end,
+            .cancelled = cli_compare_scope_cancelled, .reserve_cleanup = cli_compare_reserve,
+            .cleanup = cli_compare_cleanup, .context = &signals
+        };
+        return zcl_native_command_main_standalone(method,
+            (const char *const *)params_storage, nparams, datadir, cli_port,
+            regtest_set ? CHAIN_REGTEST : testnet_set ? CHAIN_TESTNET : CHAIN_MAIN,
+            datadir_set, &runtime);
+#else
+        return zcl_native_command_main(method,
+                                       (const char *const *)params_storage,
+                                       nparams, datadir, cli_port,
+                                       regtest_set ? CHAIN_REGTEST :
+                                       testnet_set ? CHAIN_TESTNET : CHAIN_MAIN,
+                                       datadir_set);
+
 #endif
 }

@@ -31,4 +31,10 @@ bool cli_compare_reserve(void *context, unsigned count,
                                 struct zcl_command_cleanup_slot **slots);
 bool cli_compare_cleanup(void *context);
 bool cli_compare_scope_cancelled(void *context);
+/* Entry-private synchronous dispatch keeps its fresh POSIX runtime and
+ * cleanup capsule alive through the complete call; Windows uses the legacy
+ * signal-free native entry. */
+int cli_native_registry_dispatch(const char *method,
+    const char *const *params_storage, int nparams, const char *datadir,
+    int cli_port, bool regtest_set, bool testnet_set, bool datadir_set);
 #endif

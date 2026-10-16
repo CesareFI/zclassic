@@ -2355,33 +2355,6 @@ static bool cli_compose_rpc_params(const char *method, const char **params,
 }
 
 #if !defined(ZCL_TESTING) || !defined(ZCL_RPC_COMPOSER_TEST)
-/* Own a fresh single-invocation runtime only on the standalone POSIX entry. */
-static int cli_native_registry_dispatch(const char *method,
-    const char *const *params_storage, int nparams, const char *datadir,
-    int cli_port, bool regtest_set, bool testnet_set, bool datadir_set)
-{
-#if !defined(_WIN32)
-        struct cli_compare_signals signals = {0};
-        const struct zcl_native_standalone_runtime runtime = {
-            .begin = cli_compare_scope_begin, .end = cli_compare_scope_end,
-            .cancelled = cli_compare_scope_cancelled, .reserve_cleanup = cli_compare_reserve,
-            .cleanup = cli_compare_cleanup, .context = &signals
-        };
-        return zcl_native_command_main_standalone(method,
-            (const char *const *)params_storage, nparams, datadir, cli_port,
-            regtest_set ? CHAIN_REGTEST : testnet_set ? CHAIN_TESTNET : CHAIN_MAIN,
-            datadir_set, &runtime);
-#else
-        return zcl_native_command_main(method,
-                                       (const char *const *)params_storage,
-                                       nparams, datadir, cli_port,
-                                       regtest_set ? CHAIN_REGTEST :
-                                       testnet_set ? CHAIN_TESTNET : CHAIN_MAIN,
-                                       datadir_set);
-
-#endif
-}
-
 int cli_main(int argc, char **argv)
 {
     /* Strict operator-target-flag validation FIRST — before datadir/home
