@@ -390,19 +390,19 @@ Z23_FLAG("ZCL_COMMAND_AVAILABILITY_READY_FLOOR", "env_build", "160", "-",
 Z23_FLAG("ZCL_COMMAND_CONTRACT_DIR", "env_runtime", "-", "-",
           "undocumented; first use tools/lint/lintc/gate_tree_walk.c:auto")
 Z23_FLAG("ZCL_COMMAND_INPUT_KEYS_BASELINE", "env_build", "-", "-",
-          "undocumented; first use tools/lint/check_command_input_keys.sh:auto")
+          "undocumented; first use tools/lint/lintc/gate_command_input_keys_run.c:auto")
 Z23_FLAG("ZCL_COMMAND_INPUT_KEYS_BOUND_FLOOR", "env_build", "150", "-",
-          "undocumented; first use tools/lint/check_command_input_keys.sh:auto")
+          "undocumented; first use tools/lint/lintc/gate_command_input_keys_run.c:auto")
 Z23_FLAG("ZCL_COMMAND_INPUT_KEYS_DEF_DIR", "env_build", "-", "-",
-          "undocumented; first use tools/lint/check_command_input_keys.sh:auto")
+          "undocumented; first use tools/lint/lintc/gate_command_input_keys_run.c:auto")
 Z23_FLAG("ZCL_COMMAND_INPUT_KEYS_FN_FLOOR", "env_build", "400", "-",
-          "undocumented; first use tools/lint/check_command_input_keys.sh:auto")
+          "undocumented; first use tools/lint/lintc/gate_command_input_keys_run.c:auto")
 Z23_FLAG("ZCL_COMMAND_INPUT_KEYS_LEAF_FLOOR", "env_build", "160", "-",
-          "undocumented; first use tools/lint/check_command_input_keys.sh:auto")
+          "undocumented; first use tools/lint/lintc/gate_command_input_keys_run.c:auto")
 Z23_FLAG("ZCL_COMMAND_INPUT_KEYS_RESOLVED_FLOOR", "env_build", "100", "-",
-          "undocumented; first use tools/lint/check_command_input_keys.sh:auto")
+          "undocumented; first use tools/lint/lintc/gate_command_input_keys_run.c:auto")
 Z23_FLAG("ZCL_COMMAND_INPUT_KEYS_VERBOSE", "env_build", "0", "-",
-          "undocumented; first use tools/lint/check_command_input_keys.sh:auto")
+          "undocumented; first use tools/lint/lintc/gate_command_input_keys_run.c:auto")
 Z23_FLAG("ZCL_COMMONS_DEMO_RECORD", "env_build", "0", "-",
           "first use tools/dev/commons_journey_acceptance.sh:auto; documented at docs/DEVELOPING.md:682: writes — ZCL_COMMONS_DEMO_RECORD=1 make commons-demo refreshes")
 Z23_FLAG("ZCL_COMMONS_MULTIHOST", "env_build", "0", "-",
