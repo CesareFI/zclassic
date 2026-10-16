@@ -30,6 +30,8 @@ static bool store_is_stale_profile(struct codeindex *ci,
     uint8_t cur_dep_stats[32] = {0};
     if (check_depfiles && !ci_deps_stat_root_sha3(ci->root, cur_dep_stats))
         LOG_FAIL("codeindex", "compute dep_stat_root_sha3");
+    memcpy(ci->fresh_merkle, source.digest.bytes, 32);
+    memcpy(ci->fresh_dep, cur_dep_stats, 32);
     uint8_t stored_merkle[32], stored_dep_stats[32];
     char stored_format[64], stored_schema[64];
     size_t merkle_len = 0, dep_len = 0, format_len = 0, schema_len = 0;
@@ -88,7 +90,7 @@ static bool source_view_metadata_matches(struct ci_store *s,
                   sizeof(CI_SCHEMA_VERSION) - 1) == 0;
 }
 
-bool codeindex_is_stale(struct codeindex *ci, bool *stale)
+static bool ci_is_stale_uncached(struct codeindex *ci, bool *stale)
 {
     if (stale) *stale = true;
     if (!ci || !ci->store) LOG_FAIL("codeindex", "null arg to is_stale");
@@ -112,6 +114,8 @@ bool codeindex_is_stale(struct codeindex *ci, bool *stale)
     bool current = source_view_metadata_matches(ci->store, source_root) &&
         found && len == sizeof(stored_deps) &&
         memcmp(current_deps, stored_deps, sizeof(stored_deps)) == 0;
+    memcpy(ci->fresh_merkle, source_root, 32);
+    memcpy(ci->fresh_dep, current_deps, 32);
     ci_merkle_free(ci->pending_merkle);
     ci->pending_merkle = NULL;
     ci->pending_merkle_snapshot_used = false;
@@ -119,6 +123,37 @@ bool codeindex_is_stale(struct codeindex *ci, bool *stale)
     ci->pending_merkle_inventory_changed = false;
     if (stale) *stale = !current;
     return true;
+}
+
+static bool ci_digest_known(const uint8_t d[32])
+{
+    uint8_t any = 0;
+    for (int i = 0; i < 32; i++) any |= d[i];
+    return any != 0;
+}
+
+bool codeindex_is_stale(struct codeindex *ci, bool *stale)
+{
+    if (stale) *stale = true;
+    if (!ci || !ci->store) LOG_FAIL("codeindex", "null arg to is_stale");
+    if (ci_fresh_memo_hit(ci)) {
+        if (stale) *stale = false;
+        return true;
+    }
+    /* Arm the change watch BEFORE the walk so an edit that lands during or
+     * after it is still reported to the memo. */
+    struct ci_fresh_watch *watch = ci_fresh_arm(ci->root);
+    ci_test_note_freshness_walk();
+    memset(ci->fresh_merkle, 0, sizeof(ci->fresh_merkle));
+    memset(ci->fresh_dep, 0, sizeof(ci->fresh_dep));
+    bool verdict = true;
+    bool ok = ci_is_stale_uncached(ci, &verdict);
+    /* Never record a memo entry from digests the walk did not produce. */
+    ci_fresh_finish(watch, ci, ok && !verdict &&
+                    ci_digest_known(ci->fresh_merkle) &&
+                    ci_digest_known(ci->fresh_dep));
+    if (stale) *stale = verdict;
+    return ok;
 }
 
 bool ci_codeindex_source_view_is_stale(struct codeindex *ci, bool *stale)

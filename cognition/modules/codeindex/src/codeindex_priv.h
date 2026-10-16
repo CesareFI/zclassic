@@ -67,6 +67,8 @@ struct codeindex {
     bool              pending_merkle_snapshot_used;
     bool              pending_merkle_full_rescan;
     bool              pending_merkle_inventory_changed;
+    uint8_t           fresh_merkle[32]; /* live digests of the last fresh walk */
+    uint8_t           fresh_dep[32];
     char             root[CI_PATH_MAX];
 };
 
@@ -424,6 +426,36 @@ bool ci_deps_scan_roots(const char *root, ci_dep_cb cb, void *user,
  * live compile epoch of each object root and nothing else; this path reads no
  * depfile content. */
 bool ci_deps_stat_root_sha3(const char *root, uint8_t out_root[32]);
+
+/* ── change-watched freshness memo (codeindex_fresh_memo.c) ────────────
+ * A fresh verdict proved by a full walk is held for the process together
+ * with an inotify watch armed before that walk. A hit means: the watch saw
+ * nothing relevant and the store still carries the verified digests. Every
+ * doubt falls back to the walk. */
+struct ci_fresh_watch;
+#if defined(_WIN32)
+/* No change-watch seam on Windows: every check walks. */
+static inline bool ci_fresh_memo_hit(struct codeindex *ci) { (void)ci; return false; }
+static inline struct ci_fresh_watch *ci_fresh_arm(const char *root)
+{
+    (void)root;
+    return NULL;
+}
+static inline void ci_fresh_finish(struct ci_fresh_watch *w, struct codeindex *ci,
+                                   bool fresh)
+{
+    (void)w; (void)ci; (void)fresh;
+}
+#else
+bool ci_fresh_memo_hit(struct codeindex *ci);
+struct ci_fresh_watch *ci_fresh_arm(const char *root);
+void ci_fresh_finish(struct ci_fresh_watch *w, struct codeindex *ci, bool fresh);
+#endif
+#ifdef ZCL_TESTING
+void ci_test_note_freshness_walk(void);
+#else
+#define ci_test_note_freshness_walk() ((void)0)
+#endif
 
 #ifdef ZCL_TESTING
 void ci_test_note_exact_bytes(uint64_t bytes);

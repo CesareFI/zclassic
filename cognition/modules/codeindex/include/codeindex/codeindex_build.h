@@ -62,6 +62,12 @@ void codeindex_test_remove_lock_directory_once(void);
  * sealed by the published generation without rereading source/depfile bytes. */
 void codeindex_test_reset_exact_bytes_read(void);
 uint64_t codeindex_test_exact_bytes_read(void);
+
+/* Change-watched freshness memo proof: how many whole-tree freshness walks
+ * codeindex_is_stale has run in this process, and a switch that makes arming
+ * the change watch fail so the memo must fall back to walking every open. */
+uint64_t codeindex_test_freshness_walks(void);
+void codeindex_test_force_watch_failure(bool fail);
 #endif
 
 /* ── Canonical group taxonomy (mirrors the Makefile / shape layout) ──
