@@ -270,8 +270,8 @@ static const char *tw_binary(const struct mesh_terminal_worker_config *cfg)
 
 /* The cage's filesystem grants: the workdir read/write, the one binary
  * read/execute, and for an explicit argv the standard library directories
- * that exist, read/execute. The seccomp set is unchanged except that W^X
- * becomes "file-backed exec allowed" for an explicit argv. */
+ * that exist, read/execute. For an explicit argv the exec mode is FILE_EXEC,
+ * which is not W^X (a written file can be mapped); see os_sandbox.h. */
 static size_t tw_grant_rules(const struct mesh_terminal_worker_config *cfg,
                              struct os_sandbox_path_rule *rules)
 {

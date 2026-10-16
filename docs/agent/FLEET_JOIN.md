@@ -381,7 +381,8 @@ label the lead chooses; it is not verified and the audit line says so
 Confinement is the existing terminal worker, unchanged except for the argv
 option below: Landlock grants the per-server `--workdir` (read, write, create,
 execute; shared by that server's sessions, and also the shell's cwd and HOME)
-plus the one granted binary, with the terminal seccomp set and W^X. The
+plus the one granted binary, with the terminal seccomp set and (for the default
+shell) strict W^X. The
 environment has no `PATH`. A program you want to run must either be that
 binary or live inside the workdir.
 
@@ -390,12 +391,18 @@ binary or live inside the workdir.
 in the same cage: `argv[0]` becomes the one granted binary (read and
 execute), the standard library directories that exist (`/lib`, `/lib64`,
 `/usr/lib`, `/usr/lib64`) are granted read and execute, the workdir is
-read-write, and the seccomp set is unchanged except for W^X, which for an
-explicit argv allows file-backed executable mappings only (`mmap` with
-`PROT_EXEC` needs a real fd and no `MAP_ANONYMOUS`); anonymous executable
-mappings and any `mprotect` to executable stay killed by SIGSYS. So a
-dynamically linked program (such as `/usr/bin/true`) runs, and so does a
-statically linked program (such as `fbsh -c '...'`). A program the server
+read-write, and the exec mode is relaxed from strict W^X to file-backed
+executable mappings (`mmap` with `PROT_EXEC` needs a real fd and no
+`MAP_ANONYMOUS`); anonymous executable mappings and any `mprotect` to
+executable stay killed by SIGSYS. This is not W^X: the workdir is writable, so
+a program can write a payload there and map it executable (or run it through
+the dynamic loader). Containment does not rely on W^X; it relies on what every
+process in the cage is denied: no network (the socket family and io_uring), no
+signals outside the session (pid 0, -1 and the server's own pid and group are
+refused; thread, pidfd and queued signals are killed), no inherited
+descriptors, and the filesystem grant. A dynamically linked program (such as
+`/usr/bin/true`) runs, and so does a statically linked program (such as
+`fbsh -c '...'`). A program the server
 cannot run (relative path, missing, not a regular executable file) is refused
 by name before any process starts: `EXEC_REFUSED`, exit 2. A write outside the
 workdir fails inside the cage with the program's own error.

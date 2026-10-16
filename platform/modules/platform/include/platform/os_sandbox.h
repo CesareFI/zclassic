@@ -200,7 +200,18 @@ struct os_sandbox_rlimits {
  * FILE_EXEC additionally lets mmap(PROT_EXEC) through when it maps a file
  * (MAP_ANONYMOUS clear and fd != -1) so ld.so can load shared libraries;
  * anonymous PROT_EXEC mmap and every mprotect/pkey_mprotect PROT_EXEC stay
- * killed. */
+ * killed.
+ *
+ * FILE_EXEC is NOT W^X. A confined program that can write a file (the
+ * terminal worker's workdir is read/write/execute, RLIMIT_FSIZE only caps the
+ * size at 1 MiB) can write a payload and then mmap it PROT_EXEC, run it with
+ * the dynamic loader (ld.so ./payload), or mmap it MAP_SHARED writable and
+ * map a second read-execute alias of the same file. The mode only stops
+ * anonymous and mprotect-made executable memory. Containment of such code
+ * rests on what the cage denies to every process in it: no network (socket
+ * family and io_uring), no signals outside the session (kill guard, tkill,
+ * tgkill, pidfd), and no inherited descriptors (the worker closes them before
+ * the exec). It does not rest on W^X. */
 enum os_sandbox_wx {
     OS_SANDBOX_WX_OFF = 0,
     OS_SANDBOX_WX_STRICT = 1,
@@ -631,7 +642,8 @@ struct os_sandbox_profile os_sandbox_session_child_profile(
  * rlimits + Landlock scoped to `fs_rules` (the per-terminal tmpdir r/w/create/
  * execute plus the one granted shell binary read/execute) + the seccomp
  * TERMINAL WORKER deny-list (session set minus the fork/exec family, so the
- * shell can spawn children) with W^X. Linux only; the stub profile refuses in
+ * shell can spawn children) with strict W^X (FILE_EXEC, which is not W^X, for
+ * an explicit argv; see enum os_sandbox_wx). Linux only; the stub profile refuses in
  * os_sandbox_enter() like every other profile. */
 struct os_sandbox_profile os_sandbox_terminal_worker_profile(
     const struct os_sandbox_path_rule *fs_rules, size_t n_fs_rules);

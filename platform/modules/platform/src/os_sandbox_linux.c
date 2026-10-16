@@ -583,7 +583,7 @@ const int *os_sandbox_node_steady_denied_syscalls(size_t *count_out)
 #define SC_NR_PKEY (-1)
 #endif
 /* W^X: PROT_EXEC (args[2]) on mmap/mprotect/pkey_mprotect is killed; each block
- * reloads nr. WX_FILE_EXEC's mmap block kills anonymous, fd -1, PROT_WRITE maps. */
+ * reloads nr. FILE_EXEC is NOT W^X: it only stops anonymous/fd -1/PROT_WRITE maps. */
 #define SC_ARG(n) offsetof(struct seccomp_data, args[n])
 #define SC_KILL BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS)
 #define SC_LD(off) BPF_STMT(BPF_LD | BPF_W | BPF_ABS, (off))

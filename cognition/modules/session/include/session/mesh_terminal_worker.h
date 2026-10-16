@@ -200,7 +200,8 @@ struct mesh_terminal_worker {
  * controlling terminal with the requested winsize, stdio on the slave,
  * cwd/HOME = workdir, then the terminal-worker sandbox profile (Landlock:
  * workdir + shell binary only; seccomp: session deny-set minus the
- * fork/exec family; rlimits; W^X) and execve of shell_path. Every
+ * fork/exec family; rlimits; strict W^X for the default shell, file-backed
+ * exec (not W^X) for an explicit argv) and execve of shell_path. Every
  * child-side failure is staged back through a close-on-exec pipe and
  * reported BY NAME — spawn never returns ok for a shell that failed to
  * start confined. The parent is never confined. Clock comes in, testable:

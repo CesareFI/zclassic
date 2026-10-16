@@ -558,7 +558,11 @@ static void hub_sup_reap(struct hub_sup *sup)
 }
 
 /* Every accepted connection counts toward max_sessions, a busy refusal and a
- * failed fork included: the limit bounds attempts, not authenticated users. */
+ * failed fork included: the limit bounds attempts, not authenticated users.
+ * Residual: a connection counts and holds an active slot before it has
+ * authenticated, so up to max_active unauthenticated peers can hold every
+ * slot for the handshake time (MESH_TERMINAL_HUB_HANDSHAKE_MS, 2 s each) and
+ * can spend max_sessions. The tunnel in front is the access control. */
 static void hub_sup_accept(struct hub_sup *sup, int listener,
                            const struct mesh_terminal_hub_listen_cfg *cfg)
 {
@@ -613,7 +617,13 @@ static void hub_sup_signals(struct hub_sup *sup)
  * that window sees 0 and skips the killpg; the session's SIGKILL then closes
  * its pty master, which hangs up the worker's controlling terminal (SIGHUP to
  * its foreground group). Only a worker that ignores HUP could survive, and only
- * if the stop landed inside those few instructions. */
+ * if the stop landed inside those few instructions.
+ *
+ * Residual window: the freeze is bounded (HUB_FREEZE_MS). A session that has
+ * not stopped by then is killed on its slot anyway; if it was still running it
+ * could reap its worker leader between our read of the slot and the kill, and
+ * the group id could in principle be recycled to an unrelated group. That needs
+ * a wedged session and a pid wrap inside the same few milliseconds. */
 #define HUB_FREEZE_MS 200
 #define HUB_FREEZE_STEP_MS 10
 
