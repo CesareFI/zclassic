@@ -34,6 +34,13 @@
 #include "validation/main_state.h"
 #include "wallet/wallet.h"
 #include "wallet/wallet_lock.h"
+#include "wallet/wallet_canary.h"
+#include "wallet/wallet_sqlite.h"
+#include "services/wallet_backup_service.h"
+#include "controllers/sovereignty_controller.h"
+#include "jobs/reducer_frontier.h"
+#include "storage/coins_kv.h"
+#include "core/uint256.h"
 
 #include <sqlite3.h>
 #include <stdatomic.h>
@@ -1724,6 +1731,85 @@ int test_transaction_intent(void)
         ASSERT_EQ(decision.code, VAULT_INTENT_DECISION_FEE_INVALID);
         ASSERT(!vault_intent_plan_decide(NULL, &decision));
         ASSERT(!vault_intent_plan_decide(&snapshot, NULL));
+        PASS();
+    }
+
+    TEST("transaction intent refuses planning when the wallet locks after the unlock check") {
+        char dir[256];
+        test_make_tmpdir(dir, sizeof(dir), "ti_lock_race", "main");
+        ASSERT(progress_store_open(dir));
+        sqlite3 *pdb = progress_store_db();
+        ASSERT(pdb != NULL);
+        ASSERT(coins_kv_ensure_schema(pdb));
+        reducer_frontier_provable_tip_set(50);
+        struct uint256 t1;
+        uint256_set_null(&t1);
+        t1.data[0] = 0x51;
+        t1.data[31] = 0x77;
+        unsigned char sc[4] = {0xE0, 0xE0, 0xE0, 0xE0};
+        ASSERT(coins_kv_add(pdb, t1.data, 0, 1234, 50, true, sc, sizeof(sc)));
+        char *sov_err = NULL;
+        ASSERT(sqlite3_exec(pdb, "BEGIN IMMEDIATE", NULL, NULL, &sov_err) == SQLITE_OK);
+        ASSERT(coins_kv_set_applied_height_in_tx(pdb, 51));
+        ASSERT(sqlite3_exec(pdb, "COMMIT", NULL, NULL, &sov_err) == SQLITE_OK);
+        char sov_reason[96] = {0};
+        ASSERT(sovereignty_guard_allow("wallet_spend", sov_reason, sizeof(sov_reason)));
+
+        struct node_db lock_db;
+        memset(&lock_db, 0, sizeof(lock_db));
+        ASSERT(node_db_open(&lock_db, ":memory:"));
+        struct wallet_sqlite lock_ws;
+        memset(&lock_ws, 0, sizeof(lock_ws));
+        ASSERT(wallet_sqlite_open_r(&lock_ws, lock_db.db).ok);
+        ASSERT(wallet_canary_run(lock_db.db, NULL) == WALLET_CANARY_OK);
+
+        wallet_lock_reset_for_test();
+        wallet_lock_note_encrypted_at_rest();
+        ASSERT(wallet_lock_unlock(NULL, NULL, "lock-race-test-pass").ok);
+
+        char backup_path[320];
+        snprintf(backup_path, sizeof(backup_path), "%s/wallet.enc", dir);
+        FILE *backup = fopen(backup_path, "wb");
+        ASSERT(backup != NULL);
+        ASSERT(fputs("enc", backup) >= 0);
+        ASSERT(fclose(backup) == 0);
+        wallet_backup_seed_encrypted_authority_for_test(
+            backup_path, (int64_t)platform_time_wall_time_t(), 0);
+
+        struct wallet *lock_wallet = zcl_calloc(1, sizeof(*lock_wallet), "test-wallet");
+        ASSERT(lock_wallet != NULL);
+        wallet_init(lock_wallet);
+        static struct tx_mempool lock_mempool;
+        static struct coins_view_cache lock_cache;
+        static struct main_state lock_ms;
+        memset(&lock_mempool, 0, sizeof(lock_mempool));
+        memset(&lock_cache, 0, sizeof(lock_cache));
+        memset(&lock_ms, 0, sizeof(lock_ms));
+        struct wallet_rpc_context lock_ctx;
+        memset(&lock_ctx, 0, sizeof(lock_ctx));
+        lock_ctx.wallet = lock_wallet;
+        lock_ctx.wallet_db = &lock_ws;
+        lock_ctx.node_db = &lock_db;
+        lock_ctx.mempool = &lock_mempool;
+        lock_ctx.coins_tip = &lock_cache;
+        lock_ctx.main_state = &lock_ms;
+        lock_ctx.datadir = dir;
+
+        /* The first unlock check passes; the wallet locks before the health
+         * snapshot reads the lock state. */
+        wallet_lock_flip_after_unlock_checks_for_test(1);
+        struct json_value lock_out;
+        json_init(&lock_out);
+        ASSERT(!vault_intent_context_ready(&lock_ctx, &lock_out));
+        ASSERT_STR_EQ(json_get_str(json_get(&lock_out, "code")), "WALLET_LOCKED");
+        json_free(&lock_out);
+
+        wallet_lock_reset_for_test();
+        wallet_free(lock_wallet); free(lock_wallet);
+        node_db_close(&lock_db);
+        reducer_frontier_provable_tip_reset();
+        progress_store_close();
+        (void)test_rm_rf_recursive(dir);
         PASS();
     }
 

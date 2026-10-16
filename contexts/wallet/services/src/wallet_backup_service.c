@@ -354,6 +354,23 @@ void wallet_backup_status_snapshot(struct wallet_backup_status *out)
     snprintf(out->last_error, sizeof(out->last_error), "%s", g_wbs.last_error);
     pthread_mutex_unlock(&g_wbs.lock);
 }
+
+void wallet_backup_seed_encrypted_authority_for_test(const char *path,
+                                                     int64_t run_unix,
+                                                     int64_t key_count)
+{
+    if (!path)
+        return;
+    size_t n_tables = 0;
+    (void)wallet_backup_tables(&n_tables);
+    pthread_mutex_lock(&g_wbs.lock);
+    g_wbs.last_encrypted_run_unix = run_unix;
+    g_wbs.last_encrypted_key_count = key_count;
+    g_wbs.last_encrypted_tables_verified = (int)n_tables;
+    snprintf(g_wbs.last_encrypted_path, sizeof(g_wbs.last_encrypted_path),
+             "%s", path);
+    pthread_mutex_unlock(&g_wbs.lock);
+}
 /* See CLAUDE.md "Adding state introspection". Reentrant-safe: reuses the
  * lock-guarded snapshot that RPC/agent callers already read. */
 bool wallet_backup_dump_state_json(struct json_value *out, const char *key)

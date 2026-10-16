@@ -165,6 +165,31 @@ static bool vi_decode(const uint8_t *raw, size_t len, struct vi_payload *p)
     return true;
 }
 
+struct vi_refusal {
+    const char *code;
+    const char *message;
+};
+
+/* Maps an unusable persistence snapshot to its refusal. A wallet that locked
+ * after the unlock check reports locked=true with mismatch=false, so the lock
+ * is tested before the health fields. */
+static bool vi_persistence_refusal(const struct wallet_persistence_health *h,
+                                   struct vi_refusal *r)
+{
+    if (h->locked) {
+        r->code = "WALLET_LOCKED";
+        r->message = "unlock the wallet through stdin before planning";
+        return true;
+    }
+    if (!h->open || !h->canary_ok || h->row_count < 0 || h->mismatch ||
+        h->corrupt_rows > 0) {
+        r->code = "WALLET_PERSISTENCE_UNHEALTHY";
+        r->message = "wallet persistence health gate failed; inspect core wallet status";
+        return true;
+    }
+    return false;
+}
+
 static bool vi_context_ready(struct wallet_rpc_context *ctx,
                              struct json_value *out,
                              bool require_current_backup)
@@ -185,10 +210,9 @@ static bool vi_context_ready(struct wallet_rpc_context *ctx,
     sqlite3 *db = ctx->wallet_db->open ? ctx->wallet_db->db : NULL;
     struct wallet_persistence_health h = wallet_persistence_get_health(
         db, (int)ctx->wallet->keystore.num_keys);
-    if (!h.open || !h.canary_ok || h.row_count < 0 || h.mismatch ||
-        h.corrupt_rows > 0) {
-        vi_error(out, "WALLET_PERSISTENCE_UNHEALTHY",
-                 "wallet persistence health gate failed; inspect core wallet status");
+    struct vi_refusal refusal;
+    if (vi_persistence_refusal(&h, &refusal)) {
+        vi_error(out, refusal.code, refusal.message);
         return false;
     }
     if (require_current_backup) {

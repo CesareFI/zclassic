@@ -1028,7 +1028,7 @@ contexts/wallet/controllers/src/vault_intent_common.c:vault_intent_parse_zcl_amo
 contexts/wallet/controllers/src/vault_intent_controller.c:rpc_vi_plan_checked:48
 contexts/wallet/controllers/src/vault_intent_controller.c:vault_intent_commit_input:48
 contexts/wallet/controllers/src/vault_intent_controller.c:vi_build_prepared:20
-contexts/wallet/controllers/src/vault_intent_controller.c:vi_context_ready:26
+contexts/wallet/controllers/src/vault_intent_controller.c:vi_context_ready:22
 contexts/wallet/controllers/src/vault_intent_controller.c:vi_decode:25
 contexts/wallet/controllers/src/vault_intent_controller.c:vi_encode:16
 contexts/wallet/controllers/src/vault_intent_fanout.c:vault_intent_fanout_plan_rpc:40

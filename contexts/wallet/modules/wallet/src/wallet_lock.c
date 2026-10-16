@@ -34,6 +34,9 @@ static bool  g_have_runtime_pass;   /* an unlock cached a passphrase */
 static bool  g_force_locked;        /* an explicit lock — wins over env */
 static bool  g_encrypted_at_rest;   /* the wallet uses WKS1 at-rest wrapping */
 static uint64_t g_timeout_generation;
+/* Test-only seam: 0 in production. When nonzero, the nth wallet_lock_is_unlocked()
+ * call after arming reports unlocked and then forces the wallet locked. */
+static uint32_t g_flip_after_unlock_checks;
 
 struct wallet_lock_timer {
     struct wallet *wallet;
@@ -136,6 +139,11 @@ bool wallet_lock_is_unlocked(void)
      * encrypted wallet is unlocked only while an effective passphrase is
      * available. */
     bool unlocked = !g_encrypted_at_rest || (effective_pass_locked() != NULL);
+    if (g_flip_after_unlock_checks && --g_flip_after_unlock_checks == 0) {
+        memory_cleanse(g_runtime_pass, sizeof(g_runtime_pass));
+        g_have_runtime_pass = false;
+        g_force_locked = true;
+    }
     pthread_mutex_unlock(&g_mu);
     return unlocked;
 }
@@ -333,12 +341,20 @@ void wallet_lock_status_json(struct json_value *out)
     json_push_kv_str(out, "source", source);
 }
 
+void wallet_lock_flip_after_unlock_checks_for_test(uint32_t n)
+{
+    pthread_mutex_lock(&g_mu);
+    g_flip_after_unlock_checks = n;
+    pthread_mutex_unlock(&g_mu);
+}
+
 void wallet_lock_reset_for_test(void)
 {
     pthread_mutex_lock(&g_mu);
     memory_cleanse(g_runtime_pass, sizeof(g_runtime_pass));
     g_have_runtime_pass = false;
     g_force_locked = false;
+    g_flip_after_unlock_checks = 0;
     g_encrypted_at_rest = false;
     g_timeout_generation++;
     pthread_mutex_unlock(&g_mu);
