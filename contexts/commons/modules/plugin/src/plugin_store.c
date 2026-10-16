@@ -23,6 +23,62 @@ struct ps_paths {
     char exe[PLUGIN_PATH_MAX];
 };
 
+const char *plugin_slot_state_name(enum plugin_slot_state state)
+{
+    switch (state) {
+    case PLUGIN_SLOT_OK:
+        return "ok";
+    case PLUGIN_SLOT_MISSING:
+        return "missing";
+    case PLUGIN_SLOT_UNREADABLE:
+        return "unreadable";
+    case PLUGIN_SLOT_CORRUPT:
+        return "corrupt";
+    }
+    return "corrupt";
+}
+
+#ifdef ZCL_TESTING
+static char g_ps_fail_suffix[PLUGIN_PATH_MAX];
+static unsigned g_ps_fail_after;
+static bool g_ps_fail_armed;
+
+void plugin_store_test_fail_readdir(const char *suffix, unsigned after)
+{
+    g_ps_fail_armed = suffix != NULL;
+    g_ps_fail_after = after;
+    snprintf(g_ps_fail_suffix, sizeof(g_ps_fail_suffix), "%s", suffix ? suffix : "");
+}
+
+static bool ps_seam_fails(const char *path)
+{
+    size_t n = strlen(path), m = strlen(g_ps_fail_suffix);
+    if (!g_ps_fail_armed || m > n || strcmp(path + n - m, g_ps_fail_suffix) != 0)
+        return false;
+    if (g_ps_fail_after > 0) {
+        g_ps_fail_after--;
+        return false;
+    }
+    return true;
+}
+#endif
+
+/* readdir that reports the end of the directory (NULL, errno 0) apart from a
+ * failed read (NULL, errno set). */
+static struct dirent *ps_readdir(DIR *d, const char *path)
+{
+#ifdef ZCL_TESTING
+    if (ps_seam_fails(path)) {
+        errno = EIO;
+        return NULL;
+    }
+#else
+    (void)path;
+#endif
+    errno = 0;
+    return readdir(d);
+}
+
 static bool ps_is_dir(const char *path)
 {
     struct stat st;
@@ -375,18 +431,22 @@ static int ps_cmp_generation(const void *a, const void *b)
     return strcmp(a, b);
 }
 
-static enum plugin_status ps_load_generations(const char *plugdir,
-                                              struct plugin_info *info)
+static enum plugin_slot_state ps_open_failure(int err)
 {
-    char gens[PLUGIN_PATH_MAX];
-    if (!plugin_join(gens, sizeof(gens), plugdir, "generations", NULL, NULL))
-        return PLUGIN_ERR_IO;
-    DIR *d = opendir(gens);
-    if (!d)
-        return PLUGIN_OK;
+    if (err == ENOENT)
+        return PLUGIN_SLOT_MISSING;
+    return err == ENOTDIR || err == ELOOP ? PLUGIN_SLOT_CORRUPT : PLUGIN_SLOT_UNREADABLE;
+}
+
+/* Append every generation id in the open directory. A read that fails before
+ * the end of the directory leaves what was found unusable: the caller drops it
+ * and reports the directory unreadable. */
+static enum plugin_status ps_scan_generations(DIR *d, const char *gens,
+                                              struct plugin_info *info, bool *complete)
+{
     struct dirent *e;
     size_t cap = 0;
-    while ((e = readdir(d)) != NULL) {
+    while ((e = ps_readdir(d, gens)) != NULL) {
         if (!plugin_hex_valid(e->d_name, PLUGIN_HEX_SHA3_512))
             continue;
         if (info->generation_count == cap) {
@@ -394,16 +454,40 @@ static enum plugin_status ps_load_generations(const char *plugdir,
             void *grown = zcl_realloc(info->generations,
                                       cap * (PLUGIN_HEX_SHA3_512 + 1),
                                       "plugin_generations");
-            if (!grown) {
-                closedir(d);
+            if (!grown)
                 return PLUGIN_ERR_IO;
-            }
             info->generations = grown;
         }
         memcpy(info->generations[info->generation_count++], e->d_name,
                PLUGIN_HEX_SHA3_512 + 1);
     }
+    *complete = errno == 0;
+    return PLUGIN_OK;
+}
+
+static enum plugin_status ps_load_generations(const char *plugdir,
+                                              struct plugin_info *info)
+{
+    char gens[PLUGIN_PATH_MAX];
+    if (!plugin_join(gens, sizeof(gens), plugdir, "generations", NULL, NULL))
+        return PLUGIN_ERR_IO;
+    DIR *d = opendir(gens);
+    if (!d) {
+        info->generations_state = ps_open_failure(errno);
+        return PLUGIN_OK;
+    }
+    bool complete = false;
+    enum plugin_status st = ps_scan_generations(d, gens, info, &complete);
     closedir(d);
+    if (st != PLUGIN_OK)
+        return st;
+    if (!complete) {
+        free(info->generations);
+        info->generations = NULL;
+        info->generation_count = 0;
+        info->generations_state = PLUGIN_SLOT_UNREADABLE;
+        return PLUGIN_OK;
+    }
     qsort(info->generations, info->generation_count, PLUGIN_HEX_SHA3_512 + 1,
           ps_cmp_generation);
     return PLUGIN_OK;
@@ -417,9 +501,11 @@ static enum plugin_status ps_load_info(const char *root, const char *name,
     snprintf(info->name, sizeof(info->name), "%s", name);
     if (!plugin_join(plugdir, sizeof(plugdir), root, name, NULL, NULL))
         return PLUGIN_ERR_IO;
-    if (!plugin_link_generation(plugdir, "current", info->current))
+    info->current_state = plugin_link_slot(plugdir, "current", info->current);
+    if (info->current_state != PLUGIN_SLOT_OK)
         info->current[0] = '\0';
-    if (!plugin_link_generation(plugdir, "last-good", info->last_good))
+    info->last_good_state = plugin_link_slot(plugdir, "last-good", info->last_good);
+    if (info->last_good_state != PLUGIN_SLOT_OK)
         info->last_good[0] = '\0';
     return ps_load_generations(plugdir, info);
 }
@@ -429,7 +515,7 @@ static enum plugin_status ps_collect(DIR *d, const char *root,
 {
     struct dirent *e;
     size_t cap = 0;
-    while ((e = readdir(d)) != NULL) {
+    while ((e = ps_readdir(d, root)) != NULL) {
         char path[PLUGIN_PATH_MAX];
         if (!plugin_name_valid(e->d_name) ||
             !plugin_join(path, sizeof(path), root, e->d_name, NULL, NULL) ||
@@ -449,7 +535,7 @@ static enum plugin_status ps_collect(DIR *d, const char *root,
         }
         (*count)++;
     }
-    return PLUGIN_OK;
+    return errno == 0 ? PLUGIN_OK : PLUGIN_ERR_IO;
 }
 
 enum plugin_status plugin_store_list(const char *root,

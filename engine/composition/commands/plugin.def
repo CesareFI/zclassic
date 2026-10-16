@@ -98,7 +98,9 @@ ZCL_COMMAND_READY_COMMAND(
     "Reads ~/.z23/plugins and returns, for the named plugin, the current and "
     "last-good generation ids, the stored generation count and a work line "
     "(plugins scanned, signatures verified, executables hashed). It starts "
-    "no run, verifies and hashes nothing, and changes nothing.",
+    "no run, verifies and hashes nothing, and changes nothing. Each part is "
+    "reported ok, missing, unreadable or corrupt; an unreadable or corrupt "
+    "part is refused as PLUGIN_IO, never reported as empty.",
     ZCL_COMMAND_LIST_BUDGET,
     "plugin,status,generation,current,last-good",
     "zcl.plugin_status.input.v1", "zcl.plugin_status.v1", "name", "name",

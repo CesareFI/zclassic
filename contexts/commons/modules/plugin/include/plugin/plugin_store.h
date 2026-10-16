@@ -101,17 +101,46 @@ enum plugin_status plugin_store_switch(const char *root, const char *name,
 enum plugin_status plugin_store_rollback(const char *root, const char *name,
                                          char restored[PLUGIN_HEX_SHA3_512 + 1]);
 
+/* What reading one part of a plugin's stored state found. Absent is not the
+ * same as unreadable: only PLUGIN_SLOT_MISSING means the part is not there.
+ * PLUGIN_SLOT_UNREADABLE is a permission or I/O failure, so the part may
+ * exist and nothing may be inferred from its empty value. PLUGIN_SLOT_CORRUPT
+ * is present but not what the store writes (a link that is not a
+ * generations/<128 hex> link, or a generations entry that is not a
+ * directory). */
+enum plugin_slot_state {
+    PLUGIN_SLOT_OK = 0,
+    PLUGIN_SLOT_MISSING,
+    PLUGIN_SLOT_UNREADABLE,
+    PLUGIN_SLOT_CORRUPT
+};
+
+/* "ok", "missing", "unreadable" or "corrupt". */
+const char *plugin_slot_state_name(enum plugin_slot_state state);
+
 struct plugin_info {
     char name[PLUGIN_NAME_MAX + 1];
     char current[PLUGIN_HEX_SHA3_512 + 1];   /* empty when unset */
     char last_good[PLUGIN_HEX_SHA3_512 + 1]; /* empty when unset */
     char (*generations)[PLUGIN_HEX_SHA3_512 + 1];
     size_t generation_count;
+    /* How current, last-good and the generations directory were read. An
+     * empty id with PLUGIN_SLOT_OK cannot happen; an empty id or a zero count
+     * is a fact only when the matching state is OK or MISSING. */
+    enum plugin_slot_state current_state;
+    enum plugin_slot_state last_good_state;
+    enum plugin_slot_state generations_state;
 };
 
 /* List installed plugins, sorted by name, generations sorted by id. */
 enum plugin_status plugin_store_list(const char *root,
                                      struct plugin_info **out, size_t *count);
 void plugin_store_list_free(struct plugin_info *infos, size_t count);
+
+#ifdef ZCL_TESTING
+/* Test seam: after `after` successful entries, a directory read whose path
+ * ends in suffix fails with EIO. NULL clears it. */
+void plugin_store_test_fail_readdir(const char *suffix, unsigned after);
+#endif
 
 #endif

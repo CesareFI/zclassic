@@ -910,6 +910,236 @@ struct pst_pk {
     struct plugin_pack_result res;
 };
 
+/* One plugin with two generations: v1 was current, v2 is current now, so both
+ * links and the generations directory are populated. */
+static bool pst_two_generations(struct pst_fx *fx, bool switch_current)
+{
+    struct pst_opts o = {0};
+    if (!pst_fx_open(fx, true) || pst_install(fx, "hello", "payload one", &o) != PLUGIN_OK)
+        return false;
+    if (switch_current && plugin_store_switch(fx->root, "hello", fx->generation) != PLUGIN_OK)
+        return false;
+    return pst_install(fx, "hello", "payload two", &o) == PLUGIN_OK &&
+           (!switch_current ||
+            plugin_store_switch(fx->root, "hello", fx->generation) == PLUGIN_OK);
+}
+
+static bool pst_plug_path(const struct pst_fx *fx, const char *leaf, char *out, size_t cap)
+{
+    char plug[PATH_MAX];
+    return pst_path(plug, sizeof(plug), fx->root, "hello") &&
+           (leaf ? pst_path(out, cap, plug, leaf) : snprintf(out, cap, "%s", plug) > 0);
+}
+
+/* List the store and expect exactly the one plugin "hello". */
+static bool pst_list_one(const struct pst_fx *fx, struct plugin_info **infos)
+{
+    size_t n = 0;
+    *infos = NULL;
+    if (plugin_store_list(fx->root, infos, &n) != PLUGIN_OK || n != 1) {
+        plugin_store_list_free(*infos, n);
+        *infos = NULL;
+        return false;
+    }
+    return true;
+}
+
+static bool pst_states(const struct plugin_info *i, enum plugin_slot_state cur,
+                       enum plugin_slot_state last, enum plugin_slot_state gens)
+{
+    return i->current_state == cur && i->last_good_state == last &&
+           i->generations_state == gens;
+}
+
+static int pst_case_slot_states_readable(void)
+{
+    int failures = 0;
+    TEST_CASE("list types a healthy plugin, a never-switched one and a removed generations directory") {
+        struct pst_fx fx;
+        struct plugin_info *i = NULL;
+        char path[PATH_MAX];
+        ASSERT(pst_two_generations(&fx, true));
+        ASSERT(pst_list_one(&fx, &i));
+        ASSERT(pst_states(i, PLUGIN_SLOT_OK, PLUGIN_SLOT_OK, PLUGIN_SLOT_OK));
+        ASSERT_EQ(i->generation_count, 2u);
+        plugin_store_list_free(i, 1);
+        /* nothing was ever switched: unset is missing, not a fault */
+        pst_fx_close(&fx);
+        ASSERT(pst_two_generations(&fx, false));
+        ASSERT(pst_list_one(&fx, &i));
+        ASSERT(pst_states(i, PLUGIN_SLOT_MISSING, PLUGIN_SLOT_MISSING, PLUGIN_SLOT_OK));
+        ASSERT_STR_EQ(i->current, "");
+        ASSERT_EQ(i->generation_count, 2u);
+        plugin_store_list_free(i, 1);
+        /* the generations directory is gone */
+        ASSERT(pst_plug_path(&fx, "generations", path, sizeof(path)));
+        ASSERT_EQ(test_rm_rf_recursive(path), 0);
+        ASSERT(pst_list_one(&fx, &i));
+        ASSERT(pst_states(i, PLUGIN_SLOT_MISSING, PLUGIN_SLOT_MISSING, PLUGIN_SLOT_MISSING));
+        ASSERT_EQ(i->generation_count, 0u);
+        plugin_store_list_free(i, 1);
+        pst_fx_close(&fx);
+    } TEST_END
+    return failures;
+}
+
+static int pst_case_slot_states_corrupt(void)
+{
+    int failures = 0;
+    TEST_CASE("list types a current link that is not a generation link and a generations file as corrupt") {
+        struct pst_fx fx;
+        struct plugin_info *i = NULL;
+        char path[PATH_MAX];
+        ASSERT(pst_two_generations(&fx, true));
+        /* current is a regular file, last-good points outside generations/ */
+        ASSERT(pst_plug_path(&fx, "current", path, sizeof(path)));
+        ASSERT_EQ(unlink(path), 0);
+        ASSERT(pst_write(path, "x", 1));
+        ASSERT(pst_plug_path(&fx, "last-good", path, sizeof(path)));
+        ASSERT_EQ(unlink(path), 0);
+        ASSERT_EQ(symlink("../elsewhere", path), 0);
+        ASSERT(pst_list_one(&fx, &i));
+        ASSERT(pst_states(i, PLUGIN_SLOT_CORRUPT, PLUGIN_SLOT_CORRUPT, PLUGIN_SLOT_OK));
+        ASSERT_STR_EQ(i->current, "");
+        ASSERT_STR_EQ(i->last_good, "");
+        plugin_store_list_free(i, 1);
+        /* the generations path is a file */
+        ASSERT(pst_plug_path(&fx, "generations", path, sizeof(path)));
+        ASSERT_EQ(test_rm_rf_recursive(path), 0);
+        ASSERT(pst_write(path, "x", 1));
+        ASSERT(pst_list_one(&fx, &i));
+        ASSERT(pst_states(i, PLUGIN_SLOT_CORRUPT, PLUGIN_SLOT_CORRUPT, PLUGIN_SLOT_CORRUPT));
+        plugin_store_list_free(i, 1);
+        pst_fx_close(&fx);
+    } TEST_END
+    return failures;
+}
+
+static int pst_case_slot_states_unreadable(void)
+{
+    int failures = 0;
+    TEST_CASE("list types a denied generations directory and a denied plugin directory as unreadable") {
+        struct pst_fx fx;
+        struct plugin_info *i = NULL;
+        char gens[PATH_MAX], plug[PATH_MAX];
+        ASSERT(pst_two_generations(&fx, true));
+        ASSERT(pst_plug_path(&fx, "generations", gens, sizeof(gens)));
+        ASSERT(pst_plug_path(&fx, NULL, plug, sizeof(plug)));
+        if (geteuid() != 0) {
+            /* only the generations directory is denied: the links still read */
+            ASSERT_EQ(chmod(gens, 0), 0);
+            ASSERT(pst_list_one(&fx, &i));
+            ASSERT(pst_states(i, PLUGIN_SLOT_OK, PLUGIN_SLOT_OK, PLUGIN_SLOT_UNREADABLE));
+            ASSERT_EQ(i->generation_count, 0u);
+            ASSERT(i->current[0] != '\0');
+            plugin_store_list_free(i, 1);
+            ASSERT_EQ(chmod(gens, 0700), 0);
+            /* the plugin directory cannot be searched: nothing in it can be read */
+            ASSERT_EQ(chmod(plug, 0600), 0);
+            ASSERT(pst_list_one(&fx, &i));
+            ASSERT(pst_states(i, PLUGIN_SLOT_UNREADABLE, PLUGIN_SLOT_UNREADABLE,
+                              PLUGIN_SLOT_UNREADABLE));
+            ASSERT_STR_EQ(i->current, "");
+            plugin_store_list_free(i, 1);
+            ASSERT_EQ(chmod(plug, 0700), 0);
+        }
+        pst_fx_close(&fx);
+    } TEST_END
+    return failures;
+}
+
+static int pst_case_readdir_failure(void)
+{
+    int failures = 0;
+    TEST_CASE("a directory read that fails part way is an error, not the end of the list") {
+        struct pst_fx fx;
+        struct plugin_info *i = NULL, *none = NULL;
+        size_t n = 0;
+        ASSERT(pst_two_generations(&fx, true));
+        /* the generations directory holds ".", ".." and two ids */
+        plugin_store_test_fail_readdir("/generations", 3);
+        ASSERT(pst_list_one(&fx, &i));
+        ASSERT(pst_states(i, PLUGIN_SLOT_OK, PLUGIN_SLOT_OK, PLUGIN_SLOT_UNREADABLE));
+        ASSERT_EQ(i->generation_count, 0u);
+        plugin_store_list_free(i, 1);
+        /* the store root itself fails to read */
+        plugin_store_test_fail_readdir("/plugins", 1);
+        ASSERT_EQ(plugin_store_list(fx.root, &none, &n), PLUGIN_ERR_IO);
+        ASSERT(none == NULL);
+        ASSERT_EQ(n, 0u);
+        plugin_store_test_fail_readdir(NULL, 0);
+        ASSERT(pst_list_one(&fx, &i));
+        ASSERT(pst_states(i, PLUGIN_SLOT_OK, PLUGIN_SLOT_OK, PLUGIN_SLOT_OK));
+        ASSERT_EQ(i->generation_count, 2u);
+        plugin_store_list_free(i, 1);
+        pst_fx_close(&fx);
+    } TEST_END
+    plugin_store_test_fail_readdir(NULL, 0);
+    return failures;
+}
+
+static const char *pst_str(const struct zcl_command_reply *r, const char *key)
+{
+    const char *s = json_get_str(json_get(&r->data, key));
+    return s ? s : "";
+}
+
+static int pst_case_status_states(void)
+{
+    int failures = 0;
+    struct pst_fx fx = {0};
+    const char *old_home = getenv("HOME");
+    TEST_CASE("status reports each state and refuses to call an unreadable or corrupt plugin empty") {
+        struct zcl_command_reply r;
+        char gens[PATH_MAX], cur[PATH_MAX];
+        ASSERT(pst_two_generations(&fx, false));
+        ASSERT_EQ(setenv("HOME", fx.home, 1), 0);
+        /* never switched: ok exit, unset links reported as missing */
+        ASSERT(pst_call(zcl_native_handle_plugin_status, "{\"name\":\"hello\"}", &r));
+        ASSERT_EQ(r.exit_code, ZCL_COMMAND_EXIT_OK);
+        ASSERT_STR_EQ(pst_str(&r, "current_state"), "missing");
+        ASSERT_STR_EQ(pst_str(&r, "last_good_state"), "missing");
+        ASSERT_STR_EQ(pst_str(&r, "generations_state"), "ok");
+        ASSERT_EQ(json_get_int(json_get(&r.data, "generations")), 2);
+        zcl_command_reply_free(&r);
+        ASSERT(pst_plug_path(&fx, "generations", gens, sizeof(gens)));
+        ASSERT(pst_plug_path(&fx, "current", cur, sizeof(cur)));
+        /* a corrupt current link */
+        ASSERT(pst_write(cur, "x", 1));
+        ASSERT(pst_call(zcl_native_handle_plugin_status, "{\"name\":\"hello\"}", &r));
+        ASSERT_STR_EQ(r.error.code, "PLUGIN_IO");
+        ASSERT(strstr(r.error.evidence, "current corrupt") != NULL);
+        zcl_command_reply_free(&r);
+        ASSERT_EQ(unlink(cur), 0);
+        /* a generations directory that cannot be read */
+        if (geteuid() != 0) {
+            ASSERT_EQ(chmod(gens, 0), 0);
+            ASSERT(pst_call(zcl_native_handle_plugin_status, "{\"name\":\"hello\"}", &r));
+            ASSERT_STR_EQ(r.error.code, "PLUGIN_IO");
+            ASSERT(strstr(r.error.evidence, "generations unreadable") != NULL);
+            zcl_command_reply_free(&r);
+            ASSERT(pst_call(zcl_native_handle_plugin_list, "{}", &r));
+            ASSERT_EQ(r.exit_code, ZCL_COMMAND_EXIT_OK);
+            ASSERT_STR_EQ(json_get_str(json_get(json_at(json_get(&r.data, "plugins"), 0),
+                                                "generations_state")), "unreadable");
+            zcl_command_reply_free(&r);
+            ASSERT_EQ(chmod(gens, 0700), 0);
+        }
+        /* a generations directory that failed part way through its read */
+        plugin_store_test_fail_readdir("/generations", 3);
+        ASSERT(pst_call(zcl_native_handle_plugin_status, "{\"name\":\"hello\"}", &r));
+        ASSERT_STR_EQ(r.error.code, "PLUGIN_IO");
+        ASSERT(strstr(r.error.evidence, "generations unreadable") != NULL);
+        zcl_command_reply_free(&r);
+        plugin_store_test_fail_readdir(NULL, 0);
+    } TEST_END
+    plugin_store_test_fail_readdir(NULL, 0);
+    if (old_home)
+        setenv("HOME", old_home, 1);
+    pst_fx_close(&fx);
+    return failures;
+}
+
 static const char pst_pk_body[] = "#!/bin/sh\necho packed\n";
 
 /* A publisher workspace: an executable, a key file holding the trusted seed
@@ -1248,6 +1478,11 @@ int test_plugin_store(void)
     failures += pst_case_tampered_last_good();
     failures += pst_case_input_limits();
     failures += pst_case_commands();
+    failures += pst_case_slot_states_readable();
+    failures += pst_case_slot_states_corrupt();
+    failures += pst_case_slot_states_unreadable();
+    failures += pst_case_readdir_failure();
+    failures += pst_case_status_states();
     failures += pst_case_pack_roundtrip();
     failures += pst_case_pack_deterministic();
     failures += pst_case_pack_tampered_exe();

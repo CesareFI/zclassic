@@ -227,6 +227,11 @@ static void plg_push_info(struct json_value *plugins, const struct plugin_info *
     (void)json_push_kv_str(&row, "name", info->name);
     (void)json_push_kv_str(&row, "current", info->current);
     (void)json_push_kv_str(&row, "last_good", info->last_good);
+    (void)json_push_kv_str(&row, "current_state", plugin_slot_state_name(info->current_state));
+    (void)json_push_kv_str(&row, "last_good_state",
+                           plugin_slot_state_name(info->last_good_state));
+    (void)json_push_kv_str(&row, "generations_state",
+                           plugin_slot_state_name(info->generations_state));
     for (size_t g = 0; g < info->generation_count; g++) {
         struct json_value s;
         json_init(&s);
@@ -266,6 +271,23 @@ void zcl_native_handle_plugin_list(const struct zcl_command_request *request,
     plugin_store_list_free(infos, count);
 }
 
+/* The first part of a plugin's stored state that could not be read, as
+ * "generations unreadable" or "current corrupt"; false when every part read. A
+ * missing link or directory is a fact (nothing set, nothing stored). */
+static bool plg_state_fault(const struct plugin_info *info, char *out, size_t cap)
+{
+    static const char *const part[] = { "generations", "current", "last-good" };
+    const enum plugin_slot_state state[] = { info->generations_state, info->current_state,
+                                             info->last_good_state };
+    for (size_t i = 0; i < 3; i++)
+        if (state[i] == PLUGIN_SLOT_UNREADABLE || state[i] == PLUGIN_SLOT_CORRUPT) {
+            (void)snprintf(out, cap, "%s: %s %s", info->name, part[i],
+                           plugin_slot_state_name(state[i]));
+            return true;
+        }
+    return false;
+}
+
 /* Read-only: one store scan, no signature verify, no executable hash. The
  * reply says so in "work" so an operator can see what the call cost. */
 void zcl_native_handle_plugin_status(const struct zcl_command_request *request,
@@ -295,6 +317,12 @@ void zcl_native_handle_plugin_status(const struct zcl_command_request *request,
         plugin_store_list_free(infos, count);
         return;
     }
+    char fault[PLUGIN_NAME_MAX + 64];
+    if (plg_state_fault(hit, fault, sizeof(fault))) {
+        plg_refuse(reply, PLUGIN_ERR_IO, "status", fault);
+        plugin_store_list_free(infos, count);
+        return;
+    }
     struct json_value work;
     json_init(&work);
     json_set_object(&work);
@@ -308,6 +336,12 @@ void zcl_native_handle_plugin_status(const struct zcl_command_request *request,
     (void)json_push_kv_str(&reply->data, "last_good", hit->last_good);
     (void)json_push_kv_int(&reply->data, "generations",
                            (int64_t)hit->generation_count);
+    (void)json_push_kv_str(&reply->data, "current_state",
+                           plugin_slot_state_name(hit->current_state));
+    (void)json_push_kv_str(&reply->data, "last_good_state",
+                           plugin_slot_state_name(hit->last_good_state));
+    (void)json_push_kv_str(&reply->data, "generations_state",
+                           plugin_slot_state_name(hit->generations_state));
     (void)json_push_kv(&reply->data, "work", &work);
     json_free(&work);
     plugin_store_list_free(infos, count);

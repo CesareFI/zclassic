@@ -250,22 +250,38 @@ bool plugin_remove_tree(const char *path)
     return ok && rmdir(path) == 0;
 }
 
-bool plugin_link_generation(const char *dir, const char *link,
-                            char hex[PLUGIN_HEX_SHA3_512 + 1])
+/* Why a readlink failed: nothing there, something there that is not a link,
+ * or a read the process was not allowed or able to make. */
+static enum plugin_slot_state plugin_link_failure(int err)
+{
+    if (err == ENOENT)
+        return PLUGIN_SLOT_MISSING;
+    return err == EINVAL || err == ENOTDIR || err == ELOOP ? PLUGIN_SLOT_CORRUPT
+                                                           : PLUGIN_SLOT_UNREADABLE;
+}
+
+enum plugin_slot_state plugin_link_slot(const char *dir, const char *link,
+                                        char hex[PLUGIN_HEX_SHA3_512 + 1])
 {
     static const char prefix[] = "generations/";
     char path[PLUGIN_PATH_MAX], target[PLUGIN_PATH_MAX];
     if (!plugin_join(path, sizeof(path), dir, link, NULL, NULL))
-        return false;
+        return PLUGIN_SLOT_UNREADABLE;
     ssize_t n = readlink(path, target, sizeof(target) - 1);
     if (n < 0)
-        return false;
+        return plugin_link_failure(errno);
     target[n] = '\0';
     if (strncmp(target, prefix, sizeof(prefix) - 1) != 0 ||
         !plugin_hex_valid(target + sizeof(prefix) - 1, PLUGIN_HEX_SHA3_512))
-        return false;
+        return PLUGIN_SLOT_CORRUPT;
     memcpy(hex, target + sizeof(prefix) - 1, PLUGIN_HEX_SHA3_512 + 1);
-    return true;
+    return PLUGIN_SLOT_OK;
+}
+
+bool plugin_link_generation(const char *dir, const char *link,
+                            char hex[PLUGIN_HEX_SHA3_512 + 1])
+{
+    return plugin_link_slot(dir, link, hex) == PLUGIN_SLOT_OK;
 }
 
 enum plugin_status plugin_trust_load(const char *path, char **bytes, size_t *len)

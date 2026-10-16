@@ -73,6 +73,12 @@ bool plugin_remove_tree(const char *path);
 bool plugin_link_generation(const char *dir, const char *link,
                             char hex[PLUGIN_HEX_SHA3_512 + 1]);
 
+/* As plugin_link_generation, and says why a link did not read: missing (no
+ * such link), corrupt (not a generations/<hex> symbolic link) or unreadable
+ * (any other failure). hex is written only for PLUGIN_SLOT_OK. */
+enum plugin_slot_state plugin_link_slot(const char *dir, const char *link,
+                                        char hex[PLUGIN_HEX_SHA3_512 + 1]);
+
 /* Verify a stored generation directory against the trust file. */
 enum plugin_status plugin_verify_generation(const char *root, const char *name,
                                             const char *generation);
