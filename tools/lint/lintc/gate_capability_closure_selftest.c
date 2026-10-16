@@ -223,6 +223,35 @@ static int ccs_case_sidecar(const struct ccs_fx *fx)
                            " (duplicate central row)", 1);
 }
 
+/* Repeated valid tokens make the exact declaration exceed the old buffer;
+ * the distinct final grant must survive both raw storage and normalized union. */
+static int ccs_case_long_class(const struct ccs_fx *fx)
+{
+    static const char prefix[] = "CAP_NETWORK|", tail[] = "CAP_PROCESS";
+    char raw[512], declaration[1024], cent[CCD_PATH], root[CCD_PATH];
+    size_t used = 0;
+    for (unsigned i = 0; i < 32; ++i) {
+        memcpy(raw + used, prefix, sizeof prefix - 1);
+        used += sizeof prefix - 1;
+    }
+    memcpy(raw + used, tail, sizeof tail);
+    int length = snprintf(declaration, sizeof declaration,
+        "ZCL_MODULE_CAPABILITY(\"%s\", %s, \"long union\")\n", k_own, raw);
+    int ok = length > 0 && (size_t)length < sizeof declaration && strlen(raw) > 255 &&
+        ccs_put(fx, "q/engine/composition/module_capabilities.def", "") == 0 &&
+        ccs_put(fx, "q/contexts/commons/modules/vcs/src/owned.c.capabilities.def", declaration) == 0;
+    ccs_path(fx, "q/engine/composition/module_capabilities.def", cent);
+    ccs_path(fx, "q", root);
+    struct ccd_mods m = {0};
+    int rc = ok ? ccd_modules_load(cent, NULL, root, &m) : 1;
+    int failures = ccs_say(rc == 0 && m.count == 1 && ccs_eq(&m.raw, k_own, raw) &&
+        ccs_eq(&m.uni, k_own, "CAP_NETWORK|CAP_PROCESS") &&
+        ccd_grants(ccd_map_get(&m.uni, k_own), "CAP_PROCESS"),
+        "sidecar: long raw class and final grant survive without truncation");
+    ccd_mods_free(&m);
+    return failures;
+}
+
 static int ccs_case_sets(void)
 {
     char *u1 = ccd_union_caps("CAP_A", "CAP_B|CAP_A|CAP_NONE||CAP_C"), *u2 = ccd_union_caps("", "CAP_NONE|CAP_X");
@@ -280,7 +309,7 @@ int capability_closure_data_selftest(void)
         return 2;
     }
     int fails = ccs_case_parse() + ccs_case_nm(&fx) + ccs_case_symbols(&fx) + ccs_case_platform(&fx)
-              + ccs_case_sidecar(&fx) + ccs_case_sets() + ccs_case_coverage() + ccs_case_epoch(&fx);
+              + ccs_case_sidecar(&fx) + ccs_case_long_class(&fx) + ccs_case_sets() + ccs_case_coverage() + ccs_case_epoch(&fx);
     lsc_unblock();
     rap_rm_rf(fx.base);
     puts(fails == 0 ? "== selftest: PASS ==" : "== selftest: FAIL ==");

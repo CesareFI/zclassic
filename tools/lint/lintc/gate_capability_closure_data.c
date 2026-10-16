@@ -497,7 +497,7 @@ char *ccd_union_caps(const char *out, const char *add)
     return r;
 }
 
-struct ccd_modctx { struct ccd_mods *m; int merge; size_t n; char path[CCD_PATH], cls[256]; };
+struct ccd_modctx { struct ccd_mods *m; int merge; size_t n; char path[CCD_PATH]; char *cls; };
 
 /* Sets the exact class of path and merges it into the union (merge) or
  * replaces the union with it. */
@@ -514,8 +514,13 @@ static int ccd_mod_row(void *ctx, const char *path, const char *cls)
 {
     struct ccd_modctx *c = ctx;
     c->n++;
-    if (!c->merge && c->n == 1)
-        snprintf(c->path, sizeof c->path, "%s", path), snprintf(c->cls, sizeof c->cls, "%s", cls);
+    if (!c->merge && c->n == 1) {
+        snprintf(c->path, sizeof c->path, "%s", path);
+        /* Preserve every valid class token, including grants after byte255. */
+        c->cls = strndup(cls, strlen(cls));
+        if (!c->cls)
+            return -1;
+    }
     return c->merge ? ccd_mod_set(c->m, path, cls, 1) : 0;
 }
 
@@ -543,13 +548,17 @@ static int ccd_sidecar(struct ccd_mods *m, const char *root, const char *sc)
     int rc;
     if (lstat(sc, &st) != 0 || !S_ISREG(st.st_mode))
         return ccd_sidecar_fail(m, sc, "");
-    if ((rc = ccd_def_each(sc, 1, ccd_mod_row, &one)) != 0)
-        return rc;
-    if (one.n != 1 || strlen(one.path) != el || memcmp(one.path, sc + rl, el) != 0)
-        return ccd_sidecar_fail(m, sc, "");
-    if (ccd_map_get(&m->raw, one.path))
-        return ccd_sidecar_fail(m, sc, " (duplicate central row)");
-    return ccd_mod_set(m, one.path, one.cls, 0);
+    rc = ccd_def_each(sc, 1, ccd_mod_row, &one);
+    if (rc == 0) {
+        if (one.n != 1 || strlen(one.path) != el || memcmp(one.path, sc + rl, el) != 0)
+            rc = ccd_sidecar_fail(m, sc, "");
+        else if (ccd_map_get(&m->raw, one.path))
+            rc = ccd_sidecar_fail(m, sc, " (duplicate central row)");
+        else
+            rc = ccd_mod_set(m, one.path, one.cls, 0);
+    }
+    free(one.cls);
+    return rc;
 }
 
 struct ccd_list { char **s; size_t n, cap; };
