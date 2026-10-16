@@ -14,6 +14,7 @@
 #include <stdint.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdio.h>
@@ -227,13 +228,34 @@ static bool pidns_map_identity(uid_t uid, gid_t gid)
     _exit(0);
 }
 
+/* Arm the init's parent-death signal and close the race around it. getppid()
+ * cannot be the re-check here: a process whose parent lives outside its PID
+ * namespace always reads ppid 0. Instead the outer process holds the write end
+ * of a lifeline pipe for its whole life, so a hang-up on the read end after
+ * the prctl means the outer process already died and the signal will never
+ * fire. Returns false if the init must exit. */
+static bool pidns_arm_parent_death(int lifeline_rd)
+{
+    if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0)
+        return false;
+    struct pollfd p = { .fd = lifeline_rd, .events = 0 };
+    if (poll(&p, 1, 0) < 0 || (p.revents & POLLHUP))
+        return false;
+    return true;
+}
+
 int os_sandbox_pidns_enter(int close_fd)
 {
     uid_t uid = getuid();
     gid_t gid = getgid();
-    int sp[2];
+    int sp[2], lp[2];
     if (pipe2(sp, O_CLOEXEC) != 0)
         return -1;
+    if (pipe2(lp, O_CLOEXEC) != 0) {
+        close(sp[0]);
+        close(sp[1]);
+        return -1;
+    }
     if (unshare(CLONE_NEWUSER | CLONE_NEWPID) != 0 || !pidns_map_identity(uid, gid))
         goto fail;
     pid_t init = fork();
@@ -243,10 +265,13 @@ int os_sandbox_pidns_enter(int close_fd)
         if (close_fd >= 0)
             close(close_fd);
         close(sp[1]);
+        close(lp[0]); /* lp[1] stays open until this process exits */
         pidns_outer(init, sp[0]);
     }
-    if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0)
-        goto fail;
+    close(lp[1]);
+    if (!pidns_arm_parent_death(lp[0]))
+        _exit(1);
+    close(lp[0]);
     pid_t shell = fork();
     if (shell < 0)
         goto fail;
@@ -262,6 +287,8 @@ fail:;
     int saved = errno;
     close(sp[0]);
     close(sp[1]);
+    close(lp[0]);
+    close(lp[1]);
     errno = saved;
     return -1;
 }
