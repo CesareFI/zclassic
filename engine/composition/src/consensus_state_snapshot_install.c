@@ -8,6 +8,9 @@
 #include "config/consensus_state_producer_receipt.h"
 #include "consensus_state_snapshot_install_internal.h"
 #include "core/utiltime.h"
+#include "core/amount.h"
+#include "coins/utxo_commitment.h"
+#include "script/script.h"
 #include "platform/fd_path.h"
 #include "crypto/sha3.h"
 #include "services/sync_benchmark_service.h"
@@ -33,6 +36,39 @@
 #ifdef _WIN32
 
 struct consensus_state_artifact_evidence { unsigned char unavailable; };
+
+static bool artifact_coins_begin_platform_arm(
+    const struct consensus_state_artifact_evidence *evidence,
+    struct consensus_state_artifact_coins **out)
+{
+    (void)evidence;
+    if (out) *out = NULL;
+    return false;
+}
+
+static enum coins_kv_read_snapshot_step artifact_coins_next_platform_arm(
+    struct consensus_state_artifact_coins *it,
+    struct coins_kv_read_snapshot_row *out)
+{
+    (void)it;
+    if (out) memset(out, 0, sizeof(*out));
+    return COINS_KV_READ_SNAPSHOT_ERROR;
+}
+
+static bool artifact_coins_finish_platform_arm(
+    struct consensus_state_artifact_coins *it)
+{
+    (void)it;
+    return false;
+}
+
+static void artifact_coins_abort_platform_arm(
+    struct consensus_state_artifact_coins *it)
+{
+    (void)it;
+}
+
+
 
 struct zcl_result consensus_state_artifact_evidence_open(
     const char *bundle_path, int receipt_datadir_fd,
@@ -138,6 +174,7 @@ struct consensus_state_artifact_evidence {
     zcl_mutex_t mutex;
     int artifact_fd;
     sqlite3 *bundle_db;
+    bool coins_iterator_active;
     struct stat identity;
     struct consensus_state_bundle_manifest manifest;
     uint8_t file_digest[32];
@@ -577,6 +614,200 @@ void consensus_state_artifact_evidence_candidate_lease_end(
         zcl_mutex_unlock((zcl_mutex_t *)&evidence->mutex);
 }
 
+/* One iterator borrows the evidence's already-pinned read transaction. Its
+ * lease serializes SQLite use; callers complete it on the thread that began it. */
+struct consensus_state_artifact_coins {
+    struct consensus_state_artifact_evidence *evidence;
+    sqlite3_stmt *rows;
+    struct consensus_state_bundle_manifest manifest;
+    struct sha3_256_ctx digest;
+    uint8_t last_txid[32];
+    uint32_t last_vout;
+    uint64_t count;
+    bool have_last, exhausted, failed;
+};
+
+static bool artifact_coins_begin_platform_arm(
+    const struct consensus_state_artifact_evidence *evidence,
+    struct consensus_state_artifact_coins **out)
+{
+    if (out) *out = NULL;
+    if (!evidence || !out) return false;
+    struct consensus_state_bundle_manifest manifest;
+    uint8_t receipt[32];
+    sqlite3 *db = NULL;
+    if (!consensus_state_artifact_evidence_candidate_lease_begin(
+            evidence, &manifest, receipt, &db))
+        return false;
+    struct consensus_state_artifact_evidence *owner =
+        (struct consensus_state_artifact_evidence *)evidence;
+    if (owner->coins_iterator_active) {
+        LOG_WARN(INSTALL_SUBSYS, "coin iterator already active");
+        consensus_state_artifact_evidence_candidate_lease_end(evidence);
+        return false;
+    }
+    struct consensus_state_artifact_coins *it =
+        zcl_calloc(1, sizeof(*it), "artifact coin iterator");
+    if (!it) {
+        consensus_state_artifact_evidence_candidate_lease_end(evidence);
+        return false;
+    }
+    static const char sql[] =
+        "SELECT txid,vout,value,script,height,is_coinbase "
+        "FROM coins ORDER BY txid,vout";
+    int rc = sqlite3_prepare_v2(db, sql, -1, &it->rows, NULL);
+    if (rc != SQLITE_OK) {
+        LOG_WARN(INSTALL_SUBSYS, "coin iterator prepare failed rc=%d", rc);
+        if (it->rows && sqlite3_finalize(it->rows) != SQLITE_OK)
+            LOG_WARN(INSTALL_SUBSYS, "coin iterator failed prepare cleanup");
+        free(it);
+        consensus_state_artifact_evidence_candidate_lease_end(evidence);
+        return false;
+    }
+    it->evidence = owner;
+    it->manifest = manifest;
+    sha3_256_init(&it->digest);
+    owner->coins_iterator_active = true;
+    *out = it;
+    return true;
+}
+
+static bool artifact_coin_scalars_valid(int64_t vout, int64_t value,
+                                        int64_t height, int64_t coinbase,
+                                        int32_t last_applied_height)
+{
+    return vout >= 0 && vout <= UINT32_MAX && MoneyRange(value) &&
+        height >= 0 && height <= last_applied_height &&
+        coinbase >= 0 && coinbase <= 1;
+}
+
+static bool artifact_coin_row_valid(sqlite3_stmt *rows, const int types[6],
+                                    int32_t last_applied_height)
+{
+    for (int i = 0; i < 6; i++) {
+        int expected = i == 0 || i == 3 ? SQLITE_BLOB : SQLITE_INTEGER;
+        if (types[i] != expected) return false;
+    }
+    int64_t vout = sqlite3_column_int64(rows, 1);
+    int64_t value = sqlite3_column_int64(rows, 2);
+    int64_t height = sqlite3_column_int64(rows, 4);
+    int64_t coinbase = sqlite3_column_int64(rows, 5);
+    int script_len = sqlite3_column_bytes(rows, 3);
+    return sqlite3_column_blob(rows, 0) && sqlite3_column_bytes(rows, 0) == 32 &&
+        artifact_coin_scalars_valid(vout, value, height, coinbase,
+                                    last_applied_height) &&
+        script_len >= 0 && script_len <= MAX_SCRIPT_SIZE &&
+        (script_len == 0 || sqlite3_column_blob(rows, 3) != NULL);
+}
+
+static bool artifact_coins_next_ready(
+    struct consensus_state_artifact_coins *it,
+    struct coins_kv_read_snapshot_row *out)
+{
+    if (out) memset(out, 0, sizeof(*out));
+    if (!it || !out || it->failed || it->exhausted) {
+        if (it) it->failed = true;
+        LOG_WARN(INSTALL_SUBSYS, "coin iterator next: invalid state");
+        return false;
+    }
+    if (!descriptor_identity_unchanged(it->evidence->artifact_fd,
+                                        &it->evidence->identity)) {
+        it->failed = true;
+        LOG_WARN(INSTALL_SUBSYS, "coin iterator input identity changed");
+        return false;
+    }
+    return true;
+}
+
+static enum coins_kv_read_snapshot_step artifact_coins_next_platform_arm(
+    struct consensus_state_artifact_coins *it,
+    struct coins_kv_read_snapshot_row *out)
+{
+    if (!artifact_coins_next_ready(it, out))
+        return COINS_KV_READ_SNAPSHOT_ERROR;
+    int rc = sqlite3_step(it->rows); // raw-sql-ok:read-only-introspection
+    if (rc == SQLITE_DONE) {
+        it->exhausted = true;
+        return COINS_KV_READ_SNAPSHOT_DONE;
+    }
+    if (rc != SQLITE_ROW) {
+        it->failed = true;
+        LOG_WARN(INSTALL_SUBSYS, "coin iterator step failed rc=%d", rc);
+        return COINS_KV_READ_SNAPSHOT_ERROR;
+    }
+    /* Same strict row domain as coins_kv_read_snapshot_next; no coercion,
+     * skipped rows or alternate commitment encoding is permitted here. */
+    int types[6];
+    for (int i = 0; i < 6; i++) types[i] = sqlite3_column_type(it->rows, i);
+    int64_t vout = sqlite3_column_int64(it->rows, 1);
+    int64_t value = sqlite3_column_int64(it->rows, 2);
+    int64_t height = sqlite3_column_int64(it->rows, 4);
+    int64_t coinbase = sqlite3_column_int64(it->rows, 5);
+    int script_len = sqlite3_column_bytes(it->rows, 3);
+    const uint8_t *txid = sqlite3_column_blob(it->rows, 0);
+    const uint8_t *script = sqlite3_column_blob(it->rows, 3);
+    bool valid = artifact_coin_row_valid(it->rows, types, it->manifest.height);
+    int order = valid && it->have_last ? memcmp(txid, it->last_txid, 32) : 1;
+    if (!valid || (it->have_last &&
+        (order < 0 || (order == 0 && (uint32_t)vout <= it->last_vout))) ||
+        it->count == UINT64_MAX) {
+        it->failed = true;
+        LOG_WARN(INSTALL_SUBSYS, "coin iterator malformed or unordered row");
+        return COINS_KV_READ_SNAPSHOT_ERROR;
+    }
+    memcpy(out->txid, txid, 32);
+    out->vout = (uint32_t)vout;
+    out->value = value;
+    out->script = script_len > 0 ? script : NULL;
+    out->script_len = (size_t)script_len;
+    out->height = (int32_t)height;
+    out->is_coinbase = coinbase != 0;
+    utxo_commitment_sha3_write_record(&it->digest, out->txid, out->vout,
+        out->value, out->script, (uint32_t)out->script_len,
+        (uint32_t)out->height, (uint8_t)out->is_coinbase);
+    memcpy(it->last_txid, txid, 32);
+    it->last_vout = out->vout;
+    it->have_last = true;
+    it->count++;
+    return COINS_KV_READ_SNAPSHOT_ROW;
+}
+
+static bool artifact_coins_release(struct consensus_state_artifact_coins *it)
+{
+    int rc = sqlite3_finalize(it->rows);
+    it->rows = NULL;
+    if (rc != SQLITE_OK)
+        LOG_WARN(INSTALL_SUBSYS, "coin iterator finalize failed rc=%d", rc);
+    it->evidence->coins_iterator_active = false;
+    consensus_state_artifact_evidence_candidate_lease_end(it->evidence);
+    free(it);
+    return rc == SQLITE_OK;
+}
+
+static bool artifact_coins_finish_platform_arm(
+    struct consensus_state_artifact_coins *it)
+{
+    if (!it) return false;
+    bool ok = it->exhausted && !it->failed;
+    if (ok) {
+        uint8_t digest[32];
+        sha3_256_finalize(&it->digest, digest);
+        ok = it->count == it->manifest.utxo_count &&
+             memcmp(digest, it->manifest.utxo_root, 32) == 0 &&
+             consensus_state_artifact_evidence_revalidate(it->evidence);
+    }
+    bool released = artifact_coins_release(it);
+    if (!ok || !released)
+        LOG_WARN(INSTALL_SUBSYS, "coin iterator completion refused");
+    return ok && released;
+}
+
+static void artifact_coins_abort_platform_arm(
+    struct consensus_state_artifact_coins *it)
+{
+    if (it) (void)artifact_coins_release(it);
+}
+
 bool consensus_state_snapshot_install(
     sqlite3 *progress_db,
     const struct consensus_state_snapshot_install_request *request,
@@ -665,3 +896,29 @@ bool consensus_state_snapshot_install(
 }
 
 #endif
+
+bool consensus_state_artifact_coins_begin(
+    const struct consensus_state_artifact_evidence *evidence,
+    struct consensus_state_artifact_coins **out)
+{
+    return artifact_coins_begin_platform_arm(evidence, out);
+}
+
+enum coins_kv_read_snapshot_step consensus_state_artifact_coins_next(
+    struct consensus_state_artifact_coins *iterator,
+    struct coins_kv_read_snapshot_row *out)
+{
+    return artifact_coins_next_platform_arm(iterator, out);
+}
+
+bool consensus_state_artifact_coins_finish(
+    struct consensus_state_artifact_coins *iterator)
+{
+    return artifact_coins_finish_platform_arm(iterator);
+}
+
+void consensus_state_artifact_coins_abort(
+    struct consensus_state_artifact_coins *iterator)
+{
+    artifact_coins_abort_platform_arm(iterator);
+}

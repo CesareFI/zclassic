@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 #include "storage/consensus_state_bundle_codec.h"
+#include "storage/coins_kv_read_snapshot.h"
 #include "util/result.h"
 
 struct sqlite3;
@@ -154,6 +155,34 @@ bool consensus_state_artifact_evidence_receipt_digest(
 bool consensus_state_artifact_evidence_file_digest(
     const struct consensus_state_artifact_evidence *evidence,
     uint8_t out[32]);
+
+/* A read-only iterator over the exact admitted bundle's coins. No pathname
+ * reopen, progress-store initialization, receipt write or activation occurs.
+ * Evidence must outlive the iterator and must not be freed while it is active.
+ * Begin retains its SQLite lease; begin/next/finish/abort must run on the SAME
+ * thread. Consumers on other threads serialize on that lease. Only one iterator
+ * per evidence may be active; a reentrant begin refuses. The evidence's read
+ * transaction remains owned by evidence_free, not by iterator completion.
+ *
+ * next zeroes out on every call. ROW borrows script bytes until the next call
+ * or finish/abort. DONE is terminal: calling next after DONE poisons completion.
+ * Every row is strictly typed, ordered, MoneyRange-valid and at height <= the
+ * admitted last-applied height (equivalently < its next-height frontier).
+ * finish consumes the iterator even on failure, and succeeds only after DONE,
+ * checked statement cleanup, exact manifest count/root and input revalidation.
+ * abort also consumes it, without making a completion claim. Windows refuses.
+ * A caller must withhold its own result until finish succeeds. */
+struct consensus_state_artifact_coins;
+bool consensus_state_artifact_coins_begin(
+    const struct consensus_state_artifact_evidence *evidence,
+    struct consensus_state_artifact_coins **out);
+enum coins_kv_read_snapshot_step consensus_state_artifact_coins_next(
+    struct consensus_state_artifact_coins *iterator,
+    struct coins_kv_read_snapshot_row *out);
+bool consensus_state_artifact_coins_finish(
+    struct consensus_state_artifact_coins *iterator);
+void consensus_state_artifact_coins_abort(
+    struct consensus_state_artifact_coins *iterator);
 
 /* Stream a history-complete admitted bundle into a separate FULL-durable
  * SQLite progress generation.  The builder closes and independently reopens

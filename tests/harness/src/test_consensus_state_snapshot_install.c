@@ -50,6 +50,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #if !defined(_WIN32)
+#include "../../../engine/composition/src/consensus_state_snapshot_install_internal.h"
 
 #define CSI_CHECK(label, expr) do {                                      \
     printf("consensus_state_install: %s... ", (label));                  \
@@ -2048,6 +2049,150 @@ static int csi_sync_benchmark_install_case(sqlite3 *db, struct csi_fixture *a,
     return failures;
 }
 
+static int artifact_coin_interrupt_progress(void *opaque)
+{
+    unsigned *calls = opaque;
+    (*calls)++;
+    return 1;
+}
+
+/* Exercise a real SQLITE_INTERRUPT on the admitted connection. The outer
+ * existing lease keeps access exclusive while the test installs and removes
+ * its progress handler; no production-only test hook is needed. CSI_CHECK
+ * records failures without jumping, so handler/iterator/lease cleanup runs
+ * even when the expected error or completion assertion fails. */
+static int artifact_coin_interruption_tests(
+    const struct consensus_state_artifact_evidence *evidence)
+{
+    int failures = 0;
+    struct consensus_state_bundle_manifest manifest;
+    uint8_t receipt[32];
+    sqlite3 *db = NULL;
+    bool leased = consensus_state_artifact_evidence_candidate_lease_begin(
+        evidence, &manifest, receipt, &db);
+    CSI_CHECK("coin interruption test obtains existing evidence lease",
+              leased && db);
+    if (!leased) return failures;
+
+    struct consensus_state_artifact_coins *it = NULL;
+    bool began = consensus_state_artifact_coins_begin(evidence, &it);
+    CSI_CHECK("coin interruption iterator begins", began && it);
+    unsigned calls = 0;
+    if (began) {
+        sqlite3_progress_handler(db, 1, artifact_coin_interrupt_progress, &calls);
+        struct coins_kv_read_snapshot_row row;
+        enum coins_kv_read_snapshot_step step =
+            consensus_state_artifact_coins_next(it, &row);
+        int error = sqlite3_errcode(db);
+        CSI_CHECK("coin iterator reports real SQLite interruption as ERROR",
+            calls > 0 && error == SQLITE_INTERRUPT &&
+            step == COINS_KV_READ_SNAPSHOT_ERROR && row.script == NULL);
+        bool finished = consensus_state_artifact_coins_finish(it);
+        it = NULL;
+        CSI_CHECK("interrupted iterator refuses completion", !finished);
+    }
+    /* Always remove the borrowed callback before its stack context expires. */
+    sqlite3_progress_handler(db, 0, NULL, NULL);
+
+    began = consensus_state_artifact_coins_begin(evidence, &it);
+    CSI_CHECK("new iterator begins after interruption handler removal",
+              began && it);
+    if (began) {
+        uint64_t count = 0;
+        struct coins_kv_read_snapshot_row row;
+        enum coins_kv_read_snapshot_step step;
+        while ((step = consensus_state_artifact_coins_next(it, &row)) ==
+                   COINS_KV_READ_SNAPSHOT_ROW)
+            count++;
+        bool finished = consensus_state_artifact_coins_finish(it);
+        it = NULL;
+        CSI_CHECK("new iterator completes admitted traversal after interruption",
+            step == COINS_KV_READ_SNAPSHOT_DONE &&
+            count == manifest.utxo_count && finished);
+    }
+    consensus_state_artifact_coins_abort(it);
+    consensus_state_artifact_evidence_candidate_lease_end(evidence);
+    return failures;
+}
+
+static int artifact_coin_iterator_tests(
+    const struct consensus_state_artifact_evidence *evidence)
+{
+    int failures = 0;
+    struct consensus_state_artifact_coins *it = NULL, *other = NULL;
+    struct consensus_state_bundle_manifest manifest;
+    bool ready = evidence &&
+        consensus_state_artifact_evidence_manifest_copy(evidence, &manifest);
+    CSI_CHECK("coin iterator has admitted manifest", ready);
+    if (!ready) return failures;
+    CSI_CHECK("coin iterator begin rejects null evidence/output",
+        !consensus_state_artifact_coins_begin(NULL, &it) && !it &&
+        !consensus_state_artifact_coins_begin(evidence, NULL));
+    ready = consensus_state_artifact_coins_begin(evidence, &it);
+    CSI_CHECK("coin iterator borrows admitted transaction", ready && it);
+    if (!ready) return failures;
+    CSI_CHECK("coin iterator refuses reentrant second iterator",
+        !consensus_state_artifact_coins_begin(evidence, &other) && !other);
+    struct sha3_256_ctx digest;
+    sha3_256_init(&digest);
+    uint64_t count = 0;
+    bool empty_script = false;
+    struct coins_kv_read_snapshot_row row;
+    enum coins_kv_read_snapshot_step step;
+    while ((step = consensus_state_artifact_coins_next(it, &row)) ==
+               COINS_KV_READ_SNAPSHOT_ROW) {
+        utxo_commitment_sha3_write_record(&digest, row.txid, row.vout,
+            row.value, row.script, (uint32_t)row.script_len,
+            (uint32_t)row.height, (uint8_t)row.is_coinbase);
+        empty_script |= row.script_len == 0;
+        count++;
+    }
+    uint8_t root[32];
+    sha3_256_finalize(&digest, root);
+    CSI_CHECK("coin iterator reproduces exact admitted count and root",
+        step == COINS_KV_READ_SNAPSHOT_DONE && count == manifest.utxo_count &&
+        memcmp(root, manifest.utxo_root, 32) == 0 && empty_script);
+    CSI_CHECK("coin iterator exhaustion finishes successfully",
+        consensus_state_artifact_coins_finish(it));
+    it = NULL;
+    ready = consensus_state_artifact_coins_begin(evidence, &it);
+    CSI_CHECK("coin iterator can reopen after successful completion", ready);
+    if (ready) {
+        CSI_CHECK("coin iterator premature finish refuses",
+            !consensus_state_artifact_coins_finish(it));
+        it = NULL;
+    }
+    ready = consensus_state_artifact_coins_begin(evidence, &it);
+    CSI_CHECK("premature finish released the evidence lease", ready);
+    if (ready) {
+        CSI_CHECK("coin iterator invalid next poisons completion",
+            consensus_state_artifact_coins_next(it, NULL) ==
+                COINS_KV_READ_SNAPSHOT_ERROR &&
+            !consensus_state_artifact_coins_finish(it));
+        it = NULL;
+    }
+    ready = consensus_state_artifact_coins_begin(evidence, &it);
+    CSI_CHECK("coin iterator can abort without a completion claim", ready);
+    consensus_state_artifact_coins_abort(it);
+    return failures;
+}
+
+static int artifact_coin_changed_object_test(
+    bool changed_iterator_open,
+    struct consensus_state_artifact_coins *changed_iterator)
+{
+    int failures = 0;
+    if (changed_iterator_open) {
+        struct coins_kv_read_snapshot_row changed_row;
+        CSI_CHECK("coin iterator refuses changed admitted object",
+            consensus_state_artifact_coins_next(changed_iterator, &changed_row) ==
+                COINS_KV_READ_SNAPSHOT_ERROR && changed_row.script == NULL);
+        CSI_CHECK("changed-object iterator cannot finish successfully",
+            !consensus_state_artifact_coins_finish(changed_iterator));
+    }
+    return failures;
+}
+
 static int test_consensus_state_snapshot_install_platform_arm(void)
 {
     printf("\n=== consensus_state_snapshot_install ===\n");
@@ -2160,6 +2305,14 @@ static int test_consensus_state_snapshot_install_platform_arm(void)
                   artifact, admitted_digest) &&
               memcmp(admitted_digest, b.artifact, 32) == 0);
 
+    failures += artifact_coin_iterator_tests(artifact);
+    failures += artifact_coin_interruption_tests(artifact);
+    struct consensus_state_artifact_coins *changed_iterator = NULL;
+    bool changed_iterator_open = consensus_state_artifact_coins_begin(
+        artifact, &changed_iterator);
+    CSI_CHECK("changed-object iterator begins before replacement",
+              changed_iterator_open);
+
     char moved_path[sizeof(b.path) + 16];
     snprintf(moved_path, sizeof(moved_path), "%s-moved", b.path);
     unlink(moved_path);
@@ -2178,6 +2331,8 @@ static int test_consensus_state_snapshot_install_platform_arm(void)
     CSI_CHECK("inode rename invalidates admitted metadata receipt",
               !consensus_state_artifact_evidence_manifest_copy(
                   artifact, &admitted_manifest));
+    failures += artifact_coin_changed_object_test(
+        changed_iterator_open, changed_iterator);
     consensus_state_artifact_evidence_free(artifact);
     artifact = NULL;
     unlink(b.path);
