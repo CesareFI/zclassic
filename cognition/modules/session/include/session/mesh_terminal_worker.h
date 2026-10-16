@@ -146,11 +146,20 @@ struct mesh_terminal_worker_config {
      * library directories); the environment stays PATH-less. NULL means the
      * configured shell, exactly as before. POSIX only. */
     const char *const *argv;
+    /* Optional (POSIX): where the supervisor of a session process may read the
+     * group id. Written the moment the child exists, zeroed after the group is
+     * killed and before its leader is reaped, so non-zero always names a group
+     * whose leader still holds the id. */
+    volatile pid_t *pgid_slot;
 };
 
 struct mesh_terminal_worker {
     pid_t pid;
     pid_t pgid;              /* == pid: setsid() makes the child lead its own group */
+    /* POSIX: the leader exited but is NOT reaped (waitid WNOWAIT), so it keeps
+     * the group id reserved until the group has been killed. */
+    bool leader_held;
+    volatile pid_t *pgid_slot;  /* from the config; see there */
     int master_fd;           /* PTY master; -1 once closed */
     uint64_t bytes_in;
     uint64_t bytes_out;
@@ -235,9 +244,17 @@ bool mesh_terminal_worker_budget_exceeded(struct mesh_terminal_worker *w,
  * reaped shell reads false immediately). */
 bool mesh_terminal_worker_alive(struct mesh_terminal_worker *w);
 
-/* Kill the whole process group (SIGKILL to -pgid, census-verified), reap
+/* Kill the whole process group (SIGKILL to -pgid) while the leader still
+ * holds the group id (an exited leader stays unreaped until now), reap
  * the shell, and close the PTY. Idempotent; safe on an already-exited
  * shell. close_reason is left as the enforcement path set it. */
 void mesh_terminal_worker_kill(struct mesh_terminal_worker *w);
+
+#if defined(ZCL_TESTING)
+/* Test seam (POSIX): returns the order of the last group kill and the last
+ * leader reap since the previous call (0 = none), then clears both. The
+ * custody contract is killpg_seq < reap_seq. */
+void mesh_terminal_worker_testing_order(uint32_t *killpg_seq, uint32_t *reap_seq);
+#endif
 
 #endif /* ZCL_SESSION_MESH_TERMINAL_WORKER_H */

@@ -23,20 +23,10 @@
 #include <termios.h> /* struct winsize */
 #include <unistd.h>
 #elif defined(_WIN32)
-/* ConPTY (CreatePseudoConsole/ResizePseudoConsole/ClosePseudoConsole) and
- * PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE are declared by the mingw-w64 and
- * MSVC headers only once NTDDI_VERSION names the Windows 10 October 2018
- * Update (RS5, NTDDI_WIN10_RS5 == 0x0A000006) or newer. Z23's native
- * baseline is already Windows 10 (ZCL_PLATFORM_CPPFLAGS pins
- * -D_WIN32_WINNT=0x0A00), but <sdkddkver.h> derives a LOWER default
- * NTDDI_VERSION from _WIN32_WINNT alone, which leaves ConPTY undeclared —
- * confirmed against the installed mingw-w64 headers while writing this
- * arm. Pin NTDDI_VERSION explicitly here, the same way
- * platform/modules/platform/src/logical_cpu.c pins its own per-TU
- * _WIN32_WINNT floor, so a standalone TU check (check-windows-cross-syntax
- * compiles this file on its own) sees the same API surface a real build
- * would, and refuse a lower floor set some other way rather than silently
- * compiling against an older, ConPTY-less SDK target. */
+/* ConPTY needs NTDDI_VERSION at NTDDI_WIN10_RS5 (0x0A000006) or newer, which
+ * <sdkddkver.h> does not derive from _WIN32_WINNT alone. Pin it here (as
+ * logical_cpu.c pins its own floor) so the standalone check-windows-cross-syntax
+ * compile sees the real API surface, and refuse a lower floor set elsewhere. */
 #if !defined(NTDDI_VERSION)
 #define NTDDI_VERSION 0x0A000006
 #elif NTDDI_VERSION < 0x0A000006
@@ -98,35 +88,21 @@ const char *mesh_terminal_worker_error_string(
 }
 
 /* ── Platform-neutral bookkeeping, shared by every arm below ───────────
- * Pure functions of primitive types, so a Linux-hosted unit test can
- * prove the boundary itself without spawning a shell (or a mingw build)
- * on any host. */
+ * Pure functions of primitive types: a Linux unit test proves them with no shell. */
 
-/* Bounds-check requested terminal geometry against the proto's wire
- * limits. Only moved out of the Linux arm (unchanged body, unchanged
- * call sites there) so the Windows arm below can call the same copy
- * instead of a second one drifting from it. Kept non-static: on a
- * platform that is neither Linux nor Windows only the honest-refusal
- * stub arm compiles, which calls neither this nor the budget helper
- * below, and a static function unused in that translation unit is
- * exactly what -Wunused-function (-Werror) exists to catch — the same
- * reason mesh_terminal_worker_budget_would_overrun is not static. */
+/* Bounds-check requested terminal geometry against the proto's wire limits.
+ * Shared by the Linux and Windows arms; non-static so the stub-only build
+ * (neither arm) does not trip -Wunused-function. */
 bool geometry_in_bounds(uint16_t cols, uint16_t rows)
 {
     return cols != 0 && cols <= MESH_TERMINAL_MAX_COLS && rows != 0 &&
            rows <= MESH_TERMINAL_MAX_ROWS;
 }
 
-/* True when accepting `n` more bytes on top of `used` bytes already
- * charged against `max` would cross the budget. The POSIX arm inlines
- * this exact test in mesh_terminal_worker_input_platform_arm (left
- * byte-for-byte unchanged there, so this copy is genuinely unused in a
- * Linux build's own object — kept non-static, like
- * mesh_terminal_worker_error_string, rather than static+unused, so
- * -Wunused-function never fires there); the Windows arm's input path
- * below calls this one copy, and it is declared in the header so the
- * Linux-hosted unit test can call it directly without a spawned shell or
- * a mingw build. */
+/* True when accepting `n` more bytes on top of `used` already charged against
+ * `max` would cross the budget. The Windows input path calls this; the POSIX
+ * arm inlines the same test. Non-static and declared in the header so the
+ * Linux-hosted unit test reaches it and -Wunused-function stays quiet. */
 bool mesh_terminal_worker_budget_would_overrun(uint64_t used, uint64_t max,
                                                size_t n)
 {
@@ -233,18 +209,35 @@ static void tw_record_exit(struct mesh_terminal_worker *w, int status)
         w->close_reason = MESH_TERMINAL_CLOSE_WORKER_EXITED;
 }
 
-/* Non-blocking reap; returns true when the shell has exited. */
+#if defined(ZCL_TESTING)
+static uint32_t g_tw_seq, g_tw_killpg_seq, g_tw_reap_seq;
+#define TW_MARK(v) ((v) = ++g_tw_seq)
+
+void mesh_terminal_worker_testing_order(uint32_t *killpg_seq, uint32_t *reap_seq)
+{
+    *killpg_seq = g_tw_killpg_seq;
+    *reap_seq = g_tw_reap_seq;
+    g_tw_killpg_seq = g_tw_reap_seq = 0;
+}
+#else
+#define TW_MARK(v) ((void)0)
+#endif
+
+/* Non-blocking look at the leader; true when the shell has exited. WNOWAIT
+ * leaves it a zombie that keeps the group id reserved until teardown reaps it. */
 static bool tw_reap(struct mesh_terminal_worker *w)
 {
     if (!w->running)
         return true;
-    int status = 0;
-    pid_t got = waitpid(w->pid, &status, WNOHANG);
-    if (got == w->pid) {
-        tw_record_exit(w, status);
+    siginfo_t si = { 0 };
+    int rc = waitid(P_PID, (id_t)w->pid, &si, WEXITED | WNOHANG | WNOWAIT);
+    if (rc == 0 && si.si_pid == w->pid) {
+        tw_record_exit(w, si.si_code == CLD_EXITED ? (si.si_status & 0xff) << 8
+                                                   : si.si_status & 0x7f);
+        w->leader_held = true;
         return true;
     }
-    if (got < 0 && errno == ECHILD) {
+    if (rc < 0 && errno == ECHILD) {
         /* Nobody to wait for: treat as exited (should not happen). */
         w->running = false;
         if (w->close_reason == MESH_TERMINAL_CLOSE_REQUESTED)
@@ -253,6 +246,8 @@ static bool tw_reap(struct mesh_terminal_worker *w)
     }
     return false;
 }
+
+static void tw_slot(volatile pid_t *slot, pid_t v) { if (slot) *slot = v; }
 
 /* A signal interruption does not settle child ownership. */
 static pid_t tw_wait_settled(pid_t pid, int *status)
@@ -395,6 +390,8 @@ static struct zcl_result mesh_terminal_worker_spawn_platform_arm(
 
     out->pid = 0;
     out->pgid = 0;
+    out->leader_held = false;
+    out->pgid_slot = cfg->pgid_slot;
     out->max_bytes_in = cfg->max_bytes_in;
     out->max_bytes_out = cfg->max_bytes_out;
     out->lifetime_seconds = cfg->lifetime_seconds;
@@ -444,6 +441,7 @@ static struct zcl_result mesh_terminal_worker_spawn_platform_arm(
      * execed (the pipe closed with the exec), one byte names the stage
      * that failed. */
     close(stage_pipe[1]);
+    tw_slot(cfg->pgid_slot, pid);
     uint8_t stage = 0;
     for (;;) {
         ssize_t n = read(stage_pipe[0], &stage, 1);
@@ -462,6 +460,7 @@ static struct zcl_result mesh_terminal_worker_spawn_platform_arm(
 
     if (stage != 0) {
         int status = 0;
+        tw_slot(cfg->pgid_slot, 0);
         (void)tw_wait_settled(pid, &status);
         close(master);
         enum mesh_terminal_worker_error code =
@@ -665,6 +664,30 @@ static bool mesh_terminal_worker_alive_platform_arm(struct mesh_terminal_worker 
     return w->running;
 }
 
+/* Bounded reap of the leader, then a blocking one so no zombie leaks. */
+static void tw_reap_leader(struct mesh_terminal_worker *w)
+{
+    int status = 0;
+    pid_t got = 0;
+    for (int i = 0; i < 100; i++) {
+        got = waitpid(w->pid, &status, WNOHANG);
+        if (got == w->pid || (got < 0 && os_sandbox_process_group_census(w->pgid) == 0))
+            break;
+        usleep(2000);
+    }
+    if (got != w->pid)
+        got = tw_wait_settled(w->pid, &status);
+    TW_MARK(g_tw_reap_seq);
+    if (got == w->pid && w->running)
+        tw_record_exit(w, status);
+    else if (w->running) {
+        w->running = false;
+        if (w->close_reason == MESH_TERMINAL_CLOSE_REQUESTED)
+            w->close_reason = MESH_TERMINAL_CLOSE_INTERNAL;
+    }
+    w->leader_held = false;
+}
+
 static void mesh_terminal_worker_kill_platform_arm(struct mesh_terminal_worker *w)
 {
     if (!w)
@@ -673,42 +696,17 @@ static void mesh_terminal_worker_kill_platform_arm(struct mesh_terminal_worker *
         close(w->master_fd);
         w->master_fd = -1;
     }
-    if (!w->running) {
-        /* Leader already reaped: its descendants (a child that ignored HUP)
-         * outlive it. The spawn-time pgid names them while any member lives
-         * and is never reissued then, so the census guard rules out PID reuse. */
-        if (w->pgid > 1 && os_sandbox_process_group_census(w->pgid) > 0)
-            (void)kill(-w->pgid, SIGKILL);
-        return;
-    }
+    if (!w->running && !w->leader_held)
+        return; /* fully reaped: the group id may be anyone's now */
 
-    /* Whole GROUP first — the session's process subtree dies together,
-     * then the shell itself in case the group signal raced. */
+    /* Whole group first, while the leader (running or a zombie) holds the id;
+     * only then is the leader reaped. */
     (void)kill(-w->pgid, SIGKILL);
-    (void)kill(w->pid, SIGKILL);
-
-    /* Census-verified teardown: bounded loop so a wedged (D-state) task
-     * cannot hang the node, with a blocking reap at the end so no zombie
-     * leaks even then. */
-    int status = 0;
-    for (int i = 0; i < 100; i++) {
-        pid_t got = waitpid(w->pid, &status, WNOHANG);
-        if (got == w->pid) {
-            tw_record_exit(w, status);
-            return;
-        }
-        if (os_sandbox_process_group_census(w->pgid) == 0 && got < 0)
-            break;
-        usleep(2000);
-    }
-    pid_t got = tw_wait_settled(w->pid, &status);
-    if (got == w->pid)
-        tw_record_exit(w, status);
-    else {
-        w->running = false;
-        if (w->close_reason == MESH_TERMINAL_CLOSE_REQUESTED)
-            w->close_reason = MESH_TERMINAL_CLOSE_INTERNAL;
-    }
+    TW_MARK(g_tw_killpg_seq);
+    tw_slot(w->pgid_slot, 0);
+    if (w->running)
+        (void)kill(w->pid, SIGKILL);
+    tw_reap_leader(w);
 }
 
 #elif defined(_WIN32) /* _WIN32 */

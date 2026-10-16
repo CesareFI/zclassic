@@ -78,6 +78,7 @@ static int hub_listen_run_arm(int listener,
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <termios.h>
@@ -191,6 +192,7 @@ static int hub_start_worker(struct hub_sess *s,
         .max_bytes_in = cfg->max_bytes_in, .max_bytes_out = cfg->max_bytes_out,
         .lifetime_seconds = cfg->lifetime_seconds, .idle_seconds = cfg->idle_seconds,
         .argv = exec ? hello->argv : NULL,
+        .pgid_slot = cfg->worker_pgid,
     };
     if (exec && (!mesh_terminal_shell_path_valid(MESH_TERMINAL_PLATFORM_POSIX, wc.shell_path) ||
                  !hub_exec_runnable(wc.shell_path)))
@@ -472,28 +474,23 @@ static int64_t hub_mono_ms(void)
     return platform_time_monotonic_ms();
 }
 
-/* One audit line, bounded. The sink is shared and may be a pipe nobody
- * drains, so the line is written only once the sink says it can take it (a
- * line is far under PIPE_BUF, so a ready pipe takes it whole) and is dropped
- * when that does not happen within wait_ms. False when dropped. */
+/* One audit line, bounded. The sink is shared (a pipe nobody drains, or one
+ * other sessions are also filling), so readiness proves nothing: the line is
+ * written on a non-blocking descriptor and, on EAGAIN, waited for with poll
+ * against one absolute deadline. Dropped, and false, when wait_ms passes. */
 static bool hub_audit_write(int fd, const char *line, size_t n, int wait_ms)
 {
+    struct hub_wfd w;
     int64_t deadline = hub_mono_ms() + (wait_ms > 0 ? wait_ms : HUB_AUDIT_WAIT_MS);
-    struct pollfd pfd = { .fd = fd, .events = POLLOUT };
-    for (;;) {
-        int64_t left = deadline - hub_mono_ms();
-        int ready = left > 0 ? poll(&pfd, 1, (int)left) : 0;
-        if (ready > 0)
-            break;
-        if (ready == 0 || errno != EINTR)
-            return false;
-    }
-    return write(fd, line, n) == (ssize_t)n;
+    hub_wfd_open(&w, fd);
+    bool ok = hub_wfd_write(&w, line, n, deadline);
+    hub_wfd_close(&w);
+    return ok;
 }
 
 /* A session child: its own stop pipe, so SIGTERM from the supervisor ends
  * the session through the normal path and the worker's group is killed. */
-static void hub_child(int fd, int listener,
+static void hub_child(int fd, int listener, volatile pid_t *worker_pgid,
                       const struct mesh_terminal_hub_listen_cfg *cfg)
 {
     struct mesh_terminal_hub_serve_cfg serve = cfg->serve;
@@ -501,6 +498,7 @@ static void hub_child(int fd, int listener,
     char line[768];
     close(listener);
     hub_signals_reset();
+    serve.worker_pgid = worker_pgid;
     if (hub_signals_install(false))
         serve.stop_fd = g_hub_signal_pipe[0];
 #if defined(ZCL_TESTING)
@@ -525,6 +523,9 @@ struct hub_sup {
     unsigned active, started, done, audit_dropped;
     bool stopping;
     pid_t kids[MESH_TERMINAL_HUB_ACTIVE_MAX];
+    /* Shared with the children: each child's worker group id (see
+     * mesh_terminal_hub_serve_cfg.worker_pgid), index-matched to kids. */
+    volatile pid_t *pgids;
 };
 
 static void hub_sup_gone(struct hub_sup *sup, pid_t pid, int status)
@@ -532,6 +533,7 @@ static void hub_sup_gone(struct hub_sup *sup, pid_t pid, int status)
     for (unsigned i = 0; i < MESH_TERMINAL_HUB_ACTIVE_MAX; i++)
         if (sup->kids[i] == pid) {
             sup->kids[i] = 0;
+            sup->pgids[i] = 0;
             sup->active--;
             sup->done++;
             if (WIFEXITED(status) && WEXITSTATUS(status) == HUB_EXIT_AUDIT_DROPPED)
@@ -547,6 +549,8 @@ static void hub_sup_reap(struct hub_sup *sup)
         hub_sup_gone(sup, pid, status);
 }
 
+/* Every accepted connection counts toward max_sessions, a busy refusal and a
+ * failed fork included: the limit bounds attempts, not authenticated users. */
 static void hub_sup_accept(struct hub_sup *sup, int listener,
                            const struct mesh_terminal_hub_listen_cfg *cfg)
 {
@@ -555,24 +559,23 @@ static void hub_sup_accept(struct hub_sup *sup, int listener,
                          ? cfg->max_active : MESH_TERMINAL_HUB_ACTIVE_MAX;
     if (fd < 0)
         return;
+    sup->started++;
     if (sup->active >= limit) {
         hub_busy(fd);
         close(fd);
         return;
     }
+    unsigned slot = 0;
+    while (slot + 1 < MESH_TERMINAL_HUB_ACTIVE_MAX && sup->kids[slot])
+        slot++;
     pid_t pid = fork();
     if (pid == 0)
-        hub_child(fd, listener, cfg);
+        hub_child(fd, listener, &sup->pgids[slot], cfg);
     close(fd);
     if (pid < 0)
         return;
-    for (unsigned i = 0; i < MESH_TERMINAL_HUB_ACTIVE_MAX; i++)
-        if (!sup->kids[i]) {
-            sup->kids[i] = pid;
-            break;
-        }
+    sup->kids[slot] = pid;
     sup->active++;
-    sup->started++;
 }
 
 /* A stop request and finished children arrive as bytes on the signal pipe. */
@@ -583,6 +586,27 @@ static void hub_sup_signals(struct hub_sup *sup)
     for (ssize_t i = 0; i < n; i++)
         sup->stopping = sup->stopping || sig[i] == 'T';
     hub_sup_reap(sup);
+}
+
+/* A session that outlived its grace owns a worker group of its own (the
+ * worker leads a separate group), which killing the session would orphan.
+ * Freeze the session first (SIGSTOP, confirmed, bounded) so it cannot reap
+ * its worker leader (the thing that releases the group id) between this
+ * read of the slot and the kill; a non-zero slot names a group whose leader
+ * still holds the id, so the kill cannot reach an unrelated group. */
+#define HUB_FREEZE_MS 200
+static void hub_sup_kill_worker(const struct hub_sup *sup, unsigned i)
+{
+    siginfo_t si = { 0 };
+    int64_t until = hub_mono_ms() + HUB_FREEZE_MS;
+    (void)kill(sup->kids[i], SIGSTOP);
+    while (waitid(P_PID, (id_t)sup->kids[i], &si,
+                  WEXITED | WSTOPPED | WNOHANG | WNOWAIT) == 0 &&
+           si.si_pid == 0 && hub_mono_ms() < until)
+        (void)poll(NULL, 0, 1); /* real-clock: the freeze is a kernel event with no fd */
+    pid_t pgid = sup->pgids[i];
+    if (pgid > 1)
+        (void)kill(-pgid, SIGKILL);
 }
 
 /* Ends the sessions: SIGTERM lets each close through its normal path, and a
@@ -606,6 +630,8 @@ static void hub_sup_stop(struct hub_sup *sup, int grace_ms)
     for (unsigned i = 0; i < MESH_TERMINAL_HUB_ACTIVE_MAX; i++) {
         pid_t pid = sup->kids[i];
         int status = 0;
+        if (pid)
+            hub_sup_kill_worker(sup, i);
         if (pid && resident_launch_kill_reap((uint64_t)pid, RESIDENT_REAP_GRACE_MS, &status))
             hub_sup_gone(sup, pid, status);
     }
@@ -643,11 +669,19 @@ static int hub_listen_run_arm(int listener,
                                  const struct mesh_terminal_hub_listen_cfg *cfg)
 {
     struct hub_sup sup = { 0 };
-    if (listener < 0 || !cfg || !hub_signals_install(true)) {
+    size_t map_len = sizeof(pid_t) * MESH_TERMINAL_HUB_ACTIVE_MAX;
+    void *map = listener < 0 || !cfg ? MAP_FAILED
+                    : mmap(NULL, map_len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (map == MAP_FAILED || !hub_signals_install(true)) {
+        if (map != MAP_FAILED)
+            munmap(map, map_len);
         if (listener >= 0)
             close(listener);
         return 1;
     }
+    sup.pgids = map;
+    struct hub_wfd audit;
+    hub_wfd_open(&audit, cfg->audit_fd); /* one owner sets the flag; the children share it */
     while (!sup.stopping) {
         bool full = cfg->max_sessions && sup.started >= cfg->max_sessions;
         if ((full && sup.active == 0) || !hub_sup_step(&sup, listener, cfg, full))
@@ -655,7 +689,9 @@ static int hub_listen_run_arm(int listener,
     }
     hub_sup_stop(&sup, cfg->stop_grace_ms);
     hub_sup_report_dropped(&sup);
+    hub_wfd_close(&audit);
     hub_signals_reset();
+    munmap(map, map_len);
     close(listener);
     return 0;
 }

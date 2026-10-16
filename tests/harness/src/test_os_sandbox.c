@@ -630,7 +630,7 @@ static int c_seccomp_exec(void)
 
 /* W^X variants. mode 1 = strict, 2 = file-backed exec allowed. Each child
  * installs the filter, then performs ONE memory call; kind selects which. */
-enum { WXK_FILE_EXEC, WXK_ANON_EXEC, WXK_MPROTECT_EXEC, WXK_NOFD_EXEC, WXK_PLAIN };
+enum { WXK_FILE_EXEC, WXK_ANON_EXEC, WXK_MPROTECT_EXEC, WXK_NOFD_EXEC, WXK_PLAIN, WXK_FILE_RWX };
 static int sb_wx(int mode, int kind)
 {
     int fd = open("/proc/self/exe", O_RDONLY);
@@ -642,6 +642,9 @@ static int sb_wx(int mode, int kind)
     switch (kind) {
     case WXK_FILE_EXEC:
         p = mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+        break;
+    case WXK_FILE_RWX:
+        p = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE, fd, 0);
         break;
     case WXK_ANON_EXEC:
         p = mmap(NULL, 4096, PROT_READ | PROT_EXEC,
@@ -665,6 +668,7 @@ static int sb_wx(int mode, int kind)
 }
 static int c_wx_strict_file(void) { return sb_wx(1, WXK_FILE_EXEC); }
 static int c_wx_file_file(void) { return sb_wx(2, WXK_FILE_EXEC); }
+static int c_wx_file_rwx(void) { return sb_wx(2, WXK_FILE_RWX); }
 static int c_wx_file_anon(void) { return sb_wx(2, WXK_ANON_EXEC); }
 static int c_wx_file_mprot(void) { return sb_wx(2, WXK_MPROTECT_EXEC); }
 static int c_wx_file_nofd(void) { return sb_wx(2, WXK_NOFD_EXEC); }
@@ -1515,6 +1519,8 @@ int test_os_sandbox(void)
              sb_run_child(c_wx_strict_file) == -SIGSYS);
     SB_CHECK("seccomp W^X file-exec: file-backed PROT_EXEC mmap allowed",
              sb_run_child(c_wx_file_file) == 0);
+    SB_CHECK("seccomp W^X file-exec: file-backed PROT_WRITE|PROT_EXEC mmap -> SIGSYS",
+             sb_run_child(c_wx_file_rwx) == -SIGSYS);
     SB_CHECK("seccomp W^X file-exec: anonymous PROT_EXEC mmap -> SIGSYS",
              sb_run_child(c_wx_file_anon) == -SIGSYS);
     SB_CHECK("seccomp W^X file-exec: mprotect PROT_EXEC -> SIGSYS",

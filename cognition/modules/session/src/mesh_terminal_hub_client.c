@@ -32,6 +32,8 @@ static void hub_client_run_arm(
 
 #include "mesh_terminal_hub_io.h"
 
+#include "platform/time_compat.h"
+
 #include <errno.h>
 #include <poll.h>
 #include <unistd.h>
@@ -44,6 +46,7 @@ struct hub_cl {
     const struct mesh_terminal_hub_client_cfg *cfg;
     struct mesh_terminal_hub_client_result *res;
     struct hub_rx rx;
+    struct hub_wfd wfd;           /* the screen, never blocking */
     uint8_t in[MESH_TERMINAL_HUB_FRAME_MAX];
     bool in_eof;
     bool wrote;
@@ -62,32 +65,44 @@ static void hub_cl_fail(struct hub_cl *c, int exit_code, const char *code,
 
 static void hub_cl_event(struct hub_cl *c);
 
-/* Screen bytes out. The wait is on the output AND the event pipe, and a write
- * is only issued once the output is writable (frames are at most one pipe
- * page, so a ready pipe takes the whole piece), so a reader that stops
- * draining cannot keep a termination signal from being served. False when
- * the output failed or the session ended while waiting (c->done tells which).
- * `watch` is false for the closing newline, after the session is over. */
+/* One wait for the screen: 1 writable, 0 keep waiting (an event was served),
+ * -1 give up (the output failed, the session ended, or the closing newline
+ * hit its deadline, which is counted). `watch` is false for that newline. */
+static int hub_cl_wait_out(struct hub_cl *c, bool watch, int64_t deadline)
+{
+    struct pollfd pfd[2] = {
+        { .fd = c->wfd.fd, .events = POLLOUT },
+        { .fd = watch ? c->cfg->event_fd : -1, .events = POLLIN },
+    };
+    int64_t left = deadline - platform_time_monotonic_ms();
+    int ready = left <= 0 && !watch ? 0 : poll(pfd, 2, watch ? -1 : (int)left);
+    if ((ready < 0 && errno != EINTR) || (ready == 0 && !watch)) {
+        c->res->output_dropped += watch ? 0u : 1u;
+        return -1;
+    }
+    if (pfd[1].revents) {
+        hub_cl_event(c);
+        return c->done ? -1 : 0;
+    }
+    return pfd[0].revents ? 1 : 0;
+}
+
+/* Screen bytes out, on a non-blocking descriptor. EAGAIN (another writer took
+ * the readiness, or the reader stopped draining) goes back to the wait, which
+ * also watches the event pipe, so a termination signal is always served. The
+ * closing newline has one absolute deadline. False when the output failed or
+ * the session ended while waiting (c->done tells which). */
 static bool hub_cl_write_out(struct hub_cl *c, const uint8_t *p, size_t n, bool watch)
 {
-    int fd = c->cfg->out_fd;
+    int64_t deadline = platform_time_monotonic_ms() + HUB_CLIENT_TAIL_MS;
     while (n) {
-        struct pollfd pfd[2] = {
-            { .fd = fd, .events = POLLOUT },
-            { .fd = watch ? c->cfg->event_fd : -1, .events = POLLIN },
-        };
-        int ready = poll(pfd, 2, watch ? -1 : HUB_CLIENT_TAIL_MS);
-        if ((ready < 0 && errno != EINTR) || (ready == 0 && !watch))
+        int st = hub_cl_wait_out(c, watch, deadline);
+        if (st < 0)
             return false;
-        if (pfd[1].revents) {
-            hub_cl_event(c);
-            if (c->done)
-                return false;
+        if (st == 0)
             continue;
-        }
-        if (!pfd[0].revents)
-            continue;
-        ssize_t w = write(fd, p, n);
+        hub_io_before_write(c->wfd.fd);
+        ssize_t w = write(c->wfd.fd, p, n);
         if (w > 0) {
             p += w;
             n -= (size_t)w;
@@ -328,6 +343,7 @@ static void hub_client_run_arm(
 {
     struct hub_cl c = { .cfg = cfg, .res = result };
     memset(result, 0, sizeof(*result));
+    hub_wfd_open(&c.wfd, cfg->out_fd);
     hub_cl_handshake(&c);
     if (!c.done)
         hub_cl_run(&c);
@@ -336,6 +352,7 @@ static void hub_client_run_arm(
     if (c.wrote && c.last_out != '\n')
         (void)hub_cl_write_out(&c, (const uint8_t *)"\r\n" + (cfg->quiet ? 1 : 0),
                                cfg->quiet ? 1u : 2u, false);
+    hub_wfd_close(&c.wfd);
 }
 
 #endif /* __linux__ */

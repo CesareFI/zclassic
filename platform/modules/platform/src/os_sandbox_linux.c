@@ -583,7 +583,7 @@ const int *os_sandbox_node_steady_denied_syscalls(size_t *count_out)
 #define SC_NR_PKEY (-1)
 #endif
 /* W^X: PROT_EXEC (args[2]) on mmap/mprotect/pkey_mprotect is killed; each block
- * reloads nr. WX_FILE_EXEC's mmap block kills only anonymous / fd -1 maps. */
+ * reloads nr. WX_FILE_EXEC's mmap block kills anonymous, fd -1, PROT_WRITE maps. */
 #define SC_ARG(n) offsetof(struct seccomp_data, args[n])
 #define SC_KILL BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS)
 #define SC_LD(off) BPF_STMT(BPF_LD | BPF_W | BPF_ABS, (off))
@@ -598,17 +598,18 @@ static void sc_emit_wx(struct sock_filter *filt, size_t *kp,
             BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, nr, 0, 4), SC_LD(SC_ARG(2)),
             BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, 0x4 /*PROT_EXEC*/, 0, 1),
             SC_KILL, SC_LD(offsetof(struct seccomp_data, nr)) };
-        const struct sock_filter fexec[10] = {
-            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, nr, 0, 8), SC_LD(SC_ARG(2)),
-            BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, 0x4 /*PROT_EXEC*/, 0, 6),
-            SC_LD(SC_ARG(3)),
+        const struct sock_filter fexec[12] = {
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, nr, 0, 10), SC_LD(SC_ARG(2)),
+            BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, 0x4 /*PROT_EXEC*/, 0, 8),
+            BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, 0x2 /*PROT_WRITE*/, 0, 1),
+            SC_KILL, SC_LD(SC_ARG(3)),
             BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, 0x20 /*MAP_ANONYMOUS*/, 0, 1),
             SC_KILL, SC_LD(SC_ARG(4)),
             BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0xffffffffu /*fd -1*/, 0, 1),
             SC_KILL, SC_LD(offsetof(struct seccomp_data, nr)) };
         bool fe = wx[i] == __NR_mmap && mode == OS_SANDBOX_WX_FILE_EXEC;
-        memcpy(filt + *kp, fe ? fexec : strict, (fe ? 10u : 5u) * sizeof *strict);
-        *kp += fe ? 10u : 5u;
+        memcpy(filt + *kp, fe ? fexec : strict, (fe ? 12u : 5u) * sizeof *strict);
+        *kp += fe ? 12u : 5u;
     }
 }
 
@@ -756,7 +757,7 @@ struct zcl_result os_sandbox_seccomp_deny_ext(
     enum { MAX_FILTER = 512 };
     size_t extra = 4u + SC_ABI_GUARD_INSNS + 1u +
                    (deny_exec_mmap ? SC_WX_INSNS : 0u) +
-                   (deny_exec_mmap == OS_SANDBOX_WX_FILE_EXEC ? 5u : 0u) +
+                   (deny_exec_mmap == OS_SANDBOX_WX_FILE_EXEC ? 7u : 0u) +
                    (clone_threads_only ? SC_CLONE_THREAD_INSNS : 0u);
     size_t cap = (MAX_FILTER - extra) / 2; /* counts are checked by subtraction: no wrap */
     if (n_denied > cap || n_enosys > cap - n_denied)
@@ -1149,7 +1150,6 @@ struct zcl_result os_sandbox_set_rlimits(const struct os_sandbox_rlimits *lim)
     ZCL_CHECK(set_one_rlimit(RLIMIT_CORE,  lim->core_bytes,  "RLIMIT_CORE"));
     return ZCL_OK;
 }
-
 
 /* ── process budget ────────────────────────────────────────────────────── */
 

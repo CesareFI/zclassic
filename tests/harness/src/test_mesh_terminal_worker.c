@@ -31,6 +31,7 @@
 #define mesh_terminal_worker_budget_exceeded tw_fixture_budget_exceeded
 #define mesh_terminal_worker_alive tw_fixture_alive
 #define mesh_terminal_worker_kill tw_fixture_kill
+#define mesh_terminal_worker_testing_order tw_fixture_order
 #endif
 
 #include "test/test_core.h"
@@ -706,6 +707,49 @@ static int live_orphan_descendant(void)
     return failures;
 }
 
+/* Live: group custody. A leader that exits by itself is NOT reaped until the
+ * group is killed: it stays a zombie holding the group id, so the kill cannot
+ * reach a recycled, unrelated group; the leader is reaped only after killpg. */
+static int live_custody_order(void)
+{
+    const char *const run[] = { "/bin/sh", "-c", "trap '' HUP; (kill -KILL $$; while :; do :; done)", NULL };
+    struct stat st;
+    if (stat(run[0], &st) != 0 || !(st.st_mode & S_IXUSR)) {
+        printf("mesh_terminal_worker: SKIP custody order (/bin/sh absent)\n");
+        return 0;
+    }
+    int failures = 0, status = 0;
+    uint32_t killpg_seq = 0, reap_seq = 0;
+    siginfo_t si = { 0 };
+    struct mesh_terminal_worker_config cfg;
+    struct mesh_terminal_worker w;
+    live_config(&cfg);
+    cfg.argv = run;
+    struct zcl_result r = mesh_terminal_worker_spawn(&cfg, (int64_t)platform_time_wall_time_t(), &w);
+    failures = check(failures, r.ok, "custody: spawn");
+    if (!r.ok)
+        return failures;
+    mesh_terminal_worker_testing_order(&killpg_seq, &reap_seq);
+    failures = check(failures, wait_exit(&w, 5) && !w.running, "custody: the leader exits by itself");
+    failures = check(failures, group_running(w.pgid) > 0, "custody: its HUP-ignoring child outlives it");
+    bool zombie = waitid(P_PID, (id_t)w.pid, &si, WEXITED | WNOHANG | WNOWAIT) == 0 && si.si_pid == w.pid;
+    failures = check(failures, zombie && w.leader_held, "custody: the exited leader is still unreaped, holding the group id");
+    mesh_terminal_worker_kill(&w);
+    mesh_terminal_worker_testing_order(&killpg_seq, &reap_seq);
+    failures = check(failures, killpg_seq != 0 && reap_seq > killpg_seq, "custody: the group is killed, then the leader is reaped");
+    failures = check(failures, !w.leader_held && waitpid(w.pid, &status, WNOHANG) == -1 && errno == ECHILD,
+                     "custody: the leader was reaped by the kill, exactly once");
+    unsigned left = group_running(w.pgid);
+    for (int i = 0; i < 100 && left; i++) {
+        usleep(20000); /* real-clock: the kernel finishes the kill asynchronously; no seam */
+        left = group_running(w.pgid);
+    }
+    failures = check(failures, left == 0, "custody: the descendant died with the group");
+    if (left)
+        (void)kill(-w.pgid, SIGKILL);
+    return failures;
+}
+
 /* Live: 2 MiB of output under the service byte budget. */
 static int live_two_mib_output(void)
 {
@@ -926,6 +970,7 @@ static int test_mesh_terminal_worker_platform_arm(void)
     failures += live_explicit_argv();
     failures += live_dynamic_argv();
     failures += live_orphan_descendant();
+    failures += live_custody_order();
     failures += live_two_mib_output();
 
     /* ── live: input byte budget ───────────────────────────────────── */

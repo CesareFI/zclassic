@@ -33,6 +33,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 #include "session/mesh_terminal_proto.h"
 
@@ -163,6 +164,11 @@ struct mesh_terminal_hub_serve_cfg {
     uint64_t idle_seconds;
     int handshake_ms;        /* 0: MESH_TERMINAL_HUB_HANDSHAKE_MS */
     int stop_fd;             /* readable = end now with SHUTDOWN; -1 none */
+    /* The supervisor's view of the worker group: set to the group id once the
+     * shell is up, zeroed after the group is killed and before its leader is
+     * reaped, so non-zero always names a group whose leader still holds the
+     * id. NULL when nobody supervises. */
+    volatile pid_t *worker_pgid;
 };
 
 struct mesh_terminal_hub_report {
@@ -211,6 +217,9 @@ int mesh_terminal_hub_listen_run(int listener,
 #if defined(ZCL_TESTING)
 /* Test seam: session children ignore SIGTERM (a wedged session). */
 void mesh_terminal_hub_testing_children_ignore_term(bool ignore);
+/* Test seam: called right before every hub write attempt (audit and client
+ * output), so a test can make another writer win the race. NULL clears. */
+void mesh_terminal_hub_testing_before_write(void (*hook)(int fd));
 #endif
 
 /* Formats the audit line for a finished session (without a trailing
@@ -238,6 +247,7 @@ struct mesh_terminal_hub_client_result {
     int exit_code;        /* the process exit code */
     char code[24];        /* typed code for the one error line, "" if none */
     char message[160];    /* human line, "" if none */
+    unsigned output_dropped; /* closing newline dropped at its deadline (a wedged reader) */
 };
 
 /* Drives one session to its end. Exit code: the remote shell's own (or

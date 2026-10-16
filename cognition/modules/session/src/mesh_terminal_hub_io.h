@@ -25,6 +25,28 @@ enum hub_wait { HUB_WAIT_FRAME, HUB_WAIT_TIMEOUT, HUB_WAIT_CLOSED, HUB_WAIT_BAD 
  * or a send timeout. Never raises SIGPIPE. */
 bool hub_io_send(int fd, const uint8_t *frame, size_t total);
 
+/* A write end that cannot block: O_NONBLOCK is set on the descriptor (shared
+ * with whoever else holds it) and its flags put back at close. Opened once by
+ * the single owner of the descriptor (the supervisor for the audit sink, the
+ * client for the screen), never per concurrent child, so no holder restores
+ * the flag under another. Regular files and already non-blocking descriptors
+ * are left alone. */
+struct hub_wfd {
+    int fd;
+    int restore;   /* flags to put back, -1 none */
+};
+void hub_wfd_open(struct hub_wfd *w, int fd);
+void hub_wfd_close(struct hub_wfd *w);
+
+/* Called right before each write attempt; a no-op outside ZCL_TESTING, where
+ * a test can put another writer exactly between "ready" and "write". */
+void hub_io_before_write(int fd);
+
+/* All n bytes written, or false at the absolute monotonic deadline (or a
+ * hard error). Loops write / EAGAIN / poll, so another writer consuming the
+ * readiness can never leave it blocked past the deadline. */
+bool hub_wfd_write(const struct hub_wfd *w, const void *buf, size_t n, int64_t deadline_ms);
+
 /* Copies payload behind a header into a small stack frame and sends it. For
  * control frames only: the hot paths seal a frame in place instead. */
 bool hub_io_send_frame(int fd, uint8_t type, const uint8_t *payload, size_t len);

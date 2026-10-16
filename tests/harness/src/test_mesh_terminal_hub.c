@@ -43,6 +43,8 @@
 
 #define FBSH_BIN "build/bin/fbsh"
 
+int test_mesh_terminal_hub_bounds(const char *fbsh, const char *dir);
+
 static char g_dir[160];
 static char g_fbsh[600];
 
@@ -858,7 +860,7 @@ static int listener_cases(void)
     test_key(key, 11); test_key(wrong, 12);
 
     /* Admission and the cap: one slot, the right key, a second client. */
-    bool up = lsn_start(&l, 1, 3, 11);
+    bool up = lsn_start(&l, 1, 64, 11); /* busy refusals and retries count toward the cap */
     failures = check(failures, up && l.port != 0, "listener binds 127.0.0.1 on an ephemeral port");
     int a = up ? tcp_connect(l.port) : -1;
     failures = check(failures, a >= 0 && drv_handshake(a, key, "lead", 80, 24, NULL) == MESH_TERMINAL_HUB_READY,
@@ -882,9 +884,7 @@ static int listener_cases(void)
         drv_until(e, NULL, &ex, 8000, seen, sizeof seen);
         close(e);
     }
-    int st = 0;
-    failures = check(failures, waitpid(l.pid, &st, 0) == l.pid && WIFEXITED(st) && WEXITSTATUS(st) == 0,
-                     "supervisor stops by itself after max_sessions and reaps every child");
+    failures = check(failures, lsn_stop(&l), "supervisor stops on SIGTERM and reaps every child");
     file_read(l.audit, audit, sizeof audit);
     return failures + audit_checks(audit);
 }
@@ -1483,6 +1483,7 @@ int test_mesh_terminal_hub(void)
         failures += listener_cases();
         failures += latency_case();
         failures += bound_cases();
+        failures += test_mesh_terminal_hub_bounds(g_fbsh, g_dir);
     }
     printf("mesh terminal hub: %d failures\n", failures);
     return failures;
