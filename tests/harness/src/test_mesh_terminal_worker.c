@@ -1272,7 +1272,7 @@ static int test_mesh_terminal_worker_platform_arm(void)
 
     if (!fbsh) {
         printf("mesh_terminal_worker: " FBSH_BIN
-               " not built — SKIP the live cases (run `make fbsh`)\n");
+               " not built — SKIP (live cases need `make fbsh`)\n");
         printf("mesh_terminal_worker: %d failures\n", failures);
         return failures;
     }
