@@ -16,11 +16,16 @@
 #include "lintc_proc.h"
 #include "lintc_sig.h"
 
-enum { CGS_CASES = 7, CGS_FILLER = 500 };
+enum { CGS_CASES = 12, CGS_FILLER = 500 };
 
 static const char k_fx0[] = "build/dev-obj/epochs/fx0";
 
 static const char k_use[] = "extern int connect(int, int, int);\nint use_it(void) { return connect(1, 2, 3); }\n";
+
+static const char k_arm[] = "platform/modules/platform/src/os_sandbox_linux.c";
+
+static const char k_plain[] = "static int local_only(int x) { return x + 1; }\n"
+                              "int platform_export(int x) { return local_only(x); }\n";
 
 struct cgs_res { char *text; int rc; };
 
@@ -186,6 +191,21 @@ static int cgs_case_a(const struct ccs_fx *fx)
     return cgs_check(fx, "a", &cfg, -1, need, "A: undeclared strong-undefined reach to a classified symbol");
 }
 
+/* B. a row granting a class the object never uses. */
+static int cgs_case_b(const struct ccs_fx *fx)
+{
+    struct ccg_cfg cfg;
+    char row[CCD_PATH];
+    const char *const need[] = { "overdeclared", NULL };
+    cgs_cfg(&cfg);
+    if (cgs_base(fx, "b", cgs_row(row, sizeof row, "fixture_src/overdeclared_user.c", "CAP_NETWORK")) != 0
+        || cgs_unit(fx, "b", "fixture_src/overdeclared_user.c",
+                    "static int nothing_dangerous(int x) { return x * 2; }\n"
+                    "int overdeclared_export(int x) { return nothing_dangerous(x); }\n", NULL) != 0)
+        return ccs_say(0, "B: fixture");
+    return cgs_check(fx, "b", &cfg, -1, need, "B: declared CAP_NETWORK never used by the object");
+}
+
 /* D. a correct fixture passes; restart-base.o, a relocatable aggregate of the
  * same objects, carries an unclassified edge and must stay unscanned. */
 static int cgs_case_d(const struct ccs_fx *fx)
@@ -248,6 +268,56 @@ static int cgs_case_f(const struct ccs_fx *fx)
                      "F: a partial epoch missing a declared file (above the coverage baseline) is UNPROVEN, exit 2, never 0 or 1");
 }
 
+/* G. a baseline above the true unobserved count is a violation, so the ratchet
+ * cannot rust shut at a stale number. */
+static int cgs_case_g(const struct ccs_fx *fx)
+{
+    struct ccg_cfg cfg;
+    char row[CCD_PATH];
+    const char *const need[] = { "coverage baseline is stale", NULL };
+    cgs_cfg(&cfg);
+    cfg.baseline = 1;
+    if (cgs_base(fx, "g", cgs_row(row, sizeof row, "fixture_src/declared_user_g.c", "CAP_NETWORK")) != 0
+        || cgs_unit(fx, "g", "fixture_src/declared_user_g.c", k_use, NULL) != 0)
+        return ccs_say(0, "G: fixture");
+    return cgs_check(fx, "g", &cfg, 1, need,
+                     "G: a coverage baseline held above the true (improved) unobserved count is a VIOLATION, exit 1, not silently tolerated");
+}
+
+/* J. a Windows exact override replaces the portable row, CAP_NONE included, and
+ * the platform skips apply to the named Linux arm only. */
+static int cgs_case_j(const struct ccs_fx *fx)
+{
+    struct ccg_cfg cfg;
+    char rows[2 * CCD_PATH], one[CCD_PATH];
+    cgs_cfg(&cfg);
+    cfg.os = CCD_WINDOWS;
+    snprintf(rows, sizeof rows, "%s", cgs_row(one, sizeof one, "fixture_src/platform_user.c", "CAP_NETWORK"));
+    strncat(rows, cgs_row(one, sizeof one, k_arm, "CAP_NETWORK"), sizeof rows - strlen(rows) - 1);
+    if (cgs_base(fx, "j", rows) != 0 || cgs_unit(fx, "j", "fixture_src/platform_user.c", k_plain, NULL) != 0
+        || ccs_put(fx, "j/platform/modules/platform/src/os_sandbox_linux.c", "int linux_only_fixture(void) { return 1; }\n") != 0
+        || ccs_put(fx, "j/engine/composition/module_capabilities_windows.def",
+                   cgs_row(one, sizeof one, "fixture_src/platform_user.c", "CAP_NONE")) != 0)
+        return ccs_say(0, "J: fixture");
+    return cgs_check(fx, "j", &cfg, 0, NULL,
+                     "J: Windows exact CAP_NONE override replaces portable reach and skips only the named Linux arm");
+}
+
+/* K. a Linux exact override has the same replacement semantics. */
+static int cgs_case_k(const struct ccs_fx *fx)
+{
+    struct ccg_cfg cfg;
+    char row[CCD_PATH];
+    cgs_cfg(&cfg);
+    cfg.os = CCD_LINUX;
+    if (cgs_base(fx, "k", cgs_row(row, sizeof row, "fixture_src/platform_user.c", "CAP_NETWORK")) != 0
+        || cgs_unit(fx, "k", "fixture_src/platform_user.c", k_plain, NULL) != 0
+        || ccs_put(fx, "k/engine/composition/module_capabilities_linux.def",
+                   cgs_row(row, sizeof row, "fixture_src/platform_user.c", "CAP_NONE")) != 0)
+        return ccs_say(0, "K: fixture");
+    return cgs_check(fx, "k", &cfg, 0, NULL, "K: Linux exact CAP_NONE override replaces portable cross-target reach");
+}
+
 /* M. a valid object with no symbols is still compiled evidence: nm prints no
  * row for it, so coverage must come from the frozen object list. */
 static int cgs_case_m(const struct ccs_fx *fx)
@@ -260,6 +330,18 @@ static int cgs_case_m(const struct ccs_fx *fx)
         || cgs_unit(fx, "m", "fixture_src/empty_user.c", "typedef int empty_user_not_on_this_platform;\n", NULL) != 0)
         return ccs_say(0, "M: fixture");
     return cgs_check(fx, "m", &cfg, 0, NULL, "M: a symbol-free object is present coverage evidence");
+}
+
+/* Q. the raw syscall ban reports a source that has no object in this epoch. */
+static int cgs_case_q(const struct ccs_fx *fx)
+{
+    struct ccg_cfg cfg;
+    const char *const need[] = { "raw syscall", NULL };
+    cgs_cfg(&cfg);
+    if (cgs_base(fx, "q", "") != 0
+        || ccs_put(fx, "q/fixture_src/raw_user.c", "extern long syscall(long, ...);\nlong raw_use(void) { return syscall(0); }\n") != 0)
+        return ccs_say(0, "Q: fixture");
+    return cgs_check(fx, "q", &cfg, -1, need, "Q: raw syscall in an uncompiled source still refuses");
 }
 
 /* R. the leftover object of a failed candidate has no source in this tree: it is
@@ -277,8 +359,8 @@ static int cgs_case_r(const struct ccs_fx *fx)
 
 static int cgs_cases(const struct ccs_fx *fx)
 {
-    return cgs_case_a(fx) + cgs_case_c(fx) + cgs_case_d(fx) + cgs_case_e(fx) + cgs_case_f(fx) + cgs_case_m(fx) +
-           cgs_case_r(fx);
+    return cgs_case_a(fx) + cgs_case_b(fx) + cgs_case_c(fx) + cgs_case_d(fx) + cgs_case_e(fx) + cgs_case_f(fx) +
+           cgs_case_g(fx) + cgs_case_j(fx) + cgs_case_k(fx) + cgs_case_m(fx) + cgs_case_q(fx) + cgs_case_r(fx);
 }
 
 int check_capability_closure_selftest(void)

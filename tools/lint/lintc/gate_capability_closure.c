@@ -1,23 +1,27 @@
 /* Copyright 2026 Rhett Creighton - Apache License 2.0
  *
- * purpose: the capability-closure gate in C23, closure and declaration stage. Every
- * undefined symbol in the newest build epoch must be classified and every object
- * that reaches a classified capability must be declared to; a scan below the object
- * floor or missing declared files is UNPROVEN. Symmetry, the syscall ban and the
- * compiled-out honesty follow in the next steps. Output strings and exit statuses
- * (0 clean, 1 violations, 2 unproven) are those of the shell gate this replaces.
+ * purpose: the capability-closure gate in C23. Every undefined symbol in the newest
+ * build epoch must be classified; every object that reaches a classified capability
+ * must be declared to; a declared capability must be used; a scan below the object
+ * floor or missing declared files is UNPROVEN; a raw syscall or inline-asm trap in a
+ * file without CAP_PRIVILEGE is banned. The compiled-out honesty follows. Output
+ * strings and exit statuses (0 clean, 1 violations, 2 unproven) are those of the
+ * shell gate this replaced.
  */
 #define _POSIX_C_SOURCE 200809L
 #include <dirent.h>
+#include <regex.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <sys/utsname.h>
 #include "base/safe_alloc.h"
 #include "gate_capability_closure_priv.h"
 #include "lintc.h"
+#include "lintc_proc.h"
 #include "lintc_sig.h"
 
 #define CCG_DASH "\xe2\x80\x94"
@@ -436,6 +440,137 @@ static void ccg_declaration(struct ccg_scan *s)
     }
 }
 
+static void ccg_overdeclared(struct ccg_scan *s, const char *path, const char *tok)
+{
+    ccg_say(s, "check_capability_closure: VIOLATION " CCG_DASH " %s declares %s but its\n"
+               "  compiled object does not reference any symbol classified %s.\n"
+               "  Shrink the row: ZCL_MODULE_CAPABILITY(\"%s\", <without %s>, why)\n", path, tok, tok, path, tok);
+    s->c.overdeclared++;
+}
+
+/* Item 3a for one granted class of a compiled source. */
+static void ccg_symmetry_class(struct ccg_scan *s, const char *path, const char *tok)
+{
+    char key[2 * CCD_PATH];
+    if (strcmp(tok, "CAP_NONE") == 0 || snprintf(key, sizeof key, "%s\t%s", path, tok) >= (int)sizeof key
+        || ccd_map_get(&s->used, key))
+        return;
+    if (!s->cfg->symmetry)
+        s->c.platform_unobserved++;
+    else
+        ccg_overdeclared(s, path, tok);
+}
+
+/* Items 3a and 3b: a granted class must be used, and a row's source must
+ * exist. A source with no object here is unobserved, not unused. */
+static void ccg_symmetry(struct ccg_scan *s)
+{
+    for (size_t i = 0; i < s->mods.raw.n; i++) {
+        const char *path = s->mods.raw.ent[i].key;
+        char *raw = zcl_strdup(s->mods.raw.ent[i].val, "ccg_symmetry raw"), *save = NULL;
+        if (!ccg_is_file(s->root, path)) {
+            ccg_say(s, "check_capability_closure: VIOLATION " CCG_DASH " module_capabilities.def row\n"
+                       "  names '%s', which does not exist in this tree.\n", path);
+            s->c.missing++;
+        } else if (ccd_map_get(&s->compiled, path)) {
+            for (char *tok = raw ? strtok_r(raw, "|", &save) : NULL; tok; tok = strtok_r(NULL, "|", &save))
+                ccg_symmetry_class(s, path, tok);
+        }
+        free(raw);
+    }
+}
+
+/* Coverage floor, other half: a baseline above the true count is a ratchet
+ * that can only rust. */
+static void ccg_stale_baseline(struct ccg_scan *s)
+{
+    if (s->c.unobserved >= s->cfg->baseline)
+        return;
+    ccg_say(s, "check_capability_closure: VIOLATION " CCG_DASH " coverage baseline is stale:\n"
+               "  only %d module_capabilities.def row(s) are unobserved in\n"
+               "  %s, below CAP_CLOSURE_COVERAGE_BASELINE=%ld\n"
+               "  recorded in tools/lint/check_capability_closure.sh. Coverage\n"
+               "  improved without lowering the baseline " CCG_DASH " that is what keeps this a\n"
+               "  shrink-only ratchet instead of a number that only ever grows.\n"
+               "  Lower CAP_CLOSURE_COVERAGE_BASELINE to %d (with the reason)\n"
+               "  in the same commit.\n", s->c.unobserved, s->epoch, s->cfg->baseline, s->c.unobserved);
+    s->c.stale = 1;
+}
+
+/* A hand-rolled syscall leaves no symbol for nm to see: the word-bounded call
+ * (no space before the paren, so prose is not a hit), the x86 and ARM traps,
+ * and the bare mnemonic inside an asm string. */
+static const char k_ccg_raw[] = "(^|[^A-Za-z0-9_])syscall\\(|int[[:space:]]+\\$0x80|svc[[:space:]]+#"
+                                "|\"[[:space:]]*syscall[[:space:]\\\\]";
+
+static void ccg_ban_file(struct ccg_scan *s, const regex_t *re, const char *rel)
+{
+    char path[CCD_PATH], *line = NULL;
+    size_t cap = 0, no = 0;
+    ssize_t n;
+    int hit = 0;
+    FILE *f;
+    if (snprintf(path, sizeof path, "%s/%s", s->root, rel) >= (int)sizeof path || !(f = fopen(path, "r")))
+        return;
+    while ((n = getline(&line, &cap, f)) >= 0) {
+        no++;
+        if (n > 0 && line[n - 1] == '\n')
+            line[n - 1] = '\0';
+        if (regexec(re, line, 0, NULL, 0) != 0)
+            continue;
+        if (!hit++)
+            ccg_say(s, "check_capability_closure: VIOLATION " CCG_DASH " %s reaches the kernel through a\n"
+                       "  raw syscall or inline-asm trap with no CAP_PRIVILEGE declaration:\n", rel);
+        ccg_say(s, "    %zu:%s\n", no, line);
+    }
+    free(line);
+    fclose(f);
+    s->c.syscall += hit != 0;
+}
+
+/* Tracked C sources outside vendor/; a tree without a usable index is walked.
+ * 1 when a termination signal arrived, -1 when out of memory. */
+static int ccg_sources(const struct ccg_scan *s, struct ccg_list *out)
+{
+    char *argv[] = { (char *)"git", (char *)"-C", (char *)s->root, (char *)"ls-files", (char *)"-z",
+                     (char *)"*.c", (char *)"--", (char *)":!:vendor/*", NULL };
+    struct lcp_spec sp = { argv, NULL, NULL, LCP_OUT, CCD_GRACE_MS };
+    struct lcp_buf buf = { 0 };
+    struct ccd_map walked = { 0 };
+    int code = 1, rc = lcp_run(&sp, &buf, &code);
+    for (size_t at = 0; rc == 0 && code == 0 && at < buf.len; at += strlen(buf.data + at) + 1)
+        rc = ccg_list_add(out, buf.data + at);
+    lcp_buf_free(&buf);
+    if (rc > 0)
+        return 1;
+    if (rc == 0 && out->n == 0)
+        rc = ccg_walk(s->root, "", ".c", &walked);
+    for (size_t i = 0; rc == 0 && i < walked.n; i++) {
+        const char *k = walked.ent[i].key;
+        if (strncmp(k, "build/", 6) && strncmp(k, "vendor/", 7) && strncmp(k, ".git/", 5))
+            rc = ccg_list_add(out, k);
+    }
+    ccd_map_free(&walked);
+    return rc < 0 ? -1 : 0;
+}
+
+/* Item 5: files that declared CAP_PRIVILEGE on any target have told a reviewer
+ * to look; every other tracked source is scanned. */
+static int ccg_syscall_ban(struct ccg_scan *s)
+{
+    struct ccg_list src = { 0 };
+    regex_t re;
+    int rc = regcomp(&re, k_ccg_raw, REG_EXTENDED | REG_NOSUB) ? -1 : ccg_sources(s, &src);
+    for (size_t i = 0; rc == 0 && i < src.n; i++) {
+        const char *uni = ccd_map_get(&s->mods.uni, src.s[i]);
+        if (!uni || !ccd_grants(uni, "CAP_PRIVILEGE"))
+            ccg_ban_file(s, &re, src.s[i]);
+    }
+    regfree(&re);
+    ccg_list_free(&src);
+    return rc;
+}
+
 static void ccg_summary(const struct ccg_scan *s)
 {
     const struct ccg_counts *c = &s->c;
@@ -472,7 +607,9 @@ static int ccg_grade(struct ccg_scan *s)
     if (ccg_uses(s) != 0)
         return 2;
     ccg_declaration(s);
-    return 0;
+    ccg_symmetry(s);
+    ccg_stale_baseline(s);
+    return ccg_syscall_ban(s) == 0 ? 0 : 2;
 }
 
 int ccg_check_root(const struct ccg_cfg *cfg, const char *root)
