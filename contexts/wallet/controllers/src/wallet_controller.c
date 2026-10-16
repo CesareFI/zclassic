@@ -143,6 +143,7 @@ static bool rpc_getwalletinfo(const struct json_value *params, bool help,
     json_push_kv_bool(&persistence, "healthy",
                        h.open && h.canary_ok && h.row_count >= 0 &&
                        !h.mismatch && h.corrupt_rows == 0);
+    json_push_kv_bool(&persistence, "locked",            h.locked);
     json_push_kv_bool(&persistence, "open",              h.open);
     json_push_kv_bool(&persistence, "canary_ok",         h.canary_ok);
     json_push_kv_int (&persistence, "canary_last_ok_ts", h.canary_last_ok_ts);

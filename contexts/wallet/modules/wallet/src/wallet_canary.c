@@ -4,6 +4,7 @@
 
 #include "platform/time_compat.h"
 #include "wallet/wallet_canary.h"
+#include "wallet/wallet_lock.h"
 #include "wallet/wallet_sqlite.h"
 
 #include "core/random.h"
@@ -154,6 +155,8 @@ wallet_persistence_get_health(sqlite3 *db, int keystore_count)
         .row_count      = -1,
         .keystore_count = keystore_count,
         .mismatch       = false,
+        .locked         = wallet_lock_encrypted_at_rest() &&
+                          !wallet_lock_is_unlocked(),
         .corrupt_rows   = wallet_sqlite_read_keys_corrupt_count(),
         .last_error     = { 0 },
     };
@@ -184,7 +187,7 @@ wallet_persistence_get_health(sqlite3 *db, int keystore_count)
     rc = AR_STEP_ROW_READONLY(st);
     if (rc == SQLITE_ROW) {
         h.row_count = sqlite3_column_int(st, 0);
-        if (h.row_count != keystore_count) {
+        if (!h.locked && h.row_count != keystore_count) {
             h.mismatch = true;
             if (h.last_error[0] == '\0') {
                 snprintf(h.last_error, sizeof(h.last_error),

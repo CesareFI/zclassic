@@ -391,9 +391,25 @@ static bool cr_match_wiki_chunk_ints(const char *path, const char *key,
     return true;
 }
 
+/* core.wallet.security.unlock `timeout_seconds` is an integer 1..3600, the
+ * same range wallet_lock_arm_timeout and the walletunlock RPC enforce. It is
+ * leaf-scoped because zcode.node.verify takes a much larger timeout. */
+static bool cr_match_wallet_unlock(const char *path, const char *key,
+                                   const struct json_value *value,
+                                   bool *type_ok)
+{
+    if (strcmp(path, "core.wallet.security.unlock") != 0 ||
+        strcmp(key, "timeout_seconds") != 0)
+        return false;
+    *type_ok = cr_int_range(value, 1, 3600);
+    return true;
+}
+
 static bool cr_match_leaf_ints(const char *path, const char *key,
                                const struct json_value *value, bool *type_ok)
 {
+    if (cr_match_wallet_unlock(path, key, value, type_ok))
+        return true;
     if (cr_match_wiki_chunk_ints(path, key, value, type_ok))
         return true;
     if (cr_match_vanity_ints(path, key, value, type_ok))

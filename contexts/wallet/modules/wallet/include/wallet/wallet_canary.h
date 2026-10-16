@@ -68,7 +68,8 @@ struct wallet_persistence_health {
     int64_t canary_last_ok_ts;   /* unix time of last passing canary */
     int     row_count;           /* SELECT count(*) FROM wallet_keys */
     int     keystore_count;      /* caller-supplied in-memory count */
-    bool    mismatch;            /* row_count != keystore_count */
+    bool    mismatch;            /* row_count != keystore_count (never set while locked) */
+    bool    locked;              /* encrypted wallet is locked: keys not resident, count not compared */
     int     corrupt_rows;        /* rows dropped by read_keys since boot */
     char    last_error[256];     /* most recent canary error, empty if healthy */
 };
@@ -97,7 +98,11 @@ struct wallet_canary_status wallet_canary_get_status(void);
  *
  * Queries SELECT count(*) FROM wallet_keys for row_count. On any
  * sqlite error populates last_error, leaves row_count = -1, and
- * sets mismatch = false (we can't meaningfully compare). */
+ * sets mismatch = false (we can't meaningfully compare).
+ *
+ * A locked encrypted wallet has no resident keys, so keystore_count is 0 by
+ * design: locked is set and the row/keystore comparison is skipped (mismatch
+ * stays false). The comparison still runs, and fails, once unlocked. */
 struct wallet_persistence_health
 wallet_persistence_get_health(sqlite3 *db, int keystore_count);
 

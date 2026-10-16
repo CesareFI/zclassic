@@ -13,6 +13,7 @@
 #include "models/database.h"
 
 #include "wallet/wallet_canary.h"
+#include "wallet/wallet_lock.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -197,6 +198,23 @@ static int t_health_snapshot(void)
            h.mismatch);
     WC_RUN("health: mismatch populates last_error",
            h.last_error[0] != '\0');
+
+    /* A locked encrypted wallet has no resident keys (keystore_count 0) while
+     * its rows are intact: that is "locked, not compared", never a mismatch.
+     * Once unlocked the same disagreement must fail again. */
+    wallet_lock_reset_for_test();
+    wallet_lock_note_encrypted_at_rest();
+    h = wallet_persistence_get_health(f.ndb.db, 0);
+    WC_RUN("health: locked encrypted wallet reports locked",
+           h.locked && h.row_count == 3);
+    WC_RUN("health: locked encrypted wallet is not a mismatch",
+           !h.mismatch && h.last_error[0] == '\0');
+    WC_RUN("health: unlock of register-only passphrase succeeds",
+           wallet_lock_unlock(NULL, NULL, "wallet-canary-test").ok);
+    h = wallet_persistence_get_health(f.ndb.db, 0);
+    WC_RUN("health: unlocked encrypted wallet still fails a real mismatch",
+           !h.locked && h.mismatch && h.last_error[0] != '\0');
+    wallet_lock_reset_for_test();
 
     /* An unreadable row count is UNKNOWN, never an apparent match. This is
      * the production spend gate's fail-closed persistence authority. */

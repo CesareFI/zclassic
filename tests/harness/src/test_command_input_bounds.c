@@ -854,6 +854,33 @@ static int t_moved_ttl_bounds(void)
     return failures;
 }
 
+/* core.wallet.security.unlock `timeout_seconds` is the integer the handler
+ * reads (default 300) and wallet_lock_arm_timeout bounds to 1..3600. Before
+ * the leaf rule it fell to the string default and every numeric timeout was
+ * refused at normalize on a locked wallet. */
+static int t_wallet_unlock_timeout(void)
+{
+    int failures = 0;
+    char why[192];
+    const char *path = "core.wallet.security.unlock";
+
+    CIB_CHECK("wallet unlock admits timeout_seconds=60",
+              cib_accepts_int(path, "timeout_seconds", 60));
+    CIB_CHECK("wallet unlock admits timeout_seconds=1",
+              cib_accepts_int(path, "timeout_seconds", 1));
+    CIB_CHECK("wallet unlock admits timeout_seconds=3600",
+              cib_accepts_int(path, "timeout_seconds", 3600));
+    CIB_CHECK("wallet unlock refuses timeout_seconds=0",
+              !cib_accepts_int_why(path, "timeout_seconds", 0, why,
+                                   sizeof(why)) &&
+              cib_type_refusal(why, "timeout_seconds"));
+    CIB_CHECK("wallet unlock refuses timeout_seconds=3601",
+              !cib_accepts_int_why(path, "timeout_seconds", 3601, why,
+                                   sizeof(why)) &&
+              cib_type_refusal(why, "timeout_seconds"));
+    return failures;
+}
+
 /* cr_match_chunks_and_lines, first key: a PAID chunk count starts at one —
  * zero paid chunks is not a purchase — and stops at the 32-bit chunk index
  * space. Both edges, both sides. */
@@ -1283,6 +1310,7 @@ int test_command_input_bounds(void)
     failures += t_fleet_usage_days();
     failures += t_moved_dual_shape_since();
     failures += t_moved_ttl_bounds();
+    failures += t_wallet_unlock_timeout();
     failures += t_moved_chunks_paid_bounds();
     failures += t_moved_chunk_start_bounds();
     failures += t_moved_line_bounds();
