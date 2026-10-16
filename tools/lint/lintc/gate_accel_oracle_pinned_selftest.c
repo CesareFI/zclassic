@@ -250,20 +250,6 @@ static int aops_expect(const char *name, int want_rc, const char *needle)
     return 0;
 }
 
-/* A symlink to /proc/self/mem opens, then every read
- * fails with EIO. Returns 0 when this host really behaves so, else 1. */
-static int aops_mem_probe(void)
-{
-    FILE *f = fopen("/proc/self/mem", "r");
-    int broke;
-    if (!f)
-        return 1;
-    (void)fgetc(f);
-    broke = ferror(f) != 0;
-    fclose(f);
-    return broke ? 0 : 1;
-}
-
 /* Swaps the file at path for an empty directory (opens, then read fails). */
 static int aops_swap_dir(const char *path)
 {
@@ -273,6 +259,34 @@ static int aops_swap_dir(const char *path)
 static int aops_restore_dir(const char *path)
 {
     return rmdir(path) != 0 ? -1 : aops_put_base(path);
+}
+
+/* A private header that the sha.c scan list picks up (core/ seed reads only
+ * see tracked files), built untracked: a directory is FATAL by name, and an
+ * unreadable regular file reaches the same FATAL read-failure line. */
+static int aops_header_cases(void)
+{
+    int bad = 0;
+    if (csr_write(AOPS_SHA, k_aops_sha_late) != 0 || mkdir(AOPS_LATE, 0755) != 0)
+        return aops_fail("header that is a directory", "cannot build the fixture");
+    bad |= aops_expect("a scanned header that is a directory", 2,
+                       AOPS_LATE " exists but is not a regular file");
+    if (rmdir(AOPS_LATE) != 0)
+        return aops_fail("header that is a directory", "cannot restore the fixture");
+    if (geteuid() != 0) {
+        if (csr_write(AOPS_LATE, "int late;\n") != 0 || chmod(AOPS_LATE, 0) != 0)
+            return aops_fail("unreadable header", "cannot build the fixture");
+        bad |= aops_expect("an unreadable scanned header (chmod 000)", 2,
+                           "FATAL — grep failed (exit 2) for: " AOPS_LATE);
+        if (unlink(AOPS_LATE) != 0)
+            return aops_fail("unreadable header", "cannot remove the fixture");
+    } else {
+        fprintf(stderr, "check_accel_oracle_pinned: SKIP unreadable header "
+                "case: running as root, chmod 000 does not deny the read\n");
+    }
+    if (aops_put_base(AOPS_SHA) != 0)
+        return aops_fail("scanned header cases", "cannot restore the fixture");
+    return bad;
 }
 
 /* Unreadable-file cases that a text mutation cannot express. Every case
@@ -298,21 +312,7 @@ static int aops_fs_cases(void)
                        "tests/sha_oracle.c: Is a directory");
     if (aops_restore_dir(orc) != 0)
         return aops_fail("oracle that fails to read", "cannot restore the fixture");
-    if (aops_mem_probe() != 0) {
-        fprintf(stderr, "check_accel_oracle_pinned: SKIP ISA read-error case: "
-                "/proc/self/mem does not fail reads on this host\n");
-        return bad;
-    }
-    /* An untracked private header the sha.c scan list picks up (core/ seed
-     * reads only see tracked files): it opens, then every read fails. */
-    if (csr_write(AOPS_SHA, k_aops_sha_late) != 0
-        || symlink("/proc/self/mem", AOPS_LATE) != 0)
-        return aops_fail("header that fails to read", "cannot build the fixture");
-    bad |= aops_expect("a scanned header that opens but fails to read", 2,
-                       "FATAL — grep failed (exit 2) for: " AOPS_LATE);
-    if (unlink(AOPS_LATE) != 0 || aops_put_base(AOPS_SHA) != 0)
-        return aops_fail("header that fails to read", "cannot restore the fixture");
-    return bad;
+    return bad | aops_header_cases();
 }
 
 static int aops_cases(void)
@@ -365,6 +365,6 @@ int check_accel_oracle_pinned_selftest(void)
              "malformed row, stale row, missing marker, unregistered group, "
              "unwired oracle, static-only oracle, unreached row, row without ISA dispatch, "
              "missing oracle file, hw_profile.c skip, ordered diagnostics, collapsed floors, "
-             "missing registry, unreadable oracle, read-failing oracle, read-failing ISA file)");
+             "missing registry, unreadable oracle, read-failing oracle, non-regular ISA include, unreadable ISA include)");
     return rc;
 }

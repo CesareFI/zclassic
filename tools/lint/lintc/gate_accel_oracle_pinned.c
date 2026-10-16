@@ -452,6 +452,27 @@ static int aop_files_isa(struct aop_ctx *c, const struct aop_vec *files, int *hi
     return 0;
 }
 
+/* 1 for a regular file to scan, 0 for an include that does not exist (an
+ * include outside the tree is not ours to scan), 2 FATAL for any other stat
+ * failure or an existing path that is not a regular file. */
+static int aop_include_kind(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        if (errno == ENOENT)
+            return 0;
+        fprintf(stderr, AOP_GATE ": FATAL — cannot stat scanned include %s: %s\n",
+                path, strerror(errno));
+        return 2;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        fprintf(stderr, AOP_GATE ": FATAL — scanned include %s exists but is "
+                "not a regular file\n", path);
+        return 2;
+    }
+    return 1;
+}
+
 /* The file plus the private same-directory headers it includes as "name.h". */
 static int aop_scan_list(struct aop_ctx *c, const char *f, struct aop_vec *scan)
 {
@@ -469,8 +490,10 @@ static int aop_scan_list(struct aop_ctx *c, const char *f, struct aop_vec *scan)
     for (size_t i = 0; rc == 0 && i < incs.n; i++) {
         if (ovf(snprintf(path, sizeof path, "%s/%s", dir, incs.v[i]), sizeof path))
             rc = 2;
-        else if (aop_is_file(path))
+        else if ((rc = aop_include_kind(path)) == 1)
             rc = aop_vec_push(scan, path);
+        else if (rc == 0)
+            continue;
     }
     aop_vec_free(&incs);
     return rc;
