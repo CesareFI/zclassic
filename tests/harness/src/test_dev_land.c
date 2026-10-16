@@ -10729,7 +10729,7 @@ static int dlx_hold_lock_case(void)
 {
     int failures = 0;
     int lock = -1;
-    TEST("land: hold and release serialize against the native step slot") {
+    TEST("land: hold and release do not need the native step slot") {
         struct dlx_rig rig;
         struct dlx_call c;
         char land[1200], before[16384], after[16384];
@@ -10744,19 +10744,120 @@ static int dlx_hold_lock_case(void)
         dlx_landdir(land, sizeof(land));
         lock = dlx_step_lock_take(land);
         ASSERT(lock >= 0);
+        /* Deliberate contract change: a hold is admissible while a step
+         * holds step.lock. The slot is never reported busy, and the
+         * release round trip restores the untouched row byte for byte. */
         const char *actions[] = {"hold", "release"};
         for (size_t i = 0; i < 2; i++) {
             dlx_begin(&c, actions[i]);
             (void)json_push_kv_int(&c.input, "seq", 1);
-            ASSERT(dlx_run(&c) && !dlx_ok(&c));
-            ASSERT_STR_EQ(c.reply.error.code, "STEP_BUSY"); dlx_end(&c);
-            ASSERT(dlx_queue_bytes(after, sizeof(after), &second));
-            ASSERT(first == second && memcmp(before, after, first) == 0);
+            ASSERT(dlx_run(&c) && dlx_ok(&c)); dlx_end(&c);
         }
+        ASSERT(dlx_queue_bytes(after, sizeof(after), &second));
+        ASSERT(first == second && memcmp(before, after, first) == 0);
         PASS();
     }
 _test_next:
     if (lock >= 0) { (void)flock(lock, LOCK_UN); (void)close(lock); }
+    dlx_restore();
+    return failures;
+}
+
+static bool dlx_row_hold_is(bool held)
+{
+    return dlx_priority_is(held ? "\"publication_hold\":true"
+                                : "\"publication_hold\":false");
+}
+
+static int dlx_hold_admissible_during_step(void)
+{
+    int failures = 0;
+    int lock = -1;
+    TEST("land: a hold is admissible while step.lock is held and release clears it") {
+        struct dlx_rig rig;
+        struct dlx_call c;
+        char land[1200];
+        dlx_isolate("hold_during_step");
+        ASSERT(dlx_rig_make(&rig, "hold_during_step_rig"));
+        setenv("ZCL_LAND_PROOF_STUB", "running", 1);
+        setenv("ZCL_LAND_ALLOW_UNSIGNED", "1", 1);
+        dlx_submit(&c, &rig, rig.tip);
+        ASSERT(dlx_run(&c) && dlx_ok(&c)); dlx_end(&c);
+        dlx_landdir(land, sizeof(land));
+        lock = dlx_step_lock_take(land);
+        ASSERT(lock >= 0);
+        dlx_begin(&c, "hold");
+        (void)json_push_kv_int(&c.input, "seq", 1);
+        ASSERT(dlx_run(&c) && dlx_ok(&c)); dlx_end(&c);
+        ASSERT(dlx_row_hold_is(true));
+        dlx_begin(&c, "release");
+        (void)json_push_kv_int(&c.input, "seq", 1);
+        ASSERT(dlx_run(&c) && dlx_ok(&c)); dlx_end(&c);
+        ASSERT(dlx_row_hold_is(false));
+        PASS();
+    }
+_test_next:
+    if (lock >= 0) { (void)flock(lock, LOCK_UN); (void)close(lock); }
+    dlx_restore();
+    return failures;
+}
+
+/* A hold written while a step is between picking its row and driving it must
+ * survive the step's next queue rewrite and stop publication. */
+static int dlx_hold_survives_step_rewrite(void)
+{
+    int failures = 0;
+    TEST("land: a hold set during a running step survives its rewrite and stops publication") {
+        struct dlx_rig rig;
+        struct dlx_call c;
+        pid_t child;
+        int st = 0;
+        dlx_isolate("hold_lost_update");
+        ASSERT(dlx_rig_make(&rig, "hold_lost_update_rig"));
+        setenv("ZCL_LAND_PROOF_STUB", "running", 1);
+        setenv("ZCL_LAND_ALLOW_UNSIGNED", "1", 1);
+        dlx_submit(&c, &rig, rig.tip);
+        ASSERT(dlx_run(&c) && dlx_ok(&c)); dlx_end(&c);
+        dlx_begin(&c, "step");
+        ASSERT(dlx_run(&c) && dlx_ok(&c)); dlx_end(&c);
+        setenv("ZCL_LAND_PROOF_STUB", "pass", 1);
+        setenv("ZCL_LAND_TEST_PICK_DELAY_MS", "400", 1);
+        child = fork();
+        ASSERT(child >= 0);
+        if (child == 0) {
+            struct dlx_call cc;
+            dlx_begin(&cc, "step");
+            (void)dlx_run(&cc);
+            _exit(0);
+        }
+        {
+            struct timespec ts = { 0, 60 * 1000 * 1000L };
+            (void)nanosleep(&ts, NULL);
+        }
+        dlx_begin(&c, "hold");
+        (void)json_push_kv_int(&c.input, "seq", 1);
+        ASSERT(dlx_run(&c) && dlx_ok(&c)); dlx_end(&c);
+        while (waitpid(child, &st, 0) < 0)
+            ;
+        ASSERT(WIFEXITED(st));
+        ASSERT(dlx_row_hold_is(true));
+        {
+            char landdir[1200], opath[1400], body[8192] = {0};
+            FILE *f;
+            dlx_landdir(landdir, sizeof(landdir));
+            (void)snprintf(opath, sizeof(opath), "%s/outcomes.jsonl", landdir);
+            f = fopen(opath, "r");
+            if (f) {
+                size_t n = fread(body, 1, sizeof(body) - 1, f);
+                body[n] = '\0';
+                (void)fclose(f);
+            }
+            ASSERT(strstr(body, "\"landed\"") == NULL);
+        }
+        dlx_restore();
+        PASS();
+    }
+_test_next:;
     dlx_restore();
     return failures;
 }
@@ -13654,6 +13755,8 @@ int test_dev_land(void)
     failures += dlx_hold_malformed_case();
     failures += dlx_hold_sealed_case();
     failures += dlx_hold_lock_case();
+    failures += dlx_hold_admissible_during_step();
+    failures += dlx_hold_survives_step_rewrite();
     failures += dlx_launcher_join_cases();
     failures += dlx_attest_only_cases();
     failures += dlx_attest_bounded_wire_cases();

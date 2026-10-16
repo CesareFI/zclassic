@@ -204,13 +204,13 @@ from this checkout and verified by an exact closed SHA256SUMS manifest.
 ```text
 # linux-x86_64 (native)
 make vendor && make tor-full
-make -j"$(nproc)" z23 zclassic23-package-verify zclassic23-acme
+make -j"$(nproc)" z23 z23-package-verify z23-acme
 platform/packaging/release/build_release.sh --platform linux-x86_64
 
 # windows-x86_64 (cross-linked on Linux; needs clang >= 20 and the
 # mingw-w64 target sysroot, e.g. Debian/Ubuntu's mingw-w64 package)
 VENDOR_TARGET=x86_64-w64-mingw32 tools/scripts/build_vendor.sh
-make ZCL_TARGET=windows-x86_64 -j"$(nproc)" z23 zclassic23-acme
+make ZCL_TARGET=windows-x86_64 -j"$(nproc)" z23 z23-acme
 platform/packaging/release/build_release.sh --platform windows-x86_64
 ```
 
@@ -220,7 +220,7 @@ and the C23 toolchain gate refuses it. clang reaches the same target with
 `--target=x86_64-w64-mingw32` over the same sysroot headers, CRT and libgcc.
 
 The Windows release carries three executables, not four. There is no Windows
-`zclassic23-package-verify`: that worker compiles and executes downloaded
+`z23-package-verify`: that worker compiles and executes downloaded
 package code and is safe only because it confines every child with seccomp,
 Landlock and POSIX rlimits, none of which exist for it on Windows. The
 Makefile refuses to build it there rather than produce an unconfined program
@@ -259,7 +259,7 @@ make vendor
 make tor-full
 
 # 3. The node and the workers.
-make -j"$(sysctl -n hw.ncpu)" z23 zclassic23-package-verify zclassic23-acme
+make -j"$(sysctl -n hw.ncpu)" z23 z23-package-verify z23-acme
 
 # 4. Package the measured thin Apple Silicon runtime.
 platform/packaging/release/build_release.sh --platform darwin-arm64

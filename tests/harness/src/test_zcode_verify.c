@@ -3,7 +3,7 @@
  * test_zcode_verify — the external-verifier attestation gate (slice 6:
  * contexts/commons/modules/vcs/package_attest.*, contexts/commons/modules/vcs/package_verify_policy.*, the
  * zcode package verify handler in tools/command/native_zcode_command.c,
- * and the build/bin/zclassic23-package-verify external program).
+ * and the build/bin/z23-package-verify external program).
  *
  * Coverage:
  *   1. Attestation codec: roundtrip for every result class, a frozen KAT
@@ -57,7 +57,7 @@
  *      construction and asserted by its named code plus the exact
  *      transport rule; the happy path passes and files the attestation.
  *   4. End-to-end external verifier: a tiny real C package is published
- *      into a fixture store, build/bin/zclassic23-package-verify runs it
+ *      into a fixture store, build/bin/z23-package-verify runs it
  *      (gcc + clang, plain + ASan/UBSan), and the signed attestation is
  *      checked (test-pass, verifier key, temp tree cleaned). Hostile
  *      fixtures fail closed with the named rule: a syntax-error source
@@ -69,7 +69,7 @@
  *
  * Command handlers run in-process on ./test-tmp datadirs. The e2e lane
  * forks the real verifier binary — it MUST exist (make
- * zclassic23-package-verify); a missing binary is a loud failure, never
+ * z23-package-verify); a missing binary is a loud failure, never
  * a silent skip. */
 
 #include "test/test_core.h"
@@ -119,7 +119,7 @@
     else { printf("  zcode_verify: %s... FAIL\n", (name)); failures++; } \
 } while (0)
 
-#define ZV_VERIFIER_BIN "build/bin/zclassic23-package-verify-dev"
+#define ZV_VERIFIER_BIN "build/bin/z23-package-verify-dev"
 
 /* ── small fixtures ─────────────────────────────────────────────────── */
 

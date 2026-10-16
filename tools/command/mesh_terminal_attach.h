@@ -8,9 +8,12 @@
  * test drives the exact production loop against a scripted fake.
  *
  * Exit codes (the zcl_command_exit values):
- *   0  detached by the escape, or the remote shell ended (worker-exited);
- *      the protocol carries no remote exit status, so 0 does not mean the
- *      remote command succeeded
+ *   0  detached by the escape, or the remote shell exited 0 (worker-exited)
+ *   N  the remote shell exited with status N (0..255), or 128 + S when
+ *      signal S killed it (SIGTERM gives 143), like ssh. This shares
+ *      numbers with the classes below: the stderr line says which it was
+ *      ("reason=worker-exited exit_code=N"). A node that predates the
+ *      status fields sends none, and a missing status exits 0.
  *   1  refused or ended for a reason with no more specific class
  *   2  invalid request            3  blocked (no confinement, no transport)
  *   4  denied (pairing, capability, delegation, revocation, expiry)

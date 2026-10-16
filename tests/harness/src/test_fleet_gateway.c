@@ -2132,7 +2132,7 @@ static bool gw_fake_setup(void)
     if (mkdir(bindir, 0700) != 0)
         return false;
     if (snprintf(g_gw_fake_prog, sizeof(g_gw_fake_prog),
-                 "%s/zclassic23-engine-unit", bindir) < 0)
+                 "%s/z23-engine-unit", bindir) < 0)
         return false;
     if (!old || snprintf(g_gw_saved_path, sizeof(g_gw_saved_path), "%s",
                          old) < 0)

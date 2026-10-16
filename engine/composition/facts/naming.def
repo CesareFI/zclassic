@@ -38,6 +38,6 @@ ZCL_FACT("naming", "zpkgswm_carrier",
          "engine/composition/src/mesh_stream.c",
          "multiplexed stream primitive on zpkgswm")
 ZCL_FACT("naming", "binaries",
-         "z23 is the node, z23-dev the dev CLI, and zclassic23-engine-unit the executor harness.",
+         "z23 is the node, z23-dev the dev CLI, and z23-engine-unit the executor harness.",
          "Makefile",
-         "zclassic23-engine-unit")
+         "z23-engine-unit")

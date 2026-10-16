@@ -108,6 +108,10 @@ void print_usage(const char *prog)
     printf("                      Windows only: let the terminal lane run the\n");
     printf("                      shell as the node's own user, with all of its\n");
     printf("                      rights (default off; refused on other platforms)\n");
+    printf("  -terminalmaxbytesout=<n>\n");
+    printf("                      Screen bytes one confined terminal may send before\n");
+    printf("                      it is ended byte-limit (default 1073741824; range\n");
+    printf("                      1048576..68719476736; else the default)\n");
     printf("  -packagequota=<n>   Package store quota in bytes (default 10737418240;\n");
     printf("                      20%% pins / 40%% hot / 30%% rare / 10%% staging)\n");
     printf("  -confine            After boot reaches activation-ready, apply strict\n");
@@ -228,6 +232,7 @@ static const char *const k_extra_getarg_flags[] = {
     "-meshstatusplugins", "-nomeshstatusplugins",
     "-terminalshell",
     "-terminalacceptunconfined", "-noterminalacceptunconfined",
+    "-terminalmaxbytesout",
 };
 
 static bool main_flag_is_known_extra(const char *arg)
@@ -408,10 +413,10 @@ static void args_report_tor_refusal(const struct app_context *ctx,
 
     if (strcmp(code, APP_TOR_REFUSE_DISABLE_ON_SERVING_LANE) == 0) {
         const struct boot_error_next next[] = {
-            { "zclassic23 --version",
+            { "z23 --version",
               "confirm which Tor this binary linked; -no-tor only means "
               "anything on a build that prints `tor: full`" },
-            { "zclassic23 -operator-lane=dev -datadir=<dev datadir> -no-tor",
+            { "z23 -operator-lane=dev -datadir=<dev datadir> -no-tor",
               "run the clearnet-only experiment on a dev lane, where taking "
               "Tor down costs nobody their reachability" },
         };
@@ -430,7 +435,7 @@ static void args_report_tor_refusal(const struct app_context *ctx,
          * stub, and a first next step that no-ops for everyone else teaches
          * them to stop reading these. */
         const struct boot_error_next next[] = {
-            { "zclassic23 -operator-lane=dev -datadir=<dev datadir> "
+            { "z23 -operator-lane=dev -datadir=<dev datadir> "
               "-allow-tor-stub-dev",
               "use the escape where it belongs — an offline dev/test datadir "
               "that serves nobody" },
@@ -452,11 +457,11 @@ static void args_report_tor_refusal(const struct app_context *ctx,
         const struct boot_error_next next[] = {
             { "make tor-full",
               "build a binary that links real Tor — this is the fix; "
-              "`zclassic23 --version` then prints `tor: full`" },
-            { "zclassic23 --version",
+              "`z23 --version` then prints `tor: full`" },
+            { "z23 --version",
               "read the Tor identity of the binary you are actually running; "
               "it prints `tor: stub` today" },
-            { "zclassic23 -allow-tor-stub-dev -operator-lane=dev "
+            { "z23 -allow-tor-stub-dev -operator-lane=dev "
               "-datadir=<dev datadir>",
               "boot this stub binary anyway for an offline test; Tor still "
               "does not start, and the escape is refused on canonical, soak "
@@ -1086,14 +1091,14 @@ static void args_warn_unknown_flag(const char *arg)
         CLI_FLAG_OK) {
         fprintf(stderr,
                 "Warning: unrecognized flag '%s' (ignored) — "
-                "zclassic23 flags use a single dash with '=' "
+                "z23 flags use a single dash with '=' "
                 "joining the value; did you mean %s?\n",
                 arg, suggest);
     } else {
         fprintf(stderr,
                 "Warning: unrecognized flag '%s' (ignored) — check "
                 "spelling or docs/RUNBOOK.md; this is not a supported "
-                "zclassic23 flag.\n", arg);
+                "z23 flag.\n", arg);
     }
 }
 

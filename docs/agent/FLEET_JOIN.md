@@ -7,6 +7,16 @@ computer added to their fleet. It contains no hostnames, no addresses and
 no ports: everything specific to a particular fleet arrives in the token
 the owner pastes.
 
+## Check your setup
+
+Not sure where this computer is in the setup? Run `z23 fleet doctor --datadir=<node-datadir>`. It
+reads only (it changes nothing and prints public fingerprints, never keys)
+and lists eight checks in order: node, identity, membership, delegation,
+transport, pairing, mail, wiki. Each is `ok`, `missing`, `blocked` or
+`unknown`, with one sentence and the command to run next; the top-level
+`next` is the first one to run. The mail check is marked `informational`
+and never changes either.
+
 ## What you are doing
 
 A fleet is a set of computers one owner runs. Joining one adds a **machine
@@ -185,14 +195,39 @@ with a newline), and prints every diagnostic on stderr:
 printf 'uname -a\nexit\n' | z23 ops mesh terminal --pairing_id=<64hex>
 ```
 
-Refusals print the responder's own name (`not-paired`,
-`capability-unavailable`, `confinement-unavailable`, `concurrency-limit`),
-and the signed close receipt's reason, byte counts and duration follow on
-stderr. The terminal protocol carries no remote exit status. Exit codes: `0`
-detached or the remote shell ended, `2` invalid request, `3` blocked, `4`
-denied, `5` transient (peer not connected, busy, a session limit), `6`
-internal, `130` interrupted. A `0` does not mean the remote command
-succeeded.
+Refusals print `z23: refused: <name>: <words>` (`not-paired`,
+`capability-unavailable`, `confinement-unavailable`, `concurrency-limit`: 4
+terminals per node); a node that stops answering after attach prints `z23:
+connection lost: ...`. A session end prints `z23: terminal closed: reason=<name>
+... - <words>`: `worker-exited`, `idle-timeout` (600 s), `lifetime-limit`
+(3600 s), `byte-limit` (default 1 GiB out, 16 MiB in), `session-lost` (peer
+dropped), `shutdown`, `revoked`, `expired`, `peer-closed` (no close report:
+the stream ended without one and prints `z23: terminal ended:
+reason=peer-closed ...`, exit `5`).
+
+The remote exit status is carried. The signed close report
+(`zcl.terminal_close_evidence.v1`) holds `bytes_in`, `bytes_out`,
+`duration_s`, `reason`, and for `worker-exited` exactly one optional key:
+`exit_code` (0-255) when the shell exited, or `signal` (1-64) when a signal
+killed it. The line then reads `reason=worker-exited exit_code=3` or
+`... signal=15`. The two keys are optional additions to the same signed
+capsule, which is hashed as opaque bytes: a node that predates them sends
+neither (a missing status exits `0`), and an older client ignores them. Exit
+codes: `0` detached or the remote shell exited 0; `N` (1-255) the remote
+shell exited with status N, `128+S` when signal S killed it (SIGTERM gives
+`143`), like ssh; and the local classes `2` invalid, `3` blocked, `4` denied,
+`5` transient or any limit or loss, `6` internal, `130` interrupted. A remote
+status that equals a local class number is told apart by the stderr line
+(`reason=worker-exited exit_code=3` versus `refused:` or `reason=<limit>`).
+
+Limits per session: 600 s idle, 3600 s lifetime, 16 MiB in, and 1 GiB out
+unless the node sets `-terminalmaxbytesout=<bytes>` (1048576 to 68719476736;
+anything else keeps the default). The byte budgets are a runaway backstop;
+the rate is bounded separately at 16 reads of 4 KiB per 100 ms drain tick
+(about 640 KiB/s ceiling, measured near 480 KiB/s end to end) and by the
+64 KiB stream credit window. Memory per session does not grow with the
+budget: one 4 KiB read buffer on the responder, at most 64 KiB in flight, and
+one 64 KiB screen FIFO on the requester; at most 4 sessions per node.
 
 In raw mode Ctrl-C and the other control keys go to the remote shell; only
 `~.` or an external SIGINT, SIGTERM, SIGHUP or SIGQUIT ends the command, and

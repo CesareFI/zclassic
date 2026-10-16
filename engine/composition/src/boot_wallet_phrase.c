@@ -113,7 +113,7 @@ static void boot_wallet_refuse_non_terminal(void)
         "phrase anywhere on this disk.\n"
         "\n"
         "To create the wallet, run the node ONCE from a terminal:\n"
-        "  zclassic23\n"
+        "  z23\n"
         "write the twelve words on paper when they appear, stop it, and\n"
         "start the service again as usual. The service will find the\n"
         "wallet and never need to print anything.\n"
@@ -160,7 +160,7 @@ static void boot_wallet_warn_no_phrase_backup(const char *why)
         "\n"
         "To get a wallet WITH twelve words instead, create it from a\n"
         "terminal before any coins arrive: stop this node, move this\n"
-        "datadir aside, run 'zclassic23' once by hand, write the words\n"
+        "datadir aside, run 'z23' once by hand, write the words\n"
         "on paper when they appear, then start the service again. The\n"
         "words are only ever shown at creation — an existing wallet\n"
         "cannot be given a phrase after the fact.\n"
@@ -253,7 +253,7 @@ void boot_wallet_show_recovery_phrase_once(const char *phrase)
     printf("These words restore your money in Z23 only. They will\n");
     printf("not work in Electrum, on a hardware wallet, or in any other\n");
     printf("wallet software. Keep them with a note saying they belong to\n");
-    printf("zclassic23. Typing somebody else's words in here would not\n");
+    printf("z23. Typing somebody else's words in here would not\n");
     printf("fail either — it would quietly open a different, empty wallet.\n");
     printf("\n");
     printf("To get this wallet back on a new machine:\n");

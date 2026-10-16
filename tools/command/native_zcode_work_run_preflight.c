@@ -65,7 +65,7 @@ static bool run_runner_image_path(char out[ZWORK_RUN_PATH_MAX])
     const char *const runner_ext = "";
 #endif
     int n = snprintf(out, ZWORK_RUN_PATH_MAX,
-                     "%s/zclassic23-zcode-adapter-runner%s", executable,
+                     "%s/z23-zcode-adapter-runner%s", executable,
                      runner_ext);
     return n > 0 && (size_t)n < ZWORK_RUN_PATH_MAX;
 }
@@ -317,7 +317,7 @@ static const char *run_preflight_primary(
     if (!state->runner_structural || !state->runner_identity) {
         *current = state->runner_structural ? "runner_source_mismatch"
                                             : "runner_unavailable";
-        *next = "make zclassic23-zcode-adapter-runner";
+        *next = "make z23-zcode-adapter-runner";
         return "ADAPTER_RUNNER_UNBOUND";
     }
     if (!state->codex_binding) {

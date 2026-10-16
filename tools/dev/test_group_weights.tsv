@@ -85,6 +85,7 @@ test_code_emitter	11
 test_fleet_board	56
 test_fleet_board_bridge	14
 test_fleet_steer	17
+test_fleet_mission_board	3
 test_fleet_gateway_shard_04	5
 test_fleet_enrol	21
 test_chain_restore_service	38

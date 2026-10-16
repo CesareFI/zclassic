@@ -173,3 +173,27 @@ ZCL_COMMAND_READY_READ(
     ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
     ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_IDEMPOTENT,
     ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_fleet_enrol_dispatch)
+
+ZCL_COMMAND_READY_READ(
+    "fleet.doctor", "fleet", "",
+    "Where this node is in fleet setup, and what to run next",
+    "One read-only checklist, in this order: node, identity, membership, "
+    "delegation, transport, pairing, mail, wiki. Each check is ok, missing, "
+    "blocked or unknown, with one plain sentence and an existing command to "
+    "run next; the top-level state is the worst check and the top-level next "
+    "is the first command named. Composes reads that already exist (the "
+    "node's peer list and machine identity, fleet.machines, fleet.nodes.table "
+    "and the wiki list), so it writes nothing and prints public "
+    "fingerprints only. Node calls share a six second deadline; machine and "
+    "pairing lists stop at 64 rows. Checks that need the running node are "
+    "blocked while none answers. The agent mail store is a developer tool and "
+    "is reported unknown with its z23-dev command.",
+    32768,
+    "fleet,doctor,setup,status,checklist,next,onboarding",
+    "zcl.fleet_doctor_input.v1", "zcl.fleet_doctor.v1", "datadir", "",
+    "z23 fleet doctor",
+    ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_LATENCY_FOREGROUND,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_doctor)

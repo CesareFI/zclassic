@@ -16,7 +16,7 @@ Three planes. All typed. None blocking.
 
 **Event plane.** Every claim, result, problem, and train transition is one signed append-only row. Agents subscribe and wake; nobody polls. Today: the JSONL board. Target: `zcode fleet say/read` over the peer wire (node2), and `msg_send` for point-to-point.
 
-**Verdict plane.** Gates decide. A unit's outcome is the receipt written by `zclassic23-engine-unit` after it ran the owning test group cold; a train's outcome is the proof receipt. A model's own report is never evidence.
+**Verdict plane.** Gates decide. A unit's outcome is the receipt written by `z23-engine-unit` after it ran the owning test group cold; a train's outcome is the proof receipt. A model's own report is never evidence.
 
 ### The train state machine (fleet-wide, one instance per base)
 
@@ -57,7 +57,7 @@ The rules table is one X-macro file. Documents cite it; they do not restate it. 
 
 1. Scaffold first, by a strong model: declaration, prototype, stub with the full contract in its header, pinned test group. The stub compiles and returns NOT_IMPLEMENTED. The test is red.
 2. The unit's task file is composed mechanically: the stub, the test, the reply pattern from a neighbouring handler, the spawn API (`platform/modules/util/include/util/spawn.h`), and on retry the previous gate log. Around 20 KB. The model sees nothing else.
-3. Dispatch through `zclassic23-engine-unit --engine glm --model glm-5.3-flash --group devagent_<leaf>` in its own transient systemd unit with a CPU quota. The harness applies the whole-file envelope to an isolated worktree and runs `make t-fast-exact ONLY=<group>` cold.
+3. Dispatch through `z23-engine-unit --engine glm --model glm-5.3-flash --group devagent_<leaf>` in its own transient systemd unit with a CPU quota. The harness applies the whole-file envelope to an isolated worktree and runs `make t-fast-exact ONLY=<group>` cold.
 4. The verdict is the receipt. Then `dev agent ceiling` checks the diff: exactly one file, no rewrite of a foreign file, no unrequested file.
 5. Outcome rows feed the executor heuristics. Flash is routed only to one-file units with a pinned test.
 

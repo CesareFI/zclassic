@@ -375,7 +375,7 @@ static int test_boot_datadir_lock_platform_arm(void)
                   !boot_datadir_lock_acquire(NULL) &&
                   bdl_render_is_typed_block("BOOT_DATADIR_UNSET",
                                             "datadir_lock") &&
-                  bdl_render_has("  next[1]:  zclassic23 -datadir=") &&
+                  bdl_render_has("  next[1]:  z23 -datadir=") &&
                   bdl_render_has("            why: "));
         BDL_CHECK("first FATAL code latches for the boot call site",
                   boot_error_reported() &&

@@ -316,6 +316,19 @@ static bool cr_match_tasks(const char *path, const char *key,
     return false;
 }
 
+/* fleet.vitals.table: the machine list is an array of at most 64 objects (the
+ * leaf owns the 16-machine bound and every field refusal, each with its own
+ * code) or the same list as JSON text from a shell. */
+static bool cr_match_vitals_table(const char *path, const char *key,
+                                 const struct json_value *value, bool *type_ok)
+{
+    if (strcmp(path, "fleet.vitals.table") != 0 || strcmp(key, "machines") != 0)
+        return false;
+    *type_ok = (value->type == JSON_ARR && value->num_children <= 64u) ||
+               cr_nonempty_str(value, 16384);
+    return true;
+}
+
 /* fleet.steer.send carries its bounded directive batch as objects; the leaf
  * re-validates every item field (recipient alphabet, body bound,
  * idempotency-key alphabet), so the registry gate only bounds shape. Split
@@ -323,6 +336,8 @@ static bool cr_match_tasks(const char *path, const char *key,
 static bool cr_match_fleet_steer(const char *path, const char *key,
                                const struct json_value *value, bool *type_ok)
 {
+    if (cr_match_vitals_table(path, key, value, type_ok))
+        return true;
     /* fleet.steer.grant list cursor: the ordinal a previous page returned. */
     if (!strcmp(path, "fleet.steer.grant") && !strcmp(key, "before")) {
         *type_ok = cr_int_range(value, 0, INT64_MAX);

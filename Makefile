@@ -489,7 +489,7 @@ else ifeq ($(words $(MAKECMDGOALS)),1)
 ZCL_EPOCH_SINGLE_GOAL := $(firstword $(MAKECMDGOALS))
 ifneq ($(filter build-only,$(ZCL_EPOCH_SINGLE_GOAL)),)
 ZCL_EPOCH_PROFILES := build-only
-else ifneq ($(filter zclassic23 z23 zclassic23-package-verify,$(ZCL_EPOCH_SINGLE_GOAL)),)
+else ifneq ($(filter zclassic23 z23 z23-package-verify zclassic23-package-verify,$(ZCL_EPOCH_SINGLE_GOAL)),)
 ZCL_EPOCH_PROFILES := node-c23
 else ifneq ($(filter fast-compile dev-build-only dev,$(ZCL_EPOCH_SINGLE_GOAL)),)
 ZCL_EPOCH_PROFILES := dev
@@ -673,19 +673,25 @@ $(BUILD_IDENTITY_STAMP): $(BUILD_MUTATION_STAMP) tools/dev/source-identity.sh
 	trap - EXIT HUP INT TERM
 
 # Preferred binary names are z23/z23-dev (product rename from ZClassic23).
-# The ZCLASSIC23_* variable names stay (build-internal), and the old
+# The Z23_* variables are primary; the ZCLASSIC23_* names stay as aliases of
+# them (build-internal), and the old
 # build/bin/zclassic23* names remain as temporary symlink aliases so existing
 # bots and scripts get an obvious migration path.
 ZCL_HOST_EXEEXT = $(if $(ZCL_HOST_WINDOWS),.exe,)
-ZCLASSIC23_BIN = $(BIN_DIR)/z23$(ZCL_HOST_EXEEXT)
-ZCLASSIC23_DEV_BIN = $(BIN_DIR)/z23-dev$(ZCL_HOST_EXEEXT)
+Z23_BIN = $(BIN_DIR)/z23$(ZCL_HOST_EXEEXT)
+Z23_DEV_BIN = $(BIN_DIR)/z23-dev$(ZCL_HOST_EXEEXT)
 # Unshippable compiler-speed artifact. `make ship` / `make deploy` refuse it.
 # The hyphenated z23-dev name remains the sibling watch-loop alias, installed
 # as a regular hard link: dev proof opens z23-dev with O_NOFOLLOW, which
 # refuses a symlink with ELOOP.
 Z23_DEV_UNSHIPPABLE_BIN = $(BIN_DIR)/z23.dev$(ZCL_HOST_EXEEXT)
-ZCLASSIC23_BIN_ALIAS = $(BIN_DIR)/zclassic23$(ZCL_HOST_EXEEXT)
-ZCLASSIC23_DEV_BIN_ALIAS = $(BIN_DIR)/zclassic23-dev$(ZCL_HOST_EXEEXT)
+Z23_BIN_ALIAS = $(BIN_DIR)/zclassic23$(ZCL_HOST_EXEEXT)
+Z23_DEV_BIN_ALIAS = $(BIN_DIR)/zclassic23-dev$(ZCL_HOST_EXEEXT)
+ZCLASSIC23_BIN = $(Z23_BIN)
+ZCLASSIC23_DEV_BIN = $(Z23_DEV_BIN)
+ZCLASSIC23_BIN_ALIAS = $(Z23_BIN_ALIAS)
+ZCLASSIC23_DEV_BIN_ALIAS = $(Z23_DEV_BIN_ALIAS)
+ZCLASSIC23_CHAOS_BIN = $(Z23_CHAOS_BIN)
 DEV_RESTART_PLAN = $(BUILD_DIR)/dev-loop/restart.env
 TEST_ZCL_BIN = $(BIN_DIR)/test_zcl
 TEST_PARALLEL_BIN = $(BIN_DIR)/test_parallel
@@ -697,7 +703,7 @@ PROCESS_GROUP_EXEC_BIN = $(BIN_DIR)/process-group-exec$(ZCL_HOST_EXEEXT)
 # atomic link; otherwise a newer host-built file could pass Make's timestamp
 # check and reach the release audit/install boundary.
 C23_PORTABLE_RELINK := $(if $(filter 1,$(ZCL_C23_PORTABLE_RELEASE)),FORCE,)
-ZCL_AGENT_BIN ?= $(ZCLASSIC23_DEV_BIN)
+ZCL_AGENT_BIN ?= $(Z23_DEV_BIN)
 ZCL_AGENT_DEV_BIN ?= $(HOME)/.local/bin/zclassic23-dev
 ZCL_AGENT_DEV_DATADIR ?= $(HOME)/.zclassic-c23-dev
 ZCL_AGENT_DEV_RPCPORT ?= 18252
@@ -727,7 +733,7 @@ WAL_CHECKPOINT_BIN = $(BIN_DIR)/wal_checkpoint
 SOAK_RUNNER_BIN = $(BIN_DIR)/soak_runner
 CRASH_RECOVERY_TEST_BIN = $(BIN_DIR)/crash_recovery_test
 P2_INVARIANT_CHECK_BIN = $(BIN_DIR)/p2_invariant_check
-ZCLASSIC23_CHAOS_BIN = $(BIN_DIR)/zclassic23-chaos
+Z23_CHAOS_BIN = $(BIN_DIR)/z23-chaos
 CHAOS_SEEDS ?= 64
 CHAOS_SWEEP_SCENARIO ?= tools/sim/scenarios/seeded_peer_churn.scenario
 
@@ -1072,7 +1078,7 @@ DEV_PACKAGE_VERIFY_NODE_OBJS = $(filter-out \
 	$(patsubst %.c,$(DEV_OBJ_DIR)/%.o,$(ALL_SRCS) $(DEV_ONLY_SRCS))) \
 	$(DEV_PACKAGE_VERIFY_GUI_STUB_OBJ)
 DEV_PACKAGE_VERIFY_LINK_RSP = $(DEV_OBJ_DIR)/package-verify-link-inputs.rsp
-DEV_PACKAGE_VERIFY_BIN = $(BIN_DIR)/zclassic23-package-verify-dev
+DEV_PACKAGE_VERIFY_BIN = $(BIN_DIR)/z23-package-verify-dev
 DEV_PACKAGE_VERIFY_ENSURE_STAMP = $(BUILD_DIR)/dev-package-verifier.ensure
 
 # pkg-config probes feed only compile/link flag expansion. The hot-swap loop
@@ -1980,7 +1986,7 @@ else ifeq ($(words $(MAKECMDGOALS)),1)
 ZCL_DEPFILE_SINGLE_GOAL := $(firstword $(MAKECMDGOALS))
 ifneq ($(filter build-only,$(ZCL_DEPFILE_SINGLE_GOAL)),)
 ZCL_DEPFILE_PROFILES := build-only
-else ifneq ($(filter zclassic23 z23 zclassic23-package-verify,$(ZCL_DEPFILE_SINGLE_GOAL)),)
+else ifneq ($(filter zclassic23 z23 z23-package-verify zclassic23-package-verify,$(ZCL_DEPFILE_SINGLE_GOAL)),)
 ZCL_DEPFILE_PROFILES := node-c23
 else ifneq ($(filter fast-compile dev-build-only dev-package-verifier,$(ZCL_DEPFILE_SINGLE_GOAL)),)
 ZCL_DEPFILE_PROFILES := dev
@@ -3120,7 +3126,7 @@ $(filter-out $(ZCL_VENDOR_LIB)/libsecp256k1.a,$(VENDOR_LIBS)):
         install-tip-agreement tip-agreement-status tip-agreement-selftest
 
 CLI_SRCS = engine/modules/rpc/src/client.c platform/modules/json/src/json.c platform/modules/encoding/src/utilstrencodings.c platform/modules/base/src/cleanse.c platform/modules/base/src/log_level.c
-ZCL_ADAPTER_RUNNER_TARGET = zclassic23-zcode-adapter-runner
+ZCL_ADAPTER_RUNNER_TARGET = z23-zcode-adapter-runner
 ifneq ($(ZCL_HOST_WINDOWS),)
 # Windows has no Landlock-equivalent backend in tree. Do not ship an
 # unconstrained agent adapter merely to make the native node build green.
@@ -3157,13 +3163,13 @@ endif
 # make target's stdout should not have to learn about it. Cost is one
 # `test -e` per goal.
 define ZCL_DEV_BIN_OMITTED_NOTICE
-@test ! -e "$(ZCLASSIC23_DEV_BIN)" || { \
-  echo "note: this goal does not rebuild $(ZCLASSIC23_DEV_BIN); it is a separate dev-flavour build." >&2; \
+@test ! -e "$(Z23_DEV_BIN)" || { \
+  echo "note: this goal does not rebuild $(Z23_DEV_BIN); it is a separate dev-flavour build." >&2; \
   echo "      the one on disk is from whenever 'make dev-bin' last ran. Run 'make dev-bin' before trusting it." >&2; \
 }
 endef
 
-all: test_zcl zclassic23 zcl-rpc zclassic23-package-verify \
+all: test_zcl zclassic23 zcl-rpc z23-package-verify \
 	$(ZCL_POSIX_ONLY_BINS) $(ZCL_ADAPTER_RUNNER_TARGET)
 	$(ZCL_DEV_BIN_OMITTED_NOTICE)
 
@@ -3785,7 +3791,7 @@ $(TEST_PARALLEL_BIN): $(TEST_PARALLEL_REL_CANDIDATE) FORCE
 	  "$(TEST_REL_COMPILE_EPOCH)" "$(BUILD_COMPILER_ID)" "$(TEST_REL_PROFILE)" \
 	  "$(TEST_REL_EPOCH_COMPILE_FLAGS)" "$(TEST_REL_EPOCH_LINK_FLAGS)" "$(CC)" "$(CXX)"
 
-$(TEST_PARALLEL_REL_CANDIDATE): $(VIEW_GEN_HEADERS) $(BUILD_IDENTITY_STAMP) $(TEST_PARALLEL_REL_OBJS) $(TEST_PARALLEL_REL_LINK_RSP) | $(VENDOR_LIBS) $(ZCL_NODECTL_DEP) $(FILE_SIZE_POLICY_BIN) $(BIN_DIR)/zclassic23-acme$(ZCL_HOST_EXEEXT)
+$(TEST_PARALLEL_REL_CANDIDATE): $(VIEW_GEN_HEADERS) $(BUILD_IDENTITY_STAMP) $(TEST_PARALLEL_REL_OBJS) $(TEST_PARALLEL_REL_LINK_RSP) | $(VENDOR_LIBS) $(ZCL_NODECTL_DEP) $(FILE_SIZE_POLICY_BIN) $(BIN_DIR)/z23-acme$(ZCL_HOST_EXEEXT)
 	@mkdir -p $(dir $@)
 	@set -eu; \
 	tmp="$$(mktemp "$@.link.XXXXXX")"; \
@@ -3807,7 +3813,7 @@ $(TEST_PARALLEL_FAST_BIN): $(TEST_PARALLEL_FAST_CANDIDATE) FORCE
 	  "$(TEST_FAST_COMPILE_EPOCH)" "$(BUILD_COMPILER_ID)" "$(TEST_FAST_PROFILE)" \
 	  "$(TEST_FAST_EPOCH_COMPILE_FLAGS)" "$(TEST_FAST_EPOCH_LINK_FLAGS)" "$(CC)" "$(CXX)"
 
-$(TEST_PARALLEL_FAST_CANDIDATE): $(VIEW_GEN_HEADERS) $(BUILD_IDENTITY_STAMP) $(TEST_PARALLEL_FAST_OBJS) $(TEST_PARALLEL_FAST_LINK_RSP) | $(VENDOR_LIBS) $(ZCL_NODECTL_DEP) $(FILE_SIZE_POLICY_BIN) $(BIN_DIR)/zclassic23-acme$(ZCL_HOST_EXEEXT)
+$(TEST_PARALLEL_FAST_CANDIDATE): $(VIEW_GEN_HEADERS) $(BUILD_IDENTITY_STAMP) $(TEST_PARALLEL_FAST_OBJS) $(TEST_PARALLEL_FAST_LINK_RSP) | $(VENDOR_LIBS) $(ZCL_NODECTL_DEP) $(FILE_SIZE_POLICY_BIN) $(BIN_DIR)/z23-acme$(ZCL_HOST_EXEEXT)
 	@mkdir -p $(dir $@)
 	@set -eu; \
 	tmp="$$(mktemp "$@.link.XXXXXX")"; \
@@ -4016,13 +4022,13 @@ $(TEST_PARALLEL_FAST_CANDIDATE): | $(OTLP_STARTUP_PROBE_BIN)
 endif
 
 # test_engine's end-to-end case runs $(ENGINE_UNIT_BIN) as a subprocess (same
-# reason test_acme_worker runs zclassic23-acme instead of linking it: the
+# reason test_acme_worker runs z23-acme instead of linking it: the
 # binary carries a TLS client, and test_cold_join_sovereign P2 asserts no
 # such object appears in a Z23 object file). Order-only, same as
-# zclassic23-acme above, so the test build guarantees it exists without
+# z23-acme above, so the test build guarantees it exists without
 # making every unrelated test recompile when engine_unit.c changes.
 # ENGINE_UNIT_BIN is declared later; prerequisites expand while parsing.
-$(TEST_PARALLEL_REL_CANDIDATE): | $(BIN_DIR)/zclassic23-engine-unit
+$(TEST_PARALLEL_REL_CANDIDATE): | $(BIN_DIR)/z23-engine-unit
 # Focused fast groups request this fixture through their BUILD_NEED entry.
 ifneq ($(ZCL_HOST_WINDOWS),1)
 # The bridge fixture uses POSIX process/filesystem contracts. Its registered
@@ -4177,8 +4183,8 @@ test-parallel-fast-active:
 	  $(MAKE) --no-print-directory test-parallel-fast-active-locked
 
 test-parallel-fast-active-locked: $(TEST_PARALLEL_FAST_CANDIDATE) dev-package-verifier-ensure \
-	$(BIN_DIR)/z23-git-hook$(ZCL_HOST_EXEEXT) $(BIN_DIR)/z23-lint $(BIN_DIR)/z23-fleet-gateway $(ZCLASSIC23_DEV_BIN)
-	$(ZCL_TEST_STACK_SETUP) && Z23_TEST_GATEWAY_BIN="$(BIN_DIR)/z23-fleet-gateway" Z23_TEST_NODE_BIN="$(ZCLASSIC23_DEV_BIN)" $(LINKED_TEST_ENV) $(TEST_PARALLEL_FAST_ACTIVE)
+	$(BIN_DIR)/z23-git-hook$(ZCL_HOST_EXEEXT) $(BIN_DIR)/z23-lint $(BIN_DIR)/z23-fleet-gateway $(Z23_DEV_BIN)
+	$(ZCL_TEST_STACK_SETUP) && Z23_TEST_GATEWAY_BIN="$(BIN_DIR)/z23-fleet-gateway" Z23_TEST_NODE_BIN="$(Z23_DEV_BIN)" $(LINKED_TEST_ENV) $(TEST_PARALLEL_FAST_ACTIVE)
 
 .PHONY: test-parallel
 # Checkout-locked (see CHECKOUT_LOCK above): the make_lint_gates exclusive lane
@@ -4568,7 +4574,7 @@ ZCODE_PACKAGE_SHA3_ASAN_BIN := $(BIN_DIR)/zcode-package-sha3-test-asan
 ZCODE_PACKAGE_MLKEM_ASAN_BIN := $(BIN_DIR)/zcode-package-mlkem-test-asan
 ZCODE_PACKAGE_CODEC_ASAN_BIN := $(BIN_DIR)/zcode-package-codec-test-asan
 ZCODE_PACKAGE_REGISTRY_CHECK_BIN := $(BIN_DIR)/zcode-package-registry-check
-.PHONY: zcode-package-base-test zcode-package-sha3-test zcode-package-mlkem-test zcode-package-codec-test zcode-package-fdt-test zcode-package-foundation-test zcode-package-registry-check zcode-package-asan zclassic23-package-sign
+.PHONY: zcode-package-base-test zcode-package-sha3-test zcode-package-mlkem-test zcode-package-codec-test zcode-package-fdt-test zcode-package-foundation-test zcode-package-registry-check zcode-package-asan z23-package-sign
 zcode-package-base-test: $(ZCODE_PACKAGE_BASE_TEST_BIN)
 	@$(ZCODE_PACKAGE_BASE_TEST_BIN)
 $(ZCODE_PACKAGE_BASE_TEST_BIN): platform/modules/base/tests/test_base.c \
@@ -4663,7 +4669,7 @@ $(ZCODE_PACKAGE_CODEC_ASAN_BIN): platform/modules/codec/tests/test_codec.c \
 
 zcode-package-asan: $(ZCODE_PACKAGE_BASE_ASAN_BIN) \
 		$(ZCODE_PACKAGE_SHA3_ASAN_BIN) $(ZCODE_PACKAGE_MLKEM_ASAN_BIN) $(ZCODE_PACKAGE_CODEC_ASAN_BIN) \
-		$(BIN_DIR)/zclassic23-package-verify
+		$(BIN_DIR)/z23-package-verify
 	@$(CHECKOUT_LOCK_TOOL) foreground "$(CHECKOUT_LOCK)" -- \
 	  sh -c 'set -e; ulimit -s 1048576; \
 	  export UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1; \
@@ -4859,7 +4865,7 @@ $(SEM_REPLAY_BIN): $(SEM_REPLAY_SRCS) tools/dev/sem_replay.h \
 	    -Iplatform/modules/platform/include -Iplatform/modules/util/include \
 	    -o $@ $(filter %.c,$^)
 # The sem_replay group runs this binary as a subprocess against a throwaway
-# git fixture (the same reason test_acme_worker runs zclassic23-acme).
+# git fixture (the same reason test_acme_worker runs z23-acme).
 # Order-only, so the test build guarantees it exists without relinking the
 # suite when the tool changes. Building it is all the default path does; no
 # default target runs a replay.
@@ -4895,8 +4901,8 @@ $(ZCODE_PACKAGE_REGISTRY_CHECK_BIN): tools/zcode_package_registry_check.c \
 	    -Iplatform/modules/platform/include -Ivendor/include -o $@ $(filter %.c,$^) \
 	    $(NODE_SECP_ARCHIVE) -lpthread -lm
 
-zclassic23-package-sign: $(BIN_DIR)/zclassic23-package-sign
-$(BIN_DIR)/zclassic23-package-sign: FORCE tools/zcode_dev_signer.c platform/modules/base/src/cleanse.c
+z23-package-sign: $(BIN_DIR)/z23-package-sign
+$(BIN_DIR)/z23-package-sign: FORCE tools/zcode_dev_signer.c platform/modules/base/src/cleanse.c
 	@mkdir -p $(dir $@)
 	$(CC) -std=c23 -O2 -Wall -Wextra -Werror -pedantic \
 	    -Iplatform/modules/base/include -Ivendor/include -o $@ $(filter-out FORCE,$^) \
@@ -5009,13 +5015,13 @@ endif
 # and invokes that admitted runner once; no fallback target may both build and
 # execute a suite.
 dev-proof-bundle: $(TEST_PARALLEL_FAST_CANDIDATE) dev-bin $(DEV_RESTART_PLAN) zcl-nodectl \
-	zclassic23-acme fbsh engine-unit $(BIN_DIR)/z23-git-hook$(ZCL_HOST_EXEEXT)
+	z23-acme fbsh engine-unit $(BIN_DIR)/z23-git-hook$(ZCL_HOST_EXEEXT)
 
 # The proof worker needs both the runner bundle and every executable read by
 # full lint before its test/lint children fork. Name one Make goal so the shared
 # graph schedules independent tools together under the dev+test-fast profiles.
 dev-proof-bundle-prefork: dev-proof-bundle proof-lint-prebuild \
-	zcl-nodectl zclassic23-acme fbsh engine-unit tools/file_size_policy \
+	zcl-nodectl z23-acme fbsh engine-unit tools/file_size_policy \
 	fleet-board-bridge git-hook install-hooks build/bin/z23-lint
 
 # Closed historical-failure corpus required by build_release_confirmation.v2.
@@ -5050,7 +5056,7 @@ secure-release-regressions-locked: $(TEST_PARALLEL_REL_CANDIDATE) dev-package-ve
 # daemons, mines a regtest chain and runs confined package builds.
 .PHONY: commons-demo commons-journey-acceptance \
 	commons-no-coin-onboarding-acceptance
-commons-demo: zclassic23 zcl-rpc zclassic23-package-sign zclassic23-package-verify tools/arena-product-journey-c23 process-group-exec
+commons-demo: zclassic23 zcl-rpc z23-package-sign z23-package-verify tools/arena-product-journey-c23 process-group-exec
 	@bash tools/dev/commons_journey_acceptance.sh
 
 # The same proof under its acceptance name, for scripts and release notes.
@@ -5060,7 +5066,7 @@ commons-journey-acceptance: commons-demo
 # clean consumers through `z23 join`, never passes packagehost/buildworker on
 # daemon argv, and proves onward exact-byte service after the publisher stops
 # with height/mempool/DHT all remaining empty or disabled.
-commons-no-coin-onboarding-acceptance: zclassic23 zcl-rpc zclassic23-package-sign tools/arena-runner
+commons-no-coin-onboarding-acceptance: zclassic23 zcl-rpc z23-package-sign tools/arena-runner
 	@bash tools/dev/arena_acceptance.sh
 
 # The SAME journey with nodes B and C on their own physical hosts. The
@@ -5072,7 +5078,7 @@ commons-no-coin-onboarding-acceptance: zclassic23 zcl-rpc zclassic23-package-sig
 # Fails closed without them. Deliberately not part of `make ci` and not the
 # front door: `make commons-demo` stays the fast same-host proof.
 .PHONY: commons-multihost-acceptance
-commons-multihost-acceptance: zclassic23 zcl-rpc zclassic23-package-sign zclassic23-package-verify tools/arena-product-journey-c23 process-group-exec
+commons-multihost-acceptance: zclassic23 zcl-rpc z23-package-sign z23-package-verify tools/arena-product-journey-c23 process-group-exec
 	@ZCL_COMMONS_MULTIHOST=1 bash tools/dev/commons_journey_acceptance.sh
 
 .PHONY: zcode-development-acceptance zcode-adapter-readiness-acceptance zcode-c23-commons-alpha zcode-dht-harness-selftest zcode-async-proof-acceptance zcode-async-proof-scaling public-node-coin-generation-matrix sovereign-source-roundtrip native-agent-ui-alpha native-agent-ui-physical-acceptance arena-product-journey
@@ -5082,7 +5088,7 @@ zcode-development-acceptance:
 # No-model proof that the native CLI can independently check every prerequisite
 # for the fixed, confined Codex adapter across the frozen twelve-task corpus.
 zcode-adapter-readiness-acceptance: zcode-adapter-usage-selftest $(BIN_DIR)/z23 \
-		$(BIN_DIR)/zclassic23-zcode-adapter-runner
+		$(BIN_DIR)/z23-zcode-adapter-runner
 	@tools/dev/zcode_adapter_benchmark.sh preflight
 
 .PHONY: zcode-adapter-usage-selftest
@@ -5152,11 +5158,11 @@ arena-product-journey:
 # compiler/sysroot first, avoiding any accidental host-ABI or optional-Tor
 # relink between the product build and the window proof.
 native-agent-ui-physical-acceptance: native-ui-driver
-	@test -x "$(ZCLASSIC23_BIN)" || { \
+	@test -x "$(Z23_BIN)" || { \
 	  echo 'native-agent-ui: missing audited node; run make native-agent-ui-alpha' >&2; \
 	  exit 1; \
 	}
-	@tools/scripts/check_c23_node_binary.sh "$(ZCLASSIC23_BIN)" >/dev/null
+	@tools/scripts/check_c23_node_binary.sh "$(Z23_BIN)" >/dev/null
 	@bash tools/dev/native_agent_ui_alpha_acceptance.sh
 
 native-agent-ui-alpha:
@@ -5590,7 +5596,7 @@ DEV_LINK_LIBS := $(TOR_LIBS) $(LIBS) $(GTK_LIBS) $(WEBKIT_LIBS)
 WALLET_GUI_SO :=
 WALLET_GUI_PIC_DIR :=
 endif
-dev-bin z23-dev zclassic23-dev: $(ZCLASSIC23_DEV_BIN) $(ZCLASSIC23_DEV_BIN_ALIAS) \
+dev-bin z23-dev zclassic23-dev: $(Z23_DEV_BIN) $(Z23_DEV_BIN_ALIAS) \
 	$(WALLET_GUI_SO) \
 	$(MVP_LEDGER_BIN) \
 	$(DEV_RESTART_PLAN_TARGET) \
@@ -5606,7 +5612,7 @@ dev-bin z23-dev zclassic23-dev: $(ZCLASSIC23_DEV_BIN) $(ZCLASSIC23_DEV_BIN_ALIAS
 .PHONY: z23-mind
 Z23_MIND_BIN = $(BIN_DIR)/z23-mind$(ZCL_HOST_EXEEXT)
 z23-mind: $(Z23_MIND_BIN)
-$(Z23_MIND_BIN): $(ZCLASSIC23_DEV_BIN)
+$(Z23_MIND_BIN): $(Z23_DEV_BIN)
 	@$(if $(ZCL_HOST_WINDOWS),cp -f "$<" "$@",ln -f "$<" "$@")
 
 # Compiler-speed front door: non-LTO, -Og/-g1, separate epoch, unsippable name.
@@ -5616,7 +5622,7 @@ dev: $(Z23_DEV_UNSHIPPABLE_BIN)
 
 # Temporary migration alias: build/bin/zclassic23-dev keeps resolving to
 # z23-dev while bots/scripts migrate.
-$(ZCLASSIC23_DEV_BIN_ALIAS): $(ZCLASSIC23_DEV_BIN)
+$(Z23_DEV_BIN_ALIAS): $(Z23_DEV_BIN)
 	@ln -sfn z23-dev "$@"
 # Checkout-locked (see CHECKOUT_LOCK above) — the watcher invokes this same
 # target via run_rebuild_command, so it defers instead of racing a foreground
@@ -5634,7 +5640,7 @@ $(Z23_DEV_UNSHIPPABLE_BIN): $(DEV_CANDIDATE_BIN) FORCE
 	  "$(DEV_EPOCH_COMPILE_FLAGS)" "$(DEV_EPOCH_LINK_FLAGS)" "$(CC)" "$(CXX)"
 	@echo "dev: $@ <= $(DEV_CANDIDATE_BIN) (non-LTO, -g1, unstripped; not for release/deploy)"
 
-$(ZCLASSIC23_DEV_BIN): $(Z23_DEV_UNSHIPPABLE_BIN)
+$(Z23_DEV_BIN): $(Z23_DEV_UNSHIPPABLE_BIN)
 	@$(if $(ZCL_HOST_WINDOWS),cp -f "$<" "$@",ln -f "$<" "$@")
 	$(if $(ZCL_HOST_WINDOWS),@tools/scripts/check_c23_node_binary.sh "$@")
 	@echo "dev-bin: $@ <= $< (hard-link watch-loop alias of unsippable z23.dev; regular file for O_NOFOLLOW proof open)"
@@ -6633,7 +6639,7 @@ LINT_LAND_GATES := $(LINT_FAST_GATES) $(LINT_LAND_EXTRA_GATES)
 # runs it builds them first; a root that never built them (a fresh landing
 # worktree) otherwise fails the gate as "missing" instead of judging the
 # mitigations. Defined here because rule prerequisites expand when read.
-NETWORK_TOOL_HARDENING_BINS = $(BIN_DIR)/agent_sha3 $(BIN_DIR)/zclassic23-acme$(ZCL_HOST_EXEEXT)
+NETWORK_TOOL_HARDENING_BINS = $(BIN_DIR)/agent_sha3 $(BIN_DIR)/z23-acme$(ZCL_HOST_EXEEXT)
 
 ifeq ($(ZCL_LINT_SERIAL),1)
 lint-land: $(LINT_LAND_GATES)
@@ -6668,7 +6674,7 @@ ifeq ($(ZCL_LINT_SERIAL),1)
 lint-preflight: $(LINT_PREFLIGHT_GATES)
 	@echo "lint-preflight: OK (serial)"
 else
-lint-preflight: $(ZCLASSIC23_DEV_BIN) $(DEV_PACKAGE_VERIFY_BIN) $(LINTC_TOOL) $(TOOLGEN_BIN)
+lint-preflight: $(Z23_DEV_BIN) $(DEV_PACKAGE_VERIFY_BIN) $(LINTC_TOOL) $(TOOLGEN_BIN)
 	@tools/lint/run_lint.sh --jobs "$(ZCL_LINT_JOBS)" --bin-dir "$(BIN_DIR)" $(LINT_PREFLIGHT_GATES)
 	@echo "lint-preflight: OK"
 endif
@@ -6896,12 +6902,12 @@ ZCL_BOOTSTRAP_DEADLINE ?= 900
 
 .PHONY: bootstrap bootstrap-manifest bootstrap-publish
 
-bootstrap: $(ZCLASSIC23_BIN) $(BIN_DIR)/mint_v2_snapshot $(ZCL_RPC_BIN)
+bootstrap: $(Z23_BIN) $(BIN_DIR)/mint_v2_snapshot $(ZCL_RPC_BIN)
 	@set -eu; \
 	SRC='$(ZCL_BOOTSTRAP_SRC)'; WORK='$(ZCL_BOOTSTRAP_WORK)'; \
 	OUT='$(ZCL_BOOTSTRAP_OUT)'; PROVE='$(ZCL_BOOTSTRAP_PROVE)'; \
 	PEER='$(ZCL_BOOTSTRAP_PEER)'; DEADLINE='$(ZCL_BOOTSTRAP_DEADLINE)'; \
-	NODE='$(ZCLASSIC23_BIN)'; MINT='$(BIN_DIR)/mint_v2_snapshot'; RPC='$(ZCL_RPC_BIN)'; \
+	NODE='$(Z23_BIN)'; MINT='$(BIN_DIR)/mint_v2_snapshot'; RPC='$(ZCL_RPC_BIN)'; \
 	[ -d "$$SRC" ] || { echo "bootstrap: source datadir not found: $$SRC" >&2; exit 1; }; \
 	case "$$SRC" in "$$WORK"|"$$PROVE") echo "bootstrap: SRC must differ from WORK/PROVE" >&2; exit 1;; esac; \
 	: 'SAFETY: never mint from a datadir a running node owns (torn SQLite copy).'; \
@@ -7025,7 +7031,7 @@ $(BIN_DIR)/mock_rpc: tools/mock_rpc.c
 	$(CC) -std=c23 -O2 -Wall -Wextra -Werror -pthread -o $@ $<
 
 # ── The certificate worker ────────────────────────────────────────────────
-# `zclassic23-acme` is the ONLY program in this tree that is a TLS client and
+# `z23-acme` is the ONLY program in this tree that is a TLS client and
 # the only one that carries a CA trust store. That is not incidental: the node
 # must never be able to be told who to trust by whoever ships a trust store,
 # and tests/harness/src/test_cold_join_sovereign.c P2 asserts exactly that by
@@ -7122,9 +7128,9 @@ $(BIN_DIR)/z23-land$(ZCL_HOST_EXEEXT): $(LAND_SRCS)
 	@mkdir -p $(dir $@)
 	$(CC) $(LAND_CFLAGS) -o $@ $(LAND_SRCS)
 
-.PHONY: zclassic23-acme
-zclassic23-acme: $(BIN_DIR)/zclassic23-acme$(ZCL_HOST_EXEEXT)
-$(BIN_DIR)/zclassic23-acme$(ZCL_HOST_EXEEXT): $(ACME_WORKER_SRCS) Makefile | $(NODE_VENDOR_LIBS)
+.PHONY: z23-acme
+z23-acme: $(BIN_DIR)/z23-acme$(ZCL_HOST_EXEEXT)
+$(BIN_DIR)/z23-acme$(ZCL_HOST_EXEEXT): $(ACME_WORKER_SRCS) Makefile | $(NODE_VENDOR_LIBS)
 	@mkdir -p $(dir $@)
 	$(CC) $(ACME_WORKER_CFLAGS) $(ACME_WORKER_LDFLAGS) -o $@ \
 		$(ACME_WORKER_SRCS) $(ACME_WORKER_LIBS)
@@ -7133,7 +7139,7 @@ $(BIN_DIR)/zclassic23-acme$(ZCL_HOST_EXEEXT): $(ACME_WORKER_SRCS) Makefile | $(N
 # `z23-bootstrap` is the program platform/packaging/install/install.sh downloads,
 # digest-checks and runs. It is the SECOND program in this tree that is a TLS
 # client (it fetches the release pin and the second-stage installer over
-# HTTPS), so it is built exactly the way zclassic23-acme is and for exactly
+# HTTPS), so it is built exactly the way z23-acme is and for exactly
 # the same reason: STRAIGHT FROM SOURCE to an executable, with no intermediate
 # object files. tests/harness/src/test_cold_join_sovereign.c P2 scans every Z23
 # object under build/*obj*/epochs for an undefined reference to a TLS-client
@@ -7210,7 +7216,7 @@ $(eval $(call BUILD_NODE_TOOL,rebuild_recent,tools/rebuild_recent.c,-lm,-fopenmp
 # Landlock). The node binary never does. Its fixed offline boundary also makes
 # the Tor stub the only honest link input; a host's optional full-Tor build must
 # not affect verifier bytes. See tools/package_verify.c.
-.PHONY: zclassic23-package-verify
+.PHONY: z23-package-verify
 ifneq ($(ZCL_HOST_WINDOWS),)
 # The external package verifier is the ONE program that compiles and executes
 # downloaded package code, and it is safe to do that only because it confines
@@ -7222,18 +7228,18 @@ ifneq ($(ZCL_HOST_WINDOWS),)
 # expensive, so the build refuses instead, by name, and the Windows release
 # manifest simply does not carry this member (packaging/release/
 # build_release.sh, release_members). Nothing silently degrades.
-zclassic23-package-verify:
+z23-package-verify:
 	@printf '%s\n' \
-	 'zclassic23-package-verify: REFUSE: no Windows build.' \
+	 'z23-package-verify: REFUSE: no Windows build.' \
 	 '  The verifier is only safe because it confines each child with seccomp,' \
 	 '  Landlock and rlimits. Windows has none of those here, and an unconfined' \
 	 '  binary under this name would be a false safety claim.' \
 	 '  The Windows release omits this member; z23 itself builds normally.' >&2
 	@exit 1
 else
-zclassic23-package-verify: $(BIN_DIR)/zclassic23-package-verify
+z23-package-verify: $(BIN_DIR)/z23-package-verify
 endif
-$(BIN_DIR)/zclassic23-package-verify: $(VIEW_GEN_HEADERS) \
+$(BIN_DIR)/z23-package-verify: $(VIEW_GEN_HEADERS) \
 		$(BUILD_IDENTITY_STAMP) $(NODE_C23_PACKAGE_VERIFY_OBJ) \
 		$(NODE_C23_PACKAGE_VERIFY_NODE_OBJS) \
 		$(COMMAND_CATALOG_DEFS) $(C23_PORTABLE_RELINK) | $(NODE_VENDOR_LIBS)
@@ -7272,9 +7278,9 @@ ZCODE_ADAPTER_RUNNER_SRCS = tools/zcode_adapter_runner.c \
 	$(ZCL_TOOL_SANDBOX_SRC) platform/modules/base/src/cleanse.c \
 	platform/modules/base/src/log_level.c platform/modules/base/src/result.c \
 	platform/modules/base/src/safe_alloc.c platform/modules/sha3/src/sha3.c
-.PHONY: zclassic23-zcode-adapter-runner
-zclassic23-zcode-adapter-runner: $(BIN_DIR)/zclassic23-zcode-adapter-runner
-$(BIN_DIR)/zclassic23-zcode-adapter-runner: $(BUILD_IDENTITY_STAMP) \
+.PHONY: z23-zcode-adapter-runner
+z23-zcode-adapter-runner: $(BIN_DIR)/z23-zcode-adapter-runner
+$(BIN_DIR)/z23-zcode-adapter-runner: $(BUILD_IDENTITY_STAMP) \
 		$(ZCODE_ADAPTER_RUNNER_SRCS)
 	@mkdir -p $(dir $@)
 	@set -eu; \
@@ -7295,8 +7301,8 @@ ZCODE_APP_SERVER_BENCHMARK_SRCS = tools/zcode_app_server_benchmark.c \
 	platform/modules/json/src/json.c platform/modules/base/src/cleanse.c \
 	platform/modules/base/src/safe_alloc.c platform/modules/platform/src/clock.c
 .PHONY: zcode-app-server-benchmark
-zcode-app-server-benchmark: $(BIN_DIR)/zclassic23-zcode-app-server-benchmark
-$(BIN_DIR)/zclassic23-zcode-app-server-benchmark: $(BUILD_IDENTITY_STAMP) \
+zcode-app-server-benchmark: $(BIN_DIR)/z23-zcode-app-server-benchmark
+$(BIN_DIR)/z23-zcode-app-server-benchmark: $(BUILD_IDENTITY_STAMP) \
 		$(ZCODE_APP_SERVER_BENCHMARK_SRCS)
 	@mkdir -p $(dir $@)
 	@set -eu; \
@@ -7316,8 +7322,8 @@ MARKET_ACCEPTANCE_HELPER_SRCS = tools/market_acceptance_helper.c \
 	platform/modules/json/src/json.c platform/modules/base/src/cleanse.c \
 	platform/modules/base/src/safe_alloc.c platform/modules/sha3/src/sha3.c
 .PHONY: market-acceptance-helper test-market-acceptance-helper
-market-acceptance-helper: $(BIN_DIR)/zclassic23-market-acceptance-helper
-$(BIN_DIR)/zclassic23-market-acceptance-helper: \
+market-acceptance-helper: $(BIN_DIR)/z23-market-acceptance-helper
+$(BIN_DIR)/z23-market-acceptance-helper: \
 		$(MARKET_ACCEPTANCE_HELPER_SRCS)
 	@mkdir -p $(dir $@)
 	@set -eu; \
@@ -7329,7 +7335,7 @@ $(BIN_DIR)/zclassic23-market-acceptance-helper: \
 	trap - EXIT HUP INT TERM
 
 test-market-acceptance-helper: market-acceptance-helper
-	@$(BIN_DIR)/zclassic23-market-acceptance-helper --selftest
+	@$(BIN_DIR)/z23-market-acceptance-helper --selftest
 
 .PHONY: sim dump check-wallet
 sim: wallet_sim
@@ -7346,15 +7352,46 @@ spec: spec_zcl
 
 .PHONY: z23 zclassic23 portable c23-portable-toolchain c23-portable-release \
 	c23-portable-install release-deploy
-z23: $(ZCLASSIC23_BIN) $(ZCLASSIC23_BIN_ALIAS)
+z23: $(Z23_BIN) $(Z23_BIN_ALIAS)
 	$(ZCL_DEV_BIN_OMITTED_NOTICE)
 
 # Temporary migration alias: `make zclassic23` and build/bin/zclassic23 keep
 # working while bots/scripts move to z23.
 zclassic23: z23
 
-$(ZCLASSIC23_BIN_ALIAS): $(ZCLASSIC23_BIN)
+$(Z23_BIN_ALIAS): $(Z23_BIN)
 	@$(if $(ZCL_HOST_WINDOWS),cp -f "$<" "$@",ln -sfn z23 "$@")
+
+# Helper binaries: z23-<suffix> is the real link target. The old
+# zclassic23-<suffix> names stay as migration symlinks (and make target names)
+# created by the same rule, exactly like the zclassic23 -> z23 alias above.
+Z23_HELPER_SUFFIXES = acme$(ZCL_HOST_EXEEXT) package-sign package-verify-dev \
+	zcode-adapter-runner zcode-app-server-benchmark market-acceptance-helper \
+	chaos engine-unit $(if $(ZCL_HOST_WINDOWS),,package-verify)
+define Z23_HELPER_ALIAS_RULE
+$$(BIN_DIR)/zclassic23-$(1): $$(BIN_DIR)/z23-$(1)
+	@$$(if $$(ZCL_HOST_WINDOWS),cp -f "$$<" "$$@",ln -sfn z23-$(1) "$$@")
+endef
+$(foreach s,$(Z23_HELPER_SUFFIXES),$(eval $(call Z23_HELPER_ALIAS_RULE,$(s))))
+# Old make target names keep working; building a new name builds its alias.
+.PHONY: zclassic23-acme zclassic23-package-sign zclassic23-package-verify \
+	zclassic23-zcode-adapter-runner zclassic23-chaos
+zclassic23-acme: z23-acme
+zclassic23-package-sign: z23-package-sign
+zclassic23-package-verify: z23-package-verify
+zclassic23-zcode-adapter-runner: z23-zcode-adapter-runner
+zclassic23-chaos: z23-chaos
+z23-acme: $(BIN_DIR)/zclassic23-acme$(ZCL_HOST_EXEEXT)
+z23-package-sign: $(BIN_DIR)/zclassic23-package-sign
+z23-zcode-adapter-runner: $(BIN_DIR)/zclassic23-zcode-adapter-runner
+z23-chaos: $(BIN_DIR)/zclassic23-chaos
+engine-unit: $(BIN_DIR)/zclassic23-engine-unit
+zcode-app-server-benchmark: $(BIN_DIR)/zclassic23-zcode-app-server-benchmark
+market-acceptance-helper: $(BIN_DIR)/zclassic23-market-acceptance-helper
+dev-package-verifier: $(BIN_DIR)/zclassic23-package-verify-dev
+ifeq ($(ZCL_HOST_WINDOWS),)
+z23-package-verify: $(BIN_DIR)/zclassic23-package-verify
+endif
 
 # Release portability is an explicit, reproducible build input rather than an
 # accidental property of the maintainer's workstation. This path downloads a
@@ -7393,7 +7430,7 @@ release-deploy:
 # without growing the deployed artifact. The sidecar is staged in a temp
 # dir under its final basename because --add-gnu-debuglink reads the file
 # (stored name + CRC32) at link time.
-$(ZCLASSIC23_BIN): $(VIEW_GEN_HEADERS) $(BUILD_IDENTITY_STAMP) \
+$(Z23_BIN): $(VIEW_GEN_HEADERS) $(BUILD_IDENTITY_STAMP) \
 		$(NODE_C23_OBJS) $(COMMAND_CATALOG_DEFS) \
 		$(C23_PORTABLE_RELINK) | $(NODE_VENDOR_LIBS)
 	@mkdir -p $(dir $@)
@@ -8314,9 +8351,9 @@ arena-demo-opt-parity: $(ARENA_DEMO_BINS)
 # staleness gate — change the registry or the human renderer without
 # regenerating and it names the stale figure.
 .PHONY: readme-svg readme-svg-check
-readme-svg: $(ZCLASSIC23_BIN)
+readme-svg: $(Z23_BIN)
 	@tools/dev/readme_svg.sh
-readme-svg-check: $(ZCLASSIC23_BIN)
+readme-svg-check: $(Z23_BIN)
 	@READMESVG_CHECK=1 tools/dev/readme_svg.sh
 
 
@@ -8368,7 +8405,7 @@ cc-cache-audit: cc-cache
 # the tiny-lines fixture, entirely under test-tmp/.
 .PHONY: package-factory-selftest
 package-factory-selftest: $(BIN_DIR)/package-factory $(BIN_DIR)/corpus-census \
-		zclassic23 zclassic23-package-sign zclassic23-package-verify
+		zclassic23 z23-package-sign z23-package-verify
 	$(BIN_DIR)/package-factory selftest --repo . --bin-dir $(BIN_DIR)
 
 # gen_utxo_root_ladder: one-shot tool that reads a COPY of a zclassic23
@@ -8657,23 +8694,23 @@ test-full:
 test-full-locked: test_zcl
 	$(ZCL_TEST_STACK_SETUP) && $(TEST_ZCL_BIN)
 
-# zclassic23-chaos links the FULL node source tree ($(ALL_SRCS), same
+# z23-chaos links the FULL node source tree ($(ALL_SRCS), same
 # whole-program LTO shape as wire_sweep/test_parallel below) rather than a
 # hand-picked file list. `mode simnet` scenarios drive engine/modules/sim/simnet_cluster
 # (real connect_block/disconnect_block/fork-choice), so the binary needs the
 # real consensus/coins/script/validation stack, not just sim_peer's counters.
-$(eval $(call BUILD_NODE_TOOL,zclassic23-chaos,tools/sim/chaos.c $(CHAOS_SIM_SRCS)))
+$(eval $(call BUILD_NODE_TOOL,z23-chaos,tools/sim/chaos.c $(CHAOS_SIM_SRCS)))
 
-chaos: zclassic23-chaos
+chaos: z23-chaos
 	@set -eu; \
 	for s in tools/sim/scenarios/*.scenario; do \
 	    echo "==> $$s"; \
-	    $(ZCLASSIC23_CHAOS_BIN) --scenario="$$s"; \
+	    $(Z23_CHAOS_BIN) --scenario="$$s"; \
 	done; \
 	echo "==> All chaos scenarios PASSED"
 
 .PHONY: sim-fast
-sim-fast: $(TEST_PARALLEL_REL_CANDIDATE) zclassic23-chaos
+sim-fast: $(TEST_PARALLEL_REL_CANDIDATE) z23-chaos
 	@set -eu; \
 	echo "==> chaos harness unit slice"; \
 	$(ZCL_TEST_STACK_SETUP) && $(LINKED_TEST_ENV) $(TEST_PARALLEL_REL_ACTIVE) --only=chaos_harness; \
@@ -8683,7 +8720,7 @@ sim-fast: $(TEST_PARALLEL_REL_CANDIDATE) zclassic23-chaos
 	i=1; \
 	while [ "$$i" -le "$(CHAOS_SEEDS)" ]; do \
 	    seed=$$(printf '0x%016x' "$$i"); \
-	    out="$$( $(ZCLASSIC23_CHAOS_BIN) --scenario="$(CHAOS_SWEEP_SCENARIO)" --seed="$$seed" 2>&1 )" || { \
+	    out="$$( $(Z23_CHAOS_BIN) --scenario="$(CHAOS_SWEEP_SCENARIO)" --seed="$$seed" 2>&1 )" || { \
 	        printf '%s\n' "$$out"; \
 	        exit 1; \
 	    }; \
@@ -8692,7 +8729,7 @@ sim-fast: $(TEST_PARALLEL_REL_CANDIDATE) zclassic23-chaos
 	echo "==> sim-fast PASSED ($(CHAOS_SEEDS) seeded replays)"
 
 chaos-clean:
-	rm -f $(ZCLASSIC23_CHAOS_BIN)
+	rm -f $(Z23_CHAOS_BIN) $(BIN_DIR)/zclassic23-chaos
 	rm -rf build/chaos-output/ chaos-output/
 
 # ── simnet_trace_query: linear-scan filter over a simnet state trace ─────
@@ -8873,11 +8910,11 @@ simnet-nightly: $(TEST_PARALLEL_REL_CANDIDATE)
 	    step3=FAIL; \
 	fi; \
 	echo "══ simnet-nightly: step 4/6 — byzantine detective cluster sweep ══"; \
-	if $(MAKE) --no-print-directory zclassic23-chaos >/dev/null; then \
+	if $(MAKE) --no-print-directory z23-chaos >/dev/null; then \
 	    step4=PASS; \
 	    for s in $(DETECTIVE_SCENARIOS); do \
 	        echo "  ==> $$s"; \
-	        if ! $(ZCLASSIC23_CHAOS_BIN) --scenario="$$s"; then step4=FAIL; fi; \
+	        if ! $(Z23_CHAOS_BIN) --scenario="$$s"; then step4=FAIL; fi; \
 	    done; \
 	    echo "  ==> ZCL_SIMNET_PERF=1 mixed smoke (simnet_fuzz + simnet_byzantine_cluster)"; \
 	    if ! ZCL_SIMNET_PERF=1 $(LINKED_TEST_ENV) $(TEST_PARALLEL_REL_ACTIVE) --only=simnet_fuzz; then step4=FAIL; fi; \
@@ -9496,12 +9533,12 @@ c23-commons-installed-acceptance: zcode-c23-commons-alpha
 # seven-identity DHT/Noise harness rather than inventing test-only networking;
 # the source hook assigns publisher, two independent hosts and a no-Git fresh
 # consumer after sparse authentication. Opt-in: real daemons and full builds.
-sovereign-source-network-acceptance: zclassic23 zcl-rpc zclassic23-package-sign
+sovereign-source-network-acceptance: zclassic23 zcl-rpc z23-package-sign
 	@bash tools/dev/sovereign_source_network_acceptance.sh
 
 # Two-role attestation flight over the same seven-identity DHT/Noise harness.
 # It proves that a signed ZCLATT attestation MOVES: the publisher mints one
-# with the real zclassic23-package-verify program (a genuine confined build
+# with the real z23-package-verify program (a genuine confined build
 # and test of a minimal package, really signed — never hand-assembled),
 # offers it as an ordinary blob, publishes BOTH records the design requires
 # in zclassic23.attestation (PROVIDER on the transport root, POINTER binding
@@ -9517,8 +9554,8 @@ sovereign-source-network-acceptance: zclassic23 zcl-rpc zclassic23-package-sign
 # rule is proven in-process by test_zcode_attest_transport / swarm_net and is
 # reported UNPROVEN here rather than faked.  Opt-in: seven real daemons; no
 # production datadir, wallet key, or live port.
-attestation-flight-acceptance: zclassic23 zcl-rpc zclassic23-package-sign \
-		zclassic23-package-verify
+attestation-flight-acceptance: zclassic23 zcl-rpc z23-package-sign \
+		z23-package-verify
 	@bash tools/dev/attestation_flight_acceptance.sh
 
 # B3 file-market trade acceptance: two isolated regtest daemons (395xx
@@ -9584,7 +9621,7 @@ metaverse-tour: zclassic23 zcl-rpc
 # The multi-daemon members stay OUT of hermetic `make ci` by the same rule
 # as mvp-verify (they spawn real /tmp regtest nodes).
 .PHONY: metaverse-verify
-metaverse-verify: zclassic23 zcl-rpc zclassic23-package-verify
+metaverse-verify: zclassic23 zcl-rpc z23-package-verify
 	@bash -c 'set -uo pipefail; \
 	 echo "══════════════════════════════════════════════════════════════"; \
 	 echo "  metaverse-verify: LOCAL metaverse MVP proofs (MM1-MM7)"; \
@@ -10204,7 +10241,7 @@ ci-stress: test_zcl
 # live port or the live datadir. Runs under bash because the sourced
 # isolation harness relies on `set -o pipefail`.
 .PHONY: ci-install
-ci-install: zclassic23 zcl-rpc zclassic23-package-verify zclassic23-package-sign
+ci-install: zclassic23 zcl-rpc z23-package-verify z23-package-sign
 	@bash tools/scripts/ci_install_gate.sh
 
 # ── ci-install-linger (C1 FULL operator claim, no docker) ─
@@ -11006,7 +11043,7 @@ bench-serial: $(BIN_DIR)/serial_bench
 	    $(if $(CPU),--cpu=$(CPU)) $(if $(REPS),--reps=$(REPS))
 
 bench: zclassic23
-	@ZCL_BENCH_COMMIT="$(BUILD_COMMIT)" $(ZCLASSIC23_BIN) -bench
+	@ZCL_BENCH_COMMIT="$(BUILD_COMMIT)" $(Z23_BIN) -bench
 
 # Consensus-verify microbenchmark: times the two dominant per-block verify
 # primitives (BLS12-381 Groth16 pairing + Equihash 200,9 solution check) and
@@ -11015,7 +11052,7 @@ bench: zclassic23
 # Groth16 row is skipped if ~/.zcash-params is absent (VK not vendored).
 .PHONY: bench-crypto-verify
 bench-crypto-verify: zclassic23
-	@ZCL_BENCH_COMMIT="$(BUILD_COMMIT)" $(ZCLASSIC23_BIN) -bench-crypto-verify
+	@ZCL_BENCH_COMMIT="$(BUILD_COMMIT)" $(Z23_BIN) -bench-crypto-verify
 
 # Crypto-vs-Rust microbenchmark: times EVERY consensus-path C crypto primitive
 # (Equihash verify, Groth16/BLS12-381 output verify, BLS12-381 pairing + Fp mul,
@@ -11024,7 +11061,7 @@ bench-crypto-verify: zclassic23
 # APPENDS the medians to docs/bench-history.csv.
 .PHONY: bench-crypto-vs-rust
 bench-crypto-vs-rust: zclassic23
-	@ZCL_BENCH_COMMIT="$(BUILD_COMMIT)" $(ZCLASSIC23_BIN) -bench-crypto-vs-rust
+	@ZCL_BENCH_COMMIT="$(BUILD_COMMIT)" $(Z23_BIN) -bench-crypto-vs-rust
 
 # The STANDING crypto-perf gate (docs/CRYPTO_PERF.md): measure C live and
 # enforce (a) the RATCHET — no C primitive may regress beyond the flake margin;
@@ -11036,7 +11073,7 @@ bench-crypto-vs-rust: zclassic23
 .PHONY: check-crypto-perf
 check-crypto-perf: zclassic23
 	@ZCL_BENCH_COMMIT="$(BUILD_COMMIT)" \
-	  ZCL_CRYPTO_PERF_BIN=$(ZCLASSIC23_BIN) tools/scripts/check_crypto_perf.sh
+	  ZCL_CRYPTO_PERF_BIN=$(Z23_BIN) tools/scripts/check_crypto_perf.sh
 
 # The STANDING Groth16 differential parity gate (docs/CRYPTO_PERF.md
 # "Optimizing safely"). Compiles the in-tree consensus verifier
@@ -11075,7 +11112,7 @@ bench-groth16-comb: $(PARITY_ORACLE_BIN)
 	@$(PARITY_ORACLE_BIN) bench $(or $(ITERS),30)
 
 bench-regress: zclassic23
-	@ZCL_BENCH_COMMIT="$(BUILD_COMMIT)" $(ZCLASSIC23_BIN) -bench-regress
+	@ZCL_BENCH_COMMIT="$(BUILD_COMMIT)" $(Z23_BIN) -bench-regress
 
 # CI guard: fresh datadir, must reach tip-10 in <600s against a local
 # peer. Fails the build if sync regresses to the 9-hour stall the
@@ -11097,8 +11134,8 @@ ci-sync-smoke: zclassic23
 	    exit 0; \
 	fi
 	@echo "[ci-sync-smoke] recording C benchmark placeholders..."
-	@$(ZCLASSIC23_BIN) -bench-coldstart
-	@$(ZCLASSIC23_BIN) -bench-mtbf
+	@$(Z23_BIN) -bench-coldstart
+	@$(Z23_BIN) -bench-mtbf
 	@echo "[ci-sync-smoke] OK"
 
 BUILD_ONLY_OBJECT_CFLAGS = $(BUILD_ONLY_CFLAGS)
@@ -11344,7 +11381,7 @@ $(DEV_TSAN_OBJ_DIR)/platform/modules/util/src/clientversion.o: $(BUILD_IDENTITY_
 # DELETE, no unguarded statements, and safe to re-run.
 #
 # Deploy-half-shipping guards baked into the recipe below:
-#   - A frozen candidate that IS $(ZCLASSIC23_BIN) (same inode: the file
+#   - A frozen candidate that IS $(Z23_BIN) (same inode: the file
 #     itself, a hardlink, or a symlink resolving to it) skips the self-copy
 #     GNU install would otherwise refuse; the candidate hash + agentbuild +
 #     source-id assertions below still bind the exact bytes.
@@ -11390,18 +11427,21 @@ DEPLOY_VERIFY_STAGE ?= stable
 define INSTALL_C23_PRODUCTS
 set -eu; \
 . tools/scripts/tor_stamp_lib.sh; \
-zcl_tor_require_full "$(ZCLASSIC23_BIN)" "the node this install would place"; \
+zcl_tor_require_full "$(Z23_BIN)" "the node this install would place"; \
 install -d "$(DESTDIR)$(PREFIX)/bin"; \
-install -m 755 $(ZCLASSIC23_BIN) "$(DESTDIR)$(PREFIX)/bin/z23"; \
+install -m 755 $(Z23_BIN) "$(DESTDIR)$(PREFIX)/bin/z23"; \
 ln -sfn z23 "$(DESTDIR)$(PREFIX)/bin/zclassic23"; \
 install -m 755 $(ZCL_RPC_BIN) "$(DESTDIR)$(PREFIX)/bin/zcl-rpc"; \
 install -m 755 $(ZCL_NODECTL_BIN) "$(DESTDIR)$(PREFIX)/bin/zcl-nodectl"; \
-install -m 755 $(BIN_DIR)/zclassic23-package-verify \
-	"$(DESTDIR)$(PREFIX)/bin/zclassic23-package-verify"; \
-install -m 755 $(BIN_DIR)/zclassic23-package-sign \
-	"$(DESTDIR)$(PREFIX)/bin/zclassic23-package-sign"; \
-install -m 755 $(BIN_DIR)/zclassic23-acme \
-	"$(DESTDIR)$(PREFIX)/bin/zclassic23-acme"; \
+install -m 755 $(BIN_DIR)/z23-package-verify \
+	"$(DESTDIR)$(PREFIX)/bin/z23-package-verify"; \
+ln -sfn z23-package-verify "$(DESTDIR)$(PREFIX)/bin/zclassic23-package-verify"; \
+install -m 755 $(BIN_DIR)/z23-package-sign \
+	"$(DESTDIR)$(PREFIX)/bin/z23-package-sign"; \
+ln -sfn z23-package-sign "$(DESTDIR)$(PREFIX)/bin/zclassic23-package-sign"; \
+install -m 755 $(BIN_DIR)/z23-acme \
+	"$(DESTDIR)$(PREFIX)/bin/z23-acme"; \
+ln -sfn z23-acme "$(DESTDIR)$(PREFIX)/bin/zclassic23-acme"; \
 if [ -z "$(DESTDIR)" ]; then \
 	install -d "$(HOME)/.config/systemd/user"; \
 	sed -e 's|%h/zclassic23/build/bin/zcl-nodectl|$(PREFIX)/bin/zcl-nodectl|' \
@@ -11415,7 +11455,7 @@ echo "make install: node, RPC, package verifier, signer + certificate worker -> 
 endef
 
 .PHONY: install
-install: vendor-ready zclassic23 zcl-rpc zcl-nodectl zclassic23-package-verify zclassic23-package-sign zclassic23-acme
+install: vendor-ready zclassic23 zcl-rpc zcl-nodectl z23-package-verify z23-package-sign z23-acme
 	@$(INSTALL_C23_PRODUCTS)
 
 # ── install-train-keeper ──────────────────────────────────────────────────
@@ -11538,8 +11578,8 @@ deploy: vendor-ready lint zclassic-cli zcl-nodectl tools/wal_checkpoint
 	    echo "deploy: REFUSE: ZCL_PROFILE=dev produces the unsippable $(Z23_DEV_UNSHIPPABLE_BIN)" >&2; \
 	    exit 2; \
 	fi
-	@case "$(ZCLASSIC23_BIN)" in \
-	    *.dev) echo "deploy: REFUSE: $(ZCLASSIC23_BIN) is not a shippable name" >&2; exit 2;; \
+	@case "$(Z23_BIN)" in \
+	    *.dev) echo "deploy: REFUSE: $(Z23_BIN) is not a shippable name" >&2; exit 2;; \
 	esac
 	@./tools/deploy_guard.sh canonical-deploy
 	@case "$(DEPLOY_VERIFY_STAGE)" in stable|challenger) ;; *) \
@@ -11565,7 +11605,7 @@ deploy: vendor-ready lint zclassic-cli zcl-nodectl tools/wal_checkpoint
 	@# Run every recursive Make before freezing the candidate, and pin it to the
 	@# outer parse's source record so it cannot silently authorize a newer epoch.
 	$(MAKE) BUILD_SOURCE_RECORD="$(BUILD_SOURCE_RECORD)" seed-anchor-snapshot
-	@# Force a fresh production binary. The $(ZCLASSIC23_BIN) rule is a single
+	@# Force a fresh production binary. The $(Z23_BIN) rule is a single
 	@# whole-program cc over $(ALL_SRCS) with NO depfile tracking, so a
 	@# header-only edit leaves every .c mtime unchanged and `make` would skip
 	@# the relink and ship a STALE binary — the exact footgun behind a
@@ -11581,15 +11621,15 @@ deploy: vendor-ready lint zclassic-cli zcl-nodectl tools/wal_checkpoint
 	    esac; \
 	    test -x "$$ZCL_DEPLOY_FROZEN_CANDIDATE" || { \
 	        echo "deploy: frozen candidate is not executable" >&2; exit 1; }; \
-	    if [ "$$ZCL_DEPLOY_FROZEN_CANDIDATE" -ef "$(ZCLASSIC23_BIN)" ]; then \
-	        echo "deploy: frozen candidate is $(ZCLASSIC23_BIN) itself (same file); bytes are already in place, skipping the self-copy"; \
+	    if [ "$$ZCL_DEPLOY_FROZEN_CANDIDATE" -ef "$(Z23_BIN)" ]; then \
+	        echo "deploy: frozen candidate is $(Z23_BIN) itself (same file); bytes are already in place, skipping the self-copy"; \
 	    else \
-	        install -m 755 "$$ZCL_DEPLOY_FROZEN_CANDIDATE" $(ZCLASSIC23_BIN); \
+	        install -m 755 "$$ZCL_DEPLOY_FROZEN_CANDIDATE" $(Z23_BIN); \
 	    fi; \
-	    test -x "$(ZCLASSIC23_BIN)" || { \
-	        echo "deploy: frozen candidate left $(ZCLASSIC23_BIN) missing or non-executable" >&2; exit 1; }; \
+	    test -x "$(Z23_BIN)" || { \
+	        echo "deploy: frozen candidate left $(Z23_BIN) missing or non-executable" >&2; exit 1; }; \
 	else \
-	    rm -f $(ZCLASSIC23_BIN); \
+	    rm -f $(Z23_BIN); \
 	    $(MAKE) BUILD_SOURCE_RECORD="$(BUILD_SOURCE_RECORD)" zclassic23; \
 	fi
 	@# From here through verification there are no recursive Make parses. Freeze
@@ -11611,7 +11651,7 @@ deploy: vendor-ready lint zclassic-cli zcl-nodectl tools/wal_checkpoint
 	. tools/scripts/ship_progress_lib.sh; \
 	command -v timeout >/dev/null 2>&1 || { \
 	    echo "deploy: timeout is required for candidate preflight" >&2; exit 1; }; \
-	candidate="$$(mktemp "$(dir $(ZCLASSIC23_BIN)).zclassic23.deploy.XXXXXX")"; \
+	candidate="$$(mktemp "$(dir $(Z23_BIN)).zclassic23.deploy.XXXXXX")"; \
 	prior_snapshot="$(BIN_DIR)/.zclassic23.deploy-prior"; \
 	dropin_tmp=""; service_tmp=""; rollback_bin=""; rollback_dropin=""; \
 	fleet_manifest_tmp=""; \
@@ -11663,7 +11703,7 @@ deploy: vendor-ready lint zclassic-cli zcl-nodectl tools/wal_checkpoint
 	}; \
 	trap cleanup_deploy EXIT; \
 	trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; \
-	install -m 755 "$(ZCLASSIC23_BIN)" "$$candidate"; \
+	install -m 755 "$(Z23_BIN)" "$$candidate"; \
 	artifact_sha256="$$(sha256sum < "$$candidate" | awk '{print $$1}')"; \
 	[ "$${#artifact_sha256}" -eq 64 ] || { \
 	    echo "deploy: invalid frozen candidate SHA-256" >&2; exit 1; }; \
@@ -11804,9 +11844,13 @@ deploy: vendor-ready lint zclassic-cli zcl-nodectl tools/wal_checkpoint
 	if [ -f "$$service_bin_dir/MANIFEST.sha256" ]; then \
 	    fleet_manifest_tmp="$$(mktemp "$$service_bin_dir/.MANIFEST.sha256.XXXXXX")"; \
 	    ( cd "$$service_bin_dir" && \
+	      extra=""; \
+	      for w in z23-package-verify z23-package-verify-dev; do \
+	          if [ -e "$$w" ]; then extra="$$extra $$w"; fi; \
+	      done; \
 	      sha256sum "$${SERVICE_BIN##*/}" zclassic23-package-verify \
-	                zclassic23-package-verify-dev ) > "$$fleet_manifest_tmp" || { \
-	        echo "deploy: fleet MANIFEST.sha256 beside $$SERVICE_BIN implies a release set of the daemon plus zclassic23-package-verify and zclassic23-package-verify-dev, and that set is incomplete; refusing to write a partial manifest" >&2; \
+	                zclassic23-package-verify-dev $$extra ) > "$$fleet_manifest_tmp" || { \
+	        echo "deploy: fleet MANIFEST.sha256 beside $$SERVICE_BIN implies a release set of the daemon plus zclassic23-package-verify and zclassic23-package-verify-dev (and z23-package-verify{,-dev} when present), and that set is incomplete; refusing to write a partial manifest" >&2; \
 	        rm -f "$$fleet_manifest_tmp"; exit 1; }; \
 	    install -m 644 "$$fleet_manifest_tmp" "$$service_bin_dir/MANIFEST.sha256"; \
 	    rm -f "$$fleet_manifest_tmp"; fleet_manifest_tmp=""; \
@@ -11886,8 +11930,8 @@ ship:
 	    echo "ship: REFUSE: ZCL_PROFILE=dev produces the unsippable $(Z23_DEV_UNSHIPPABLE_BIN)" >&2; \
 	    exit 2; \
 	fi
-	@case "$(ZCLASSIC23_BIN)" in \
-	    *.dev) echo "ship: REFUSE: $(ZCLASSIC23_BIN) is not a shippable name" >&2; exit 2;; \
+	@case "$(Z23_BIN)" in \
+	    *.dev) echo "ship: REFUSE: $(Z23_BIN) is not a shippable name" >&2; exit 2;; \
 	esac
 	@set +e; ./tools/ship.sh $(SHIP_ARGS); ship_rc=$$?; set -e; \
 	case "$$ship_rc" in \
@@ -12497,7 +12541,7 @@ worktree-init:
 clean:
 	rm -rf $(BUILD_DIR)
 	rm -f test_zcl test_parallel zclassic23 zclassic-cli zcl-rpc zcl-nodectl \
-	    zclassic23-chaos p2_invariant_check crash_recovery_test rebuild_recent \
+	    z23-chaos p2_invariant_check crash_recovery_test rebuild_recent \
 	    shadow_replay_proof wallet_check spec_zcl session bot wallet_dump \
 	    wallet_sim wallet-wireframes mock_rpc export_snapshot bench_fresh_sync \
 	    fuzz_block fuzz_script fuzz_p2p fuzz_http fuzz_compactblock \
@@ -13116,7 +13160,7 @@ $(MUTATION_CAMPAIGN_BIN): $(MUTATION_CAMPAIGN_SRCS)
 # decides. It is the one C23 engine-unit path; the earlier shell dispatcher
 # and self-report extractor were retired once this lifecycle was proven.
 #
-# Like $(BIN_DIR)/zclassic23-acme above, this is compiled STRAIGHT FROM SOURCE
+# Like $(BIN_DIR)/z23-acme above, this is compiled STRAIGHT FROM SOURCE
 # to an executable with no intermediate object files, and for the same reason:
 # it links tools/acme/tls_client.c, and tests/harness/src/test_cold_join_sovereign.c
 # P2 asserts that no Z23 object under build/*obj*/epochs carries an undefined
@@ -13130,7 +13174,7 @@ $(MUTATION_CAMPAIGN_BIN): $(MUTATION_CAMPAIGN_SRCS)
 # lib module, and is linked into the node like any other. That split is the
 # whole reason this program can exist without weakening the node's claim that
 # it consults no certificate authority.
-ENGINE_UNIT_BIN = $(BIN_DIR)/zclassic23-engine-unit
+ENGINE_UNIT_BIN = $(BIN_DIR)/z23-engine-unit
 ENGINE_UNIT_SRCS = tools/engine_unit.c \
 	contexts/commons/modules/vcs/src/vcs_object.c \
 	contexts/commons/packages/zutf8/src/zutf8.c \
@@ -13303,7 +13347,7 @@ zvcs-unseal: dev-bin
 	fi
 	@echo "══ zvcs-unseal: authorizing exactly the CURRENT tree's sealed content for ONE anchor ══"
 	@reason_json=$$(printf '%s' "$(REASON)" | sed 's/\\/\\\\/g; s/"/\\"/g'); \
-	$(ZCLASSIC23_DEV_BIN) dev vcs seal grant \
+	$(Z23_DEV_BIN) dev vcs seal grant \
 	    --input="{\"reason\":\"$$reason_json\",\"confirm\":true}"
 
 # HARD lint gate for the seal (frozen at W5 — the whole W0–W4 split has landed).
@@ -13468,7 +13512,7 @@ check-model-sql-literals:
 # still be tracked. There is no baseline — a row that stopped being true is
 # not a debt, it is a false statement.
 .PHONY: check-cookbook
-check-cookbook: $(ZCLASSIC23_DEV_BIN) $(LINTC_TOOL)
+check-cookbook: $(Z23_DEV_BIN) $(LINTC_TOOL)
 	@echo "══ LINT: every cookbook recipe still works ══"
 	@./tools/lint/check_cookbook.sh --selftest
 	@./tools/lint/check_cookbook.sh
@@ -13881,7 +13925,7 @@ check-toolchain:
 # gold with no lint signal. mold/lld already parallelize internally, so this
 # only asserts the gold branch. Confinement: ZCL_DEV_LINKER (and therefore
 # this flag) feeds TEST_FAST_LDFLAGS/TEST_REL_LDFLAGS/DEV_LDFLAGS only --
-# $(LDFLAGS) itself (what $(ZCLASSIC23_BIN), the release/LTO link, uses)
+# $(LDFLAGS) itself (what $(Z23_BIN), the release/LTO link, uses)
 # must never carry it.
 check-dev-linker-threads:
 	@echo "══ LINT: dev/test linker keeps gold multi-threaded, release stays plain ══"
@@ -15227,7 +15271,7 @@ check-outparam-init-before-return:
 	@bash tools/lint/check_outparam_init_before_return.sh --selftest
 	@bash tools/lint/check_outparam_init_before_return.sh
 
-check-codeindex-coverage: $(ZCLASSIC23_DEV_BIN) $(LINTC_TOOL)
+check-codeindex-coverage: $(Z23_DEV_BIN) $(LINTC_TOOL)
 	@echo "══ LINT: every tracked maintained source node is indexed ══"
 	@./build/bin/z23-lint check-codeindex-coverage --selftest
 	@./build/bin/z23-lint check-codeindex-coverage
@@ -15646,7 +15690,7 @@ LINT_BUILT_PREREQS = tools/core_seal tools/check_observability_pairing \
 # tor-ready: a manifest that EXISTS but disagrees with the archives must
 # still reach check_tor_provenance.sh's own diagnostic and fail there, never
 # be silently re-attested here.
-lint lint-cached lint-cold-audit: $(ZCLASSIC23_DEV_BIN) \
+lint lint-cached lint-cold-audit: $(Z23_DEV_BIN) \
 	$(DEV_PACKAGE_VERIFY_BIN) $(LINT_BUILT_PREREQS) tor-provenance-ready
 
 ifeq ($(ZCL_LINT_SERIAL),1)
@@ -15678,7 +15722,7 @@ endif
 #
 # So the proof builds this target first, alone, and both dimensions then only
 # read. Name the lint umbrella's own built prerequisites, never a copy of the
-# list — one definition, no drift. $(ZCLASSIC23_DEV_BIN) and
+# list — one definition, no drift. $(Z23_DEV_BIN) and
 # $(DEV_PACKAGE_VERIFY_BIN) are deliberately absent: the proof admits those by
 # content through --source-record and marks them fresh, and building them here
 # would throw that admission away.
@@ -15783,7 +15827,7 @@ ci-symbol-floor: zclassic23
 # DECISION (Wave-2 lane B2, measured 2026-07-10): `make chaos` deliberately
 # does NOT gate `make ci`. The 13-scenario corpus itself runs in ~1.6s once
 # built — that part is cheap. The cost that matters is building the
-# zclassic23-chaos binary in the first place: it is its own whole-program
+# z23-chaos binary in the first place: it is its own whole-program
 # LTO link over $(ALL_SRCS) (same shape as zclassic23; test_parallel is now a
 # cached per-TU non-LTO build, so it is no longer in this class), and a clean
 # build of it alone measured 1m33s. `make ci` already pays for the whole-program

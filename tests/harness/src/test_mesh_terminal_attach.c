@@ -36,6 +36,13 @@ struct fake_node {
     const char *output;            /* delivered on the first live read */
     int end_at_read;               /* 1-based read that reports "ended"; 0 never */
     const char *evidence_reason;   /* CLOSED receipt evidence, or NULL */
+    const char *evidence_extra;    /* extra evidence members, e.g. ,"exit_code":3 */
+    const char *close_reason;      /* locally named end, no evidence, or NULL */
+    int fail_at_read;              /* 1-based read after which the node is gone */
+    size_t burst_total;            /* output burst size; ends when drained */
+    size_t burst_left;
+    bool burst_started;
+    bool dead;
     /* observations */
     int opens, polls, reads, writes, resizes, closes, calls;
     unsigned open_cols, open_rows, resize_cols, resize_rows;
@@ -68,6 +75,8 @@ struct fake_term {
     int64_t clock_ms;
     char out[CAP], err[CAP * 2];
     size_t out_len;
+    size_t out_total;          /* every byte written, kept or not */
+    bool discard_output;       /* count output instead of keeping it */
 };
 
 static char *fake_dup(const char *s)
@@ -99,18 +108,56 @@ static char *fake_poll(struct fake_node *n)
                  "{\"ok\":true,\"state\":\"ended\",\"verdict\":\"closed\","
                  "\"bytes_in\":%zu,\"bytes_out\":7,\"close_evidence\":"
                  "{\"bytes_in\":%zu,\"bytes_out\":7,\"duration_s\":2,"
-                 "\"reason\":\"%s\"}}",
-                 n->sent_len, n->sent_len, n->evidence_reason);
+                 "\"reason\":\"%s\"%s}}",
+                 n->sent_len, n->sent_len, n->evidence_reason,
+                 n->evidence_extra ? n->evidence_extra : "");
+    else if (n->ended && n->close_reason)
+        snprintf(b, sizeof(b),
+                 "{\"ok\":true,\"state\":\"ended\",\"verdict\":\"closed\","
+                 "\"close_reason\":\"%s\",\"bytes_in\":%zu,\"bytes_out\":9}",
+                 n->close_reason, n->sent_len);
     else
         snprintf(b, sizeof(b), "{\"ok\":true,\"state\":\"%s\",\"bytes_in\":%zu}",
                  state, n->sent_len);
     return fake_dup(b);
 }
 
+/* A shell flooding output: every read hands back a full 8192-byte block
+ * until the burst is spent, then the session ends with its evidence. */
+static char *fake_burst_read(struct fake_node *n)
+{
+    if (!n->burst_started) {
+        n->burst_started = true;
+        n->burst_left = n->burst_total;
+    }
+    if (n->burst_left == 0) {
+        n->ended = true;
+        return fake_dup("{\"ok\":true,\"state\":\"ended\",\"output_bytes\":0}");
+    }
+    uint8_t block[8192];
+    size_t take = n->burst_left < sizeof(block) ? n->burst_left : sizeof(block);
+    memset(block, 'x', take);
+    char *b = malloc(take * 2u + 128u);
+    if (!b)
+        return NULL;
+    int used = snprintf(b, take * 2u + 128u,
+                        "{\"ok\":true,\"state\":\"live\",\"output_hex\":\"");
+    zcl_hex_encode(block, take, b + used);
+    strcpy(b + used + take * 2u, "\"}");
+    n->burst_left -= take;
+    return b;
+}
+
 static char *fake_read(struct fake_node *n)
 {
     char b[CAP];
     n->reads++;
+    if (n->burst_total)
+        return fake_burst_read(n);
+    if (n->fail_at_read && n->reads >= n->fail_at_read) {
+        n->dead = true;
+        return NULL;
+    }
     if (n->end_at_read && n->reads >= n->end_at_read) {
         n->ended = true;
         return fake_dup("{\"ok\":true,\"state\":\"ended\",\"output_bytes\":0}");
@@ -153,6 +200,8 @@ static char *fake_rpc(void *ctx, const char *method, const char *params)
 {
     struct fake_node *n = ctx;
     struct json_value arr;
+    if (n->dead)
+        return NULL;
     json_init(&arr);
     if (!json_read(&arr, params, strlen(params)))
         return NULL;
@@ -221,6 +270,9 @@ static long tty_read(void *ctx, uint8_t *buf, size_t cap, int timeout_ms)
 static bool tty_write(void *ctx, const uint8_t *buf, size_t len)
 {
     struct fake_term *t = ctx;
+    t->out_total += len;
+    if (t->discard_output)
+        return true;
     if (t->out_len + len > sizeof(t->out))
         return false;
     memcpy(t->out + t->out_len, buf, len);
@@ -679,6 +731,228 @@ static int test_active_hold(void)
     return failures;
 }
 
+static int test_control_keys_reach_remote(void)
+{
+    int failures = 0;
+    TEST("mesh terminal attach: Ctrl-C, Ctrl-Z, Ctrl-backslash and Ctrl-D "
+         "are remote input, never a local signal, and ~. is the way out") {
+        struct fake_node n;
+        struct fake_term t;
+        fake_init(&n, &t);
+        t.inputs[0] = "\x03";
+        t.inputs[1] = "\x1a";
+        t.inputs[2] = "\x1c\x04";
+        t.inputs[3] = "\r";
+        t.inputs[4] = "~.";
+        t.input_count = 5;
+        int rc = run(&n, &t, true, PAIRING);
+        ASSERT_EQ(rc, 0);
+        ASSERT(sent_is(&n, "\x03\x1a\x1c\x04\r"));
+        ASSERT(strstr(t.err, "z23: attached; type ~. at the start of a line "
+                             "to detach") != NULL);
+        ASSERT(strstr(t.err, "z23: detached") != NULL);
+        ASSERT(strstr(t.err, "interrupted") == NULL);
+        ASSERT_EQ(t.raw_off_count, 1);
+#ifndef _WIN32
+        ASSERT(zcl_native_mesh_terminal_test_raw_is_transparent());
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_remote_end_messages(void)
+{
+    static const struct {
+        const char *reason;
+        int exit_code;
+        const char *words;
+    } rows[] = {
+        {"worker-exited", 0, "the remote shell exited"},
+        {"idle-timeout", 5, "no input or output for 600 s"},
+        {"lifetime-limit", 5, "3600 s session limit"},
+        {"byte-limit", 5, "byte budget"},
+        {"session-lost", 5, "link to the peer was lost"},
+        {"shutdown", 5, "remote node is shutting down"},
+        {"revoked", 4, "pairing was revoked"},
+        {"expired", 4, "pairing expired"},
+    };
+    int failures = 0;
+    TEST("mesh terminal attach: every way the remote ends has its own exit "
+         "class and a plain-words line on stderr") {
+        for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+            struct fake_node n;
+            struct fake_term t;
+            fake_init(&n, &t);
+            n.end_at_read = 2;
+            n.evidence_reason = rows[i].reason;
+            ASSERT_EQ(run(&n, &t, true, PAIRING), rows[i].exit_code);
+            ASSERT(strstr(t.err, rows[i].reason) != NULL);
+            ASSERT(strstr(t.err, rows[i].words) != NULL);
+            ASSERT_EQ(t.raw_off_count, 1);
+            ASSERT(!t.raw_state);
+        }
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_remote_exit_status(void)
+{
+    static const struct {
+        const char *extra;
+        int exit_code;
+        const char *words;
+    } rows[] = {
+        {",\"exit_code\":3", 3, "exit_code=3"},
+        {",\"exit_code\":255", 255, "exit_code=255"},
+        {",\"exit_code\":0", 0, "exit_code=0"},
+        {",\"signal\":15", 143, "signal=15"},
+        {",\"signal\":9", 137, "signal=9"},
+        {NULL, 0, "reason=worker-exited"}, /* old node: no status */
+        {",\"exit_code\":300", 0, "reason=worker-exited"}, /* out of range */
+    };
+    int failures = 0;
+    TEST("mesh terminal attach: worker-exited carries the remote status "
+         "(N, 128+signal), and a report without one exits 0") {
+        for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+            struct fake_node n;
+            struct fake_term t;
+            fake_init(&n, &t);
+            n.end_at_read = 2;
+            n.evidence_reason = "worker-exited";
+            n.evidence_extra = rows[i].extra;
+            ASSERT_EQ(run(&n, &t, true, PAIRING), rows[i].exit_code);
+            ASSERT(strstr(t.err, rows[i].words) != NULL);
+            ASSERT_EQ(t.raw_off_count, 1);
+        }
+        /* The status belongs to worker-exited only: a limit ending keeps
+         * its class whatever the report adds. */
+        struct fake_node n;
+        struct fake_term t;
+        fake_init(&n, &t);
+        n.end_at_read = 2;
+        n.evidence_reason = "idle-timeout";
+        n.evidence_extra = ",\"exit_code\":9";
+        ASSERT_EQ(run(&n, &t, true, PAIRING), 5);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_end_without_evidence(void)
+{
+    int failures = 0;
+    TEST("mesh terminal attach: a link loss with no signed close report "
+         "is a transient failure, and an unexplained peer close is not a "
+         "clean exit") {
+        struct fake_node n;
+        struct fake_term t;
+        fake_init(&n, &t);
+        n.end_at_read = 2;
+        n.close_reason = "session-lost";
+        ASSERT_EQ(run(&n, &t, true, PAIRING), 5);
+        ASSERT(strstr(t.err, "reason=session-lost") != NULL);
+        ASSERT(strstr(t.err, "link to the peer was lost") != NULL);
+        fake_init(&n, &t);
+        n.end_at_read = 2;
+        n.close_reason = "requested";
+        ASSERT_EQ(run(&n, &t, true, PAIRING), 5);
+        ASSERT(strstr(t.err, "without a close report") != NULL);
+        ASSERT_EQ(t.raw_off_count, 1);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_admission_message(void)
+{
+    int failures = 0;
+    TEST("mesh terminal attach: the session cap refusal says what the cap "
+         "is") {
+        struct fake_node n;
+        struct fake_term t;
+        fake_init(&n, &t);
+        n.refused_verdict = "concurrency-limit";
+        ASSERT_EQ(run(&n, &t, true, PAIRING), 5);
+        ASSERT(strstr(t.err, "z23: refused: concurrency-limit:") != NULL);
+        ASSERT(strstr(t.err, "4 terminals") != NULL);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_node_lost_mid_session(void)
+{
+    int failures = 0;
+    TEST("mesh terminal attach: the node vanishing mid-session restores "
+         "the terminal at once and says the connection was lost") {
+        struct fake_node n;
+        struct fake_term t;
+        fake_init(&n, &t);
+        n.fail_at_read = 3;
+        int rc = run(&n, &t, true, PAIRING);
+        ASSERT_EQ(rc, 5);
+        ASSERT_EQ(t.raw_on_count, 1);
+        ASSERT_EQ(t.raw_off_count, 1);
+        ASSERT(!t.raw_state);
+        ASSERT(strstr(t.err, "z23: connection lost: NODE_UNAVAILABLE") != NULL);
+        ASSERT(strstr(t.err, "z23: refused:") == NULL);
+        /* Bounded: the loop stops at the first failed read, not after a
+         * timeout of its own. */
+        ASSERT(t.clock_ms < 1000);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_output_failure_restores(void)
+{
+    int failures = 0;
+    TEST("mesh terminal attach: a failed local write restores the "
+         "terminal and exits internal") {
+        struct fake_node n;
+        struct fake_term t;
+        fake_init(&n, &t);
+        n.output = "zz";
+        t.out_len = sizeof(t.out);
+        int rc = run(&n, &t, true, PAIRING);
+        ASSERT_EQ(rc, 6);
+        ASSERT_EQ(t.raw_off_count, 1);
+        ASSERT(!t.raw_state);
+        ASSERT(strstr(t.err, "OUTPUT_FAILED") != NULL);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_burst_throughput(void)
+{
+    int failures = 0;
+    TEST("mesh terminal attach: a 1 MiB output burst drains in 16 poll "
+         "cycles with no stall") {
+        struct fake_node n;
+        struct fake_term t;
+        fake_init(&n, &t);
+        n.burst_total = 1048576u;
+        n.evidence_reason = "worker-exited";
+        t.discard_output = true;
+        t.clock_on_read = true;
+        int rc = run(&n, &t, true, PAIRING);
+        ASSERT_EQ(rc, 0);
+        ASSERT_EQ(t.out_total, (size_t)1048576);
+        /* 128 full 8 KiB reads at 8 per cycle: 16 cycles of the 20 ms
+         * active poll, the client side's whole cost. */
+        ASSERT_EQ(n.reads, 129);
+        ASSERT(t.clock_ms <= 17 * 20 + 100);
+        printf("  mesh terminal attach: 1 MiB burst = %d RPC reads, %lld ms "
+               "simulated client time\n",
+               n.reads, (long long)t.clock_ms);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 int test_mesh_terminal_attach(void)
 {
     int failures = 0;
@@ -698,5 +972,13 @@ int test_mesh_terminal_attach(void)
     failures += test_timeout();
     failures += test_bad_pairing();
     failures += test_active_hold();
+    failures += test_control_keys_reach_remote();
+    failures += test_remote_end_messages();
+    failures += test_end_without_evidence();
+    failures += test_admission_message();
+    failures += test_node_lost_mid_session();
+    failures += test_output_failure_restores();
+    failures += test_burst_throughput();
+    failures += test_remote_exit_status();
     return failures;
 }

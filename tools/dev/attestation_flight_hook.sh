@@ -10,7 +10,7 @@
 # second harness.
 #
 # THE CLAIM, IN ONE SENTENCE: a signed attestation minted on node P by the
-# separate zclassic23-package-verify program reaches node R by itself — no
+# separate z23-package-verify program reaches node R by itself — no
 # operator carries bytes — is independently re-verified there, and lands as
 # BYTE-IDENTICAL filed evidence under the SAME attestation-id filename that
 # R's own quorum policy then evaluates and honestly declines to count.
@@ -31,11 +31,11 @@ afl_note() { dht_note "attestation-flight: $*"; }
 
 JSONQ="${JSONQ:-$REPO_ROOT/build/bin/jsonq}"
 [ -x "$JSONQ" ] || afl_die "build/bin/jsonq is missing"
-AFL_SIGNER="$REPO_ROOT/build/bin/zclassic23-package-sign"
-AFL_VERIFIER="$REPO_ROOT/build/bin/zclassic23-package-verify"
-[ -x "$AFL_SIGNER" ] || afl_die "build/bin/zclassic23-package-sign is missing"
+AFL_SIGNER="$REPO_ROOT/build/bin/z23-package-sign"
+AFL_VERIFIER="$REPO_ROOT/build/bin/z23-package-verify"
+[ -x "$AFL_SIGNER" ] || afl_die "build/bin/z23-package-sign is missing"
 [ -x "$AFL_VERIFIER" ] ||
-    afl_die "build/bin/zclassic23-package-verify is missing; the attestation \
+    afl_die "build/bin/z23-package-verify is missing; the attestation \
 must be minted by the real verifier, never hand-assembled"
 
 afl_json() {
@@ -374,7 +374,7 @@ AFL_DECOY_TRANSPORT="$AFL_PACKAGE_TRANSPORT"
 afl_note "leg 1 PASS: publisher holds flight=$AFL_FLIGHT_ROOT decoy=$AFL_DECOY_ROOT"
 
 # ── leg 2: mint a REALLY SIGNED attestation on the publisher ───────────
-# The node never compiles downloaded code: zclassic23-package-verify is the
+# The node never compiles downloaded code: z23-package-verify is the
 # separate program that runs the confined build+test and signs the ZCLATT
 # wire. This is a genuine build of a genuine (tiny) package, not a fixture
 # blob — the smallest honest package that really compiles and really passes

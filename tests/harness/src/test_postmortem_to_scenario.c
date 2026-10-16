@@ -178,7 +178,7 @@ int test_postmortem_to_scenario(void)
     chaos_ctx_init(&cctx);
     cctx.scenario_path = out_path;
     int parse_rc = run_scenario(&cctx);
-    P2S_CHECK("skeleton parses via zclassic23-chaos run_scenario()",
+    P2S_CHECK("skeleton parses via z23-chaos run_scenario()",
               parse_rc == 0);
     P2S_CHECK("parsed seed matches converter's seed slot",
               cctx.seed_set && cctx.seed == st.seed_slot);

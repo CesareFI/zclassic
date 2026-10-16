@@ -153,6 +153,10 @@ struct mesh_terminal_worker {
     /* Meaningful once !running: WEXITSTATUS of the reaped shell, or
      * 128 + terminating signal. */
     int exit_code;
+    /* The terminating signal number when the shell was killed by a
+     * signal (POSIX), else 0. Lets the close evidence name a signal
+     * apart from a shell that itself exited with 128 + n. */
+    int term_signal;
     /* Why the session ended. MESH_TERMINAL_CLOSE_REQUESTED (0) is the
      * zero value: a session that has not ended reads as "requested" by
      * construction, and every enforcement path names itself. */

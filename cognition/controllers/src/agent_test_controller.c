@@ -3,7 +3,7 @@
  * agenttest — native agent contract wrapping tools/agent_test_runner.sh,
  * which in turn runs ONE allowlisted test surface:
  *   kind=test_group -> build/bin/test_parallel --only=<name>
- *   kind=scenario   -> build/bin/zclassic23-chaos --scenario=tools/sim/scenarios/<name>.scenario
+ *   kind=scenario   -> build/bin/z23-chaos --scenario=tools/sim/scenarios/<name>.scenario
  *
  * Cloned end-to-end from the agentcopyprove pattern
  * (cognition/controllers/src/agent_copy_prove_controller.c) — same async-by-design
@@ -22,7 +22,7 @@
  *   - `name` must match ^[a-z0-9_]{1,64}$ — no slash, no dot, no shell
  *     metacharacter of any kind can survive that charset. No arbitrary
  *     `make` targets are ever invoked; the only two binaries this contract
- *     can launch are build/bin/test_parallel and build/bin/zclassic23-chaos.
+ *     can launch are build/bin/test_parallel and build/bin/z23-chaos.
  *   - test_group additionally cross-checks `name` against the COMPILED
  *     group registry via `test_parallel --list` (exact line match) when
  *     that binary is reachable — not a substring match, so this contract's
@@ -252,7 +252,7 @@ bool rpc_agent_test(const struct json_value *params, bool help,
         "return immediately without blocking for the run. There is no\n"
         "arbitrary-command field — the two inputs (kind, name) are\n"
         "allowlist-validated below and can only ever select build/bin/\n"
-        "test_parallel --only=<name> or build/bin/zclassic23-chaos\n"
+        "test_parallel --only=<name> or build/bin/z23-chaos\n"
         "--scenario=tools/sim/scenarios/<name>.scenario.\n"
         "\nParams:\n"
         "  kind (string, required)  \"test_group\" or \"scenario\"\n"

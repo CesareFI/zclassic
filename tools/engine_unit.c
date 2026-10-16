@@ -42,7 +42,7 @@
  * stranger's machine may not have. This program uses the tree's own TLS
  * client (tools/acme/tls_client.h) and its own JSON parser. It is compiled
  * straight from source into its own executable, with no intermediate object
- * files, for the same reason zclassic23-acme is: nothing that references a
+ * files, for the same reason z23-acme is: nothing that references a
  * TLS-client or trust-store symbol may appear in a Z23 object file, and
  * tests/harness/src/test_cold_join_sovereign.c P2 asserts exactly that.
  *
@@ -980,7 +980,7 @@ static bool dispatch_https(const struct engine_vendor *v, const char *body,
         .content_type = "application/json",
         .body         = body,
         .body_len     = body_len,
-        .user_agent   = "zclassic23-engine-unit",
+        .user_agent   = "z23-engine-unit",
         .timeout_ms   = timeout_ms,
         .headers      = headers,
         .header_count = 1,

@@ -2056,7 +2056,7 @@ static bool tc_external_exec_denied(void)
 static bool tc_acme_and_agent_policy(void)
 {
     return file_contains("tests/harness/src/test_acme_worker.c",
-                         "build/bin/zclassic23-acme") &&
+                         "build/bin/z23-acme") &&
            testcache_group_is_denylisted("test_agent_copy_prove") &&
            tc_external_exec_denied();
 }
@@ -2262,7 +2262,7 @@ static int tc_rail_pin_bindable(struct testcache *tc)
 {
     int failures = 0;
     static const char *const bindable[] = {
-        "test_acme_worker",            /* binds zclassic23-acme */
+        "test_acme_worker",            /* binds z23-acme */
         "test_consensus_rule_sweep",   /* binds consensus_rule_sweep */
         "test_fleet_board_bridge",     /* binds fleet-board-bridge */
         "test_fleet_gateway",          /* binds z23-fleet-gateway + zclassic23 */

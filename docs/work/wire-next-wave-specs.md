@@ -224,7 +224,7 @@ detail).
 - **Files (new)**:
   - `tools/sim/wire_sweep.c` — model on the existing `tools/sim/chaos.c`
     pattern (standalone `cc`-compiled binary, not part of the whole-program
-    LTO build — see `Makefile:774-784` for the `zclassic23-chaos` target
+    LTO build — see `Makefile:774-784` for the `z23-chaos` target
     shape to copy). Loop over a seed range (or `--seed=N --count=K`),
     construct a `wire_scenario` per seed (mix of peer kinds proportional to
     a config, similar to `sw_run_mixed` in `test_simnet_wire.c:199-243` but

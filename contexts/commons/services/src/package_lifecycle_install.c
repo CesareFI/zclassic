@@ -43,8 +43,12 @@
 #include <io.h>
 #endif
 
-#define PKGL_DEV_WORKER_NAME "zclassic23-package-verify-dev"
-#define PKGL_RELEASE_WORKER_NAME "zclassic23-package-verify"
+#define PKGL_DEV_WORKER_NAME "z23-package-verify-dev"
+#define PKGL_RELEASE_WORKER_NAME "z23-package-verify"
+/* Pre-rename names: migration symlinks, and the only names in release trees
+ * shipped before the z23-* rename. Searched after the z23-* names. */
+#define PKGL_DEV_WORKER_LEGACY_NAME "zclassic23-package-verify-dev"
+#define PKGL_RELEASE_WORKER_LEGACY_NAME "zclassic23-package-verify"
 
 #ifndef _WIN32
 static struct zcl_result pkgl_parent_shape(const char *path,
@@ -101,6 +105,8 @@ struct zcl_result pkgl_worker_path_for_executable(const char *executable,
     const char *names[] = {
         PKGL_DEV_WORKER_NAME,
         PKGL_RELEASE_WORKER_NAME,
+        PKGL_DEV_WORKER_LEGACY_NAME,
+        PKGL_RELEASE_WORKER_LEGACY_NAME,
     };
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         int w = snprintf(out, cap, "%s/%s", exe, names[i]);

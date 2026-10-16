@@ -4735,6 +4735,92 @@ static int zwn_t_ordinary_c23_redundant(const struct chain_params *params)
         "lib", k_dirs, sizeof(k_dirs) / sizeof(k_dirs[0]), 1600u);
 }
 
+/* Late joiner discovery by announcement: A and B both hold the package, A
+ * disappears, and only then C starts. C has no provider handle; the surviving
+ * holder reaches it through B's ANNOUNCE, peers_for / advertised name B (and
+ * never the vanished A), and a plain fetch completes from B. */
+static int zwn_t_late_joiner_announce_discovery(
+    const struct chain_params *params)
+{
+    int failures = 0;
+    struct zwn_fixture fixture = {0};
+    TEST("late joiner finds the surviving holder by announcement and "
+         "fetches with no provider handle") {
+        struct zwn_pkg pkg;
+        ASSERT(zwn_make_package(&pkg, 4, 0x3c));
+
+        struct zwn_node a, b, c;
+        const struct zwn_node_spec holders[] = {{&a, "lj-a"}, {&b, "lj-b"}};
+        ASSERT(zwn_fixture_nodes(&fixture, params, holders, 2));
+        ASSERT(zwn_store_package(a.store, &pkg));
+        ASSERT(zwn_store_package(b.store, &pkg));
+
+        /* A held the package redundantly with B, then vanishes before the
+         * late joiner exists. */
+        struct zwn_link a_b, b_a;
+        const struct zwn_link_spec a_b_links[] = {
+            {&a, &a_b, {12, 0, 0, 1}, "lj-b"},
+            {&b, &b_a, {12, 0, 0, 2}, "lj-a"},
+        };
+        ASSERT(zwn_fixture_links(&fixture, a_b_links, 2));
+        ASSERT(zwn_meet_side(&a, &a_b));
+        ASSERT(zwn_meet_side(&b, &b_a));
+        zwn_fixture_release_link(&fixture, &a_b);
+        zwn_fixture_release_link(&fixture, &b_a);
+        zwn_fixture_release_node(&fixture, &a);
+
+        const struct zwn_node_spec joiner[] = {{&c, "lj-c"}};
+        ASSERT(zwn_fixture_nodes(&fixture, params, joiner, 1));
+        struct zwn_link b_c, c_b;
+        const struct zwn_link_spec b_c_links[] = {
+            {&b, &b_c, {12, 0, 0, 3}, "lj-c"},
+            {&c, &c_b, {12, 0, 0, 4}, "lj-b"},
+        };
+        ASSERT(zwn_fixture_links(&fixture, b_c_links, 2));
+        ASSERT(zwn_meet_side(&b, &b_c));
+        ASSERT(zwn_meet_side(&c, &c_b));
+
+        /* Nothing announced has crossed the wire yet. */
+        struct vcs_swarm_peer_info holders_seen[4];
+        ASSERT(vcs_swarm_engine_peers_for(c.engine, pkg.root, holders_seen,
+                                          4) == 0);
+        struct vcs_swarm_advertised adv[4];
+        ASSERT(vcs_swarm_engine_advertised(c.engine, adv, 4) == 0);
+
+        size_t found = 0;
+        for (int r = 0; r < 20 && found == 0; r++) {
+            ASSERT(zwn_round(&b_c, &c_b, params->pchMessageStart));
+            found = vcs_swarm_engine_peers_for(c.engine, pkg.root,
+                                               holders_seen, 4);
+        }
+        /* Exactly one holder is discoverable: the survivor. */
+        ASSERT(found == 1);
+        ASSERT(holders_seen[0].peer == (uint64_t)c_b.node->id);
+        ASSERT(vcs_swarm_engine_advertised(c.engine, adv, 4) == 1);
+        ASSERT(memcmp(adv[0].root, pkg.root, 32) == 0);
+        ASSERT(adv[0].advertisers == 1);
+
+        /* No provider handle: the engine picks from the announcement. */
+        uint32_t replies_before = b.chunk_data_replies[0];
+        ASSERT(vcs_swarm_engine_fetch(c.engine, pkg.root, ZWN_DAY,
+                                      ++c.now) == VCS_SWARM_FETCH_OK);
+        enum vcs_swarm_download_state state = VCS_SWARM_DL_INACTIVE;
+        bool terminal = false;
+        for (int r = 0; r < 600 && !terminal; r++) {
+            ASSERT(zwn_round(&b_c, &c_b, params->pchMessageStart));
+            terminal = zwn_download_done(&c, pkg.root, &state);
+        }
+        ASSERT(terminal);
+        ASSERT(state == VCS_SWARM_DL_COMPLETE);
+        ASSERT(b.chunk_data_replies[0] > replies_before);
+        ASSERT(zwn_store_matches(c.store, &pkg));
+        ASSERT(c_b.node->misbehavior == 0);
+        PASS();
+    } _test_next:
+    zwn_fixture_cleanup(&fixture);
+    return failures;
+}
+
 /* ── attestation flight: a signed ZCLATT crosses the real swarm ─────── */
 
 /* An attestation is at most VCS_PACKAGE_ATTEST_MAX_WIRE_BYTES (681),
@@ -8475,6 +8561,7 @@ static const struct zwn_case g_zwn_cases[] = {
     ZWN_CASE(zwn_t_deterministic_replay, 2),
     ZWN_CASE(zwn_t_useful_c23_redundant, 3),
     ZWN_CASE(zwn_t_ordinary_c23_redundant, 1),
+    ZWN_CASE(zwn_t_late_joiner_announce_discovery, 2),
     ZWN_CASE(zwn_t_attestation_flight, 4),
     ZWN_CASE(zwn_t_task_flight, 4),
     ZWN_CASE(zwn_t_shared_focus_flight, 3),
@@ -8509,6 +8596,7 @@ static const char *const g_zwn_original[] = {
     "zwn_t_corrupt_local_repair", "zwn_t_unrequested",
     "zwn_t_quota_exhaustion", "zwn_t_deterministic_replay",
     "zwn_t_useful_c23_redundant", "zwn_t_ordinary_c23_redundant",
+    "zwn_t_late_joiner_announce_discovery",
     "zwn_t_attestation_flight", "zwn_t_task_flight",
     "zwn_t_shared_focus_flight", "zwn_t_task_hostile_pointer",
     "zwn_t_attestation_hostile_pointer", "zwn_t_attestation_corrupt_wire",

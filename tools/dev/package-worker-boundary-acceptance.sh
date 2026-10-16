@@ -4,7 +4,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
-verifier="${1:-$repo_root/build/bin/zclassic23-package-verify}"
+verifier="${1:-$repo_root/build/bin/z23-package-verify}"
 test -x "$verifier" || { echo 'package verifier is not built' >&2; exit 2; }
 scratch="$(mktemp -d /tmp/z23-package-boundary.XXXXXXXX)"
 trap 'rm -rf -- "$scratch"' EXIT

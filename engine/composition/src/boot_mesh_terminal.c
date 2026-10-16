@@ -44,6 +44,7 @@
 static struct boot_svc_ctx *g_term_svc; /* borrowed; set by wire() */
 static bool g_term_unconfined; /* -terminalacceptunconfined admitted */
 static char g_term_shell[600]; /* -terminalshell; empty = lane unavailable */
+static uint64_t g_term_max_out = MESH_TERMINAL_SERVICE_MAX_BYTES_OUT; /* -terminalmaxbytesout */
 
 /* First four bytes of the pairing id as hex: enough to tell peers apart in a
  * log without naming the pairing. */
@@ -70,7 +71,7 @@ static void terminal_log_opened(const struct mesh_terminal_open_v1 *open,
              terminal_state_name(), peer, (unsigned long long)stream_id,
              (unsigned long long)MESH_TERMINAL_SERVICE_LIFETIME_SECONDS,
              (unsigned long long)MESH_TERMINAL_SERVICE_MAX_BYTES_IN,
-             (unsigned long long)MESH_TERMINAL_SERVICE_MAX_BYTES_OUT);
+             (unsigned long long)boot_mesh_terminal_max_bytes_out());
 }
 
 /* One confined terminal's own state, hung off its stream. The stream owns
@@ -341,7 +342,7 @@ bool boot_mesh_terminal_render_grant_capsule_marked(
         json_push_kv_int(&capsule, "max_bytes_in",
                          (int64_t)MESH_TERMINAL_SERVICE_MAX_BYTES_IN) &&
         json_push_kv_int(&capsule, "max_bytes_out",
-                         (int64_t)MESH_TERMINAL_SERVICE_MAX_BYTES_OUT);
+                         (int64_t)boot_mesh_terminal_max_bytes_out());
     if (rendered && marker)
         rendered = json_push_kv_str(&capsule, "terminal_confinement", marker);
     if (!rendered) {
@@ -352,10 +353,27 @@ bool boot_mesh_terminal_render_grant_capsule_marked(
     return terminal_capsule_commit(&capsule, out, out_len);
 }
 
-bool boot_mesh_terminal_render_close_capsule(
-    uint64_t bytes_in, uint64_t bytes_out, uint64_t duration_seconds,
-    enum mesh_terminal_close_reason reason,
-    uint8_t out[MESH_TERMINAL_CAPSULE_MAX], size_t *out_len)
+/* worker-exited carries exactly one status; every other reason carries
+ * none. */
+static bool terminal_close_status_valid(enum mesh_terminal_close_reason reason,
+                                        int exit_code, int signal)
+{
+    bool has_exit = exit_code >= 0;
+    bool has_signal = signal != 0;
+    if (exit_code < -1 || exit_code > 255 || signal < 0 || signal > 64)
+        return false;
+    if (reason == MESH_TERMINAL_CLOSE_WORKER_EXITED)
+        return has_exit != has_signal;
+    return !has_exit && !has_signal;
+}
+
+/* Shared body: writes "exit_code" when >= 0 and "signal" when > 0. */
+static bool terminal_render_close(uint64_t bytes_in, uint64_t bytes_out,
+                                  uint64_t duration_seconds,
+                                  enum mesh_terminal_close_reason reason,
+                                  int exit_code, int signal,
+                                  uint8_t out[MESH_TERMINAL_CAPSULE_MAX],
+                                  size_t *out_len)
 {
     if (!out || !out_len || bytes_in > INT64_MAX || bytes_out > INT64_MAX ||
         duration_seconds > INT64_MAX)
@@ -371,12 +389,51 @@ bool boot_mesh_terminal_render_close_capsule(
         json_push_kv_int(&capsule, "duration_s", (int64_t)duration_seconds) &&
         json_push_kv_str(&capsule, "reason",
                          mesh_terminal_close_reason_string(reason));
+    if (rendered && exit_code >= 0)
+        rendered = json_push_kv_int(&capsule, "exit_code", exit_code);
+    if (rendered && signal > 0)
+        rendered = json_push_kv_int(&capsule, "signal", signal);
     if (!rendered) {
         json_free(&capsule);
         LOG_ERROR("net.mesh_terminal", "close capsule render refused");
         return false;
     }
     return terminal_capsule_commit(&capsule, out, out_len);
+}
+
+/* The pre-status shape: no status keys whatever the reason, exactly what a
+ * node that predates the fields sends. */
+bool boot_mesh_terminal_render_close_capsule(
+    uint64_t bytes_in, uint64_t bytes_out, uint64_t duration_seconds,
+    enum mesh_terminal_close_reason reason,
+    uint8_t out[MESH_TERMINAL_CAPSULE_MAX], size_t *out_len)
+{
+    return terminal_render_close(bytes_in, bytes_out, duration_seconds,
+                                 reason, -1, 0, out, out_len);
+}
+
+bool boot_mesh_terminal_render_close_capsule_status(
+    uint64_t bytes_in, uint64_t bytes_out, uint64_t duration_seconds,
+    enum mesh_terminal_close_reason reason, int exit_code, int signal,
+    uint8_t out[MESH_TERMINAL_CAPSULE_MAX], size_t *out_len)
+{
+    if (!terminal_close_status_valid(reason, exit_code, signal))
+        return false;
+    return terminal_render_close(bytes_in, bytes_out, duration_seconds,
+                                 reason, exit_code, signal, out, out_len);
+}
+
+uint64_t boot_mesh_terminal_resolve_max_bytes_out(int64_t arg)
+{
+    if (arg < (int64_t)MESH_TERMINAL_SERVICE_MIN_BYTES_OUT_ARG ||
+        (uint64_t)arg > MESH_TERMINAL_SERVICE_MAX_BYTES_OUT_ARG)
+        return MESH_TERMINAL_SERVICE_MAX_BYTES_OUT;
+    return (uint64_t)arg;
+}
+
+uint64_t boot_mesh_terminal_max_bytes_out(void)
+{
+    return g_term_max_out;
 }
 
 bool boot_mesh_terminal_pairing_lost(
@@ -557,6 +614,23 @@ static bool terminal_end_identity(struct mesh_terminal_end *end)
     return end->identity_ok;
 }
 
+/* The remote shell's status for the close evidence: a signal death names
+ * the signal, a normal exit names the (8-bit) exit code. Only a
+ * worker-exited ending carries one. */
+static void terminal_close_status(const struct mesh_terminal_worker *w,
+                                  int *exit_code, int *signal)
+{
+    *exit_code = -1;
+    *signal = 0;
+    if (w->close_reason != MESH_TERMINAL_CLOSE_WORKER_EXITED)
+        return;
+    if (w->term_signal > 0 && w->term_signal <= 64)
+        *signal = w->term_signal;
+    else
+        *exit_code = (w->exit_code >= 0 && w->exit_code <= 255) ? w->exit_code
+                                                                : 255;
+}
+
 /* End one live session: the CLOSED receipt with byte/duration evidence as
  * the stream's last DATA (when an honest identity exists and the credit
  * is there), then the stream CLOSE naming the reason. The kill, the
@@ -583,9 +657,11 @@ static void terminal_end_session(struct mesh_stream *st,
             duration = now_unix - (uint64_t)s->worker.started_unix;
         uint8_t capsule[MESH_TERMINAL_CAPSULE_MAX];
         size_t capsule_len = 0;
-        if (boot_mesh_terminal_render_close_capsule(
+        int status_exit = -1, status_signal = 0;
+        terminal_close_status(&s->worker, &status_exit, &status_signal);
+        if (boot_mesh_terminal_render_close_capsule_status(
                 s->worker.bytes_in, s->worker.bytes_out, duration, reason,
-                capsule, &capsule_len)) {
+                status_exit, status_signal, capsule, &capsule_len)) {
             struct mesh_terminal_receipt_v1 receipt;
             /* responder_noise_static is THIS node's Noise identity, the
              * same field the status lane receipts carry; the requester
@@ -777,7 +853,7 @@ static enum mesh_stream_refusal terminal_service_open(
             cfg.cols = open.cols;
             cfg.rows = open.rows;
             cfg.max_bytes_in = MESH_TERMINAL_SERVICE_MAX_BYTES_IN;
-            cfg.max_bytes_out = MESH_TERMINAL_SERVICE_MAX_BYTES_OUT;
+            cfg.max_bytes_out = boot_mesh_terminal_max_bytes_out();
             cfg.lifetime_seconds = MESH_TERMINAL_SERVICE_LIFETIME_SECONDS;
             cfg.idle_seconds = MESH_TERMINAL_SERVICE_IDLE_SECONDS;
             struct zcl_result r =
@@ -1096,12 +1172,18 @@ bool boot_mesh_terminal_configure(enum mesh_terminal_platform platform,
     return false;
 }
 
-/* Reads -terminalshell and -terminalacceptunconfined. The shell is set only
+/* Reads -terminalmaxbytesout, -terminalshell and -terminalacceptunconfined. The shell is set only
  * when its path is valid and the platform gate admits the lane; every other
  * state leaves it empty, so the lane answers CONFINEMENT_UNAVAILABLE. */
 static void terminal_configure_shell(void)
 {
     const char *why = NULL;
+    int64_t out_arg = GetArgInt("-terminalmaxbytesout", 0);
+    g_term_max_out = boot_mesh_terminal_resolve_max_bytes_out(out_arg);
+    if (out_arg != 0 && g_term_max_out != (uint64_t)out_arg)
+        LOG_WARN("net.mesh_terminal",
+                 "-terminalmaxbytesout out of range; using the default %llu",
+                 (unsigned long long)g_term_max_out);
     bool configured = boot_mesh_terminal_configure(
         MESH_TERMINAL_PLATFORM_NATIVE, GetArg("-terminalshell", ""),
         GetBoolArg("-terminalacceptunconfined", false), g_term_shell,

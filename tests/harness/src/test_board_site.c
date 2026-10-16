@@ -27,10 +27,13 @@
 #include "util/fleet_role_check.h"
 
 #include "controllers/board_site_controller.h"
+#include "controllers/wiki_site_controller.h"
 
 #include "config/boot_internal.h"
 #include "config/runtime.h"
 #include "crypto/ed25519.h"
+#include "json/json.h"
+#include "zutf8/zutf8.h"
 #include "models/database.h"
 #include "models/fleet_board_post.h"
 #include "platform/time_compat.h"
@@ -81,6 +84,448 @@ static const char *bs_get(const char *path, size_t *len_out)
 static bool bs_has(const char *resp, const char *needle)
 {
     return strstr(resp, needle) != NULL;
+}
+
+
+/* ── public wiki pages (wiki_site_controller.c) ─────────────────────── */
+
+static const char *bsw_get(const char *method, const char *path)
+{
+    size_t n = wiki_site_handle_request(method, path, NULL, 0, g_resp,
+                                        BS_RESP_CAP - 1, NULL);
+    g_resp[n] = '\0';
+    return (const char *)g_resp;
+}
+
+/* The body of the last response, after the header block. */
+static const char *bsw_body(const char *resp)
+{
+    const char *p = strstr(resp, "\r\n\r\n");
+    return p ? p + 4 : "";
+}
+
+static bool bsw_add(struct node_db *db, const uint8_t seed[32],
+                    const uint8_t pk[32], const char *slug, const char *title,
+                    const char *agent, const char *text, uint8_t scope,
+                    uint64_t created_at, const uint8_t *supersedes,
+                    uint8_t id_out[32])
+{
+    struct fleet_board_post p;
+    bs_compose(&p, FLEET_BOARD_KIND_WIKI, scope,
+               scope == FLEET_BOARD_SCOPE_PUBLIC ? "general" : "", agent,
+               text, created_at, 86400);
+    (void)snprintf(p.slug, sizeof(p.slug), "%s", slug);
+    (void)snprintf(p.title, sizeof(p.title), "%s", title);
+    if (supersedes)
+        memcpy(p.supersedes, supersedes, 32);
+    if (fleet_board_post_sign(&p, seed, pk) != FLEET_BOARD_OK)
+        return false;
+    memcpy(id_out, p.id, 32);
+    return db_fleet_board_post_ingest(db, &p, (int64_t)created_at, NULL) ==
+           FLEET_BOARD_OK;
+}
+
+static bool bsw_json(const char *resp, struct json_value *doc)
+{
+    const char *body = bsw_body(resp);
+    json_init(doc);
+    return json_read(doc, body, strlen(body));
+}
+
+static int test_board_site_wiki(void)
+{
+    int failures = 0;
+    zcl_fleet_role_checker_install_permissive_for_testing();
+    TEST("board site: public wiki lists, renders, escapes and refuses") {
+        wiki_site_cache_reset_for_testing();
+        /* No runtime: a malformed slug is a 404 decided before any lookup,
+         * while a well-formed one needs the database and says so. */
+        app_runtime_set_current(NULL);
+        ASSERT(strstr(bsw_get("GET", "/wiki/Upper"), "404 Not Found"));
+        ASSERT(strstr(bsw_get("GET", "/wiki/../x"), "404 Not Found"));
+        ASSERT(strstr(bsw_get("GET", "/wiki/a%2fb"), "404 Not Found"));
+        char longslug[96] = "/wiki/";
+        memset(longslug + 6, 'a', 65);
+        longslug[71] = '\0';
+        ASSERT(strstr(bsw_get("GET", longslug), "404 Not Found"));
+        ASSERT(strstr(bsw_get("GET", "/wiki/some-page"),
+                      "503 Service Unavailable"));
+        ASSERT_EQ(wiki_site_handle_request("GET", "/wikipedia", NULL, 0,
+                                           g_resp, BS_RESP_CAP, NULL), 0);
+
+        struct node_db db;
+        memset(&db, 0, sizeof(db));
+        ASSERT(node_db_open(&db, ":memory:"));
+        uint8_t seed[32], pk[32], seed2[32], pk2[32];
+        bs_identity(1, seed, pk);
+        bs_identity(2, seed2, pk2);
+        const uint64_t now = (uint64_t)platform_time_wall_time_t();
+        uint8_t id_zeta[32], id_alpha1[32], id_alpha2[32], id_bad[32],
+                id_fleet[32], id_only[32];
+        static const char entry_text[] =
+            "{\"schema\":\"zcl.fleet_wiki_entry.v1\",\"topic\":\"alpha-page\","
+            "\"summary\":\"Run <full> lint & wait\","
+            "\"lessons\":[{\"rule\":\"never <script>alert(1)</script> & lint\","
+            "\"why\":\"because \\\"quotes\\\"\",\"evidence\":\"see <a href=x>\"}],"
+            "\"applies_to\":[\"lint\"],\"updated\":\"2026-10-01T00:00:00Z\"}";
+        ASSERT(bsw_add(&db, seed, pk, "zeta-page", "Zeta notes", "lane-a",
+                       "first line <b>&amp; more\nsecond line", 0, now,
+                       NULL, id_zeta));
+        ASSERT(bsw_add(&db, seed2, pk2, "alpha-page", "Alpha", "lane-b",
+                       "old alpha text", 0, now + 1, NULL, id_alpha1));
+        ASSERT(bsw_add(&db, seed2, pk2, "alpha-page", "Alpha", "lane-b",
+                       entry_text, 0, now + 2, id_alpha1, id_alpha2));
+        ASSERT(bsw_add(&db, seed, pk, "private-page", "Private", "lane-a",
+                       "FLEETONLY-MARKER", FLEET_BOARD_SCOPE_FLEET, now + 3,
+                       NULL, id_fleet));
+        ASSERT(bsw_add(&db, seed, pk, "broken-only", "Broken", "tamper-a",
+                       "will be altered", 0, now + 4, NULL, id_only));
+        ASSERT(bsw_add(&db, seed, pk, "half-broken", "Half", "lane-a",
+                       "good older revision", 0, now + 5, NULL, id_bad));
+        uint8_t id_bad2[32];
+        ASSERT(bsw_add(&db, seed, pk, "half-broken", "Half", "tamper-b",
+                       "newer revision to alter", 0, now + 6, id_bad,
+                       id_bad2));
+        ASSERT(node_db_exec(&db, "UPDATE fleet_board_posts SET text='altered' "
+                                 "WHERE agent IN ('tamper-a','tamper-b')"));
+        struct db_service service = {.node_db = &db, .started = true};
+        struct app_runtime_context runtime = {.db_service = &service};
+        app_runtime_set_current(&runtime);
+
+        char hex_zeta[65], hex_a2[65], hex_a1[65], hex_bad[65], hex_pk[65],
+             hex_pk2[65];
+        fleet_board_id_to_hex(id_zeta, hex_zeta);
+        fleet_board_id_to_hex(id_alpha2, hex_a2);
+        fleet_board_id_to_hex(id_alpha1, hex_a1);
+        fleet_board_id_to_hex(id_bad, hex_bad);
+        fleet_board_id_to_hex(pk, hex_pk);
+        fleet_board_id_to_hex(pk2, hex_pk2);
+
+        /* Index: both public pages, slug order, newest revision, signer. */
+        const char *resp = bsw_get("GET", "/wiki");
+        ASSERT(strstr(resp, "200 OK"));
+        ASSERT(strstr(resp, "Content-Type: text/html; charset=utf-8"));
+        ASSERT(strstr(resp, "Content-Security-Policy: default-src 'none'"));
+        ASSERT(strstr(resp, "X-Content-Type-Options: nosniff"));
+        ASSERT(strstr(resp, "untrusted knowledge"));
+        ASSERT(strstr(resp, hex_zeta));
+        ASSERT(strstr(resp, hex_a2));
+        ASSERT(!strstr(resp, hex_a1));
+        char short_pk[17], short_pk2[17];
+        memcpy(short_pk, hex_pk, 16);
+        short_pk[16] = '\0';
+        memcpy(short_pk2, hex_pk2, 16);
+        short_pk2[16] = '\0';
+        ASSERT(strstr(resp, short_pk));
+        ASSERT(strstr(resp, short_pk2));
+        const char *a = strstr(resp, "href='/wiki/alpha-page'");
+        const char *z = strstr(resp, "href='/wiki/zeta-page'");
+        ASSERT(a && z && a < z);
+        /* Structured pages list their summary, plain pages their first line,
+         * both escaped. */
+        ASSERT(strstr(resp, "Run &lt;full&gt; lint &amp; wait"));
+        ASSERT(strstr(resp, "first line &lt;b&gt;&amp;amp; more"));
+        ASSERT(!strstr(resp, "second line"));
+        ASSERT(!strstr(resp, "<b>&amp;"));
+        /* Fleet-private and unverifiable-only pages never appear. */
+        ASSERT(!strstr(resp, "private-page"));
+        ASSERT(!strstr(resp, "FLEETONLY-MARKER"));
+        ASSERT(!strstr(resp, "broken-only"));
+        ASSERT(strstr(resp, "href='/wiki/half-broken'"));
+        ASSERT(strstr(resp, "/wiki.json"));
+
+        /* The same index mounted under /board/wiki links to itself. */
+        ASSERT(strstr(bsw_get("GET", "/board/wiki"),
+                      "href='/board/wiki/alpha-page'"));
+        resp = bs_get("/board/wiki/alpha-page", NULL);
+        ASSERT(strstr(resp, "200 OK"));
+
+        /* Index JSON. */
+        struct json_value doc;
+        resp = bsw_get("GET", "/wiki.json");
+        ASSERT(strstr(resp, "Content-Type: application/json"));
+        ASSERT(bsw_json(resp, &doc));
+        ASSERT_EQ(strcmp(json_get_str(json_get(&doc, "schema")),
+                         "zcl.public_wiki_index.v1"), 0);
+        ASSERT_EQ(json_get_int(json_get(&doc, "count")), 3);
+        const struct json_value *rows = json_get(&doc, "pages");
+        ASSERT_EQ(strcmp(json_get_str(json_get(json_at(rows, 0), "slug")),
+                         "alpha-page"), 0);
+        ASSERT_EQ(strcmp(json_get_str(json_get(json_at(rows, 0),
+                                               "revision_id")), hex_a2), 0);
+        ASSERT_EQ(strcmp(json_get_str(json_get(json_at(rows, 0), "signer")),
+                         hex_pk2), 0);
+        ASSERT_EQ(strcmp(json_get_str(json_get(json_at(rows, 2), "slug")),
+                         "zeta-page"), 0);
+        json_free(&doc);
+
+        /* A structured page: every field escaped. */
+        resp = bsw_get("GET", "/wiki/alpha-page");
+        ASSERT(strstr(resp, "200 OK"));
+        ASSERT(strstr(resp, hex_a2));
+        ASSERT(strstr(resp, hex_pk2));
+        ASSERT(strstr(resp, "never &lt;script&gt;alert(1)&lt;/script&gt; "
+                            "&amp; lint"));
+        ASSERT(strstr(resp, "because &quot;quotes&quot;"));
+        ASSERT(strstr(resp, "Evidence: see &lt;a href=x&gt;"));
+        ASSERT(!strstr(resp, "<script"));
+        ASSERT(strstr(resp, "href='/wiki'"));
+        ASSERT(strstr(resp, "href='/wiki/alpha-page.json'"));
+
+        /* A plain page: preformatted escaped text. */
+        resp = bsw_get("GET", "/wiki/zeta-page");
+        ASSERT(strstr(resp, "<pre>first line &lt;b&gt;&amp;amp; more"));
+        ASSERT(strstr(resp, "second line"));
+        ASSERT(!strstr(resp, "<b>&amp;"));
+
+        /* Page JSON matches. */
+        resp = bsw_get("GET", "/wiki/alpha-page.json");
+        ASSERT(bsw_json(resp, &doc));
+        ASSERT_EQ(strcmp(json_get_str(json_get(&doc, "schema")),
+                         "zcl.public_wiki_page.v1"), 0);
+        ASSERT_EQ(strcmp(json_get_str(json_get(&doc, "revision_id")),
+                         hex_a2), 0);
+        ASSERT(json_get(&doc, "entry") != NULL);
+        ASSERT_EQ(strcmp(json_get_str(json_get(json_get(&doc, "entry"),
+                                               "topic")), "alpha-page"), 0);
+        json_free(&doc);
+        resp = bsw_get("GET", "/wiki/zeta-page.json");
+        ASSERT(bsw_json(resp, &doc));
+        ASSERT_EQ(strcmp(json_get_str(json_get(&doc, "text")),
+                         "first line <b>&amp; more\nsecond line"), 0);
+        ASSERT_EQ(strcmp(json_get_str(json_get(&doc, "signer")), hex_pk), 0);
+        json_free(&doc);
+
+        /* Unknown, malformed, private and tampered-only slugs are 404. */
+        ASSERT(strstr(bsw_get("GET", "/wiki/no-such-page"), "404 Not Found"));
+        ASSERT(strstr(bsw_get("GET", "/wiki/Upper"), "404 Not Found"));
+        ASSERT(strstr(bsw_get("GET", "/wiki/../x"), "404 Not Found"));
+        ASSERT(strstr(bsw_get("GET", longslug), "404 Not Found"));
+        ASSERT(strstr(bsw_get("GET", "/wiki/zeta-page/"), "404 Not Found"));
+        ASSERT(strstr(bsw_get("GET", "/wiki/private-page"), "404 Not Found"));
+        ASSERT(!strstr((const char *)g_resp, "FLEETONLY-MARKER"));
+        ASSERT(strstr(bsw_get("GET", "/wiki/broken-only"), "404 Not Found"));
+        ASSERT(strstr(bsw_get("GET", "/wiki/broken-only.json"),
+                      "404 Not Found"));
+
+        /* A page whose newest revision fails verification shows the newest
+         * revision that does verify, never the altered one. */
+        resp = bsw_get("GET", "/wiki/half-broken");
+        ASSERT(strstr(resp, "200 OK"));
+        ASSERT(strstr(resp, hex_bad));
+        ASSERT(strstr(resp, "good older revision"));
+        ASSERT(!strstr(resp, "altered"));
+
+        /* Read-only: HEAD has no body, POST is refused. */
+        resp = bsw_get("HEAD", "/wiki/zeta-page");
+        ASSERT(strstr(resp, "200 OK"));
+        ASSERT_EQ((int)strlen(bsw_body(resp)), 0);
+        ASSERT(strstr(bsw_get("POST", "/wiki"), "405 Method Not Allowed"));
+
+        app_runtime_set_current(NULL);
+        node_db_close(&db);
+        PASS();
+    } _test_next:;
+    zcl_fleet_role_checker_install(NULL);
+    return failures;
+}
+
+
+/* ── hardening: untrusted bytes, the index cache, scopes, the mount ──── */
+
+#define BSW_BIG_CAP 400000
+
+/* Bad bytes, one run each: stray, truncated lead, overlong. Quote, backslash
+ * and tab must survive JSON escaping. */
+static const char k_bad_text[] =
+    "q\"uo\\te\tA\xff" "B\xe2\x82" "C\xc0\xaf" "D";
+static const char k_clean_text[] =
+    "q\"uo\\te\tA\xEF\xBF\xBD" "B\xEF\xBF\xBD\xEF\xBF\xBD"
+    "C\xEF\xBF\xBD\xEF\xBF\xBD" "D";
+
+static size_t bsw_get_big(uint8_t *buf, const char *method, const char *path)
+{
+    size_t n = wiki_site_handle_request(method, path, NULL, 0, buf,
+                                        BSW_BIG_CAP - 1, NULL);
+    buf[n] = '\0';
+    return n;
+}
+
+/* 256 slugs across two keys, ingested in distinct quota windows. */
+static bool bsw_fill_256(struct node_db *db, size_t count)
+{
+    uint8_t seed[32], pk[32], id[32];
+    for (size_t i = 0; i < count; i++) {
+        bs_identity((uint8_t)(10 + i / 128), seed, pk);
+        char slug[32];
+        (void)snprintf(slug, sizeof(slug), "pg-%03zu", i);
+        /* 20 revisions per key per 600 s window: a new window every 16. */
+        uint64_t when = 1800000000u + 700u * (i / 16);
+        if (!bsw_add(db, seed, pk, slug, "T", "fill", "page body", 0, when,
+                     NULL, id))
+            return false;
+    }
+    return true;
+}
+
+static int test_board_site_wiki_hardening(void)
+{
+    int failures = 0;
+    zcl_fleet_role_checker_install_permissive_for_testing();
+    TEST("board site: wiki bytes, scopes, cache, mount and edge routes") {
+        struct node_db db;
+        memset(&db, 0, sizeof(db));
+        ASSERT(node_db_open(&db, ":memory:"));
+        uint8_t seed[32], pk[32];
+        bs_identity(3, seed, pk);
+        const uint64_t now = (uint64_t)platform_time_wall_time_t();
+        uint8_t id_bad[32], id_pub[32], id_old[32], id_fleet[32], id_a[32],
+                id_b[32], id_c[32];
+        ASSERT(bsw_add(&db, seed, pk, "bytes-page", "T\xff" "itle", "lane-a",
+                       k_bad_text, 0, now, NULL, id_bad));
+        ASSERT(bsw_add(&db, seed, pk, "pub-page", "Public", "lane-a",
+                       "public scope text", FLEET_BOARD_SCOPE_PUBLIC, now + 1,
+                       NULL, id_pub));
+        ASSERT(bsw_add(&db, seed, pk, "mixed-page", "Mixed", "lane-a",
+                       "older public revision", FLEET_BOARD_SCOPE_PUBLIC,
+                       now + 2, NULL, id_old));
+        ASSERT(bsw_add(&db, seed, pk, "mixed-page", "Mixed", "lane-a",
+                       "FLEETONLY-NEWER", FLEET_BOARD_SCOPE_FLEET, now + 3,
+                       NULL, id_fleet));
+        ASSERT(bsw_add(&db, seed, pk, "half-broken", "Half", "lane-a",
+                       "good older revision", 0, now + 4, NULL, id_a));
+        ASSERT(bsw_add(&db, seed, pk, "half-broken", "Half", "tamper-b",
+                       "newer revision to alter", 0, now + 5, id_a, id_b));
+        ASSERT(bsw_add(&db, seed, pk, "healthy", "Healthy", "lane-a",
+                       "all good", 0, now + 6, NULL, id_c));
+        ASSERT(node_db_exec(&db, "UPDATE fleet_board_posts SET text='altered' "
+                                 "WHERE agent='tamper-b'"));
+        struct db_service service = {.node_db = &db, .started = true};
+        struct app_runtime_context runtime = {.db_service = &service};
+        app_runtime_set_current(&runtime);
+        wiki_site_cache_reset_for_testing();
+
+        /* The production mount carries the main cases. */
+        const char *resp = bs_get("/board/wiki", NULL);
+        ASSERT(strstr(resp, "200 OK"));
+        ASSERT(strstr(resp, "href='/board/wiki/pub-page'"));
+        ASSERT(strstr(resp, "href='/board/wiki/bytes-page'"));
+        ASSERT(strstr(resp, "href='/board/wiki/healthy'"));
+        /* Public scope rows show; a slug whose newest revision is
+         * fleet-private is absent, text and slug. */
+        ASSERT(!strstr(resp, "mixed-page"));
+        ASSERT(!strstr(resp, "FLEETONLY-NEWER"));
+        ASSERT(strstr(bs_get("/board/wiki/mixed-page", NULL), "404 Not Found"));
+        ASSERT(strstr(bs_get("/board/wiki/mixed-page.json", NULL),
+                      "404 Not Found"));
+        resp = bs_get("/board/wiki/pub-page", NULL);
+        ASSERT(strstr(resp, "200 OK"));
+        ASSERT(strstr(resp, "public scope text"));
+        struct json_value doc;
+        resp = bs_get("/board/wiki.json", NULL);
+        ASSERT(bsw_json(resp, &doc));
+        ASSERT_EQ(json_get_int(json_get(&doc, "count")), 4);
+        ASSERT(!json_get_int(json_get(&doc, "truncated")));
+        json_free(&doc);
+        resp = bs_get("/board/wiki/pub-page.json", NULL);
+        ASSERT(bsw_json(resp, &doc));
+        ASSERT_EQ(strcmp(json_get_str(json_get(&doc, "text")),
+                         "public scope text"), 0);
+        json_free(&doc);
+
+        /* Untrusted bytes: the JSON form parses, is valid UTF-8, and carries
+         * U+FFFD where the bad bytes were. */
+        resp = bs_get("/board/wiki/bytes-page.json", NULL);
+        const char *body = bsw_body(resp);
+        ASSERT(zutf8_validate_n(body, strlen(body)));
+        ASSERT(bsw_json(resp, &doc));
+        ASSERT_EQ(strcmp(json_get_str(json_get(&doc, "text")), k_clean_text), 0);
+        ASSERT(zutf8_validate(json_get_str(json_get(&doc, "title"))));
+        json_free(&doc);
+        resp = bs_get("/board/wiki/bytes-page", NULL);
+        body = bsw_body(resp);
+        ASSERT(zutf8_validate_n(body, strlen(body)));
+        ASSERT(strstr(body, "\xEF\xBF\xBD"));
+        resp = bs_get("/board/wiki.json", NULL);
+        body = bsw_body(resp);
+        ASSERT(zutf8_validate_n(body, strlen(body)));
+
+        /* A newer revision that failed verification is disclosed. */
+        resp = bs_get("/board/wiki/half-broken.json", NULL);
+        ASSERT(bsw_json(resp, &doc));
+        ASSERT(json_get_bool(json_get(&doc, "newer_revision_unverified")));
+        json_free(&doc);
+        ASSERT(strstr(bs_get("/board/wiki/half-broken", NULL),
+                      "newer revision of this page is held here but failed "
+                      "verification"));
+        resp = bs_get("/board/wiki/healthy.json", NULL);
+        ASSERT(bsw_json(resp, &doc));
+        ASSERT(json_get(&doc, "newer_revision_unverified") == NULL);
+        json_free(&doc);
+
+        /* Edge routes. */
+        ASSERT(strstr(bs_get("/board/wiki/Upper.json", NULL), "404 Not Found"));
+        ASSERT(strstr(bs_get("/board/wiki/..%2fx.json", NULL), "404 Not Found"));
+        ASSERT(strstr(bs_get("/board/wiki//", NULL), "404 Not Found"));
+        ASSERT(strstr(bs_get("/board/wiki//healthy", NULL), "404 Not Found"));
+        ASSERT(strstr(bs_get("/board/wiki/.json", NULL), "404 Not Found"));
+        ASSERT(strstr(bs_get("/board/wiki/healthy?x=1", NULL), "200 OK"));
+        ASSERT(strstr(bs_get("/board/wiki?x=1", NULL), "200 OK"));
+        ASSERT(strstr(bs_get("/board/wiki.json?x=1", NULL),
+                      "application/json"));
+        resp = bsw_get("HEAD", "/board/wiki");
+        ASSERT(strstr(resp, "200 OK"));
+        ASSERT(strstr(resp, "Content-Length: "));
+        ASSERT_EQ((int)strlen(bsw_body(resp)), 0);
+
+        /* The index cache: two quick requests verify once, in both forms
+         * and for HEAD; the other mount prefix has its own slot. */
+        wiki_site_cache_reset_for_testing();
+        ASSERT_EQ((int)wiki_site_index_builds_for_testing(), 0);
+        (void)bsw_get("GET", "/board/wiki");
+        (void)bsw_get("GET", "/board/wiki");
+        (void)bsw_get("GET", "/board/wiki.json");
+        (void)bsw_get("HEAD", "/board/wiki");
+        ASSERT_EQ((int)wiki_site_index_builds_for_testing(), 1);
+        (void)bsw_get("GET", "/wiki");
+        ASSERT_EQ((int)wiki_site_index_builds_for_testing(), 2);
+        wiki_site_cache_reset_for_testing();
+        (void)bsw_get("GET", "/board/wiki");
+        ASSERT_EQ((int)wiki_site_index_builds_for_testing(), 1);
+        node_db_close(&db);
+
+        /* Exactly 256 pages are complete; a 257th makes the list truncated. */
+        memset(&db, 0, sizeof(db));
+        ASSERT(node_db_open(&db, ":memory:"));
+        service.node_db = &db;
+        ASSERT(bsw_fill_256(&db, 256));
+        wiki_site_cache_reset_for_testing();
+        uint8_t *big = malloc(BSW_BIG_CAP);
+        ASSERT(big != NULL);
+        ASSERT(bsw_get_big(big, "GET", "/board/wiki.json") > 0);
+        ASSERT(bsw_json((const char *)big, &doc));
+        ASSERT_EQ(json_get_int(json_get(&doc, "count")), 256);
+        ASSERT(!json_get_int(json_get(&doc, "truncated")));
+        json_free(&doc);
+        ASSERT(bsw_get_big(big, "GET", "/board/wiki") > 0);
+        ASSERT(strstr((const char *)big, "200 OK"));
+        ASSERT(!strstr((const char *)big, "The list is bounded"));
+        ASSERT(bsw_fill_256(&db, 257));
+        wiki_site_cache_reset_for_testing();
+        ASSERT(bsw_get_big(big, "GET", "/board/wiki.json") > 0);
+        ASSERT(bsw_json((const char *)big, &doc));
+        ASSERT_EQ(json_get_int(json_get(&doc, "count")), 256);
+        ASSERT(json_get_bool(json_get(&doc, "truncated")));
+        json_free(&doc);
+        free(big);
+
+        app_runtime_set_current(NULL);
+        node_db_close(&db);
+        wiki_site_cache_reset_for_testing();
+        PASS();
+    } _test_next:;
+    zcl_fleet_role_checker_install(NULL);
+    return failures;
 }
 
 int test_board_site(void)
@@ -196,6 +641,8 @@ int test_board_site(void)
         node_db_close(&db);
         PASS();
     } _test_next:;
+    failures += test_board_site_wiki();
+    failures += test_board_site_wiki_hardening();
     zcl_fleet_role_checker_install(NULL);
     return failures;
 }

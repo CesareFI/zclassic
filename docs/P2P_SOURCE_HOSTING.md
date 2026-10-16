@@ -699,7 +699,7 @@ review and tests.
 - [x] Explicit build/test/install transaction; downloads never execute.
   `zcode package add plan|commit` is the one lifecycle. It resolves the
   root-pinned dependency DAG, re-derives an expiring plan at commit, invokes
-  only `zclassic23-package-verify --emit` under confinement, rehashes emitted
+  only `z23-package-verify --emit` under confinement, rehashes emitted
   artifacts, installs atomically, and pins the generation. There is no generic
   downloaded `zcode.install`/shell-script surface, by design.
 <!-- claim: symbol-present zcode.package.add.commit engine/composition/commands/zcode.def # the explicit lifecycle exists -->

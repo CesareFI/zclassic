@@ -166,6 +166,21 @@ static void terminal_make_raw(struct termios *t)
     t->c_cc[VTIME] = 0;
 }
 
+#ifdef ZCL_TESTING
+bool zcl_native_mesh_terminal_test_raw_is_transparent(void)
+{
+    struct termios t;
+    memset(&t, 0xff, sizeof(t));
+    terminal_make_raw(&t);
+    const tcflag_t in_bad = IGNBRK | BRKINT | ISTRIP | INLCR | IGNCR | ICRNL |
+                            IXON;
+    const tcflag_t local_bad = ECHO | ECHONL | ICANON | ISIG | IEXTEN;
+    return (t.c_iflag & in_bad) == 0 && (t.c_oflag & OPOST) == 0 &&
+           (t.c_lflag & local_bad) == 0 && (t.c_cflag & CSIZE) == CS8 &&
+           t.c_cc[VMIN] == 1 && t.c_cc[VTIME] == 0;
+}
+#endif
+
 /* Restores the saved line discipline only. Modes the remote program set by
  * escape sequence (alternate screen, mouse reporting, bracketed paste) are
  * not reset: the remote owns them. */

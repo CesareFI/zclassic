@@ -2565,7 +2565,7 @@ static int case_state(void)
  * Runs the standalone binary with --engine fixture across two turns and
  * checks state.txt after turn 1 and that prompt.txt (turn 2) carries it. */
 
-static const char ENGINE_UNIT_BIN[] = "build/bin/zclassic23-engine-unit";
+static const char ENGINE_UNIT_BIN[] = "build/bin/z23-engine-unit";
 
 static bool engine_unit_binary_present(void)
 {

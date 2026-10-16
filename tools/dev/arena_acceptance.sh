@@ -124,7 +124,7 @@ NODE_BIN="${ZCL_NODE_BIN:-$REPO_ROOT/build/bin/zclassic23}"
 RPC_BIN="${ZCL_RPC_BIN:-$REPO_ROOT/build/bin/zcl-rpc}"
 ARENA_BIN="${ZCL_ARENA_BIN:-$REPO_ROOT/build/bin/arena_runner}"
 JSONQ="${JSONQ:-$REPO_ROOT/build/bin/jsonq}"
-PACKAGE_SIGN_BIN="${ZCL_PACKAGE_SIGN_BIN:-$REPO_ROOT/build/bin/zclassic23-package-sign}"
+PACKAGE_SIGN_BIN="${ZCL_PACKAGE_SIGN_BIN:-$REPO_ROOT/build/bin/z23-package-sign}"
 
 # ── CONFIG ────────────────────────────────────────────────────────────
 # An explicit source store can replay a previously published fixture. By
@@ -392,7 +392,7 @@ if [ -n "$ARENA_SOURCE_STORE" ]; then
     done
 else
     [ -x "$PACKAGE_SIGN_BIN" ] ||
-        aa_die "$PACKAGE_SIGN_BIN not built — run make zclassic23-package-sign"
+        aa_die "$PACKAGE_SIGN_BIN not built — run make z23-package-sign"
     git -C "$REPO_ROOT" cat-file -e "$ARENA_SOURCE_COMMIT^{commit}" ||
         aa_die "historical Arena source commit $ARENA_SOURCE_COMMIT is unavailable"
 fi

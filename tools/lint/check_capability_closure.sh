@@ -86,7 +86,7 @@
 # rebuild) with:
 #
 #     tools/dev/checkout-lock.sh foreground build/.checkout.lock -- \
-#       make -j16 build/bin/z23-dev build/bin/zclassic23-package-verify-dev
+#       make -j16 build/bin/z23-dev build/bin/z23-package-verify-dev
 #
 # A cold build/dev-obj/ prints UNPROVEN and exits 2 rather than reporting a
 # false clean — see HOLLOWNESS above. A newer-but-partial epoch (present but
@@ -133,7 +133,7 @@ CAP_CLOSURE_MIN_OBJECTS_SCANNED=500
 #
 # Baseline measured 2026-08-30 against a freshly built COMPLETE Linux epoch:
 #   tools/dev/checkout-lock.sh foreground build/.checkout.lock -- \
-#     make -j16 build/bin/z23-dev build/bin/zclassic23-package-verify-dev
+#     make -j16 build/bin/z23-dev build/bin/z23-package-verify-dev
 # (2060 objects, epoch 2617150eb95064fbce18c5cd445173e9dc2e80d3787aa96ad604d8c14f9b26f7).
 # Of the host-selected module declaration set, exactly 2 have no compiled
 # object anywhere in that epoch, both genuine standalone binaries neither
@@ -770,7 +770,7 @@ check_root() {
         if [ "$CAP_CLOSURE_HOST_WINDOWS" = true ]; then
             echo "      make -j16 z23-dev"
         else
-            echo "      make -j16 build/bin/z23-dev build/bin/zclassic23-package-verify-dev"
+            echo "      make -j16 build/bin/z23-dev build/bin/z23-package-verify-dev"
         fi
         return 2
     fi

@@ -185,7 +185,7 @@ static size_t zcode_emit_attest_card(char *buf, size_t max,
     SITE_APPEND(off, buf, max,
         "<div class='card'><h2>Verifier attestations</h2>"
         "<p class='meta'>Attestations are produced by the external "
-        "<code>zclassic23-package-verify</code> program &mdash; this node "
+        "<code>z23-package-verify</code> program &mdash; this node "
         "never compiles or executes downloaded code. %zu attestation "
         "wire%s scanned, %zu naming this package.</p>",
         in->attest_scanned, in->attest_scanned == 1 ? "" : "s",

@@ -103,6 +103,8 @@ speed, safety, customization, exact reproduction or preservation. Prefer
 deletion, reuse and composition over new abstractions.
 ## First session
 
+New to a fleet? Read [START_HERE.md](docs/agent/START_HERE.md) first.
+
 Read the installed
 `~/.config/dev-workers/OPERATIONS.md`, `STORAGE.md` and `WORKER.md`, then
 run `devworker where z23`. Their current reserves supersede historical

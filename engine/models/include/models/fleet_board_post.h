@@ -225,6 +225,15 @@ int db_fleet_board_list(struct node_db *ndb,
 bool db_fleet_board_wiki_read(struct node_db *ndb, const char *slug,
                               struct db_fleet_board_post *out);
 
+
+/* db_fleet_board_wiki_read with the same newest-verifying rule, bounded to
+ * FLEET_BOARD_LIST_MAX revision verifications. *newer_unverified is set when
+ * a newer stored revision of the slug failed verification and an older one
+ * is returned instead. */
+bool db_fleet_board_wiki_read_checked(struct node_db *ndb, const char *slug,
+                                      struct db_fleet_board_post *out,
+                                      bool *newer_unverified);
+
 enum fleet_wiki_query_status {
     FLEET_WIKI_QUERY_DONE, FLEET_WIKI_QUERY_PAGE,
     FLEET_WIKI_QUERY_VERIFY_BUDGET, FLEET_WIKI_QUERY_STORAGE,

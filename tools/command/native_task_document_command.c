@@ -86,9 +86,11 @@ static struct zcl_result ntd_task_window(const struct json_value *input,
     char *slash = strrchr(executable, '/');
     if (!slash) return ZCL_ERR(-1, "tasks: cannot find the verifier directory");
     *slash = 0;
-    const char *names[] = { "zclassic23-package-verify-dev", "zclassic23-package-verify" };
+    const char *names[] = { "z23-package-verify-dev", "z23-package-verify",
+                            "zclassic23-package-verify-dev",
+                            "zclassic23-package-verify" };
     bool found = false;
-    for (unsigned i = 0; i < 2 && !found; ++i) {
+    for (unsigned i = 0; i < 4 && !found; ++i) {
         int n = snprintf(verifier, sizeof(verifier), "%s/%s", executable, names[i]);
         found = n > 0 && (size_t)n < sizeof(verifier) && access(verifier, X_OK) == 0;
     }

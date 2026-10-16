@@ -10,7 +10,7 @@
 # writes a JSON status file the caller polls via `z23 dumpstate
 # subsystem=agent_test key=<kind>_<name>` instead of holding an RPC thread:
 #   - kind=test_group: build/bin/test_parallel --only=<name>
-#   - kind=scenario:   build/bin/zclassic23-chaos --scenario=tools/sim/scenarios/<name>.scenario
+#   - kind=scenario:   build/bin/z23-chaos --scenario=tools/sim/scenarios/<name>.scenario
 #
 # SAFETY: this script re-validates --kind/--name itself (belt and suspenders
 # on top of the C controller's allowlist) and NEVER passes them through a
@@ -96,7 +96,7 @@ fi
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
 TEST_PARALLEL_BIN="${ZCL_AGENT_TEST_PARALLEL_BIN:-$REPO_ROOT/build/bin/test_parallel}"
-CHAOS_BIN="${ZCL_AGENT_TEST_CHAOS_BIN:-$REPO_ROOT/build/bin/zclassic23-chaos}"
+CHAOS_BIN="${ZCL_AGENT_TEST_CHAOS_BIN:-$REPO_ROOT/build/bin/z23-chaos}"
 SCENARIOS_DIR="${ZCL_AGENT_TEST_SCENARIOS_DIR:-$REPO_ROOT/tools/sim/scenarios}"
 
 mkdir -p "$(dirname "$STATUS_FILE")" 2>/dev/null || true
@@ -123,7 +123,7 @@ case "$KIND" in
         ;;
     scenario)
         SCEN_PATH="$SCENARIOS_DIR/$NAME.scenario"
-        CMD_DESC="zclassic23-chaos --scenario=$SCEN_PATH"
+        CMD_DESC="z23-chaos --scenario=$SCEN_PATH"
         if [ ! -f "$SCEN_PATH" ]; then
             emit_status "done" "ERROR" 2 \
                 "$(json_escape "scenario file not found: $SCEN_PATH")" \
@@ -132,7 +132,7 @@ case "$KIND" in
         fi
         if [ ! -x "$CHAOS_BIN" ]; then
             emit_status "done" "ERROR" 127 \
-                "$(json_escape "zclassic23-chaos binary not built: $CHAOS_BIN")" \
+                "$(json_escape "z23-chaos binary not built: $CHAOS_BIN")" \
                 | atomic_write "$STATUS_FILE"
             exit 1
         fi

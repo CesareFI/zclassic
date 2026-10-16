@@ -339,7 +339,7 @@ static bool boot_step_init_observability(void)
      * only once we reach ready. Sibling of the stale-binary blocker above.
      * No-op when launched directly (env unset). */
     binary_ab_raise_fallback_blocker_env();
-    event_emitf(EV_NODE_STARTING, 0, "zclassic23 1.0.0");
+    event_emitf(EV_NODE_STARTING, 0, "z23 1.0.0");
     return true;
 }
 static bool boot_step_select_chain_and_datadir(struct app_context *ctx)

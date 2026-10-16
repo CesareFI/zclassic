@@ -26,7 +26,7 @@
  * tests/harness/src/test_z23_front_door.c). This file is the transports: uname,
  * a DNS datagram, two HTTPS GETs, a SHA-256, and the handoff. It is compiled
  * STRAIGHT FROM SOURCE to an executable with no intermediate object files,
- * for the same reason zclassic23-acme is: it links a TLS client and a CA
+ * for the same reason z23-acme is: it links a TLS client and a CA
  * trust store, and tests/harness/src/test_cold_join_sovereign.c P2 scans every Z23
  * object under the build obj epochs for exactly those symbols. Nothing compiled here
  * can appear in a scanned epoch tree, which keeps that assertion green

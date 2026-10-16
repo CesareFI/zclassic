@@ -46,7 +46,7 @@
 #define ACME_DEFAULT_POLL_ATTEMPTS   40
 #define ACME_DEFAULT_POLL_INTERVAL_MS 3000
 #define ACME_MAX_NONCE               256
-#define ACME_USER_AGENT              "zclassic23-acme/1"
+#define ACME_USER_AGENT              "z23-acme/1"
 
 struct acme_session {
     const struct acme_client_config *cfg;

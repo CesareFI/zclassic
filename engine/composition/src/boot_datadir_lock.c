@@ -179,7 +179,7 @@ bool boot_datadir_lock_acquire(const char *datadir)
 {
     if (!datadir || !*datadir) {
         const struct boot_error_next next[] = {
-            { "zclassic23 -datadir=/path/to/datadir",
+            { "z23 -datadir=/path/to/datadir",
               "name the data directory explicitly; an empty -datadir= value "
               "resolves to nothing and the default only applies when the flag "
               "is absent entirely" },
@@ -238,13 +238,13 @@ bool boot_datadir_lock_acquire(const char *datadir)
              * let the datadir be swapped underneath a running node. */
             const struct boot_error_next next[] = {
                 { rl, "resolve the link and pass the real directory with "
-                      "-datadir=; zclassic23 opens the datadir with O_NOFOLLOW "
+                      "-datadir=; z23 opens the datadir with O_NOFOLLOW "
                       "so the target cannot be swapped under a running node" },
             };
             boot_error_report(BOOT_ERROR_FATAL,
                               "BOOT_DATADIR_SYMLINK_REFUSED", BDL_PHASE,
                               "the -datadir path is a symbolic link; "
-                              "zclassic23 refuses to follow it",
+                              "z23 refuses to follow it",
                               next, 1,
                               "datadir=%s is_symlink=true open_errno=%s",
                               datadir, strerror(e));
@@ -335,7 +335,7 @@ bool boot_datadir_lock_acquire(const char *datadir)
         (void)snprintf(ls, sizeof(ls), "ls -l %s/%s", datadir, BDL_PIDFILE);
         const struct boot_error_next next[] = {
             { ls, e == ELOOP
-                      ? "the lock file is a symlink; zclassic23 opens it with "
+                      ? "the lock file is a symlink; z23 opens it with "
                         "O_NOFOLLOW and refuses. Remove the link only after "
                         "confirming no node is running"
                       : "inspect the lock file's owner and mode" },
@@ -391,7 +391,7 @@ bool boot_datadir_lock_acquire(const char *datadir)
                     { ps, "identify the process that holds the lock before "
                           "stopping anything; it is normally the node service "
                           "for this datadir" },
-                    { "zclassic23 -datadir=/path/to/other/datadir",
+                    { "z23 -datadir=/path/to/other/datadir",
                       k_second_instance_reason },
                 };
                 boot_error_report(BOOT_ERROR_FATAL, "BOOT_DATADIR_LOCKED",
@@ -406,7 +406,7 @@ bool boot_datadir_lock_acquire(const char *datadir)
                     { ls, "the lock file records the owning PID but was empty "
                           "or unparseable here; its mtime still dates the "
                           "holder's start" },
-                    { "zclassic23 -datadir=/path/to/other/datadir",
+                    { "z23 -datadir=/path/to/other/datadir",
                       k_second_instance_reason },
                 };
                 boot_error_report(BOOT_ERROR_FATAL, "BOOT_DATADIR_LOCKED",

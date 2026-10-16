@@ -74,17 +74,17 @@ z23 discover schema <path> --side=input|output
 
 | Catalog fact | Count |
 |---|---|
-| Registry entries (branches + leaves) | 951 |
+| Registry entries (branches + leaves) | 956 |
 | Top-level roots | 15 |
-| Branches | 207 |
-| Leaves (dispatchable command paths) | 744 |
-| … `ready` (live handler in this build) | 651 |
+| Branches | 208 |
+| Leaves (dispatchable command paths) | 748 |
+| … `ready` (live handler in this build) | 655 |
 | … `compat` (metadata only, names a fallback) | 63 |
 | … `planned` (fail-closed BLOCKED, exit 3) | 30 |
 | … dev-gated 🔧 (`ready` only in `z23-dev`) | 62 |
 | Leaves with `effect=mutate` | 286 |
 | Leaves with `effect=destructive` | 6 |
-| Leaves requiring **owner** authority | 150 |
+| Leaves requiring **owner** authority | 151 |
 
 Per source file:
 
@@ -109,9 +109,9 @@ Per source file:
 | `engine/composition/commands/story.def` | 5 | 1 | 4 |
 | `engine/composition/commands/fleet_board.def` | 12 | 3 | 9 |
 | `engine/composition/commands/mind.def` | 4 | 1 | 3 |
-| `engine/composition/commands/fleet.def` | 37 | 8 | 29 |
+| `engine/composition/commands/fleet.def` | 41 | 9 | 32 |
 | `engine/composition/commands/fleet_agents.def` | 1 | 0 | 1 |
-| `engine/composition/commands/fleet_enrol.def` | 5 | 0 | 5 |
+| `engine/composition/commands/fleet_enrol.def` | 6 | 0 | 6 |
 | `engine/composition/commands/telemetry/root.def` | 6 | 2 | 4 |
 | `engine/composition/commands/telemetry/watch.def` | 1 | 0 | 1 |
 | `engine/composition/commands/telemetry/runtime.def` | 4 | 1 | 3 |
@@ -1870,6 +1870,7 @@ represented by its children's sections.
 | `fleet admit` | ready | mutate / app-write / **owner** · fast/low | **`receipt`**, `bridge` | `zcl.fleet.admit.v1` | `z23 fleet admit <receipt>` | Admit one joined computer to this fleet's machine roster |
 | `fleet import` | ready | mutate / app-write / **owner** · fast/low | **`line`** | `zcl.fleet.import.v1` | `z23 fleet import <roster-line>` | Copy one manager-sealed roster line onto this box's machine roster |
 | `fleet machines` | ready | read / read / **owner** · fast/low | `offset`, `limit` | `zcl.fleet.machines.v1` | `z23 fleet machines --input='{"offset":0,"limit":64}'` | List the computers this owner has admitted to the fleet |
+| `fleet doctor` | ready | read / read / **owner** · foreground/low | `datadir` | `zcl.fleet_doctor.v1` | `z23 fleet doctor` | Where this node is in fleet setup, and what to run next |
 
 #### `fleet.board` — Signed, gossiped posts every node carries
 
@@ -1902,6 +1903,8 @@ represented by its children's sections.
 | Command | Avail | Policy | Input keys (**required**) | Output schema | Example | Summary |
 |---|---|---|---|---|---|---|
 | `fleet vitals sample` | ready | mutate / dev-mutation / operator · fast/low | `id` | `zcl.fleet_vitals_sample.v1` | `z23 fleet vitals sample` | Measure this box and append one signed vitals row per catalog metric |
+| `fleet vitals read` | ready | read / read / operator · instant/tiny | none | `zcl.fleet_vitals_read.v1` | `z23 fleet vitals read` | Measure this box now: load, memory, disk and uptime |
+| `fleet vitals table` | ready | read / read / operator · foreground/low | `machines`, `deadline_ms` | `zcl.fleet_vitals_table.v1` | `z23 fleet vitals table` | One table of every named machine's load, memory and disk |
 
 #### `fleet.experiment` — Record and query delegation experiments
 
@@ -1950,6 +1953,12 @@ represented by its children's sections.
 | `fleet steer inbox` | ready | read / read / operator · fast/low | `show` | `zcl.fleet_steer_inbox.v1` | `z23 fleet steer inbox [--show=<upload>]` | List quarantined uploads for the local reviewer |
 | `fleet steer drop` | ready | mutate / dev-mutation / **owner** · fast/low | **`upload`** | `zcl.fleet_steer_drop.v1` | `z23 fleet steer drop --upload=<identity>` | Remove one retained quarantine upload (owner cleanup) |
 | `fleet steer grant` | ready | mutate / dev-mutation / **owner** · fast/low | **`action`**, `scopes`, `ttl_seconds`, `label`, `id`, `peer`, `limit`, `before` | `zcl.fleet_steer_grant.v1` | `z23 fleet steer grant --action=mint --scopes=brief,send` | Mint and revoke the adapter's scoped bearer grants |
+
+#### `fleet.mission` — A kanban projection of the fleet's durable work state
+
+| Command | Avail | Policy | Input keys (**required**) | Output schema | Example | Summary |
+|---|---|---|---|---|---|---|
+| `fleet mission board` | ready | read / read / operator · fast/low | `hours`, `limit` | `zcl.fleet_mission_board.v1` | `z23 fleet mission board` | Kanban of fleet work: backlog, claimed, building, review, proving, landed, failed |
 
 #### `fleet.nodes` — Inspect the recorded peers
 

@@ -247,7 +247,7 @@ too. `z23 zcode project init plan` proposes the key when it finds
 1. Create a package-only key. It is not a wallet or node identity:
 
    ```bash
-   zclassic23-package-sign --generate ./author.key
+   z23-package-sign --generate ./author.key
    ```
 
 2. Derive the exact package, recipe, dependency-lock, API, and signing roots
@@ -263,7 +263,7 @@ too. `z23 zcode project init plan` proposes the key when it finds
 
    ```bash
    exec 7<./author.key
-   zclassic23-package-sign --sign-digest <64hex-digest> --key-fd 7
+   z23-package-sign --sign-digest <64hex-digest> --key-fd 7
    exec 7<&-
 
    z23 zcode package dev seal -datadir=/tmp/z23-commons \
@@ -431,7 +431,7 @@ its signature — it is not acceptance; the local approved-verifier quorum
 policy applies at evaluation.
 
 `zcode work toolchain` reports this node's `capsule_root`, whether
-`zclassic23-package-verify` sits next to the binary (`verifier_present` /
+`z23-package-verify` sits next to the binary (`verifier_present` /
 `can_prove`), whether this process has joined independent compile work
 (`package_hosting` / `build_worker` / `joined`), the copy-paste `join_flags`
 (`-packagehost=1 -buildworker=1`), and a named `blocker` (`NONE`,

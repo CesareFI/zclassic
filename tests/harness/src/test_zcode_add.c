@@ -3,7 +3,7 @@
  * test_zcode_add — the ZCODE package INSTALL lifecycle (phase 1):
  * engine/services/src/package_lifecycle*.c plus its pure rules in
  * contexts/commons/modules/vcs/package_{deps,build,install}.c and the
- * zclassic23-package-verify --emit build worker.
+ * z23-package-verify --emit build worker.
  *
  * Coverage:
  *   1. Pure rules: the dependency declaration grammar, the lock wire, and
@@ -22,8 +22,8 @@
  *      and the three refusals that must never install anything: an
  *      expired plan, a hand-edited plan file, and a tampered CAS chunk.
  *
- * The e2e lane forks build/bin/zclassic23-package-verify — it MUST exist
- * (make zclassic23-package-verify); a missing binary is a loud failure,
+ * The e2e lane forks build/bin/z23-package-verify — it MUST exist
+ * (make z23-package-verify); a missing binary is a loud failure,
  * never a silent skip. */
 
 #include "test/test_core.h"
@@ -1985,8 +1985,8 @@ static int t_e2e(void)
         printf("  zcode_add: cannot create the fixture datadir... FAIL\n");
         return 1;
     }
-    if (!za_exists("build/bin/zclassic23-package-verify-dev")) {
-        printf("  zcode_add: build/bin/zclassic23-package-verify-dev missing "
+    if (!za_exists("build/bin/z23-package-verify-dev")) {
+        printf("  zcode_add: build/bin/z23-package-verify-dev missing "
                "(make dev-bin)... FAIL\n");
         za_rm_rf(base);
         return 1;
@@ -3370,8 +3370,8 @@ static int t_programs(void)
                "FAIL\n");
         return 1;
     }
-    if (!za_exists("build/bin/zclassic23-package-verify-dev")) {
-        printf("  zcode_add: build/bin/zclassic23-package-verify-dev missing "
+    if (!za_exists("build/bin/z23-package-verify-dev")) {
+        printf("  zcode_add: build/bin/z23-package-verify-dev missing "
                "(make dev-bin)... FAIL\n");
         za_rm_rf(base);
         return 1;
@@ -3520,7 +3520,7 @@ static int t_worker_literal_path(void)
     test_make_tmpdir(base, sizeof(base), "zcode_add", "worker-path");
     (void)snprintf(directory, sizeof(directory), "%s/kept (deleted) files", base);
     (void)snprintf(executable, sizeof(executable), "%s/z23", directory);
-    (void)snprintf(worker, sizeof(worker), "%s/zclassic23-package-verify-dev", directory);
+    (void)snprintf(worker, sizeof(worker), "%s/z23-package-verify-dev", directory);
     bool prepared = za_mkdir_p(directory) && za_write_file(worker, "", 0, 0700);
     ZA_CHECK("worker discovery fixture prepared", prepared);
     ZA_CHECK("literal deleted text in install directory is preserved", prepared &&
@@ -3531,7 +3531,7 @@ static int t_worker_literal_path(void)
         pkgl_worker_path_for_executable(executable, found, sizeof(found)).ok &&
         strcmp(found, worker) == 0);
     (void)snprintf(release_worker, sizeof(release_worker),
-                   "%s/zclassic23-package-verify", directory);
+                   "%s/z23-package-verify", directory);
     bool replaced = za_rm_rf(worker) && za_mkdir_p(worker) &&
                     za_write_file(release_worker, "", 0, 0700);
     ZA_CHECK("a directory named like the dev verifier cannot mask the release verifier",

@@ -1,6 +1,6 @@
 /* Copyright 2026 Rhett Creighton - Apache License 2.0
  *
- * `zclassic23-acme` — the node's certificate worker.
+ * `z23-acme` — the node's certificate worker.
  *
  * WHY THIS IS A SEPARATE PROGRAM. Getting a certificate from Let's Encrypt
  * means being a TLS client with a CA trust store, and a program with a trust
@@ -9,7 +9,7 @@
  * Z23-authored object the node links carries an undefined reference to any
  * TLS-client or CA-trust-store entry point. So the CA conversation lives
  * out here, exactly as package verification lives in
- * `zclassic23-package-verify`, and the node keeps doing the only thing it
+ * `z23-package-verify`, and the node keeps doing the only thing it
  * ever knew how to do with a certificate: load one from a file.
  *
  * This is deliberately the ONE place in the tree that trusts a public
@@ -60,15 +60,15 @@
 static void usage(FILE *out)
 {
     fputs(
-        "zclassic23-acme — issue and renew the node's TLS certificate\n"
+        "z23-acme — issue and renew the node's TLS certificate\n"
         "\n"
-        "  zclassic23-acme obtain|renew --domain NAME --account PEM --cert PEM\n"
+        "  z23-acme obtain|renew --domain NAME --account PEM --cert PEM\n"
         "                               --key PEM --handoff PATH --agree-tos\n"
         "                               [--staging | --directory URL]\n"
         "                               [--email ADDRESS] [--timeout-ms N]\n"
         "                               [--poll-attempts N] [--poll-interval-ms N]\n"
-        "  zclassic23-acme check  --cert PEM\n"
-        "  zclassic23-acme selftest\n"
+        "  z23-acme check  --cert PEM\n"
+        "  z23-acme selftest\n"
         "\n"
         "  --handoff PATH must be the SAME path the node was told to read.\n"
         "  It is how the node learns the key authorization to present on 443.\n"
@@ -161,7 +161,7 @@ int main(int argc, char **argv)
     const bool renew = strcmp(command, "renew") == 0;
     const bool check = strcmp(command, "check") == 0;
     if (!obtain && !renew && !check) {
-        fprintf(stderr, "zclassic23-acme: unknown command \"%s\"\n", command);
+        fprintf(stderr, "z23-acme: unknown command \"%s\"\n", command);
         usage(stderr);
         return ACME_EXIT_USAGE;
     }
@@ -186,19 +186,19 @@ int main(int argc, char **argv)
         else if (strcmp(a, "--staging") == 0)       staging = true;
         else if (strcmp(a, "--agree-tos") == 0)     cfg.agree_terms_of_service = true;
         else {
-            fprintf(stderr, "zclassic23-acme: unknown option \"%s\"\n", a);
+            fprintf(stderr, "z23-acme: unknown option \"%s\"\n", a);
             usage(stderr);
             return ACME_EXIT_USAGE;
         }
         if (!ok) {
-            fprintf(stderr, "zclassic23-acme: %s needs a value\n", a);
+            fprintf(stderr, "z23-acme: %s needs a value\n", a);
             return ACME_EXIT_USAGE;
         }
     }
     cfg.cert_path = cert_path;
 
     if (!cert_path) {
-        fprintf(stderr, "zclassic23-acme: --cert names the certificate this "
+        fprintf(stderr, "z23-acme: --cert names the certificate this "
                         "command reads or writes; it has no default\n");
         return ACME_EXIT_USAGE;
     }
@@ -206,7 +206,7 @@ int main(int argc, char **argv)
         return report_check(cert_path);
 
     if (staging && cfg.directory_url) {
-        fprintf(stderr, "zclassic23-acme: --staging and --directory both name a "
+        fprintf(stderr, "z23-acme: --staging and --directory both name a "
                         "certificate authority; pass one\n");
         return ACME_EXIT_USAGE;
     }

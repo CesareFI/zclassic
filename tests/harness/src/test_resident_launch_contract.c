@@ -317,7 +317,7 @@ static bool rlc_send_frame(struct resident_launch *launch, const char *text)
  * real packages through the production zcode lifecycle (publish, plan, commit):
  *   - ztasks, the shipped resident app, from contexts/commons/packages/ztasks/;
  *   - rlc/parker, a resident program that answers READY then parks forever.
- * The e2e lane forks build/bin/zclassic23-package-verify-dev, which MUST
+ * The e2e lane forks build/bin/z23-package-verify-dev, which MUST
  * exist; a missing binary is a loud failure, never a skip. */
 
 #define RLC_ZTASKS_DIR "contexts/commons/packages/ztasks"
@@ -607,8 +607,8 @@ static bool rlc_install_fixtures(const char *base, const char *zcode,
         printf("[cannot create the fixture zcode store] ");
         return false;
     }
-    if (!rlc_executable("build/bin/zclassic23-package-verify-dev")) {
-        printf("[build/bin/zclassic23-package-verify-dev missing "
+    if (!rlc_executable("build/bin/z23-package-verify-dev")) {
+        printf("[build/bin/z23-package-verify-dev missing "
                "(make dev-bin) — loud failure, never a skip] ");
         return false;
     }
@@ -1091,7 +1091,7 @@ static int rlc_task_journey(const char *base, const struct rlc_binding *n,
     size_t fd_before = 0, fd_after = 0;
     bool counted = os_proc_open_fd_count(&fd_before);
     char verifier[4096];
-    if (!realpath("build/bin/zclassic23-package-verify-dev", verifier)) return 1;
+    if (!realpath("build/bin/z23-package-verify-dev", verifier)) return 1;
     struct package_resident_store store = {0};
     struct task_document document = {0}, expected = {0};
     struct package_resident_identity first = rlc_task_identity(n);
@@ -1215,7 +1215,7 @@ static int rlc_task_preview_latency(const char *base, const char *zcode,
 {
     int failures = 0;
     char verifier[4096];
-    if (!realpath("build/bin/zclassic23-package-verify-dev", verifier)) return 1;
+    if (!realpath("build/bin/z23-package-verify-dev", verifier)) return 1;
     struct package_resident_store store = {0};
     struct task_update update = {0};
     struct package_resident_identity accepted = rlc_task_identity(n);

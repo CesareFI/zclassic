@@ -271,7 +271,7 @@ static void boot_sd_watchdog_maybe_notify_ready(void)
         return;
     atomic_store(&g_notify_ready_sent, true);
     char status[256];
-    snprintf(status, sizeof(status), "zclassic23 started (%s)", desc);
+    snprintf(status, sizeof(status), "z23 started (%s)", desc);
     sd_notify_status(status);
     printf("[sd-watchdog] READY=1 sent: %s\n", desc);
     fflush(stdout);

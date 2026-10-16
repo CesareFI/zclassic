@@ -278,7 +278,7 @@ static bool dvx_file_absent(const char *path)
 }
 
 #if !defined(_WIN32)
-/* A fake zclassic23-engine-unit: parses --state-dir, writes a receipt.json
+/* A fake z23-engine-unit: parses --state-dir, writes a receipt.json
  * there, and prints the lines reap reads (rc=, plus a vendor refusal in
  * rate-limit mode). With DVX_HOLD naming a file it keeps running, holding
  * its worktree lock, until that file is gone. */
@@ -321,7 +321,7 @@ static bool dvx_fake_on_path(const char *tag, char *bindir, size_t cap)
     char base[512], prog[1024], path[9000];
     test_make_tmpdir(base, sizeof(base), "devagent_queue", tag);
     (void)snprintf(bindir, cap, "%s/bin", base);
-    (void)snprintf(prog, sizeof(prog), "%s/zclassic23-engine-unit", bindir);
+    (void)snprintf(prog, sizeof(prog), "%s/z23-engine-unit", bindir);
     if (mkdir(bindir, 0700) != 0)
         return false;
     if (!dvx_write(prog, k_dvx_fake))

@@ -255,6 +255,29 @@ appends one signed `vitals` row per catalog metric `/proc` or `statvfs` can
 answer. An unknown id is refused by name. Unmeasurable facts are stored ABSENT,
 never as zero. A second sample appends a new sequence rather than overwriting.
 
+### Latest recorded samples
+
+The C23 module API `zcl_fleet_ledger_vitals_latest` returns the latest
+recorded row for each held box and metric. It preserves that row's sequence,
+timestamp and explicit value presence. Sequence determines the winner even
+when a writer's clock moves backward; a newer absent sample clears the
+previous measurement. For sum metrics this is the latest sample, not a total.
+The historical aggregate API retains its separate semantics.
+
+The projection is built during verified chain replay, append and replication.
+A query performs no file or network access and creates no identity or store.
+Its bounded table covers every admitted box and catalog subject.
+A short output buffer returns `ZCL_FLEET_FULL` with the number of entries
+filled; an unknown box has no entries and does not establish fleet coverage.
+The API supplies timestamps, not a freshness verdict. A reader must disclose
+age, stale data and future-clock uncertainty rather than treating response time
+as measurement time.
+
+Read-only opening requires the public local box and signer identity to include
+the self chain. Without that identity only held peer chains are loaded.
+Readers can obtain those public fields from the delegation; reading a signing
+seed is unnecessary. This module API adds no remote command authority.
+
 ## Experiments
 
 A box records a prediction before a delegated task, then the result after.

@@ -24,7 +24,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#define REGISTRY_PACKAGE_VERIFIER "build/bin/zclassic23-package-verify-dev"
+#define REGISTRY_PACKAGE_VERIFIER "build/bin/z23-package-verify-dev"
 #define REGISTRY_DOGFOOD_MAX_DEPS 8u
 
 struct registry_expected {

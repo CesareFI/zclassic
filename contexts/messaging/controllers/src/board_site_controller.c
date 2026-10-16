@@ -12,6 +12,8 @@
 
 #include "controllers/board_site_controller.h"
 
+#include "controllers/wiki_site_controller.h"
+
 #include "config/runtime.h"
 #include "models/fleet_board_post.h"
 #include "platform/time_compat.h"
@@ -234,6 +236,16 @@ size_t board_site_handle_request(const char *method, const char *path,
         rlen++;
     }
     route[rlen] = '\0';
+
+    /* /board/wiki is the public wiki (controllers/wiki_site_controller.h);
+     * it answers every path it owns, including its own 404s. */
+    if (strncmp(route, "/board/wiki", 11) == 0) {
+        size_t wiki = wiki_site_handle_request(method, path, body, body_len,
+                                               response, response_max,
+                                               datadir);
+        if (wiki > 0)
+            return wiki;
+    }
 
     struct node_db *ndb = app_runtime_node_db();
     if (!ndb || !ndb->open)

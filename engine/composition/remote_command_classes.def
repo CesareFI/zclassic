@@ -1311,6 +1311,7 @@ REMOTE_COMMAND_CLASS("fleet.join", REMOTE_CLASS_NEVER, "")
 REMOTE_COMMAND_CLASS("fleet.admit", REMOTE_CLASS_NEVER, "")
 REMOTE_COMMAND_CLASS("fleet.import", REMOTE_CLASS_NEVER, "")
 REMOTE_COMMAND_CLASS("fleet.machines", REMOTE_CLASS_NEVER, "")
+REMOTE_COMMAND_CLASS("fleet.doctor", REMOTE_CLASS_NEVER, "")
 
 /* ── the datagram link probe — 1 never_remote ──────────────────────────
  *
@@ -1325,7 +1326,15 @@ REMOTE_COMMAND_CLASS("fleet.machines", REMOTE_CLASS_NEVER, "")
  * `mode=echo` here and `mode=probe` there. */
 REMOTE_COMMAND_CLASS("fleet.link.probe", REMOTE_CLASS_NEVER, "")
 
+/* fleet.mission.board: a lead's local view of queue, land and mail state;
+ * it is never offered to a peer. */
+REMOTE_COMMAND_CLASS("fleet.mission.board", REMOTE_CLASS_NEVER, "")
+
 /* z23-toolgen:begin remote-classes - generated, do not edit */
 /* fleet.nodes.table: readonly-local-v1 fixes this leaf to never remote. */
 REMOTE_COMMAND_CLASS("fleet.nodes.table", REMOTE_CLASS_NEVER, "")
+/* fleet.vitals.read: readonly-local-v1 fixes this leaf to never remote. */
+REMOTE_COMMAND_CLASS("fleet.vitals.read", REMOTE_CLASS_NEVER, "")
+/* fleet.vitals.table: readonly-local-v1 fixes this leaf to never remote. */
+REMOTE_COMMAND_CLASS("fleet.vitals.table", REMOTE_CLASS_NEVER, "")
 /* z23-toolgen:end remote-classes */

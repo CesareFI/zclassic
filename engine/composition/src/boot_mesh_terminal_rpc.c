@@ -177,6 +177,12 @@ static void client_view_json(struct json_value *result,
         json_push_kv_int(&evidence, "duration_s",
                          (int64_t)view->evidence_duration_s);
         json_push_kv_str(&evidence, "reason", view->evidence_reason);
+        if (view->evidence_has_exit)
+            json_push_kv_int(&evidence, "exit_code",
+                             (int64_t)view->evidence_exit_code);
+        if (view->evidence_signal > 0)
+            json_push_kv_int(&evidence, "signal",
+                             (int64_t)view->evidence_signal);
         json_push_kv(result, "close_evidence", &evidence);
         json_free(&evidence);
     }

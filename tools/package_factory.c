@@ -7,7 +7,7 @@
  * admission, and optional corpus registration — reusing only the existing
  * machinery: contexts/commons/modules/vcs package_prepare/release/build/reproduce, the
  * zclassic23 native CLI (zcode package dev/publish/add/verify), and the
- * offline signers (zclassic23-package-sign, zclassic23-package-verify).
+ * offline signers (z23-package-sign, z23-package-verify).
  * It adds NO second scheduler, store, transport, or receipt family.
  *
  * Subcommands:
@@ -38,9 +38,9 @@
  * report carries durable_hosting:"unavailable_offline". No daemon is ever
  * started.
  *
- * The key file is the zclassic23-package-sign format: exactly 32 RAW
+ * The key file is the z23-package-sign format: exactly 32 RAW
  * secp256k1 secret bytes, mode 0600/0400 (generate a throwaway one with
- * `zclassic23-package-sign --generate PATH`). The publisher pubkey is
+ * `z23-package-sign --generate PATH`). The publisher pubkey is
  * cross-checked against the key before anything is signed.
  */
 
@@ -728,7 +728,7 @@ static bool pf_signer(const char *bin_dir, const char *mode,
         return false;
     }
     char bin[PF_PATH_CAP], fdstr[16];
-    if (snprintf(bin, sizeof(bin), "%s/zclassic23-package-sign", bin_dir) >=
+    if (snprintf(bin, sizeof(bin), "%s/z23-package-sign", bin_dir) >=
         (int)sizeof(bin) ||
         snprintf(fdstr, sizeof(fdstr), "%d", fd) >= (int)sizeof(fdstr)) {
         close(fd);
@@ -1617,7 +1617,7 @@ static bool fsr_build_fixed_args(struct fsr_verify_args *fa,
                                  const char *emit_dir, const char *lock_hex,
                                  const char *pkg_name, const char *plan_path)
 {
-    if (snprintf(fa->bin, sizeof(fa->bin), "%s/zclassic23-package-verify",
+    if (snprintf(fa->bin, sizeof(fa->bin), "%s/z23-package-verify",
                 args->bin_dir) >= (int)sizeof(fa->bin))
         LOG_FAIL(PF_LOG, "verifier path overflow");
     if (snprintf(fa->source_arg, sizeof(fa->source_arg),
@@ -3594,7 +3594,7 @@ static int cst_generate_key(const char *bin_dir, const char *key,
                             char pubkey[256])
 {
     char bin[PF_PATH_CAP];
-    if (snprintf(bin, sizeof(bin), "%s/zclassic23-package-sign", bin_dir) >=
+    if (snprintf(bin, sizeof(bin), "%s/z23-package-sign", bin_dir) >=
         (int)sizeof(bin))
         LOG_ERR(PF_LOG, "signer path overflow");
     char *argv[] = {bin, (char *)"--generate", (char *)key, NULL};

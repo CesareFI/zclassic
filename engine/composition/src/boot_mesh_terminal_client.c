@@ -64,6 +64,9 @@ struct mesh_terminal_client_session {
     uint64_t evidence_bytes_out;
     uint64_t evidence_duration_s;
     char evidence_reason[24];
+    bool evidence_has_exit; /* "exit_code" present and in range */
+    int evidence_exit_code;
+    int evidence_signal;    /* 1..64, or 0 when absent */
     size_t output_len;
 };
 
@@ -262,6 +265,30 @@ static const char *client_evidence_reason(const struct json_value *doc)
     return "unknown";
 }
 
+/* The optional remote status. Old peers omit both keys, which reads as no
+ * status (exit 0 at the attach client). A key that is present but not an
+ * integer in its range, or both keys together, counts as absent: the
+ * status is advisory and never makes the signed evidence unreadable. */
+static void client_evidence_status(struct mesh_terminal_client_session *s,
+                                   const struct json_value *doc)
+{
+    const struct json_value *ec = json_get(doc, "exit_code");
+    const struct json_value *sg = json_get(doc, "signal");
+    s->evidence_has_exit = false;
+    s->evidence_exit_code = 0;
+    s->evidence_signal = 0;
+    if (ec && sg)
+        return;
+    if (ec && ec->type == JSON_INT && json_get_int(ec) >= 0 &&
+        json_get_int(ec) <= 255) {
+        s->evidence_has_exit = true;
+        s->evidence_exit_code = (int)json_get_int(ec);
+    } else if (sg && sg->type == JSON_INT && json_get_int(sg) >= 1 &&
+               json_get_int(sg) <= 64) {
+        s->evidence_signal = (int)json_get_int(sg);
+    }
+}
+
 /* Reads the verified CLOSED receipt's evidence capsule
  * (zcl.terminal_close_evidence.v1). A capsule that does not parse, or whose
  * fields are not exact, leaves the evidence absent; the verdict itself is
@@ -284,6 +311,7 @@ static void client_close_evidence(struct mesh_terminal_client_session *s,
                                 &s->evidence_duration_s)) {
             snprintf(s->evidence_reason, sizeof(s->evidence_reason), "%s",
                      reason);
+            client_evidence_status(s, &doc);
             s->evidence_valid = true;
         }
     }
@@ -704,6 +732,9 @@ static bool client_poll_visit(struct mesh_stream *st, void *ctx)
         v->view->evidence_bytes_in = s->evidence_bytes_in;
         v->view->evidence_bytes_out = s->evidence_bytes_out;
         v->view->evidence_duration_s = s->evidence_duration_s;
+        v->view->evidence_has_exit = s->evidence_has_exit;
+        v->view->evidence_exit_code = s->evidence_exit_code;
+        v->view->evidence_signal = s->evidence_signal;
         memcpy(v->view->evidence_reason, s->evidence_reason,
                sizeof(v->view->evidence_reason));
     }

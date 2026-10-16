@@ -82,8 +82,19 @@ struct vcs_zcode_dht_delegation;
  * than its receipt proves. */
 #define MESH_TERMINAL_SERVICE_LIFETIME_SECONDS UINT64_C(3600)
 #define MESH_TERMINAL_SERVICE_IDLE_SECONDS UINT64_C(600)
-#define MESH_TERMINAL_SERVICE_MAX_BYTES_IN UINT64_C(65536)
-#define MESH_TERMINAL_SERVICE_MAX_BYTES_OUT UINT64_C(1048576)
+/* The byte budgets are a runaway backstop, not a throttle: the rate
+ * bound (MESH_TERMINAL_PUMP_CHUNKS_PER_TICK per drain tick), the stream
+ * credit window and the idle and lifetime limits are what keep one
+ * session from starving the node. A session may print a large file or take
+ * a large paste: 16 MiB in and, by default, 1 GiB out. The output budget
+ * is the node arg -terminalmaxbytesout=<n> (bytes; default this value,
+ * accepted range MIN..MAX below, anything else falls back to the default).
+ * Neither budget is ever buffered: memory per session is independent of
+ * the budget (see MESH_TERMINAL_PUMP_CHUNKS_PER_TICK). */
+#define MESH_TERMINAL_SERVICE_MAX_BYTES_IN UINT64_C(16777216)
+#define MESH_TERMINAL_SERVICE_MAX_BYTES_OUT UINT64_C(1073741824)
+#define MESH_TERMINAL_SERVICE_MIN_BYTES_OUT_ARG UINT64_C(1048576)
+#define MESH_TERMINAL_SERVICE_MAX_BYTES_OUT_ARG UINT64_C(68719476736)
 
 /* Four concurrent confined terminals per node. A fifth concurrent OPEN is
  * refused with CONCURRENCY_LIMIT, never queued. The streams themselves
@@ -101,9 +112,15 @@ struct vcs_zcode_dht_delegation;
 /* DATA messages the stream drain moves per live session per tick;
  * leftover output waits for the next tick, so a noisy shell is throttled,
  * never unbounded. With the 100 ms drain cadence this is ~640 KiB/s worst
- * case per session, far above interactive use and far under the 1 MiB
- * lifetime byte cap — and the stream's credit window stops the sender
- * dead when the requester has not read what it already has. */
+ * case per session, far above interactive use (measured end to end: about
+ * 480 KiB/s) — and the stream's credit window stops the sender dead when
+ * the requester has not read what it already has.
+ *
+ * Memory bound per responder session: one 4 KiB worker read buffer plus
+ * one frame on the stack per chunk, and at most the stream credit window
+ * (MESH_TERMINAL_CLIENT_OUTPUT_MAX, 64 KiB) in flight; the requester side
+ * holds one MESH_TERMINAL_CLIENT_OUTPUT_MAX FIFO. Nothing grows with the
+ * byte budgets. */
 #define MESH_TERMINAL_PUMP_CHUNKS_PER_TICK 16
 
 /* Records the composition context and registers the "terminal" stream
@@ -168,11 +185,32 @@ bool boot_mesh_terminal_configure(enum mesh_terminal_platform platform,
                                   char *out, size_t out_cap, bool *unconfined,
                                   const char **why);
 
-/* Render the close-evidence capsule a CLOSED receipt carries. */
+/* Render the close-evidence capsule a CLOSED receipt carries, with no
+ * remote exit status keys at all (what a node that predates them sends). */
 bool boot_mesh_terminal_render_close_capsule(
     uint64_t bytes_in, uint64_t bytes_out, uint64_t duration_seconds,
     enum mesh_terminal_close_reason reason,
     uint8_t out[MESH_TERMINAL_CAPSULE_MAX], size_t *out_len);
+
+/* Same, carrying the remote shell's status. For reason worker-exited
+ * exactly one of exit_code (0..255) or signal (1..64) must be given (pass
+ * -1 / 0 for the other), else the render is refused; for every other
+ * reason both must be absent (-1 / 0). The status rides as the OPTIONAL
+ * keys "exit_code" or "signal" of zcl.terminal_close_evidence.v1: readers
+ * look keys up by name and ignore the rest, so old peers still verify and
+ * parse the capsule and a missing key reads as exit 0. */
+bool boot_mesh_terminal_render_close_capsule_status(
+    uint64_t bytes_in, uint64_t bytes_out, uint64_t duration_seconds,
+    enum mesh_terminal_close_reason reason, int exit_code, int signal,
+    uint8_t out[MESH_TERMINAL_CAPSULE_MAX], size_t *out_len);
+
+/* The session output budget for a -terminalmaxbytesout value (`arg` is the
+ * raw integer; <= 0 or absent means default). Out-of-range values give the
+ * default. Pure. */
+uint64_t boot_mesh_terminal_resolve_max_bytes_out(int64_t arg);
+
+/* The budget this node grants and enforces (the resolved arg). */
+uint64_t boot_mesh_terminal_max_bytes_out(void);
 
 /* Mid-session authority re-check for a live responder session: true when
  * the local pairing row no longer grants terminal-exec — vanished row or
@@ -227,7 +265,7 @@ enum boot_mesh_terminal_client_state {
 #define MESH_TERMINAL_CLIENT_SESSIONS_MAX 4u
 
 /* Bounded pending-screen FIFO per client session: the responder's own
- * 1 MiB byte-out ceiling bounds what can ever be in flight, so a laggard
+ * credit window (this size) bounds what can ever be in flight, so a laggard
  * reader sees drops at this mark, not unbounded growth. */
 #define MESH_TERMINAL_CLIENT_OUTPUT_MAX (size_t)(64u * 1024u)
 
@@ -257,6 +295,11 @@ struct boot_mesh_terminal_client_view {
     uint64_t evidence_bytes_out;
     uint64_t evidence_duration_s;
     char evidence_reason[24];
+    /* Optional remote status (absent from old peers): exit_code is
+     * meaningful only when evidence_has_exit; evidence_signal 0 = none. */
+    bool evidence_has_exit;
+    int evidence_exit_code;
+    int evidence_signal;
 };
 
 const char *boot_mesh_terminal_open_result_string(

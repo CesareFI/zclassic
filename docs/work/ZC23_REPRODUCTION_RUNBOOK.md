@@ -132,7 +132,7 @@ directories through an authenticated out-of-band handoff. B then runs the
 existing verifier directly:
 
 ```sh
-build/bin/zclassic23-package-verify "$PACKAGE_ROOT" \
+build/bin/z23-package-verify "$PACKAGE_ROOT" \
   --store="$PACKAGE_STORE" \
   --emit="$OUTPUT_DIR" \
   --lock-root="$LOCK_ROOT" \

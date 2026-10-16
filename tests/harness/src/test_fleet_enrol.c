@@ -19,16 +19,21 @@
 
 #include "command/native_command.h"
 #include "config/command_catalog.h"
+#include "base/hex.h"
 #include "crypto/ed25519.h"
+#include "controllers/rpc_client.h"
 #include "fleet_enrol.h"
 #include "json/json.h"
 #include "kernel/command_registry.h"
+#include "models/database.h"
+#include "models/mesh_pairing.h"
 #include "net/acme_b64url.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #define FE_NOW 1757030400
 #define FE_TTL 24
@@ -1061,6 +1066,347 @@ static int test_fe_render(void)
     return failures;
 }
 
+/* ── fleet.doctor ───────────────────────────────────────────────────────── */
+
+#define FD_FP "ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12"
+#define FD_DECOY "deadc0dedeadc0dedeadc0dedeadc0dedeadc0dedeadc0dedeadc0dedeadc0de"
+
+static bool g_fd_node_up;
+
+/* A stand-in node: a stub error when "down", else the three reads the
+ * doctor makes. Five peers, two of them on the hybrid transport; the
+ * identity capsule carries a decoy private field the doctor must drop. */
+static char *fd_rpc_hook(const char *method, const char *params)
+{
+    (void)params;
+    if (!g_fd_node_up)
+        return strdup("{\"code\":-32603,\"message\":\"connect failed\"}");
+    if (strcmp(method, "getpeerinfo") == 0)
+        return strdup("[{\"transport\":\"noise_xxhfs\"},"
+                      "{\"transport\":\"plaintext\"},"
+                      "{\"transport\":\"noise_xxhfs\"},"
+                      "{\"transport\":\"handshaking\"},"
+                      "{\"transport\":\"plaintext\"}]");
+    if (strcmp(method, "dumpstate") == 0)
+        return strdup("{\"state\":{\"transport\":{\"observed\":true,"
+                      "\"noise_enabled\":true,\"identity_loaded\":true,"
+                      "\"local_noise_fingerprint_sha3\":\"" FD_FP "\","
+                      "\"noise_private_key\":\"" FD_DECOY "\"},"
+                      "\"authenticated_dht\":{\"observed\":true,"
+                      "\"enabled\":true,\"disabled_reason\":\"\"}}}");
+    if (strcmp(method, "fleet_board") == 0)
+        return strdup("{\"ok\":true,\"posts\":[],\"returned\":3}");
+    return strdup("{\"code\":-32601,\"message\":\"no such method\"}");
+}
+
+/* A datadir holding `count` recorded pairings, the first expiring at
+ * `first_expiry`; the rest a year out. */
+static bool fd_make_datadir(const char *tag, int count, int64_t first_expiry,
+                            char *dir, size_t cap)
+{
+    char path[PATH_MAX + 16];
+    struct node_db db;
+    int64_t now = (int64_t)time(NULL);
+    test_make_tmpdir(dir, cap, "fleet_enrol", tag);
+    if (count == 0)
+        return true;
+    if (snprintf(path, sizeof(path), "%s/node.db", dir) <= 0 ||
+        !node_db_open(&db, path))
+        return false;
+    for (int i = 0; i < count; i++) {
+        struct db_mesh_pairing row;
+        memset(&row, 0, sizeof(row));
+        memset(row.network_genesis, 0x11, 32);
+        memset(row.peer_master_pubkey, 0x40 + (i % 50), 32);
+        row.peer_master_pubkey[0] = (uint8_t)i;
+        memset(row.peer_noise_pubkey, 0x20, 32);
+        row.peer_noise_pubkey[1] = (uint8_t)i;
+        row.capability_mask = MESH_PAIRING_CAP_STATUS_READ;
+        row.delegation_sequence = 1;
+        row.paired_at = now - 1000;
+        row.expires_at = i == 0 ? first_expiry : now + 365 * 86400;
+        if (!mesh_pairing_id_derive(row.network_genesis, row.peer_master_pubkey,
+                                    row.peer_noise_pubkey, row.pairing_id) ||
+            !db_mesh_pairing_insert(&db, &row)) {
+            node_db_close(&db);
+            return false;
+        }
+    }
+    node_db_close(&db);
+    return true;
+}
+
+static bool fd_run(const char *datadir, struct zcl_command_reply *reply)
+{
+    const struct zcl_command_spec *spec = zcl_command_registry_find(
+        zcl_command_catalog(), "fleet.doctor", NULL);
+    struct zcl_command_request request = {0};
+    struct json_value input;
+    char why[160];
+    bool ok;
+    zcl_command_reply_init(reply, "zcl.fleet_doctor.v1");
+    json_init(&input);
+    json_set_object(&input);
+    (void)json_push_kv_str(&input, "datadir", datadir);
+    ok = spec && spec->handler &&
+         zcl_command_registry_input_validate(spec, &input, why, sizeof(why));
+    request.spec = spec;
+    request.input = &input;
+    if (ok)
+        spec->handler(&request, reply);
+    json_free(&input);
+    return ok;
+}
+
+static const struct json_value *fd_check_row(const struct zcl_command_reply *r,
+                                             const char *name)
+{
+    const struct json_value *checks = json_get(&r->data, "checks");
+    for (size_t i = 0; checks && i < checks->num_children; i++)
+        if (strcmp(json_get_str(json_get(&checks->children[i], "name")),
+                   name) == 0)
+            return &checks->children[i];
+    return NULL;
+}
+
+static const char *fd_cstr(const struct json_value *o, const char *k)
+{
+    return json_get_str(json_get(o, k));
+}
+
+/* "z23 fleet invite --name=<box>" names the catalog path fleet.invite. */
+static bool fd_next_resolves(const char *next)
+{
+    char path[96];
+    size_t n = 0;
+    if (strncmp(next, "z23 ", 4) != 0)
+        return false;
+    for (const char *p = next + 4; *p && *p != '-' && *p != '<' && n < 90; p++)
+        path[n++] = *p == ' ' ? '.' : *p;
+    while (n > 0 && path[n - 1] == '.')
+        n--;
+    path[n] = '\0';
+    return zcl_command_registry_find(zcl_command_catalog(), path, NULL) != NULL;
+}
+
+static int test_fd_empty_datadir(void)
+{
+    int failures = 0;
+    static const char *const order[] = { "node", "identity", "membership",
+        "delegation", "transport", "pairing", "mail", "wiki" };
+    TEST("fleet doctor: an empty datadir and no node is blocked at the node "
+         "and names an existing command for every gap") {
+        char dir[PATH_MAX];
+        struct zcl_command_reply reply;
+        const struct json_value *checks = NULL;
+        fe_isolate("doctor-empty");
+        ASSERT(fd_make_datadir("doctor-empty-dd", 0, 0, dir, sizeof(dir)));
+        g_fd_node_up = false;
+        node_rpc_client_set_test_hook(fd_rpc_hook);
+        ASSERT(fd_run(dir, &reply));
+        ASSERT_STR_EQ(fd_cstr(&reply.data, "schema"), "zcl.fleet_doctor.v1");
+        ASSERT_STR_EQ(fd_cstr(&reply.data, "state"), "blocked");
+        ASSERT_STR_EQ(fd_cstr(&reply.data, "next"), "z23 core status");
+        checks = json_get(&reply.data, "checks");
+        ASSERT(checks && checks->num_children == 8);
+        for (size_t i = 0; i < 8; i++)
+            ASSERT_STR_EQ(fd_cstr(&checks->children[i], "name"), order[i]);
+        ASSERT_STR_EQ(fd_cstr(fd_check_row(&reply, "node"), "state"),
+                      "blocked");
+        ASSERT_STR_EQ(fd_cstr(fd_check_row(&reply, "identity"), "state"),
+                      "blocked");
+        ASSERT_STR_EQ(fd_cstr(fd_check_row(&reply, "membership"), "state"),
+                      "missing");
+        ASSERT_STR_EQ(fd_cstr(fd_check_row(&reply, "membership"), "next"),
+                      "z23 fleet invite --name=<box>");
+        ASSERT_STR_EQ(fd_cstr(fd_check_row(&reply, "delegation"), "state"),
+                      "blocked");
+        ASSERT_STR_EQ(fd_cstr(fd_check_row(&reply, "transport"), "state"),
+                      "blocked");
+        ASSERT_STR_EQ(fd_cstr(fd_check_row(&reply, "pairing"), "state"),
+                      "missing");
+        ASSERT_STR_EQ(fd_cstr(fd_check_row(&reply, "mail"), "state"),
+                      "unknown");
+        ASSERT_STR_EQ(fd_cstr(fd_check_row(&reply, "mail"), "next"),
+                      "z23-dev dev agent mail");
+        ASSERT_STR_EQ(fd_cstr(fd_check_row(&reply, "wiki"), "state"),
+                      "blocked");
+        /* Every named command is a real catalog path (mail is z23-dev). */
+        for (size_t i = 0; i < 8; i++) {
+            const char *next = fd_cstr(&checks->children[i], "next");
+            ASSERT(next[0] == '\0' || i == 6 || fd_next_resolves(next));
+        }
+        zcl_command_reply_free(&reply);
+        PASS();
+    } _test_next:;
+    node_rpc_client_set_test_hook(NULL);
+    return failures;
+}
+
+static int test_fd_transport_and_warning(void)
+{
+    int failures = 0;
+    TEST("fleet doctor: hybrid peers are counted from the peer list, and a "
+         "pairing under 24h warns while a distant one does not") {
+        char soon[PATH_MAX], far[PATH_MAX];
+        struct zcl_command_reply reply;
+        const struct json_value *row = NULL;
+        uint8_t op_seed[32], op_pub[32];
+        const char *why = NULL;
+        int64_t now = (int64_t)time(NULL);
+        fe_isolate("doctor-up");
+        fe_key(0xc1, op_seed, op_pub);
+        ASSERT(fleet_enrol_operator_write(op_pub, &why));
+        ASSERT(fd_make_datadir("doctor-soon", 1, now + 3600, soon,
+                               sizeof(soon)));
+        ASSERT(fd_make_datadir("doctor-far", 1, now + 10 * 86400, far,
+                               sizeof(far)));
+        g_fd_node_up = true;
+        node_rpc_client_set_test_hook(fd_rpc_hook);
+        ASSERT(fd_run(soon, &reply));
+        ASSERT_EQ(json_get_int(json_get(&reply.data, "connected_peers")), 5);
+        ASSERT_EQ(json_get_int(json_get(&reply.data, "hybrid_peers")), 2);
+        ASSERT_STR_EQ(fd_cstr(&reply.data, "noise_fingerprint_sha3"), FD_FP);
+        row = fd_check_row(&reply, "transport");
+        ASSERT_STR_EQ(fd_cstr(row, "state"), "ok");
+        ASSERT(strstr(fd_cstr(row, "detail"), "2 of 5") != NULL);
+        ASSERT_STR_EQ(fd_cstr(fd_check_row(&reply, "node"), "state"), "ok");
+        ASSERT_STR_EQ(fd_cstr(fd_check_row(&reply, "identity"), "state"),
+                      "ok");
+        ASSERT_STR_EQ(fd_cstr(fd_check_row(&reply, "membership"), "state"),
+                      "ok");
+        ASSERT_STR_EQ(fd_cstr(fd_check_row(&reply, "pairing"), "state"), "ok");
+        ASSERT_EQ(json_get_int(json_get(&reply.data, "wiki_pages")), 3);
+        row = fd_check_row(&reply, "delegation");
+        ASSERT_STR_EQ(fd_cstr(row, "state"), "ok");
+        ASSERT(json_get(row, "warning") != NULL);
+        ASSERT(strstr(fd_cstr(row, "warning"), "expires in") != NULL);
+        /* Every product check is ok and mail is unknown but informational:
+         * the node is ok overall and has nothing left to run. */
+        ASSERT_STR_EQ(fd_cstr(fd_check_row(&reply, "mail"), "state"), "unknown");
+        ASSERT_STR_EQ(fd_cstr(&reply.data, "state"), "ok");
+        ASSERT_STR_EQ(fd_cstr(&reply.data, "next"), "");
+        ASSERT(json_get_bool(json_get(fd_check_row(&reply, "mail"),
+                                      "informational")));
+        zcl_command_reply_free(&reply);
+
+        ASSERT(fd_run(far, &reply));
+        ASSERT(json_get(fd_check_row(&reply, "delegation"), "warning") == NULL);
+        zcl_command_reply_free(&reply);
+        PASS();
+    } _test_next:;
+    node_rpc_client_set_test_hook(NULL);
+    return failures;
+}
+
+static int test_fd_bounded(void)
+{
+    int failures = 0;
+    TEST("fleet doctor: more than 64 machines or pairings never grow the "
+         "answer past 64 rows") {
+        char row[FLEET_ENROL_MACHINE_TEXT_MAX];
+        char name[8];
+        char full[PATH_MAX], over[PATH_MAX];
+        struct zcl_command_reply reply;
+        uint8_t op_seed[32], op_pub[32];
+        const char *why = NULL;
+        int64_t now = (int64_t)time(NULL);
+        fe_isolate("doctor-bound");
+        fe_key(0xd1, op_seed, op_pub);
+        ASSERT(fleet_enrol_operator_write(op_pub, &why));
+        for (unsigned i = 0; i < 70u; i++) {
+            ASSERT(snprintf(name, sizeof(name), "m%02u", i) > 0);
+            ASSERT(fe_row(name, 0xd1, (uint8_t)(0x10u + i),
+                          (uint16_t)(FLEET_ENROL_PORT_FIRST + i), "", row,
+                          sizeof(row)));
+            ASSERT(fleet_roster_append(row, &why));
+        }
+        ASSERT(fd_make_datadir("doctor-64", 64, now + 10 * 86400, full,
+                               sizeof(full)));
+        ASSERT(fd_make_datadir("doctor-65", 65, now + 10 * 86400, over,
+                               sizeof(over)));
+        g_fd_node_up = false;
+        node_rpc_client_set_test_hook(fd_rpc_hook);
+        ASSERT(fd_run(full, &reply));
+        ASSERT_EQ(json_get_int(json_get(&reply.data, "machines_total")), 70);
+        ASSERT(json_get_bool(json_get(&reply.data, "machines_truncated")));
+        ASSERT_EQ(json_get(&reply.data, "machines")->num_children, 64u);
+        ASSERT_EQ(json_get_int(json_get(&reply.data, "pairings_total")), 64);
+        ASSERT_EQ(json_get(&reply.data, "pairings")->num_children, 64u);
+        ASSERT_STR_EQ(fd_cstr(fd_check_row(&reply, "pairing"), "state"), "ok");
+        zcl_command_reply_free(&reply);
+
+        ASSERT(fd_run(over, &reply));
+        ASSERT_STR_EQ(fd_cstr(fd_check_row(&reply, "pairing"), "state"),
+                      "unknown");
+        ASSERT_EQ(json_get(&reply.data, "pairings")->num_children, 0u);
+        zcl_command_reply_free(&reply);
+        PASS();
+    } _test_next:;
+    node_rpc_client_set_test_hook(NULL);
+    return failures;
+}
+
+static int test_fd_no_secret_material(void)
+{
+    int failures = 0;
+    TEST("fleet doctor: neither the box's fleet seed nor a private field in "
+         "the node's capsule reaches the answer") {
+        static char text[131072];
+        char dir[PATH_MAX];
+        char seed_hex[65];
+        uint8_t seed[FLEET_ENROL_SEED_BYTES], pub[FLEET_ENROL_PUBKEY_BYTES];
+        struct zcl_command_reply reply;
+        const char *why = NULL;
+        bool present = false;
+        fe_isolate("doctor-secret");
+        ASSERT(fleet_enrol_key_load(seed, pub, true, &present, &why));
+        zcl_hex_encode(seed, sizeof(seed), seed_hex);
+        ASSERT(fd_make_datadir("doctor-secret-dd", 1, (int64_t)time(NULL) + 864000, dir,
+                               sizeof(dir)));
+        g_fd_node_up = true;
+        node_rpc_client_set_test_hook(fd_rpc_hook);
+        ASSERT(fd_run(dir, &reply));
+        ASSERT(json_write(&reply.data, text, sizeof(text)) > 0);
+        ASSERT(strstr(text, FD_FP) != NULL);
+        ASSERT(strstr(text, seed_hex) == NULL);
+        ASSERT(strstr(text, FD_DECOY) == NULL);
+        ASSERT(strstr(text, "private") == NULL);
+        zcl_command_reply_free(&reply);
+        PASS();
+    } _test_next:;
+    node_rpc_client_set_test_hook(NULL);
+    return failures;
+}
+
+
+static int test_fd_unreadable_store(void)
+{
+    int failures = 0;
+    TEST("fleet doctor: a pairing store that is not a database is refused "
+         "by name, not reported as missing") {
+        char dir[PATH_MAX], path[PATH_MAX + 16];
+        struct zcl_command_reply reply;
+        FILE *fp = NULL;
+        fe_isolate("doctor-junk");
+        ASSERT(fd_make_datadir("doctor-junk-dd", 0, 0, dir, sizeof(dir)));
+        ASSERT(snprintf(path, sizeof(path), "%s/node.db", dir) > 0);
+        fp = fopen(path, "w");
+        ASSERT(fp != NULL);
+        ASSERT(fputs("this is not a sqlite database at all, just text", fp) >= 0);
+        ASSERT(fclose(fp) == 0);
+        g_fd_node_up = false;
+        node_rpc_client_set_test_hook(fd_rpc_hook);
+        ASSERT(fd_run(dir, &reply));
+        ASSERT_STR_EQ(reply.error.code, "FLEET_DOCTOR_PAIRING_UNREADABLE");
+        ASSERT(reply.status != ZCL_COMMAND_STATUS_PASSED);
+        zcl_command_reply_free(&reply);
+        PASS();
+    } _test_next:;
+    node_rpc_client_set_test_hook(NULL);
+    return failures;
+}
+
 int test_fleet_enrol(void)
 {
     int failures = 0;
@@ -1081,6 +1427,11 @@ int test_fleet_enrol(void)
     failures += test_fe_onion_refused_at_mint();
     failures += test_fe_machines_page();
     failures += test_fe_render();
+    failures += test_fd_empty_datadir();
+    failures += test_fd_transport_and_warning();
+    failures += test_fd_bounded();
+    failures += test_fd_no_secret_material();
+    failures += test_fd_unreadable_store();
     fe_restore();
     return failures;
 }

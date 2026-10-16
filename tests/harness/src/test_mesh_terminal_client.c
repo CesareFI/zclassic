@@ -652,6 +652,45 @@ int test_mesh_terminal_client(void)
         PASS();
     }
 
+    TEST("mesh terminal client: close evidence carries an optional remote "
+         "exit code or signal; old evidence carries none") {
+        boot_mesh_terminal_client_test_reset();
+        struct boot_mesh_terminal_client_view v;
+        static const char head[] =
+            "{\"schema\":\"zcl.terminal_close_evidence.v1\","
+            "\"bytes_in\":1,\"bytes_out\":2,\"duration_s\":3,"
+            "\"reason\":\"worker-exited\"";
+        static const struct {
+            const char *tail;
+            bool has_exit;
+            int exit_code;
+            int signal;
+        } rows[] = {
+            {"}", false, 0, 0},                       /* old peer */
+            {",\"exit_code\":3}", true, 3, 0},
+            {",\"exit_code\":0}", true, 0, 0},
+            {",\"signal\":15}", false, 0, 15},
+            {",\"exit_code\":256}", false, 0, 0},     /* out of range */
+            {",\"exit_code\":-1}", false, 0, 0},
+            {",\"signal\":0}", false, 0, 0},
+            {",\"signal\":65}", false, 0, 0},
+            {",\"exit_code\":\"3\"}", false, 0, 0},   /* wrong type */
+            {",\"exit_code\":3,\"signal\":9}", false, 0, 0}, /* both */
+            {",\"future_key\":[1,2]}", false, 0, 0},  /* unknown key */
+        };
+        for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+            char cap[320];
+            snprintf(cap, sizeof(cap), "%s%s", head, rows[i].tail);
+            ASSERT(client_closed_view(&f, &cnode, (uint8_t)(0x70 + i), cap, &v));
+            ASSERT(v.evidence_valid);
+            ASSERT_STR_EQ(v.evidence_reason, "worker-exited");
+            ASSERT_EQ(v.evidence_has_exit, rows[i].has_exit);
+            ASSERT_EQ(v.evidence_exit_code, rows[i].exit_code);
+            ASSERT_EQ(v.evidence_signal, rows[i].signal);
+        }
+        PASS();
+    }
+
     TEST("mesh terminal client: close evidence takes only whitelisted reasons "
          "and exact integers") {
         boot_mesh_terminal_client_test_reset();

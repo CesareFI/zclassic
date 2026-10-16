@@ -590,7 +590,7 @@ int test_chaos_harness(void)
                 file_contains_text(summary_path, "partition_drops=1") &&
                 file_contains_text(summary_path, "auto_reindex_anchor=3173739") &&
                 file_contains_text(summary_path, "auto_reindex_pending=1") &&
-                file_contains_text(summary_path, "replay_command=build/bin/zclassic23-chaos") &&
+                file_contains_text(summary_path, "replay_command=build/bin/z23-chaos") &&
                 file_contains_text(copied_path, "expect tip_height > 0"));
     unlink(summary_path);
     unlink(copied_path);

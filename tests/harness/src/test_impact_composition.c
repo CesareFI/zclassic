@@ -8085,7 +8085,7 @@ static int test_ic_proof_lint_and_test_share_admitted_executables(void)
             ASSERT(strncmp(sources[i], "build/bin/", 10) == 0);
             ASSERT(strstr(targets[i], "..") == NULL);
             if (strcmp(targets[i],
-                       "build/bin/zclassic23-package-verify-dev") == 0)
+                       "build/bin/z23-package-verify-dev") == 0)
                 has_verifier = true;
             if (strcmp(targets[i], "build/bin/z23-dev") == 0)
                 has_dev_node = true;
@@ -8598,7 +8598,7 @@ static int test_ic_local_selection_build_needs(void)
                 strcmp(verifier_groups[i], "test_zcode_swarm_net_shard_01") == 0;
             ASSERT(n == verifier_needs + (swarm ? pure_needs : 0));
             ASSERT(ic_needs_have(needs, n, "dev-package-verifier-ensure",
-                                 "build/bin/zclassic23-package-verify-dev") ==
+                                 "build/bin/z23-package-verify-dev") ==
                    (verifier_needs != 0));
         }
         ASSERT(zcl_test_selection_build_needs(
@@ -8617,7 +8617,7 @@ static int test_ic_local_selection_build_needs(void)
                                               needs, 19, &n));
         ASSERT(n == 1);
         ASSERT(ic_needs_have(needs, n, "engine-unit",
-                             "build/bin/zclassic23-engine-unit"));
+                             "build/bin/z23-engine-unit"));
         n = 99;
 
         /* The operator contract exercises the real native claim CLI. */
@@ -8731,11 +8731,11 @@ static int test_ic_local_selection_build_needs(void)
         ASSERT(ic_needs_have(needs, n, "soak_runner", "build/bin/soak_runner") ==
                (soak_needs != 0));
         ASSERT(ic_needs_have(needs, n, "dev-package-verifier-ensure",
-                             "build/bin/zclassic23-package-verify-dev") ==
+                             "build/bin/z23-package-verify-dev") ==
                (verifier_needs != 0));
         ASSERT(ic_needs_have(needs, n, "dev-bin", "build/bin/z23-dev"));
         ASSERT(ic_needs_have(needs, n, "engine-unit",
-                             "build/bin/zclassic23-engine-unit"));
+                             "build/bin/z23-engine-unit"));
         ASSERT(ic_needs_have(needs, n, "zclassic23", "build/bin/zclassic23"));
         ASSERT(ic_needs_have(needs, n, "tools/consensus_rule_sweep",
                              "build/bin/consensus_rule_sweep"));
@@ -8804,7 +8804,7 @@ static int test_ic_proof_prefork_builds_the_shared_targets(void)
         /* Every executable the test dimension execs out of the generation,
          * and the one lint-side target that names the rest. */
         static const char *const helpers[] = {
-            "zcl-nodectl", "zclassic23-acme", "fbsh", "engine-unit",
+            "zcl-nodectl", "z23-acme", "fbsh", "engine-unit",
             "tools/file_size_policy", "fleet-board-bridge", "git-hook",
             "build/bin/z23-lint",
         };

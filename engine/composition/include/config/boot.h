@@ -357,7 +357,7 @@ struct app_context {
      * ADDITIONAL names this host answers for on the SAME 443 listener, each
      * served its own certificate by TLS SNI. The pair for NAME lives in its
      * own directory beside the main one — <datadir>/ssl/NAME/fullchain.pem
-     * and <datadir>/ssl/NAME/privkey.pem — so `zclassic23-acme` writes a
+     * and <datadir>/ssl/NAME/privkey.pem — so `z23-acme` writes a
      * second name exactly the way it writes the first, one directory over.
      * Empty by default: with none of these the listener behaves exactly as
      * it did before, presenting the one certificate to everybody. */

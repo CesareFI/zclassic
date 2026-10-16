@@ -386,7 +386,7 @@ store, chain simulator, or policy database.
 | Historical 4/5 contribution evidence | `zcl.zcode.score_receipt.v1`, `work_receipt.v1`, `proof_set.v1`, and the PROVEN lane | Score v1 bytes and semantics stay frozen; its independent bit remains forbidden |
 | Exact package inputs | `content.v2`, package manifest/release, recipe, dependency lock, toolchain capsule | Public bytes only; no downloaded scripts, credentials, or machine-specific source paths |
 | Reference and rebuilt outputs | `zcl.zcode_build.v1` package-build reports plus `build_artifact_manifest.v1` | Existing canonical output paths, SHA3 hashes, sizes, and dependency roots remain authoritative |
-| Byte-identity verdict | `vcs_package_reproduce_compare` and `zclassic23-package-verify --emit --reproduce-against` | Exact package/recipe/lock/dependency/output match; no favorable-result selection |
+| Byte-identity verdict | `vcs_package_reproduce_compare` and `z23-package-verify --emit --reproduce-against` | Exact package/recipe/lock/dependency/output match; no favorable-result selection |
 | Confinement | existing package verifier and ZBuild worker | Declarative recipe, Landlock, seccomp, rlimits, no network, bounded resources; degraded confinement cannot qualify |
 | Work transport and result | ZBuild worker, `zcode_work_swarm`, signed `work_receipt.v1`, `zpkgswm`, signed provider records, and DHT | Remote transport is reported as a fact, never inferred from a signer or hostname |
 | Signer identity and history | contributor binding/ZID and existing delegated worker identity | Approval is checked at receipt time; later expiry preserves history but cannot authorize new work |

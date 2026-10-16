@@ -284,7 +284,7 @@ static int t_codec_roundtrip(void)
     (void)snprintf(in.toolchain_desc, sizeof(in.toolchain_desc),
                    "GCC: (Ubuntu 14.2.0) 14.2.0");
     (void)snprintf(in.artifacts[1].path, VCS_NODE_REPRO_PATH_MAX,
-                   "bin/zclassic23-package-verify");
+                   "bin/z23-package-verify");
     memset(in.artifacts[1].sha3, 0x7e, 32);
     in.artifacts[1].bytes = 99;
     in.artifact_count = 2;
@@ -304,7 +304,7 @@ static int t_codec_roundtrip(void)
                  strcmp(out.toolchain_desc, in.toolchain_desc) == 0 &&
                  out.artifact_count == 2 && out.unverified_count == 1 &&
                  strcmp(out.artifacts[1].path,
-                        "bin/zclassic23-package-verify") == 0 &&
+                        "bin/z23-package-verify") == 0 &&
                  out.artifacts[1].bytes == 99 &&
                  memcmp(out.artifacts[0].sha3, in.artifacts[0].sha3, 32) == 0 &&
                  strcmp(out.unverified[0].component,

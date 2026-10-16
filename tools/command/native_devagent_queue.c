@@ -83,7 +83,7 @@
  * gates through arrives as ZCL_Z23_BIN: an operator override wins,
  * otherwise the primed build/bin/z23-dev inside the running worktree;
  * unset means inherit. The harness binary itself is ZCL_ENGINE_UNIT_BIN
- * or zclassic23-engine-unit on PATH.
+ * or z23-engine-unit on PATH.
  *
  * OUTPUT (zcl.agent_queue.v1) on ok=true: leaf is always "dev.agent.queue",
  * plus per action: post {seq, name, state:"queued"}; next {seq, name,
@@ -120,6 +120,7 @@
 
 #include "command/native_command.h"
 #include "command/native_devagent.h"
+#include "command/native_devagent_queue_read.h"
 
 #include "base/safe_alloc.h"
 #include "base/hex.h"
@@ -166,7 +167,7 @@
 #define DVQ_FILE_CAP (1024u * 1024u)
 #define DVQ_TASK_CAP (128u * 1024u)
 #define DVQ_SNIPPET_CAP (32u * 1024u)
-#define DVQ_HARNESS_NAME "zclassic23-engine-unit"
+#define DVQ_HARNESS_NAME "z23-engine-unit"
 #define DVQ_QUEUED_MAX 64
 #define DVQ_PRIORITY_DEFAULT 3
 
@@ -795,6 +796,106 @@ refused:
     free(rows);
     free(text);
     return false;
+}
+
+/* ── read-only view for projections (native_devagent_queue_read.h) ─────── */
+
+static bool dvq_view_push(struct zcl_dvq_row_view **rows, size_t *n,
+                          size_t *cap, const struct dvq_row *r)
+{
+    struct zcl_dvq_row_view *v;
+    if (*n == *cap) {
+        size_t ncap = *cap ? *cap * 2 : 32;
+        struct zcl_dvq_row_view *grow;
+        if (ncap > 65536)
+            return false;
+        grow = (struct zcl_dvq_row_view *)zcl_realloc(
+            *rows, ncap * sizeof(*grow), "devagent.queue.view");
+        if (!grow)
+            return false;
+        *rows = grow;
+        *cap = ncap;
+    }
+    v = &(*rows)[(*n)++];
+    memset(v, 0, sizeof(*v));
+    v->seq = r->seq;
+    v->attempt = r->attempt;
+    v->started = r->started;
+    (void)snprintf(v->ts, sizeof(v->ts), "%s", r->ts);
+    (void)snprintf(v->name, sizeof(v->name), "%s", r->name);
+    (void)snprintf(v->kind, sizeof(v->kind), "%s", r->kind);
+    (void)snprintf(v->engine, sizeof(v->engine), "%s", r->engine);
+    (void)snprintf(v->state, sizeof(v->state), "%s", r->state);
+    return true;
+}
+
+static bool dvq_view_lines(char *text, size_t length,
+                           struct zcl_dvq_row_view **rows, size_t *n,
+                           size_t *skipped)
+{
+    size_t cap = 0;
+    struct dvq_row *r = (struct dvq_row *)zcl_malloc(sizeof(*r), "devagent.queue.viewrow");
+    bool ok = r != NULL;
+    for (char *line = text; ok && line < text + length;) {
+        char *end = memchr(line, '\n', (size_t)(text + length - line));
+        char *next = end ? end + 1 : text + length;
+        if (end)
+            *end = '\0';
+        if (line[0] && memchr(line, 0, strlen(line)) == NULL) {
+            if (!dvq_snapshot_row(line, r))
+                (*skipped)++;
+            else
+                ok = dvq_view_push(rows, n, &cap, r);
+        }
+        line = next;
+    }
+    free(r);
+    return ok;
+}
+
+bool zcl_devagent_queue_rows_read(struct zcl_dvq_row_view **rows, size_t *n,
+                                  size_t *skipped)
+{
+    struct dvq_dirs *d;
+    char qpath[4096 + 32];
+    char *text;
+    size_t length = 0, skip = 0;
+    bool ok;
+    if (!rows || !n)
+        return false;
+    *rows = NULL;
+    *n = 0;
+    if (skipped)
+        *skipped = 0;
+    d = (struct dvq_dirs *)zcl_malloc(sizeof(*d), "devagent.queue.viewdirs");
+    if (!d)
+        return false;
+    ok = dvq_dirs_resolve(d, false) &&
+         snprintf(qpath, sizeof(qpath), "%s/queue.jsonl", d->queue) <
+             (int)sizeof(qpath);
+    free(d);
+    if (!ok)
+        return true; /* no state root yet: an empty queue */
+    text = (char *)zcl_malloc(DVQ_FILE_CAP, "devagent.queue.viewfile");
+    if (!text)
+        return false;
+    errno = 0;
+    if (!dvq_read_file(qpath, text, DVQ_FILE_CAP, &length)) {
+        ok = errno == ENOENT;
+        free(text);
+        return ok;
+    }
+    ok = dvq_view_lines(text, length, rows, n, &skip);
+    free(text);
+    if (!ok) {
+        free(*rows);
+        *rows = NULL;
+        *n = 0;
+        return false;
+    }
+    if (skipped)
+        *skipped = skip;
+    return true;
 }
 
 /* ── the short scheduler flock ─────────────────────────────────────────── */
@@ -2802,7 +2903,7 @@ static void dvq_next(const struct zcl_command_request *req,
         dvq_close_wt(wtfd);
         dvq_unmark(d.queue, qpath, pick.seq);
         dvq_fail(reply, "DISPATCH_NO_HARNESS", "dispatch",
-                 "zclassic23-engine-unit is not on PATH and "
+                 "z23-engine-unit is not on PATH and "
                  "ZCL_ENGINE_UNIT_BIN is unset",
                  "install the harness or set ZCL_ENGINE_UNIT_BIN");
         return;

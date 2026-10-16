@@ -7,7 +7,7 @@
  * Entirely hermetic: every fixture lives under ./test-tmp/, the status dir
  * is always overridden to an isolated tmp dir, and the runner script is
  * swapped for a tiny stub in the launch+poll test so no real
- * test_parallel/zclassic23-chaos process is ever spawned by this file
+ * test_parallel/z23-chaos process is ever spawned by this file
  * except in the one real-script sub-test. Cover:
  *   - rpc_agent_test() param validation / refusal paths for both kind
  *     values: invalid kind, invalid name charset (path traversal / shell

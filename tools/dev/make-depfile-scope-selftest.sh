@@ -68,7 +68,7 @@ PROBE_MK="$WORK/probe.mk"
     # These recipes normally invoke a recursive Make even under -n. Replace
     # only their actions; retain the real graph selection and prerequisites.
     printf 't-hotswap hotswap-test-so: $(ZCL_DEP_PROBE_OBJECTS)\n\t@:\n'
-    printf 'zclassic23 z23 zclassic23-package-verify: $(ZCL_DEP_PROBE_OBJECTS)\n'
+    printf 'zclassic23 z23 z23-package-verify: $(ZCL_DEP_PROBE_OBJECTS)\n'
     printf 'zcl-depfile-unknown zcl-depfile-default: $(ZCL_DEP_PROBE_OBJECTS)\n'
     printf '\t@:\n'
     printf '.DEFAULT_GOAL := zcl-depfile-default\n'
@@ -182,7 +182,7 @@ run_probe "$WORK/hot-mixed.out" t-hotswap t-fast ONLY=boot_phase
 # this to every profile, and a missing -include would silently empty it.
 run_probe "$WORK/node.out" zclassic23
 run_probe "$WORK/node-alias.out" z23
-run_probe "$WORK/verifier.out" zclassic23-package-verify
+run_probe "$WORK/verifier.out" z23-package-verify
 
 # Two goals and an unknown explicit goal are ambiguous. They must import every
 # depfile, so every newer header schedules a rebuild. No explicit goal is the

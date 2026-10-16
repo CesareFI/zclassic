@@ -198,8 +198,8 @@ static bool fcw_worker_path(char *out, size_t cap)
         return false;
     *slash = '\0';
     static const char *const names[] = {
-        "zclassic23-package-verify-dev",
-        "zclassic23-package-verify",
+        "z23-package-verify-dev",
+        "z23-package-verify",
     };
     for (size_t pass = 0; pass < 2u; pass++) {
         for (size_t i = 0; i < 2u; i++) {

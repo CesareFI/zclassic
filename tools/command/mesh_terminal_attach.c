@@ -48,6 +48,9 @@ struct mta_view {
     uint64_t evidence_out;
     uint64_t evidence_duration_s;
     char evidence_reason[24];
+    bool evidence_has_exit;   /* the node reported an exit_code */
+    uint64_t evidence_exit_code; /* 0..255 */
+    uint64_t evidence_signal;    /* 1..64, 0 when none */
 };
 
 enum mta_esc { MTA_ESC_BOL, MTA_ESC_TILDE, MTA_ESC_MID };
@@ -70,6 +73,7 @@ struct mta {
     int64_t open_deadline_ms;
     enum mta_esc esc;
     bool stdin_open;
+    bool live; /* the open receipt arrived: failures are link losses, not refusals */
     int64_t active_until_ms;
     struct mta_refusal ref;
 };
@@ -91,6 +95,7 @@ static const struct {
     {"concurrency-limit", 5}, {"busy", 5}, {"peer_not_connected", 5},
     {"send_failed", 5}, {"idle-timeout", 5}, {"lifetime-limit", 5},
     {"byte-limit", 5}, {"session-lost", 5}, {"shutdown", 5},
+    {"peer-closed", 5},
     {"NODE_UNAVAILABLE", 5}, {"OPEN_TIMEOUT", 5},
     {"internal", 6}, {"BAD_RPC_BODY", 6}, {"OUTPUT_FAILED", 6},
 };
@@ -103,6 +108,45 @@ static int mta_exit_for(const char *name)
         if (strcmp(name, g_exit_table[i].name) == 0)
             return g_exit_table[i].exit_code;
     return 1;
+}
+
+/* ── Plain words for every close and refusal ─────────────────────────── */
+
+/* The terminal protocol names why a session ended but carries no remote
+ * exit status, so the stderr line adds what the name means in operator
+ * terms. The numbers are the responder's own ceilings
+ * (boot_mesh_terminal.h). Unknown names get no gloss. */
+static const struct {
+    const char *name;
+    const char *text;
+} g_gloss_table[] = {
+    {"worker-exited", "the remote shell exited"},
+    {"requested", "the session was closed on request"},
+    {"idle-timeout", "no input or output for 600 s"},
+    {"lifetime-limit", "the 3600 s session limit was reached"},
+    {"byte-limit", "the session byte budget (set by the node; default 1 GiB out, 16 MiB in) was used up"},
+    {"session-lost", "the link to the peer was lost"},
+    {"shutdown", "the remote node is shutting down"},
+    {"revoked", "the pairing was revoked"},
+    {"expired", "the pairing expired"},
+    {"internal", "the responder hit an internal error"},
+    {"peer-closed",
+     "the peer closed the session without a close report (link dropped or "
+     "closed elsewhere)"},
+    {"concurrency-limit",
+     "the node already runs 4 terminals; retry when one closes"},
+    {"confinement-unavailable",
+     "the node cannot confine a shell on this platform"},
+    {"not-paired", "this machine is not paired with the node"},
+    {"capability-unavailable", "the pairing does not carry the terminal capability"},
+};
+
+static const char *mta_gloss_text(const char *name)
+{
+    for (size_t i = 0; i < sizeof(g_gloss_table) / sizeof(g_gloss_table[0]); i++)
+        if (strcmp(name, g_gloss_table[i].name) == 0)
+            return g_gloss_table[i].text;
+    return NULL;
 }
 
 /* ── JSON helpers ────────────────────────────────────────────────────── */
@@ -240,6 +284,13 @@ static bool mta_poll(struct mta *s, struct mta_view *v)
         v->evidence_in = mta_u64(ev, "bytes_in");
         v->evidence_out = mta_u64(ev, "bytes_out");
         v->evidence_duration_s = mta_u64(ev, "duration_s");
+        v->evidence_has_exit = json_get(ev, "exit_code") != NULL;
+        v->evidence_exit_code = mta_u64(ev, "exit_code");
+        v->evidence_signal = mta_u64(ev, "signal");
+        if (v->evidence_exit_code > 255)
+            v->evidence_exit_code = 0;
+        if (v->evidence_signal > 64)
+            v->evidence_signal = 0;
         mta_copy_str(ev, "reason", v->evidence_reason,
                      sizeof(v->evidence_reason));
     }
@@ -281,8 +332,9 @@ static enum mta_end mta_await_live(struct mta *s)
         if (strcmp(v.state, "ended") == 0)
             return MTA_END_REMOTE;
         if (strcmp(v.state, "refused") == 0) {
+            const char *gloss = mta_gloss_text(v.verdict);
             mta_set_ref(s, v.verdict[0] ? v.verdict : "refused",
-                        "the responder refused the terminal open");
+                        gloss ? gloss : "the responder refused the terminal open");
             return MTA_END_FAILED;
         }
         if (s->tty->now_ms(s->tty->ctx) >= s->open_deadline_ms) {
@@ -502,6 +554,7 @@ static enum mta_end mta_session(struct mta *s)
     enum mta_end end = mta_await_live(s);
     if (end != MTA_END_LIVE)
         return end;
+    s->live = true;
     if (s->config->interactive) {
         mta_say(s, "z23: attached; type ~. at the start of a line to detach");
         s->tty->raw(s->tty->ctx, true);
@@ -518,28 +571,67 @@ static int mta_conclude_failed(struct mta *s)
 {
     struct mta_refusal ref = s->ref;
     mta_close(s);
-    mta_say(s, "z23: refused: %s: %s", ref.code, ref.message);
+    /* After the open receipt a failure is a lost connection, not a refusal. */
+    mta_say(s, "z23: %s: %s: %s", s->live ? "connection lost" : "refused",
+            ref.code, ref.message);
     return mta_exit_for(ref.code);
+}
+
+/* " - words" for a reason the lane names, else nothing. */
+static void mta_gloss_suffix(const char *reason, char *dst, size_t cap)
+{
+    const char *text = mta_gloss_text(reason);
+    if (text)
+        snprintf(dst, cap, " - %s", text);
+    else
+        dst[0] = '\0';
+}
+
+/* The local exit code for a CLOSED report. A worker-exited ending carries
+ * the remote shell's status: its exit code N, or 128 + the signal that
+ * killed it. A report without a status (a node that predates the fields)
+ * keeps the old class, 0. */
+static int mta_remote_exit(const struct mta_view *v)
+{
+    if (strcmp(v->evidence_reason, "worker-exited") != 0)
+        return mta_exit_for(v->evidence_reason);
+    if (v->evidence_signal > 0)
+        return 128 + (int)v->evidence_signal;
+    return (int)v->evidence_exit_code;
 }
 
 static int mta_conclude_remote(struct mta *s)
 {
     struct mta_view v;
+    char gloss[160];
     if (!mta_poll(s, &v))
         return mta_conclude_failed(s);
     if (v.evidence) {
+        char status[40] = "";
+        if (v.evidence_signal > 0)
+            snprintf(status, sizeof(status), " signal=%llu",
+                     (unsigned long long)v.evidence_signal);
+        else if (v.evidence_has_exit)
+            snprintf(status, sizeof(status), " exit_code=%llu",
+                     (unsigned long long)v.evidence_exit_code);
+        mta_gloss_suffix(v.evidence_reason, gloss, sizeof(gloss));
         mta_say(s,
-                "z23: terminal closed: reason=%s bytes_in=%llu bytes_out=%llu "
-                "duration_s=%llu",
-                v.evidence_reason, (unsigned long long)v.evidence_in,
+                "z23: terminal closed: reason=%s%s bytes_in=%llu "
+                "bytes_out=%llu duration_s=%llu%s",
+                v.evidence_reason, status, (unsigned long long)v.evidence_in,
                 (unsigned long long)v.evidence_out,
-                (unsigned long long)v.evidence_duration_s);
-        return mta_exit_for(v.evidence_reason);
+                (unsigned long long)v.evidence_duration_s, gloss);
+        return mta_remote_exit(&v);
     }
+    /* No signed close report: a stream that ended and was never closed by
+     * this client is the peer's doing, whatever the stream layer calls it. */
     const char *reason = v.close_reason[0] ? v.close_reason : v.verdict;
-    mta_say(s, "z23: terminal ended: reason=%s bytes_in=%llu bytes_out=%llu",
+    if (strcmp(reason, "requested") == 0)
+        reason = "peer-closed";
+    mta_gloss_suffix(reason, gloss, sizeof(gloss));
+    mta_say(s, "z23: terminal ended: reason=%s bytes_in=%llu bytes_out=%llu%s",
             reason, (unsigned long long)v.bytes_in,
-            (unsigned long long)v.bytes_out);
+            (unsigned long long)v.bytes_out, gloss);
     return mta_exit_for(reason);
 }
 

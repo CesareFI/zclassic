@@ -460,7 +460,7 @@ int agent_broker_mode_main(int argc, char **argv)
      * longer holds and must not reach around to. It is a demo instrument and
      * exists only in a -DZCL_TESTING build. */
     static const char k_usage[] =
-        "usage: zclassic23 --metaverse-broker --broker-dir=DIR "
+        "usage: z23 --metaverse-broker --broker-dir=DIR "
         "[--script=NAME] [--canary=PATH] [--requests=N] [--listen] "
         "[--expect-uid=N] [--agent-uid=N]\n"
         "  authority (one is REQUIRED; without it the broker serves nothing):\n"

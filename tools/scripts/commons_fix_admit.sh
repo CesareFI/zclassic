@@ -31,7 +31,7 @@ selftest_helper() {
     awk '/^tool_root=/ {print "tool_root=$(cd \"$(dirname \"$0\")/../..\" && pwd -P) || exit 1";next} {print}' \
         "$subject" > "$toolkit/tools/scripts/commons_fix_admit.sh" || return 1
     chmod +x "$toolkit/tools/scripts/commons_fix_admit.sh" || return 1
-    cp "$tool_root/build/bin/zclassic23-package-verify-dev" "$toolkit/build/bin/" || return 1
+    cp "$tool_root/build/bin/z23-package-verify-dev" "$toolkit/build/bin/" || return 1
     git -C "$toolkit" init -q || return 1
     git -C "$toolkit" add tools/jsonq.c contexts || return 1
     git -C "$toolkit" -c user.name=Fixture -c user.email=fixture@example.invalid \
@@ -119,7 +119,7 @@ selftest_git_environment() {
 }
 
 selftest_native() {
-    local fixture=$1 mode rc verifier=$tool_root/build/bin/zclassic23-package-verify-dev
+    local fixture=$1 mode rc verifier=$tool_root/build/bin/z23-package-verify-dev
     mkdir "$fixture/native-source" "$fixture/native-build" || return 1
     printf 'source\n' > "$fixture/native-source/sentinel" || return 1
     printf 'evidence\n' > "$fixture/native-evidence" || return 1
@@ -292,7 +292,7 @@ scratch=$(mktemp -d) || refuse temporary-copy-failed
 trap 'rm -rf "$scratch"' EXIT
 cp "$patch" "$scratch/patch" || refuse temporary-copy-failed
 compiler=${CC:-gcc-14}
-verifier=$tool_root/build/bin/zclassic23-package-verify-dev
+verifier=$tool_root/build/bin/z23-package-verify-dev
 [[ -x "$verifier" ]] || refuse confinement-unavailable
 if ! command -v "$compiler" >/dev/null 2>&1; then refuse compiler-unavailable; fi
 # Pin the toolkit's accepted helper inputs; caller proposals remain inert even

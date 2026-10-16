@@ -499,7 +499,7 @@ static int write_failure_artifacts(const struct chaos_ctx *ctx)
     fprintf(summary, "auto_reindex_clears=%" PRId64 "\n",
             ctx->auto_reindex_clears);
     fprintf(summary, "artifact_scenario=%s\n", scenario_path);
-    fprintf(summary, "replay_command=build/bin/zclassic23-chaos --scenario=%s --verbose\n",
+    fprintf(summary, "replay_command=build/bin/z23-chaos --scenario=%s --verbose\n",
             scenario_path);
     int close_rc = fclose(summary);
     if (close_rc != 0)

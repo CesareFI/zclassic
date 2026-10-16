@@ -938,6 +938,12 @@ ZCL_CAPABILITY_SYMBOL("getgid", CAP_HARMLESS,
     "Reports identity. CAP_PRIVILEGE is the class for changing it.")
 ZCL_CAPABILITY_SYMBOL("getpgid", CAP_HARMLESS,
     "Reports a process group. setpgid, which changes one, is CAP_PROCESS.")
+ZCL_CAPABILITY_SYMBOL("gethostname", CAP_HARMLESS,
+    "Reports this host's own name; static system description like uname.")
+ZCL_CAPABILITY_SYMBOL("__gethostname_chk", CAP_HARMLESS,
+    "Fortified gethostname; same verdict.")
+ZCL_CAPABILITY_SYMBOL("getloadavg", CAP_FS_READ,
+    "Reads the kernel load averages (/proc/loadavg on Linux); no write.")
 ZCL_CAPABILITY_SYMBOL("getpgrp", CAP_HARMLESS,
     "Reports this process group. setpgid, which changes it, is CAP_PROCESS.")
 ZCL_CAPABILITY_SYMBOL("getpid", CAP_HARMLESS, "")

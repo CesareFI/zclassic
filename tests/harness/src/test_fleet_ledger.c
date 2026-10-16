@@ -237,6 +237,28 @@ static enum zcl_fleet_status fl_add_result_counters(
                                    NULL, b->seed, NULL);
 }
 
+#if !defined(_WIN32)
+static int64_t fl_latest_wall_ms;
+
+static int64_t fl_latest_wall(void *self)
+{
+    (void)self;
+    return fl_latest_wall_ms;
+}
+
+static enum zcl_fleet_status fl_latest_at(struct fl_box *box,
+                                         int64_t seconds, int64_t value)
+{
+    const clock_iface_t *saved = clock_default();
+    const clock_iface_t fixed = { .now_wall_ms = fl_latest_wall };
+    fl_latest_wall_ms = seconds * 1000;
+    clock_set_default(&fixed);
+    enum zcl_fleet_status status = fl_add_vital(box, "box.load1", value);
+    clock_set_default(saved);
+    return status;
+}
+#endif
+
 /* The one usage bucket for a provider over today, or false. */
 static bool fl_usage_bucket(struct zcl_fleet_ledger *ledger, uint16_t provider,
                             const uint8_t box_id[32],
@@ -667,6 +689,118 @@ static int test_fleet_ledger_observation(void)
 }
 #endif
 
+static int fl_latest_cases(const char *root)
+{
+    int failures = 0;
+    struct fl_box lv = {0}, replica = {0};
+    TEST("fleet latest vitals retain sequence, absence and row time across replay") {
+        ASSERT(fl_box_open(&lv, root, "latest", 0x71));
+        ASSERT(fl_box_open(&replica, root, "latest-replica", 0x72));
+        uint16_t load = 0, sum = 0;
+        ASSERT(zcl_fleet_subject_from_name(ZCL_FLEET_KIND_VITALS,
+                                           "box.load1", &load));
+        ASSERT(zcl_fleet_subject_from_name(ZCL_FLEET_KIND_VITALS,
+                                           "spend.tokens_in", &sum));
+        ASSERT_EQ(fl_add_vital(&lv, "box.load1", 9), ZCL_FLEET_OK);
+        ASSERT_EQ(zcl_fleet_ledger_append(lv.ledger, ZCL_FLEET_KIND_VITALS,
+                       load, NULL, 0, NULL, NULL, lv.seed, NULL), ZCL_FLEET_OK);
+        struct zcl_fleet_vital_latest rows[4];
+        size_t count = 99;
+        ASSERT_EQ(zcl_fleet_ledger_vitals_latest(lv.ledger, lv.box_id, load,
+                       rows, 4, &count), ZCL_FLEET_OK);
+        ASSERT_EQ(count, (size_t)1);
+        ASSERT_EQ(rows[0].seq, UINT64_C(2));
+        ASSERT(!rows[0].present);
+        ASSERT_EQ(fl_add_vital(&lv, "box.load1", 0), ZCL_FLEET_OK);
+        ASSERT_EQ(fl_add_vital(&lv, "spend.tokens_in", 11), ZCL_FLEET_OK);
+        ASSERT_EQ(fl_add_vital(&lv, "spend.tokens_in", 7), ZCL_FLEET_OK);
+        ASSERT_EQ(zcl_fleet_ledger_vitals_latest(lv.ledger, NULL, -1,
+                       rows, 1, &count), ZCL_FLEET_FULL);
+        ASSERT_EQ(count, (size_t)1);
+        ASSERT_EQ(zcl_fleet_ledger_vitals_latest(lv.ledger, NULL, -1,
+                       NULL, 0, &count), ZCL_FLEET_FULL);
+        ASSERT_EQ(count, (size_t)0);
+        ASSERT_EQ(zcl_fleet_ledger_vitals_latest(lv.ledger, lv.box_id, load,
+                       rows, 4, &count), ZCL_FLEET_OK);
+        ASSERT(rows[0].present);
+        ASSERT_EQ(rows[0].value, INT64_C(0));
+        ASSERT_EQ(rows[0].seq, UINT64_C(3));
+#if !defined(_WIN32)
+        /* Chain order remains authoritative across a backwards UTC-day jump. */
+        ASSERT_EQ(fl_latest_at(&lv, INT64_C(1700172800), 41), ZCL_FLEET_OK);
+        ASSERT_EQ(fl_latest_at(&lv, INT64_C(1700000000), 42), ZCL_FLEET_OK);
+        ASSERT_EQ(zcl_fleet_ledger_vitals_latest(lv.ledger, lv.box_id, load,
+                       rows, 4, &count), ZCL_FLEET_OK);
+        ASSERT_EQ(rows[0].seq, UINT64_C(7));
+        ASSERT_EQ(rows[0].ts_unix, INT64_C(1700000000));
+        ASSERT_EQ(rows[0].value, INT64_C(42));
+        /* A later unknown sample must not inherit a preceding value or time. */
+        ASSERT_EQ(zcl_fleet_ledger_append(lv.ledger, ZCL_FLEET_KIND_VITALS,
+                       load, NULL, 0, NULL, NULL, lv.seed, NULL), ZCL_FLEET_OK);
+        ASSERT_EQ(zcl_fleet_ledger_vitals_latest(lv.ledger, lv.box_id, load,
+                       rows, 4, &count), ZCL_FLEET_OK);
+        ASSERT_EQ(rows[0].seq, UINT64_C(8));
+        ASSERT(!rows[0].present);
+#endif
+        struct zcl_fleet_vital_latest expected[4];
+        ASSERT_EQ(zcl_fleet_ledger_vitals_latest(lv.ledger, NULL, -1,
+                       expected, 4, &count), ZCL_FLEET_OK);
+        ASSERT_EQ(count, (size_t)2);
+        ASSERT_EQ(expected[1].subject, sum);
+        ASSERT_EQ(expected[1].value, INT64_C(7));
+        uint8_t wire[8192];
+        size_t len = fl_rows_of(&lv, wire, sizeof wire), accepted = 0;
+        ASSERT(len > 0);
+        ASSERT_EQ(zcl_fleet_ledger_replicate(replica.ledger, lv.box_id,
+                       lv.signer, wire, len, &accepted), ZCL_FLEET_OK);
+        uint64_t expected_max_seq = expected[0].seq > expected[1].seq
+            ? expected[0].seq : expected[1].seq;
+        ASSERT_EQ(accepted, (size_t)expected_max_seq);
+        fl_box_close(&lv);
+        struct zcl_fleet_report report;
+        lv.ledger = zcl_fleet_ledger_open_readonly(lv.dir, lv.box_id,
+                                                  lv.signer, &report);
+        ASSERT(lv.ledger);
+        ASSERT_EQ(zcl_fleet_ledger_vitals_latest(lv.ledger, NULL, -1,
+                       rows, 4, &count), ZCL_FLEET_OK);
+        ASSERT_EQ(count, (size_t)2);
+        for (size_t i = 0; i < count; i++) {
+            ASSERT_EQ(rows[i].seq, expected[i].seq);
+            ASSERT_EQ(rows[i].ts_unix, expected[i].ts_unix);
+            ASSERT_EQ(rows[i].value, expected[i].value);
+            ASSERT_EQ(rows[i].present, expected[i].present);
+        }
+        ASSERT_EQ(zcl_fleet_ledger_vitals_latest(replica.ledger, lv.box_id,
+                       -1, rows, 4, &count), ZCL_FLEET_OK);
+        ASSERT_EQ(count, (size_t)2);
+        for (size_t i = 0; i < count; i++) {
+            ASSERT_EQ(rows[i].seq, expected[i].seq);
+            ASSERT_EQ(rows[i].ts_unix, expected[i].ts_unix);
+            ASSERT_EQ(rows[i].value, expected[i].value);
+            ASSERT_EQ(rows[i].present, expected[i].present);
+        }
+        ASSERT_EQ(zcl_fleet_ledger_vitals_latest(lv.ledger, NULL, -2,
+                       rows, 4, &count), ZCL_FLEET_ARGUMENT);
+        ASSERT_EQ(count, (size_t)0);
+        ASSERT_EQ(zcl_fleet_ledger_vitals_latest(lv.ledger, NULL,
+                       (int)zcl_fleet_vital_count(), rows, 4, &count),
+                  ZCL_FLEET_VITAL_UNKNOWN);
+        ASSERT_EQ(zcl_fleet_ledger_vitals_latest(lv.ledger, NULL, -1,
+                       NULL, 1, &count), ZCL_FLEET_ARGUMENT);
+        uint8_t unknown_box[32];
+        memset(unknown_box, 0xee, sizeof unknown_box);
+        ASSERT_EQ(zcl_fleet_ledger_vitals_latest(lv.ledger, unknown_box, -1,
+                       rows, 4, &count), ZCL_FLEET_OK);
+        ASSERT_EQ(count, (size_t)0);
+        PASS();
+    }
+
+_test_next:
+    fl_box_close(&lv);
+    fl_box_close(&replica);
+    return failures;
+}
+
 int test_fleet_ledger(void)
 {
     int failures = 0;
@@ -774,6 +908,8 @@ int test_fleet_ledger(void)
                   ZCL_FLEET_MERGE_COUNTER);
         PASS();
     }
+
+    failures += fl_latest_cases(root);
 
     TEST("fleet ledger: refused appends clear the sequence output") {
         uint64_t seq = 77;

@@ -404,7 +404,7 @@ static void aih_scan_dir_for_reference(const char *dir, const char *path,
 /* Scanning every tests/harness/src/ and tools/lint/lintc/ file's content is
  * only cheap enough to run unconditionally for the class of path it can
  * actually hit: a tools/-rooted translation unit builds a named binary
- * (zcl-rpc, zclassic23-package-sign, …), and THAT name — not an #include
+ * (zcl-rpc, z23-package-sign, …), and THAT name — not an #include
  * edge — is what a lint-gate assertion or an acceptance harness names in a
  * string literal. A core/engine/platform/contexts source is reached through
  * compiled-source edges the shared rule table already walks, never through

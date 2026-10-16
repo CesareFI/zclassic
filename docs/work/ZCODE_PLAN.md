@@ -79,7 +79,7 @@ JSON (JSON is display-only).
 5. [x] Declarative C23 build recipe (bounded: public_headers/sources/test_sources/include_dirs/
        defines/allowed system libs = libc,libm,pthread/expected exit/max seconds/max bytes;
        node never compiles or executes downloaded code)
-6. [x] External verifier attestations (`zclassic23-package-verify <release-root>`: no network,
+6. [x] External verifier attestations (`z23-package-verify <release-root>`: no network,
        no wallet, no datadir, read-only source, tmp build dir, CPU/RAM/proc/time limits,
        GCC+Clang, ASan+UBSan, delete binaries after attestation; ≥2 approved independent
        verifier keys sign matching attestations before any reward)
@@ -191,7 +191,7 @@ independent rebuild of the same package root + recipe root + dependency
 lock that emits byte-for-byte the committed artifacts
 (`contexts/commons/modules/vcs/package_reproduce.*` compares two `package_build` receipts and
 names the first divergence). It is runnable today —
-`zclassic23-package-verify <root> --store=<dir> --emit=<dir>
+`z23-package-verify <root> --store=<dir> --emit=<dir>
 --lock-root=<hex> --reproduce-against=<build-report>` exits 0 on
 `reproduction=MATCH` and 6 with a loud stderr `REPRODUCTION MISMATCH`
 naming the diverging rule otherwise. `zcode package verify` reports the
@@ -226,7 +226,7 @@ machines).
   `package_policy` + `package_service` (tiers, local ratio, offence
   accounting), `package_swarm_node` (BitTorrent-like engine over the
   `zpkgswm` wire, rarest-first, resume-after-restart).
-- **Verifier binary:** `build/bin/zclassic23-package-verify` — the only
+- **Verifier binary:** `build/bin/z23-package-verify` — the only
   program that compiles package code (gcc+clang × plain+ASan/UBSan,
   Landlock+seccomp+rlimits, recipe-only input, binaries deleted after).
   `--reproduce-against=<build-report>` on `--emit` is the third-party

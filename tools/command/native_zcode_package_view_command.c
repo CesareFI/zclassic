@@ -186,7 +186,7 @@ static void package_guide_journeys(struct json_value *data)
     json_init(&author);
     json_set_array(&author);
     package_guide_step(
-        &author, "zclassic23-package-sign --generate <key>",
+        &author, "z23-package-sign --generate <key>",
         "publisher_pubkey", "local-author-key-created", "public key only",
         "zcode package dev prepare");
     package_guide_step(

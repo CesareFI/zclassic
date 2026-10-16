@@ -1,7 +1,7 @@
 /* Copyright 2026 Rhett Creighton - Licensed under Apache-2.0
  *
  * purpose: C23 lint gate — check-network-tool-hardening. Verifies that the
- * tree's Internet-facing standalone tools — build/bin/zclassic23-acme (TLS
+ * tree's Internet-facing standalone tools — build/bin/z23-acme (TLS
  * client to the public ACME/CDN network), build/bin/agent_sha3, and, when
  * built, build/bin/z23-clang-manifest — carry the ELF mitigations the tree
  * declares through HARDEN_CFLAGS/HARDEN_LDFLAGS: PIE (ET_DYN), a GNU_RELRO
@@ -47,7 +47,7 @@ struct nth_tool {
 };
 
 static const struct nth_tool k_nth_tools[] = {
-    { "build/bin/zclassic23-acme", "build/bin/zclassic23-acme", false },
+    { "build/bin/z23-acme", "build/bin/z23-acme", false },
     { "build/bin/agent_sha3", "build/bin/agent_sha3", false },
     { "build/bin/z23-clang-manifest", "clang-manifest", true },
 };

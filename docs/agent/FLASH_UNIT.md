@@ -4,7 +4,7 @@ This document is the contract for a one-file unit given to GLM 5.3 flash and jud
 
 ## Purpose
 
-A flash unit is one mechanical file edit with a pinned test. The worker model is GLM 5.3 flash. Dispatch and judgement go through the tree's own unit harness, `tools/engine_unit.c`, built as `build/bin/zclassic23-engine-unit`. The verdict is the receipt, `receipt.json` in the `--state-dir`. The model's own report is not evidence. This document states what flash finishes and does not finish, how a unit is composed, how it is dispatched and judged, the retry policy, the acceptance checks after a PASS receipt, and the rules the model must follow.
+A flash unit is one mechanical file edit with a pinned test. The worker model is GLM 5.3 flash. Dispatch and judgement go through the tree's own unit harness, `tools/engine_unit.c`, built as `build/bin/z23-engine-unit`. The verdict is the receipt, `receipt.json` in the `--state-dir`. The model's own report is not evidence. This document states what flash finishes and does not finish, how a unit is composed, how it is dispatched and judged, the retry policy, the acceptance checks after a PASS receipt, and the rules the model must follow.
 
 ## What flash is good at and not
 
@@ -54,7 +54,7 @@ The prompt is one task file, at most 128 KB, about 20 KB in practice. It contain
 
 | Step | Fact |
 | --- | --- |
-| Harness | `tools/engine_unit.c`, binary `build/bin/zclassic23-engine-unit`. |
+| Harness | `tools/engine_unit.c`, binary `build/bin/z23-engine-unit`. |
 | Prompt | One prompt per attempt. The task file is the prompt. Maximum 128 KB. |
 | Reply format | Whole-file envelopes: `Z23-BEGIN-FILE path`, the complete file contents, `Z23-END-FILE`. |
 | Apply | The harness applies the envelopes to an isolated git worktree. |

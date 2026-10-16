@@ -32,7 +32,7 @@
  *   seed slot" (engine/modules/sim/src/seed_tape.c: seed_tape_save_to_memory), i.e.
  *   the live xoshiro256++ register `rng.s[0]` at capture time — NOT the
  *   original scalar seed passed to `seed_tape_open()`. Feeding it into a
- *   FRESH `zclassic23-chaos` run will NOT reproduce the capsule's exact
+ *   FRESH `z23-chaos` run will NOT reproduce the capsule's exact
  *   RNG stream (xoshiro state isn't invertible from one register). For an
  *   EXACT deterministic replay of the captured run, load the capsule
  *   directly via `postmortem_capsule_load_tape()` /
@@ -408,7 +408,7 @@ static void p2s_render_skeleton(const struct postmortem_to_scenario_stats *st,
         "#   capture time (engine/modules/sim/src/seed_tape.c: seed_tape_save_to_memory,\n"
         "#   \"informational seed slot\"), NOT the original scalar seed passed\n"
         "#   to seed_tape_open(). Feeding `seed 0x%016" PRIx64 "` below into a\n"
-        "#   FRESH zclassic23-chaos run will NOT reproduce this capsule's\n"
+        "#   FRESH z23-chaos run will NOT reproduce this capsule's\n"
         "#   exact RNG stream -- xoshiro state is not invertible from one\n"
         "#   register. It is recorded here as a labeled fingerprint / manual\n"
         "#   reduction starting point (steps 3-5), not a proven bit-identical\n"
@@ -589,7 +589,7 @@ static void p2s_usage(const char *argv0)
     fprintf(stderr,
         "usage: %s --cap=DIR [--out=PATH]\n\n"
         "  Converts a postmortem crash capsule (an UNPACKED .cap directory)\n"
-        "  into a .scenario skeleton for zclassic23-chaos. Automates ONLY\n"
+        "  into a .scenario skeleton for z23-chaos. Automates ONLY\n"
         "  the seed + best-effort boot-phase steps of docs/CHAOS_HARNESS.md's\n"
         "  \"From Capsule To Scenario\" workflow -- translating the recorded\n"
         "  events into chaos commands and adding the catching assertion stays\n"

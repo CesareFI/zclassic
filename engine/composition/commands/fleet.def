@@ -774,6 +774,38 @@ ZCL_COMMAND_READY_COMMAND(
     ZCL_COMMAND_CAP_DEV_STATE_WRITE, ZCL_COMMAND_TRAIT_NONE,
     zcl_native_handle_fleet_steer_grant)
 
+ZCL_COMMAND_BRANCH("fleet.mission", "fleet",
+                   "A kanban projection of the fleet's durable work state",
+                   ZCL_COMMAND_LAYER_OPS)
+
+ZCL_COMMAND_READY_READ(
+    "fleet.mission.board", "fleet.mission", "",
+    "Kanban of fleet work: backlog, claimed, building, review, proving, "
+    "landed, failed",
+    "Projects the dev agent queue (BACKLOG queued, BUILDING running), the "
+    "steer outbox (CLAIMED bodies starting CLAIM, deduplicated by sender and "
+    "ref; REVIEW bodies starting READY; both within hours) and the dev land "
+    "queue (PROVING queued or inflight; LANDED and FAILED within hours, "
+    "FAILED with its dimension) into seven columns. hours is 1..168, default "
+    "24; limit is 1..32 cards per column, default 12, and a column over its "
+    "limit reports the overflow count. Each card is one line of at most 46 "
+    "characters. Holds no state of its own and is read-only: it creates no "
+    "file, takes no queue or step lock and never advances a mail cursor; the "
+    "steer outbox is read only from its last 2 MiB and last 4096 rows, and "
+    "when it is absent CLAIMED and REVIEW show one card, steer bus not on "
+    "this host. A malformed row is skipped and counted in skipped. Output is "
+    "columns, counts and a box-drawn screen at most 120 columns wide. It "
+    "contacts no peer and never waits.", 65536,
+    "fleet,mission,board,kanban,backlog,claimed,building,review,proving,landed,failed,queue,land,steer",
+    "zcl.fleet_mission_board.input.v1", "zcl.fleet_mission_board.v1",
+    "hours,limit", "",
+    "z23 fleet mission board",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_mission_board)
+
 /* z23-toolgen:begin commands - generated, do not edit */
 ZCL_COMMAND_BRANCH("fleet.nodes", "fleet",
     "Inspect the recorded peers",
@@ -801,4 +833,42 @@ ZCL_COMMAND_READY_READ(
     ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
     ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_IDEMPOTENT,
     ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_nodes_table)
+
+ZCL_COMMAND_READY_READ(
+    "fleet.vitals.read", "fleet.vitals", "",
+    "Measure this box now: load, memory, disk and uptime",
+    "Measures this machine once through the same platform seam that "
+    "fleet.vitals.sample uses and reports load 1/5/15, cpu count, memory "
+    "total/available/used, home-filesystem disk total/used/free and "
+    "uptime. A fact this platform cannot measure is null, never zero. It "
+    "appends no ledger row, writes no file and contacts no peer.",
+    4096,
+    "fleet,vitals,read,load,memory,disk",
+    "zcl.command.empty_input.v1", "zcl.fleet_vitals_read.v1",
+    "", "",
+    "z23 fleet vitals read",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_INSTANT,
+    ZCL_COMMAND_COST_TINY, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_vitals_read)
+
+ZCL_COMMAND_READY_READ(
+    "fleet.vitals.table", "fleet.vitals", "",
+    "One table of every named machine's load, memory and disk",
+    "Measures this box and, for each named remote machine, runs the fixed "
+    "read leaf fleet vitals read over the host tunnel with one pinned ssh "
+    "argv, concurrently, each under its own deadline. At most 16 machines. "
+    "A machine that cannot be reached shows as unreachable with an error "
+    "code and never fails the call. It writes nothing.",
+    32768,
+    "fleet,vitals,table,load,memory,disk,machines",
+    "zcl.fleet_vitals_table_input.v1", "zcl.fleet_vitals_table.v1",
+    "machines,deadline_ms", "",
+    "z23 fleet vitals table",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FOREGROUND,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_vitals_table)
 /* z23-toolgen:end commands */

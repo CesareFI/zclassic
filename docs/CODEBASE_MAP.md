@@ -288,7 +288,7 @@ page changing with it.
 <!--   app_shape_folders    = directories directly under app/                        -->
 <!-- Fix a mismatch with `tools/scripts/check_doc_counts.sh --fix`, never by hand.  -->
 
-test_groups: 1330
+test_groups: 1334
 port_interfaces: 13
 persistence_adapters: 14
 condition_registrations: 56
@@ -322,7 +322,7 @@ known in advance. Remote transfers use a 10-second connect deadline, a
 deadlines with 64-MiB node/alias and 128-MiB verifier ceilings. The manifest
 must contain exactly one strict lowercase SHA-256 row for each required payload. The
 checksummed runtime set contains `z23`, its
-`zclassic23` daemon alias, and the confined `zclassic23-package-verify` worker
+`zclassic23` daemon alias, and the confined `z23-package-verify` worker
 that the daemon resolves beside itself (SHA256SUMS fail-closed; no registry).
 `make release-deploy Z23_RELEASE_HOSTS='host1 host2'` builds that portable set
 once locally, then bootstraps and process-qualifies fresh hosts sequentially;

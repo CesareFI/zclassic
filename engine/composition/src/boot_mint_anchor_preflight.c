@@ -804,10 +804,10 @@ static bool preflight_check_fold_inram_ram(const char *datadir, char *why, size_
 
 static const struct preflight_check g_preflight_checks[] = {
     {"datadir_lock_acquirable", preflight_check_datadir_lock,
-     "stop any other zclassic23 process using this datadir before starting "
+     "stop any other z23 process using this datadir before starting "
      "-mint-anchor"},
     {"legacy_block_index_covers_anchor", preflight_check_legacy_block_index,
-     "run: zclassic23 --importblockindex $HOME/.zclassic <datadir>/node.db "
+     "run: z23 --importblockindex $HOME/.zclassic <datadir>/node.db "
      "(a zclassicd datadir with a header chain reaching the anchor height), "
      "then a normal boot before -mint-anchor"},
     {"bodies_present_sampled", preflight_check_bodies_sampled,

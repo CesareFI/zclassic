@@ -153,6 +153,10 @@ int64_t os_proc_uptime_seconds(void);
 /* 1-minute load average in hundredths, or -1 if unreadable (never 0). */
 int64_t os_proc_load1_centi(void);
 
+/* Whole-machine uptime in seconds (boot-relative), or -1 where the platform
+ * cannot say. Unlike os_proc_uptime_seconds() this is not the process age. */
+int64_t os_proc_system_uptime_seconds(void);
+
 /* Resolve this process's own executable path into `buf` (NUL-terminated,
  * with failure if it does not fit `n`). Linux: readlink /proc/self/exe. Note this is the
  * PATHNAME only — on Linux a `readlink` result whose original dentry was

@@ -1,6 +1,6 @@
 /* Copyright 2026 Rhett Creighton - Apache License 2.0
  *
- * zclassic23-package-verify — the EXTERNAL ZCODE package verifier (slice 6).
+ * z23-package-verify — the EXTERNAL ZCODE package verifier (slice 6).
  * This is a SEPARATE program from the node: the Z23 node itself NEVER * compiles or executes downloaded code. Given a package root, this program
  * loads the signed release envelope, the manifest, the CAS chunks, and the
  * slice-5 declarative recipe from an EXPLICIT package store directory, then
@@ -10,7 +10,7 @@
  * (the node's `zcode package verify` command); this program only ever
  * produces one attestation signed by one verifier key.
  *
- *   zclassic23-package-verify <package-root-hex> --store=<dir> --key=<file>
+ *   z23-package-verify <package-root-hex> --store=<dir> --key=<file>
  *                             [--work=<dir>] [--require-full-isolation]
  *
  * Isolation contract (per spawned child — every compile, link, and test
@@ -111,7 +111,7 @@ volatile sig_atomic_t g_shutdown_requested = 0;
 static int pv_main_windows(void)
 {
     fprintf(stderr,
-            "zclassic23-package-verify: native Windows package execution "
+            "z23-package-verify: native Windows package execution "
             "is unavailable: the restricted-token, handle-allowlist, and "
             "kill-on-close Job Object sandbox is not implemented yet; "
             "fetched source remains inert\n");
@@ -280,13 +280,13 @@ struct pv_emit_dep {
 static void pv_usage(FILE *out)
 {
     fprintf(out,
-        "usage: zclassic23-package-verify <package-root-hex> --store=<dir>\n"
+        "usage: z23-package-verify <package-root-hex> --store=<dir>\n"
         "           --key=<file> [--work=<dir>] [--require-full-isolation]\n"
-        "   or: zclassic23-package-verify <package-root-hex> --store=<dir>\n"
+        "   or: z23-package-verify <package-root-hex> --store=<dir>\n"
         "           --emit=<dir> --lock-root=<64hex> [--dep=<64hex>,<dir>]...\n"
         "           [--reproduce-against=<build-report>] [--plan=<file>]\n"
         "           [--work=<dir>] [--require-full-isolation]\n"
-        "   or: zclassic23-package-verify <candidate-source-root-hex>\n"
+        "   or: z23-package-verify <candidate-source-root-hex>\n"
         "           --zbuild-package-source=<abs-dir>\n"
         "           --zbuild-package-recipe=<abs-file>\n"
         "           --zbuild-package-name=<publisher/package>\n"
@@ -297,12 +297,12 @@ static void pv_usage(FILE *out)
         "           [--plan=<file>] [--fast-cache=<dir>]\n"
         "           [--allow-testless-standard]\n"
         "           --require-full-isolation\n"
-        "   or: zclassic23-package-verify --zbuild-input=<abs>/unit.i\n"
+        "   or: z23-package-verify --zbuild-input=<abs>/unit.i\n"
         "           --zbuild-output=<abs>/unit.o --require-full-isolation\n"
-        "   or: zclassic23-package-verify --zbuild-test-input=<abs>/test.bin\n"
+        "   or: z23-package-verify --zbuild-test-input=<abs>/test.bin\n"
         "           --zbuild-test-output=<abs>/test.evidence.v1\n"
         "           --require-full-isolation\n"
-        "   or: zclassic23-package-verify --zbuild-fuzz-input=<abs>/fuzz.bin\n"
+        "   or: z23-package-verify --zbuild-fuzz-input=<abs>/fuzz.bin\n"
         "           --zbuild-fuzz-output=<abs>/fuzz.evidence.v1\n"
         "           --zbuild-fuzz-seeds=<1..4096>\n"
         "           --zbuild-fuzz-cpu-seconds=<1..600>\n"

@@ -54,8 +54,10 @@ Use an ordinary content.v2 package and the existing three-step receiver chain:
 These existing commands need no new transport or receiver leaf. Source
 boundaries are [checkout](../tools/command/native_zcode_add_command.c) and
 [the plugin API](../contexts/commons/modules/plugin/include/plugin/plugin_store.h).
-Their composition still needs the proposed hermetic two-store acceptance;
-the existence of each command is not an executed integration result.
+The registered two-store fixture now verifies bounded transfer, checkout and
+local installation through their underlying APIs; see
+[the acceptance evidence](experiments/PLUGIN_PACKAGE_2026-10-15.md).
+The full publishing CLI recipe and live fleet authentication remain unqualified.
 
 Keep the ordinary package root distinct from a signed transport-carrier root.
 `zcode.package.admit` is the separate importer for complete signed carriers;
@@ -73,10 +75,13 @@ For already verified receiver-held ordinary package bytes, the local steps are:
 
 ```sh
 z23 zcode package checkout --datadir=<receiver-datadir> --input='{"root":"<64-hex-package-root>","destination":"./plugin-received"}'
-z23 plugin install --datadir=<receiver-datadir> --manifest=./plugin-received/NAME.plugin.json
+z23 plugin install --manifest=./plugin-received/NAME.plugin.json
 ```
 
 The destination must be absent and beneath an owner-private parent.
+Plugin installation and publisher trust use the invoking account's
+`HOME/.z23/plugins` store. The checkout datadir does not select or isolate
+that plugin store; installation requires the receiver account's authorization.
 Replace the root and NAME with the exact approved values; do not execute
 downloaded build or startup scripts. Install is still a separate owner action.
 

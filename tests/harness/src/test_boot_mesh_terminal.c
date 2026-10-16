@@ -212,8 +212,8 @@ int test_boot_mesh_terminal(void)
         ASSERT(mesh_term_capsule_text(capsule, capsule_len, text,
                                       sizeof(text)));
         ASSERT(strstr(text, "{\"schema\":\"zcl.terminal_grant.v1\"") != NULL);
-        ASSERT(strstr(text, "\"max_bytes_in\":65536") != NULL);
-        ASSERT(strstr(text, "\"max_bytes_out\":1048576") != NULL);
+        ASSERT(strstr(text, "\"max_bytes_in\":16777216") != NULL);
+        ASSERT(strstr(text, "\"max_bytes_out\":1073741824") != NULL);
         ASSERT(strstr(text, "terminal_confinement") == NULL);
 
         /* The owner-accepted marker is additive: same schema prefix, same
@@ -227,7 +227,7 @@ int test_boot_mesh_terminal(void)
                                       sizeof(marked_text)));
         ASSERT(strstr(marked_text, "{\"schema\":\"zcl.terminal_grant.v1\"") !=
                NULL);
-        ASSERT(strstr(marked_text, "\"max_bytes_in\":65536") != NULL);
+        ASSERT(strstr(marked_text, "\"max_bytes_in\":16777216") != NULL);
         ASSERT(strstr(marked_text,
                       "\"terminal_confinement\":\"unconfined-owner-accepted\"") !=
                NULL);
@@ -487,6 +487,118 @@ int test_boot_mesh_terminal(void)
             f.resp_noise_pub, 0, TERM_WIRE_NOW, junk, sizeof(junk) - 1,
             f.resp_online_seed, &bad));
         ASSERT_EQ(bad.capsule_len, 0);
+        PASS();
+    }
+
+    TEST("boot mesh terminal: close evidence carries exactly one remote "
+         "status for worker-exited, and the signed receipt verifies "
+         "unchanged") {
+        uint8_t pairing_id[32];
+        ASSERT(zcl_hex_decode_lower(f.term_peer.pairing.pairing_id,
+                                    pairing_id, 32));
+        struct mesh_terminal_open_v1 open;
+        mesh_term_compose_open(&f, &f.term_peer, pairing_id,
+                               TERM_WIRE_NOW - 10, TERM_WIRE_NOW + 20,
+                               MESH_TERMINAL_CAP_TERMINAL_EXEC, &open);
+        uint8_t capsule[MESH_TERMINAL_CAPSULE_MAX];
+        uint8_t legacy[MESH_TERMINAL_CAPSULE_MAX];
+        size_t capsule_len = 0, legacy_len = 0;
+        char text[MESH_TERMINAL_CAPSULE_MAX + 1];
+
+        ASSERT(boot_mesh_terminal_render_close_capsule_status(
+            1, 2, 3, MESH_TERMINAL_CLOSE_WORKER_EXITED, 3, 0, capsule,
+            &capsule_len));
+        ASSERT(mesh_term_capsule_text(capsule, capsule_len, text,
+                                      sizeof(text)));
+        ASSERT(strstr(text, "\"reason\":\"worker-exited\"") != NULL);
+        ASSERT(strstr(text, "\"exit_code\":3") != NULL);
+        ASSERT(strstr(text, "\"signal\"") == NULL);
+        ASSERT(boot_mesh_terminal_render_close_capsule_status(
+            1, 2, 3, MESH_TERMINAL_CLOSE_WORKER_EXITED, -1, 15, capsule,
+            &capsule_len));
+        ASSERT(mesh_term_capsule_text(capsule, capsule_len, text,
+                                      sizeof(text)));
+        ASSERT(strstr(text, "\"signal\":15") != NULL);
+        ASSERT(strstr(text, "\"exit_code\"") == NULL);
+
+        /* Exactly one status for worker-exited; none for any other reason;
+         * ranges are exact. */
+        size_t n = 0;
+        ASSERT(!boot_mesh_terminal_render_close_capsule_status(
+            1, 2, 3, MESH_TERMINAL_CLOSE_WORKER_EXITED, -1, 0, legacy, &n));
+        ASSERT(!boot_mesh_terminal_render_close_capsule_status(
+            1, 2, 3, MESH_TERMINAL_CLOSE_WORKER_EXITED, 3, 15, legacy, &n));
+        ASSERT(!boot_mesh_terminal_render_close_capsule_status(
+            1, 2, 3, MESH_TERMINAL_CLOSE_WORKER_EXITED, 256, 0, legacy, &n));
+        ASSERT(!boot_mesh_terminal_render_close_capsule_status(
+            1, 2, 3, MESH_TERMINAL_CLOSE_WORKER_EXITED, -1, 65, legacy, &n));
+        ASSERT(!boot_mesh_terminal_render_close_capsule_status(
+            1, 2, 3, MESH_TERMINAL_CLOSE_BYTE_LIMIT, 1, 0, legacy, &n));
+        ASSERT(boot_mesh_terminal_render_close_capsule_status(
+            1, 2, 3, MESH_TERMINAL_CLOSE_BYTE_LIMIT, -1, 0, legacy, &n));
+
+        /* The pre-status renderer is the exact old capsule. */
+        ASSERT(boot_mesh_terminal_render_close_capsule(
+            1, 2, 3, MESH_TERMINAL_CLOSE_WORKER_EXITED, legacy, &legacy_len));
+        ASSERT(mesh_term_capsule_text(legacy, legacy_len, text, sizeof(text)));
+        ASSERT_STR_EQ(text,
+                      "{\"schema\":\"zcl.terminal_close_evidence.v1\","
+                      "\"bytes_in\":1,\"bytes_out\":2,\"duration_s\":3,"
+                      "\"reason\":\"worker-exited\"}");
+
+        /* The capsule is opaque bytes under capsule_root, so the signed
+         * receipt layout is unchanged: old and new capsules both compose,
+         * encode, decode and bind the open with the same code. */
+        const uint8_t *caps[2] = { capsule, legacy };
+        size_t lens[2] = { capsule_len, legacy_len };
+        for (int i = 0; i < 2; i++) {
+            struct mesh_terminal_receipt_v1 r, back;
+            uint8_t wire[MESH_TERMINAL_RECEIPT_V1_MAX_WIRE_BYTES];
+            size_t wire_len = 0;
+            ASSERT(boot_mesh_terminal_compose_receipt(
+                &open, &f.term_peer.res_snap, MESH_TERMINAL_RECEIPT_CLOSED,
+                f.genesis, f.resp_master_pub, f.resp_online_pub,
+                f.resp_noise_pub, 0, open.expires_unix + 10, caps[i], lens[i],
+                f.resp_online_seed, &r));
+            ASSERT_EQ(mesh_terminal_receipt_v1_encode(&r, wire, sizeof(wire),
+                                                      &wire_len),
+                      MESH_TERMINAL_PROTO_OK);
+            ASSERT_EQ(mesh_terminal_receipt_v1_decode(&back, wire, wire_len),
+                      MESH_TERMINAL_PROTO_OK);
+            ASSERT_EQ(mesh_terminal_receipt_v1_matches_open(&back, &open),
+                      MESH_TERMINAL_PROTO_OK);
+        }
+        PASS();
+    }
+
+    TEST("boot mesh terminal: byte budgets leave room for large sessions "
+         "and the output budget arg is range-checked") {
+        ASSERT(MESH_TERMINAL_SERVICE_MAX_BYTES_OUT >= UINT64_C(1) << 30);
+        ASSERT(MESH_TERMINAL_SERVICE_MAX_BYTES_IN >= UINT64_C(16) << 20);
+        ASSERT_EQ(boot_mesh_terminal_max_bytes_out(),
+                  MESH_TERMINAL_SERVICE_MAX_BYTES_OUT);
+        ASSERT_EQ(boot_mesh_terminal_resolve_max_bytes_out(0),
+                  MESH_TERMINAL_SERVICE_MAX_BYTES_OUT);
+        ASSERT_EQ(boot_mesh_terminal_resolve_max_bytes_out(-5),
+                  MESH_TERMINAL_SERVICE_MAX_BYTES_OUT);
+        ASSERT_EQ(boot_mesh_terminal_resolve_max_bytes_out(1048575),
+                  MESH_TERMINAL_SERVICE_MAX_BYTES_OUT);
+        ASSERT_EQ(boot_mesh_terminal_resolve_max_bytes_out(1048576),
+                  UINT64_C(1048576));
+        ASSERT_EQ(boot_mesh_terminal_resolve_max_bytes_out(INT64_C(4) << 30),
+                  UINT64_C(4) << 30);
+        ASSERT_EQ(boot_mesh_terminal_resolve_max_bytes_out(
+                      (INT64_C(64) << 30) + 1),
+                  MESH_TERMINAL_SERVICE_MAX_BYTES_OUT);
+        /* The per-tick rate bound and the memory bound did not move with
+         * the budgets: 16 reads of one 4 KiB chunk per drain tick, and one
+         * 64 KiB credit window / requester FIFO per session. */
+        ASSERT_EQ(MESH_TERMINAL_PUMP_CHUNKS_PER_TICK, 16);
+        ASSERT_EQ(MESH_TERMINAL_WORKER_IO_CHUNK, 4096u);
+        ASSERT(MESH_TERMINAL_PUMP_CHUNKS_PER_TICK *
+                   MESH_TERMINAL_WORKER_IO_CHUNK <= 65536u);
+        ASSERT_EQ(MESH_TERMINAL_CLIENT_OUTPUT_MAX, (size_t)65536);
+        ASSERT_EQ(MESH_TERMINAL_SESSIONS_MAX, 4u);
         PASS();
     }
 

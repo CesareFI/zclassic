@@ -22,7 +22,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 NODE_BIN="${ZCL_NODE_BIN:-$REPO_ROOT/build/bin/zclassic23}"
 RPC_BIN="${ZCL_RPC_BIN:-$REPO_ROOT/build/bin/zcl-rpc}"
-MKT_HELPER="${ZCL_MARKET_HELPER:-$REPO_ROOT/build/bin/zclassic23-market-acceptance-helper}"
+MKT_HELPER="${ZCL_MARKET_HELPER:-$REPO_ROOT/build/bin/z23-market-acceptance-helper}"
 
 MKT_LIVE_PORTS="8023 8033 8034 8035 8043 8044 8045 8046 8232 8443 \
 18034 18232 18234 18243 18244 18245 18246"

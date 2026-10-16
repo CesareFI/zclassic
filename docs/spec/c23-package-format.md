@@ -185,7 +185,7 @@ Two evidence lanes exist, and they are not interchangeable:
   root, per-compiler and sanitizer outcomes, the test facts, and the
   isolation level, signed under the verifier's secp256k1 key
   (`zcl.zcode_attest.v1` domain). Only the separate
-  `zclassic23-package-verify` program signs them; the node never compiles
+  `z23-package-verify` program signs them; the node never compiles
   or executes downloaded code. Attestations are filed under
   `attestations/<attestation-id-hex>` and evaluated by
   `zcode package verify`. They are portable: `zcode package attest import`

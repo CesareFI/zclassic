@@ -152,6 +152,10 @@ static const struct rlw_leaf g_rlw_leaves[] = {
      * the same afterwards. */
     { "ops.mesh.roster",        zcl_native_handle_fleet_roster,
       NULL, NULL,               NULL, NULL, NULL },
+    /* fleet.doctor composes fleet.nodes.table (the guarded read-only open)
+     * and node RPC reads; it never writes the datadir it is pointed at. */
+    { "fleet.doctor",           zcl_native_handle_fleet_doctor,
+      NULL, NULL,               NULL, NULL, NULL },
 /* z23-toolgen:begin datadir-leaves - generated, do not edit */
     { "fleet.nodes.table",      zcl_native_handle_fleet_nodes_table,
       NULL, NULL,               NULL, NULL, NULL },

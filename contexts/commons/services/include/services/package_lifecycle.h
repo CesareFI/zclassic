@@ -38,7 +38,7 @@
  *    a static archive on disk that the confined worker links against; there
  *    is no dlopen, no dlsym, and no link edge from the node to it.
  *  - Compilation and test execution happen ONLY in
- *    build/bin/zclassic23-package-verify --emit (seccomp + rlimits +
+ *    build/bin/z23-package-verify --emit (seccomp + rlimits +
  *    Landlock where available). This layer spawns that program and re-checks
  *    its output; it never compiles anything itself.
  *  - Identity is the 32-byte package root. A name or a version only ever

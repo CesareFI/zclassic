@@ -335,6 +335,11 @@ bool zcl_native_mesh_terminal_try_attach(const char *const *words,
 bool zcl_native_mesh_terminal_write_all(int fd, const uint8_t *buf, size_t len);
 #ifdef ZCL_TESTING
 void zcl_native_mesh_terminal_test_set_stop(bool stop);
+/* True when the raw line discipline the attach client installs, applied to a
+ * termios with every flag set, turns off signal generation (so Ctrl-C,
+ * Ctrl-Z and Ctrl-\ are bytes for the remote), flow control, line editing,
+ * echo, CR mapping and output post-processing, and reads byte by byte. */
+bool zcl_native_mesh_terminal_test_raw_is_transparent(void);
 #endif
 void zcl_native_handle_ops_mesh_machines(
     const struct zcl_command_request *request,
@@ -1469,7 +1474,7 @@ void zcl_native_handle_zcode_package_recipe(
  * root: evaluates the attestations/ dir against the local approved-verifier
  * allowlist (<datadir>/zcode/approved_verifiers) and reports the quorum
  * state with every named rule. The node only READS attestations; they are
- * produced by the separate zclassic23-package-verify program. */
+ * produced by the separate z23-package-verify program. */
 void zcl_native_handle_zcode_package_verify(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);

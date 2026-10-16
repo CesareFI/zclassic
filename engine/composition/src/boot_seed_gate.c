@@ -112,7 +112,7 @@ bool boot_seed_oneshot_headers_preflight(const struct app_context *ctx,
             "FATAL: -coldstart-seed-oneshot: PREREQUISITE NOT MET — the block "
             "index has no header at the snapshot height h=%lld (imported header "
             "tip h=%lld). The seed one-shot cannot sync headers itself; import "
-            "the header chain to >= h=%lld first (zclassic23 --importblockindex "
+            "the header chain to >= h=%lld first (z23 --importblockindex "
             "<datadir-with-headers>), then re-run the seed.\n",
             (long long)seed_h, (long long)hdr_tip, (long long)seed_h);
         event_emitf(EV_BOOT_VALIDATION_FAILED, 0,

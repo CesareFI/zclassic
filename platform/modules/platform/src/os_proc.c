@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #if defined(_WIN32)
 #include <windows.h>
 #include <shellapi.h>
@@ -52,6 +53,7 @@
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
 #include <sys/sysctl.h>
+#include <sys/time.h>
 #endif
 
 #if defined(__linux__)
@@ -348,6 +350,30 @@ int64_t os_proc_uptime_seconds(void)
     double proc_start_sec = (double)starttime / (double)clk;
     double age = sys_up - proc_start_sec;
     return age > 0 ? (int64_t)age : 0;
+#endif
+}
+
+int64_t os_proc_system_uptime_seconds(void)
+{
+#if defined(__linux__)
+    FILE *f = fopen("/proc/uptime", "r");
+    double seconds = -1.0;
+    if (!f)
+        return -1; // raw-return-ok:platform-cannot-answer
+    if (fscanf(f, "%lf", &seconds) != 1 || seconds < 0 || seconds > 3.0e9)
+        seconds = -1.0;
+    fclose(f);
+    return seconds < 0 ? -1 : (int64_t)seconds; // raw-return-ok:platform-cannot-answer
+#elif defined(__APPLE__)
+    struct timeval boot;
+    size_t size = sizeof boot;
+    time_t now = time(NULL);
+    if (sysctlbyname("kern.boottime", &boot, &size, NULL, 0) != 0 ||
+        size != sizeof boot || now < boot.tv_sec)
+        return -1; // raw-return-ok:platform-cannot-answer
+    return (int64_t)(now - boot.tv_sec);
+#else
+    return -1; // raw-return-ok:platform-cannot-answer
 #endif
 }
 

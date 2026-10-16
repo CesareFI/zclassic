@@ -26,6 +26,8 @@ static bool ztc_first_line(const char *const argv[], char *out, size_t cap)
 static bool ztc_verifier_name(const char **name_out)
 {
     static const char *const names[] = {
+        "z23-package-verify-dev",
+        "z23-package-verify",
         "zclassic23-package-verify-dev",
         "zclassic23-package-verify",
     };
@@ -148,7 +150,7 @@ void zcl_native_handle_zcode_toolchain_show(
         next_action = next;
     } else if (!verifier_present) {
         next_action =
-            "Place zclassic23-package-verify next to this binary, then rerun "
+            "Place z23-package-verify next to this binary, then rerun "
             "zcode work toolchain. A worker cannot prove without the "
             "confined verifier.";
     } else {

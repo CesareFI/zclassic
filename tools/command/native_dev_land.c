@@ -133,6 +133,7 @@
 
 #include "command/native_command.h"
 #include "command/native_dev_land_regen.h"
+#include "command/native_dev_land_read.h"
 #include "command/native_dev_land_attestation.h"
 #include "command/native_dev_land_window.h"
 #include "util/clientversion.h"
@@ -1336,6 +1337,175 @@ static bool dl_load_rows(const char *qpath, struct dl_row **rows_out,
     return true;
 }
 
+
+/* ── lock-free read view for projections (native_dev_land_read.h) ──────── */
+
+#define DL_VIEW_ROWS_MAX 32768u
+#define DL_VIEW_TAIL_BYTES (2u * 1024u * 1024u)
+#define DL_VIEW_OUTCOMES_MAX 4096u
+
+struct dl_view_set {
+    struct zcl_dl_row_view *rows;
+    size_t n, cap, skipped;
+};
+
+static bool dl_view_push(struct dl_view_set *s, const struct dl_row *r)
+{
+    struct zcl_dl_row_view *v;
+    if (s->n == s->cap) {
+        size_t ncap = s->cap ? s->cap * 2 : 32;
+        struct zcl_dl_row_view *grow;
+        if (ncap > DL_VIEW_ROWS_MAX)
+            return false;
+        grow = (struct zcl_dl_row_view *)zcl_realloc(
+            s->rows, ncap * sizeof(*grow), "dev.land.view");
+        if (!grow)
+            return false;
+        s->rows = grow;
+        s->cap = ncap;
+    }
+    v = &s->rows[s->n++];
+    memset(v, 0, sizeof(*v));
+    v->seq = r->seq;
+    (void)snprintf(v->tip12, sizeof(v->tip12), "%.12s", r->tip);
+    (void)snprintf(v->state, sizeof(v->state), "%s", r->state);
+    (void)snprintf(v->phase, sizeof(v->phase), "%s", r->phase);
+    (void)snprintf(v->dimension, sizeof(v->dimension), "%s", r->dimension);
+    (void)snprintf(v->note, sizeof(v->note), "%.63s", r->note);
+    (void)snprintf(v->ts, sizeof(v->ts), "%s", r->ts);
+    return true;
+}
+
+/* One parse per line; a bad line is counted and skipped, never fatal. */
+static bool dl_view_lines(struct dl_view_set *s, char *text, size_t len)
+{
+    struct dl_row *row = (struct dl_row *)zcl_malloc(sizeof(*row), "dev.land.viewrow");
+    bool ok = row != NULL;
+    for (char *line = text; ok && line < text + len;) {
+        char *end = memchr(line, '\n', (size_t)(text + len - line));
+        char *next = end ? end + 1 : text + len;
+        if (end)
+            *end = '\0';
+        if (line[0] && memchr(line, 0, strlen(line)) == NULL) {
+            if (!dl_parse_row(line, row))
+                s->skipped++;
+            else
+                ok = dl_view_push(s, row);
+        }
+        line = next;
+    }
+    free(row);
+    return ok;
+}
+
+static bool dl_view_queue(struct dl_view_set *s, const char *qpath)
+{
+    size_t len = 0;
+    char *text = (char *)zcl_malloc(DL_FILE_CAP, "dev.land.viewfile");
+    bool ok;
+    if (!text)
+        return false;
+    if (!dl_read_file(qpath, text, DL_FILE_CAP, &len)) {
+        ok = errno == ENOENT;
+        free(text);
+        return ok;
+    }
+    ok = dl_view_lines(s, text, len);
+    free(text);
+    return ok;
+}
+
+/* The last DL_VIEW_TAIL_BYTES of outcomes.jsonl, minus a cut first line. */
+static bool dl_view_tail_read(const char *opath, char **text, size_t *len,
+                              bool *cut)
+{
+    FILE *f = fopen(opath, "rb");
+    long size;
+    size_t start = 0, got;
+    *text = NULL;
+    *len = 0;
+    if (!f)
+        return errno == ENOENT;
+    if (fseek(f, 0, SEEK_END) != 0 || (size = ftell(f)) < 0) {
+        (void)fclose(f);
+        return false;
+    }
+    *cut = (size_t)size > DL_VIEW_TAIL_BYTES;
+    if (*cut)
+        start = (size_t)size - DL_VIEW_TAIL_BYTES;
+    *text = (char *)zcl_malloc(DL_VIEW_TAIL_BYTES + 1, "dev.land.viewtail");
+    if (!*text || fseek(f, (long)start, SEEK_SET) != 0) {
+        (void)fclose(f);
+        return false;
+    }
+    got = fread(*text, 1, DL_VIEW_TAIL_BYTES, f);
+    (void)fclose(f);
+    (*text)[got] = '\0';
+    *len = got;
+    return true;
+}
+
+static bool dl_view_outcomes(struct dl_view_set *s, const char *opath)
+{
+    char *text = NULL, *body;
+    size_t len = 0, first = s->n;
+    bool cut = false;
+    bool ok = dl_view_tail_read(opath, &text, &len, &cut);
+    if (ok && text) {
+        body = text;
+        /* A tail that starts mid-line drops its first, partial line. */
+        if (cut) {
+            char *nl = memchr(text, '\n', len);
+            body = nl ? nl + 1 : text + len;
+        }
+        ok = dl_view_lines(s, body, len - (size_t)(body - text));
+    }
+    free(text);
+    if (ok && s->n - first > DL_VIEW_OUTCOMES_MAX) {
+        size_t drop = s->n - first - DL_VIEW_OUTCOMES_MAX;
+        memmove(&s->rows[first], &s->rows[first + drop],
+                DL_VIEW_OUTCOMES_MAX * sizeof(*s->rows));
+        s->n -= drop;
+    }
+    return ok;
+}
+
+bool zcl_dev_land_rows_read(struct zcl_dl_row_view **rows, size_t *n,
+                            size_t *skipped)
+{
+    struct dl_view_set s = {0};
+    struct dl_dirs *d;
+    char qpath[4096 + 32], opath[4096 + 32];
+    bool ok = false;
+    if (!rows || !n)
+        return false;
+    *rows = NULL;
+    *n = 0;
+    if (skipped)
+        *skipped = 0;
+    d = (struct dl_dirs *)zcl_malloc(sizeof(*d), "dev.land.viewdirs");
+    if (!d)
+        return false;
+    if (!dl_dirs_resolve(d, false)) {
+        free(d);
+        return true; /* no state root yet: nothing queued, nothing landed */
+    }
+    if (snprintf(qpath, sizeof(qpath), "%s/queue.jsonl", d->land) <
+            (int)sizeof(qpath) &&
+        snprintf(opath, sizeof(opath), "%s/outcomes.jsonl", d->land) <
+            (int)sizeof(opath))
+        ok = dl_view_queue(&s, qpath) && dl_view_outcomes(&s, opath);
+    free(d);
+    if (!ok) {
+        free(s.rows);
+        return false;
+    }
+    *rows = s.rows;
+    *n = s.n;
+    if (skipped)
+        *skipped = s.skipped;
+    return true;
+}
 static const char *dl_reason_or_path(const char *why, const char *path)
 {
     return why && why[0] ? why : path;
@@ -4198,7 +4368,7 @@ static bool dl_commit_row(const struct dl_dirs *d, struct dl_row *row,
     struct dl_row *rows = NULL;
     size_t nrows = 0, kept = 0;
     char qpath[4096 + 32];
-    bool ok, found = false, post = false;
+    bool ok, found = false, post = false, held_seal = false;
     int lock;
     if (snprintf(qpath, sizeof(qpath), "%s/queue.jsonl", d->land) >=
         (int)sizeof(qpath))
@@ -4213,8 +4383,17 @@ static bool dl_commit_row(const struct dl_dirs *d, struct dl_row *row,
     for (size_t i = 0; i < nrows; i++) {
         if (rows[i].seq == row->seq) {
             found = true;
+            /* publication_hold is owned by dl_hold, which writes it under
+             * this lock while a step runs. The step's copy of the row may
+             * be stale, so the durable value always wins: a hold set (or
+             * released) since the row was picked is never overwritten. */
+            row->publication_hold = rows[i].publication_hold;
             if (terminal)
                 continue;
+            if (!dl_hold_row_ok(row)) {
+                held_seal = true;
+                break;
+            }
             post = dl_phase_stamp(row, rows[i].phase_mail);
             rows[kept++] = *row;
             continue;
@@ -4227,7 +4406,7 @@ static bool dl_commit_row(const struct dl_dirs *d, struct dl_row *row,
      * "inflight" and no cancelled row should ever get a second, later
      * outcome appended on top of cancel's own. Refuse instead of silently
      * treating an unmatched rewrite as success. */
-    if (!found) {
+    if (!found || held_seal) {
         free(rows);
         dl_unlock(lock);
         return false;
@@ -4293,6 +4472,7 @@ static bool dl_requeue_successor(const struct dl_dirs *d, struct dl_row *row,
         goto done;
     }
     struct dl_row successor = *row;
+    successor.publication_hold = rows[at].publication_hold;
     successor.seq = next_seq;
     (void)snprintf(successor.state, sizeof(successor.state), "queued");
     (void)snprintf(successor.phase, sizeof(successor.phase), "rebase");
@@ -8006,6 +8186,33 @@ static bool dl_push_pair_same(const struct dl_row *a, const struct dl_row *b)
            strcmp(a->publication_signature, b->publication_signature) == 0;
 }
 
+/* Re-read the durable publication_hold for row under the queue lock, so the
+ * pre-publish decision never rests on a copy picked before a hold landed.
+ * False when the queue cannot be read: no publication on unknown state. */
+static bool dl_hold_refresh(const struct dl_dirs *d, struct dl_row *row)
+{
+    struct dl_row *rows = NULL;
+    size_t nrows = 0;
+    char qpath[4096 + 32];
+    bool ok = false;
+    if (snprintf(qpath, sizeof(qpath), "%s/queue.jsonl", d->land) >=
+        (int)sizeof(qpath))
+        return false;
+    int lock = dl_rows_lock(d->land);
+    if (lock < 0)
+        return false;
+    if (dl_load_rows(qpath, &rows, &nrows, NULL, 0)) {
+        for (size_t i = 0; i < nrows; i++)
+            if (rows[i].seq == row->seq) {
+                row->publication_hold = rows[i].publication_hold;
+                ok = true;
+            }
+    }
+    free(rows);
+    dl_unlock(lock);
+    return ok;
+}
+
 static bool dl_publication_held(const struct dl_row *row,
                                  struct zcl_command_reply *reply)
 {
@@ -8018,10 +8225,36 @@ static bool dl_publication_held(const struct dl_row *row,
     return true;
 }
 
-static bool dl_push_allowed(const struct dl_dirs *d, const struct dl_row *row,
+static bool dl_push_allowed(const struct dl_dirs *d, struct dl_row *row,
                               struct zcl_command_reply *reply)
 {
+    if (!dl_hold_refresh(d, row)) {
+        dl_fail(reply, "QUEUE_READ_FAILED", "publication",
+                "cannot re-read the publication hold; publication refused",
+                "locked queue");
+        return false;
+    }
     return !dl_publication_held(row, reply) && dl_push_intent_ready(d, row, reply);
+}
+
+/* A hold that landed after the refresh makes the pre-push commit refuse a
+ * sealed hold row; report the hold, not a persistence failure. */
+static void dl_push_checkpoint_failed(const struct dl_dirs *d, struct dl_row *row,
+                                     struct zcl_command_reply *reply)
+{
+    dl_log(row, "pre-push checkpoint failed; remote untouched\n");
+    if (dl_hold_refresh(d, row) && dl_publication_held(row, reply))
+        return;
+    (void)json_push_kv_str(&reply->data, "leaf", DL_LEAF);
+    zcl_command_reply_fail(reply, ZCL_COMMAND_STATUS_BLOCKED,
+                           ZCL_COMMAND_EXIT_BLOCKED,
+                           "PUSH_INTENT_PERSIST_FAILED", "push_intent",
+                           true, false,
+                           "cannot persist the exact push pair; retry before dispatch",
+                           d->land);
+    (void)snprintf(reply->error.next_action,
+                   sizeof(reply->error.next_action), "%s",
+                   "z23-dev dev land step");
 }
 
 static void dl_step_push(const struct dl_dirs *d, struct dl_row *row,
@@ -8047,17 +8280,7 @@ static void dl_step_push(const struct dl_dirs *d, struct dl_row *row,
     (void)snprintf(row->phase, sizeof(row->phase), "push");
     row->push_diagnostic_pending = true;
     if (!dl_commit_row(d, row, false)) {
-        dl_log(row, "pre-push checkpoint failed; remote untouched\n");
-        (void)json_push_kv_str(&reply->data, "leaf", DL_LEAF);
-        zcl_command_reply_fail(reply, ZCL_COMMAND_STATUS_BLOCKED,
-                               ZCL_COMMAND_EXIT_BLOCKED,
-                               "PUSH_INTENT_PERSIST_FAILED", "push_intent",
-                               true, false,
-                               "cannot persist the exact push pair; retry before dispatch",
-                               d->land);
-        (void)snprintf(reply->error.next_action,
-                       sizeof(reply->error.next_action), "%s",
-                       "z23-dev dev land step");
+        dl_push_checkpoint_failed(d, row, reply);
         return;
     }
     {
@@ -11253,6 +11476,11 @@ done:
         dl_fail(reply, "QUEUE_LOCK_FAILED", "hold", "cannot lock queue", path);
         return;
     }
+    if (dl_fence_blocks(d, seq)) {
+        dl_fail(reply, "PUBLICATION_FENCED", "hold", "sequence is owned by a retained fence", "input.seq");
+        dl_unlock(lock);
+        return;
+    }
     if (!dl_load_rows(path, &rows, &count, why, sizeof(why))) {
         dl_fail(reply, "QUEUE_READ_FAILED", "hold", "cannot read queue", why);
         goto done;
@@ -11287,13 +11515,10 @@ static void dl_hold(const struct zcl_command_request *request,
         dl_fail(reply, "STATE_DIR_FAILED", "hold", "private state root unavailable", "state root");
         return;
     }
-    int slot = dl_step_lock(d.land);
-    if (slot < 0) { dl_step_busy(reply, d.land); return; }
-    if (dl_fence_blocks(&d, seq))
-        dl_fail(reply, "PUBLICATION_FENCED", "hold", "sequence is owned by a retained fence", "input.seq");
-    else
-        dl_hold_locked(&d, seq, hold, reply);
-    dl_unlock(slot);
+    /* No step.lock: a hold is one atomic rewrite under queue.lock, so it is
+     * admissible while a step runs. A step merges the on-disk hold in
+     * dl_commit_row and re-reads it before its push checkpoint. */
+    dl_hold_locked(&d, seq, hold, reply);
 #endif
 }
 

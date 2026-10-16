@@ -4,7 +4,7 @@ Two chaos tools, for two layers:
 
 | Tool | Layer | What it kills | Make target |
 |------|-------|---------------|-------------|
-| `zclassic23-chaos` | **Simulation engine** | Nothing real — a deterministic in-process state machine driven by `.scenario` files | `make chaos` |
+| `z23-chaos` | **Simulation engine** | Nothing real — a deterministic in-process state machine driven by `.scenario` files | `make chaos` |
 | `crash_recovery_test` | **Real process (C7)** | A real `build/bin/z23` binary, via `SIGKILL` to its process group | `make test-crash` / `make test-crash-bootstrap` |
 
 Use the **full-binary kill-9 harness** to prove on-disk recovery of a real
@@ -115,9 +115,9 @@ timing-sensitive, so it would ship opt-in/operational and **not** in
 
 ---
 
-## Simulation chaos engine (`zclassic23-chaos`)
+## Simulation chaos engine (`z23-chaos`)
 
-`zclassic23-chaos` runs declarative scenarios. Each non-comment line is one
+`z23-chaos` runs declarative scenarios. Each non-comment line is one
 command, arguments are whitespace-separated, and assertions use simple integer
 comparisons.
 
@@ -146,8 +146,8 @@ make sim-fast CHAOS_SEEDS=256
 Run one scenario with command-level progress:
 
 ```bash
-make zclassic23-chaos
-build/bin/zclassic23-chaos --scenario=tools/sim/scenarios/peer_churn.scenario --verbose
+make z23-chaos
+build/bin/z23-chaos --scenario=tools/sim/scenarios/peer_churn.scenario --verbose
 ```
 
 The checked-in corpus includes `partition_recovery_c3.scenario`, a deterministic
@@ -159,7 +159,7 @@ before escalating to the full `make mvp-coldstart-to-tip-local` wall-clock proof
 Replay a scenario under a specific seed:
 
 ```bash
-build/bin/zclassic23-chaos --scenario=tools/sim/scenarios/seeded_peer_churn.scenario --seed=0x2a --verbose
+build/bin/z23-chaos --scenario=tools/sim/scenarios/seeded_peer_churn.scenario --seed=0x2a --verbose
 ```
 
 Failed standalone runs write a summary and a copy of the scenario into
@@ -346,7 +346,7 @@ including a deliberately-unconverged scenario proving the invariant check
 fires instead of silently reporting PASS.
 
 Because `mode simnet` links the real consensus/coins/script/validation
-stack, `zclassic23-chaos` is now built the same whole-program-LTO way as
+stack, `z23-chaos` is now built the same whole-program-LTO way as
 `wire_sweep`/`test_parallel` (`$(ALL_SRCS)`), not a hand-picked file list —
 expect a longer first build, same as any other `ALL_SRCS`-linked tool.
 
@@ -367,7 +367,7 @@ by anything — a scenario that never mentions tracing, and `make chaos`
 by default, write no trace file and behave exactly as before this existed.
 
 ```bash
-build/bin/zclassic23-chaos --scenario=tools/sim/scenarios/simnet_partition_heal.scenario \
+build/bin/z23-chaos --scenario=tools/sim/scenarios/simnet_partition_heal.scenario \
     --trace-dir=/tmp/zcl-trace
 ```
 
@@ -518,7 +518,7 @@ monitor failure.
 For a `.scenario`-file failure (the DSL harness above, not
 `wire_sweep`), the equivalent one-liner is the `--seed=` override
 already documented under "Simulation chaos engine":
-`build/bin/zclassic23-chaos --scenario=PATH --seed=0x... --verbose`.
+`build/bin/z23-chaos --scenario=PATH --seed=0x... --verbose`.
 See `docs/SIMULATOR.md`'s "Reproducing a failure" section for the
 `wire_sweep` side with the fuller "why no tape parsing is needed"
 rationale.

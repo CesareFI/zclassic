@@ -254,7 +254,7 @@ static void boot_api_cache_stop(void *ctx)
 /* The clearnet certificate lives under <datadir>/ssl:
  *
  *   fullchain.pem / privkey.pem
- *       the CA-issued pair. Written ONLY by `zclassic23-acme`. Preferred
+ *       the CA-issued pair. Written ONLY by `z23-acme`. Preferred
  *       whenever it is readable, and adopted with no restart when it
  *       appears or is renewed (https_server_watch_certificate).
  *   self-signed-placeholder.pem / self-signed-placeholder-key.pem
@@ -360,7 +360,7 @@ static bool boot_https_explorer_start(void *ctx)
                "HTTPS: starting on the self-signed placeholder at %s so the\n"
                "HTTPS: TLS-ALPN-01 challenge can be answered. To get a real\n"
                "HTTPS: certificate with no restart afterwards, run:\n"
-               "HTTPS:   zclassic23-acme obtain --domain %s --agree-tos \\\n"
+               "HTTPS:   z23-acme obtain --domain %s --agree-tos \\\n"
                "HTTPS:     --account %s/ssl/account.pem --cert %s \\\n"
                "HTTPS:     --key %s --handoff %s\n",
                cert_path, placeholder_cert,
@@ -381,7 +381,7 @@ static bool boot_https_explorer_start(void *ctx)
     /* ADDITIONAL names on this same listener (-httpsaltdomain=NAME), each
      * with its own certificate selected by TLS SNI. The pair for a name
      * lives in <datadir>/ssl/NAME/fullchain.pem and .../privkey.pem (the same
-     * filenames `zclassic23-acme` writes). Watched, never required: a name
+     * filenames `z23-acme` writes). Watched, never required: a name
      * without an issued certificate is not served from its own certificate
      * yet, and does not affect other names.
      *
@@ -418,7 +418,7 @@ static bool boot_https_explorer_start(void *ctx)
             printf("HTTPS: %s is configured but has no certificate yet. It is "
                    "served the main certificate until one lands at %s; to get "
                    "one with no restart, run:\n"
-                   "HTTPS:   zclassic23-acme obtain --domain %s --agree-tos \\\n"
+                   "HTTPS:   z23-acme obtain --domain %s --agree-tos \\\n"
                    "HTTPS:     --account %s/ssl/account.pem --cert %s \\\n"
                    "HTTPS:     --key %s --handoff %s\n",
                    alt, alt_cert, alt, svc->datadir, alt_cert, alt_key,

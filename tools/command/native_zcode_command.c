@@ -1621,7 +1621,7 @@ void zcl_native_handle_zcode_package_recipe(
         &reply->data, "execution_note",
         "declarative only: the node never compiles or executes downloaded "
         "code; compilation belongs to the external verifier "
-        "(zclassic23-package-verify)");
+        "(z23-package-verify)");
 }
 
 /* ── zcode package verify (slice 6) ─────────────────────────────────── */
@@ -1943,12 +1943,12 @@ void zcl_native_handle_zcode_package_verify(
         "filed under <datadir>/zcode/receipts) committing byte-identical "
         "output sets for this package+recipe; reproduce an installed "
         "package on this node with zcode package reproduce, or externally "
-        "with zclassic23-package-verify --emit=... "
+        "with z23-package-verify --emit=... "
         "--reproduce-against=<report>. "
         "The signer quorum (2+ approved independent verifier keys signing "
         "matching attestations) is the latency fast path over "
         "reproduction, never a substitute for it; attestations are "
-        "produced by the external zclassic23-package-verify program — the "
+        "produced by the external z23-package-verify program — the "
         "node never compiles or executes downloaded code");
 }
 

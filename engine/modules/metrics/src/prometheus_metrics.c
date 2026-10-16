@@ -817,7 +817,7 @@ size_t metrics_prometheus_render_prometheus(char *buf, size_t cap)
     int64_t mbreach = atomic_load(&g_mirror_lag_breach_seconds);
     int64_t mcrit = atomic_load(&g_mirror_lag_critical_seconds);
     pos = append(buf, cap, pos,
-        "# HELP zcl_mirror_lag_blocks zclassic23 block-height lag behind zclassicd (-1 pre-bootstrap)\n"
+        "# HELP zcl_mirror_lag_blocks z23 block-height lag behind zclassicd (-1 pre-bootstrap)\n"
         "# TYPE zcl_mirror_lag_blocks gauge\n"
         "zcl_mirror_lag_blocks %lld\n"
         "# HELP zcl_mirror_lag_breach_seconds Seconds spent above the breach SLO (0 when under)\n"

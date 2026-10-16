@@ -29,7 +29,7 @@
 #                                   <root>/ with a build-report
 #
 # Both builds run the confined verifier in candidate mode
-# (build/bin/zclassic23-package-verify, profile=standard, cpu=120 — the
+# (build/bin/z23-package-verify, profile=standard, cpu=120 — the
 # factory's own reproduction parameters) with --emit + --plan. The emitted
 # output trees are compared per path + SHA3-256 + byte count; the
 # toolchain capsule identity (zcl.dep_plan.v1 toolchain block: compiler
@@ -54,9 +54,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-VERIFY_BIN="$ROOT/build/bin/zclassic23-package-verify"
+VERIFY_BIN="$ROOT/build/bin/z23-package-verify"
 NODE_BIN="$ROOT/build/bin/zclassic23"
-SIGN_BIN="$ROOT/build/bin/zclassic23-package-sign"
+SIGN_BIN="$ROOT/build/bin/z23-package-sign"
 JSONQ="${JSONQ:-$ROOT/build/bin/jsonq}"
 SCOPES="$ROOT/contexts/commons/corpus/scopes.def"
 OUTDIR="$ROOT/.cache/zcl-cross-machine"
@@ -367,7 +367,7 @@ if [ -n "$SSH_HOST" ]; then
         log "transferring verifier + exact inputs to $SSH_HOST:$RWORK"
         TRANSFER_OK=1
         scp "${SSH_OPTS[@]}" -q "$VERIFY_BIN" \
-            "$SSH_HOST:$RWORK/zclassic23-package-verify" || TRANSFER_OK=0
+            "$SSH_HOST:$RWORK/z23-package-verify" || TRANSFER_OK=0
         scp "${SSH_OPTS[@]}" -q "$WORK/recipe.wire" \
             "$SSH_HOST:$RWORK/recipe.wire" || TRANSFER_OK=0
         tar czf - -C "$ROOT/packages" "$SHORT" |
@@ -395,7 +395,7 @@ if [ -n "$SSH_HOST" ]; then
         log "remote confined build on $SSH_HOST"
         RC_B=0
         ssh "${SSH_OPTS[@]}" "$SSH_HOST" \
-            "'$RWORK/zclassic23-package-verify' '$DERIVED_ROOT' \
+            "'$RWORK/z23-package-verify' '$DERIVED_ROOT' \
 '--zbuild-package-source=$RWORK/src/$SHORT' \
 '--zbuild-package-recipe=$RWORK/recipe.wire' \
 '--zbuild-package-name=$FULL_NAME' \

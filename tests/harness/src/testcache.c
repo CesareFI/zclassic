@@ -506,7 +506,7 @@ static bool group_reads_external_inputs(const char *name)
         /* Delegated host capture executes export_snapshot outside the
          * group's scanned closure; its executable bytes are not bound. */
         "export_snapshot",
-        /* execv zclassic23-package-verify next to the test image.
+        /* execv z23-package-verify next to the test image.
          * That verifier's link is outside the group's forward C closure. */
         "fastobj_carrier",
         /* Spawns build/bin/fbsh through a macro-expanded helper the rail
@@ -569,7 +569,7 @@ static bool group_reads_external_inputs(const char *name)
          * call in the fixture. Refuse reuse until its bytes are bound. */
         "sqlq",
         "replay_canary_verdict",
-        /* package_lifecycle_commit spawns zclassic23-package-verify-dev from
+        /* package_lifecycle_commit spawns z23-package-verify-dev from
          * engine code the rail does not scan — the entry file's literals are
          * not the exec target. Verified: removed, probed plain cacheable with
          * no binding, restored. */
@@ -605,7 +605,7 @@ static bool group_reads_external_inputs(const char *name)
         "verify_bench_selftest",
         "wallet_persistence_cycle",
         "wallet_view",
-        /* pkgl_run_worker spawns zclassic23-package-verify-dev from
+        /* pkgl_run_worker spawns z23-package-verify-dev from
          * commons lifecycle code the rail does not scan. The entry file
          * has no exec-family call, so the build/bin literal is not bound.
          * Verified: probed plain cacheable, so a stored PASS would skip
@@ -619,7 +619,7 @@ static bool group_reads_external_inputs(const char *name)
         /* Compiles and runs the commons journey seed sources with the host
          * compiler at run time; those fixture files are outside the closure. */
         "zcode_recipe",
-        /* zv_run_verifier spawns build/bin/zclassic23-package-verify-dev.
+        /* zv_run_verifier spawns build/bin/z23-package-verify-dev.
          * That verifier's link is outside this group's forward C closure. */
         "zcode_verify",
         /* --- live node DB / external zclassicd / datadir / built artifacts --- */

@@ -5,7 +5,7 @@
  * full-state trace").
  *
  * A trace is one NDJSON object per (node, event) snapshot, written by
- * `zclassic23-chaos --trace-dir=PATH` (or the `trace_dir PATH` scenario
+ * `z23-chaos --trace-dir=PATH` (or the `trace_dir PATH` scenario
  * command). This tool answers "what did node N's state look like at event
  * E" without a database: read the file once, parse each line, print the
  * ones that match every filter given. No filters given prints every line.

@@ -6773,7 +6773,7 @@ static bool proof_observation_env_close(const char *state, const char *key)
  * standalone tool targets exported by check_standalone_tools_link.sh into
  * the same prefork Make graph -- a set that includes z23-lint,
  * zcl-nodectl, fbsh, file_size_policy, fleet-board-bridge and
- * zclassic23-engine-unit, i.e. the very executables the test dimension is
+ * z23-engine-unit, i.e. the very executables the test dimension is
  * reading. A relink unlinks the output before it writes it, and on
  * 2026-09-06 a landing proof's shard exec'd build/bin/z23-lint inside that
  * window and got "No such file or directory" twice.
@@ -6786,7 +6786,7 @@ static bool proof_observation_env_close(const char *state, const char *key)
  * list, so the two can never drift apart. `jobs` is stored by pointer and
  * must outlive argv. */
 static const char *const proof_prefork_helpers[] = {
-    "zcl-nodectl", "zclassic23-acme", "fbsh", "engine-unit",
+    "zcl-nodectl", "z23-acme", "fbsh", "engine-unit",
     "tools/file_size_policy", "fleet-board-bridge", "git-hook",
     "build/bin/z23-lint",
 };
@@ -7922,8 +7922,8 @@ struct proof_admitted_executable {
 };
 
 static const struct proof_admitted_executable proof_admitted_executables[] = {
-    {"build/bin/zclassic23-package-verify-dev",
-     "build/bin/zclassic23-package-verify-dev"},
+    {"build/bin/z23-package-verify-dev",
+     "build/bin/z23-package-verify-dev"},
     {"build/bin/z23-dev", "build/bin/z23-dev"},
     {"build/bin/z23-dev", "build/bin/zclassic23"},
 };
@@ -8274,7 +8274,7 @@ static bool dp_helper_built_paths(
     return dp_path_written(snprintf(t[0], PATH_MAX,
                                     "%s/build/bin/zcl-nodectl", generation)) &&
            dp_path_written(snprintf(t[1], PATH_MAX,
-                                    "%s/build/bin/zclassic23-acme",
+                                    "%s/build/bin/z23-acme",
                                     generation)) &&
            dp_path_written(snprintf(t[2], PATH_MAX,
                                     "%s/build/bin/fbsh", generation)) &&

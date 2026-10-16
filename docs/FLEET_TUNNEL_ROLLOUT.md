@@ -2,8 +2,23 @@
 
 # Fleet HOST tunnel rollout
 
-Status: preparation; no host is approved for deployment by this document.
-Source under qualification: `74bdde92b7926fab5cee262212c23464750396db`.
+Status: Linux hub running; complete fleet acceptance remains pending.
+This document does not itself approve deployment.
+
+Independent readback on 2026-10-16 found the r2 user units
+`z23-tunnel-receiver@r1.service`, `@r3.service` and `@r4.service` loaded,
+active and running. All three running executables had SHA256
+`4a081c6821d757b559167afbd2a4f27d390525df04972b4eecabc08584a8dc09`.
+The deployment lead reports source
+`146061d3387a8f5c7e7ada8b97d10dae185bd083` and 15 passing smoke checks
+under steer reference `hub-live-20261016`. The process/hash readback does
+not independently establish that source binding, smoke results, retained
+qualification, forward secrecy or Mac support. Exact deployment receipts
+and the per-host authorization packet remain required.
+
+The retained two-train qualification below used earlier source
+`74bdde92b7926fab5cee262212c23464750396db`; it does not qualify the newer
+running executable.
 Run one host at a time after an explicit owner GO naming that host, source,
 image hash, peer, permitted target and lifetime. Keep the existing pinned
 SSH route available for rollback. Do not change a canonical node or firewall.
@@ -192,3 +207,40 @@ matched the write receipt:
 `c64cee59697fd351777bbbcd9828405d5703f838a569d00acf778a3b626fdb6b`.
 It records the known shutdown defect and approval boundaries. Publication
 does not establish a currently approved route or authorize deployment.
+
+## Observed OpenSSH peer access
+
+On 2026-10-15 all twelve directed pairs among z23-r1 through z23-r4 passed
+remote execution and checksummed transfer, both directly and through an SSH
+forwarding carrier. This is an available development route while native HOST
+qualification proceeds. The [retained observation](experiments/FLEET_SHELL_ROUTES_2026-10-15.md)
+records exact evidence and limits.
+
+From any of those four hosts, choose another existing peer alias:
+
+```sh
+PEER=z23-r2
+ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+  -o ControlMaster=no -o ControlPath=none \
+  -o KexAlgorithms=sntrup761x25519-sha512@openssh.com \
+  "$PEER" 'hostname; id -un'
+```
+
+To carry that shell through an explicit SSH forwarding tunnel to the peer's
+loopback SSH listener, use the same peer for both layers:
+
+```sh
+ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+  -o ControlMaster=no -o ControlPath=none \
+  -o KexAlgorithms=sntrup761x25519-sha512@openssh.com \
+  -o "ProxyCommand=ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ControlMaster=no -o ControlPath=none -o KexAlgorithms=sntrup761x25519-sha512@openssh.com -W 127.0.0.1:22 $PEER" \
+  "$PEER" 'hostname; id -un'
+```
+
+This command-scoped carrier exits with the shell; it installs no listener or
+service. Keep the existing key pins and use only the permitted account's work.
+
+The same observation now includes z23-mac in both directions with every
+Linux peer: all twenty directed pairs among five hosts passed. Use the
+existing z23-mac alias when targeting the Mac. This extends OpenSSH access,
+not native HOST platform qualification; retained Mac receipts are linked above.

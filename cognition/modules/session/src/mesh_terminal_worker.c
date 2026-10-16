@@ -224,8 +224,10 @@ static void tw_record_exit(struct mesh_terminal_worker *w, int status)
 {
     if (WIFEXITED(status))
         w->exit_code = WEXITSTATUS(status);
-    else if (WIFSIGNALED(status))
+    else if (WIFSIGNALED(status)) {
         w->exit_code = 128 + WTERMSIG(status);
+        w->term_signal = WTERMSIG(status);
+    }
     w->running = false;
     if (w->close_reason == MESH_TERMINAL_CLOSE_REQUESTED)
         w->close_reason = MESH_TERMINAL_CLOSE_WORKER_EXITED;

@@ -6,7 +6,7 @@
  * This codec is the one piece of ACME vocabulary the NODE itself needs: the
  * TLS-ALPN-01 responder builds a key authorization, and that is a base64url
  * string. Everything else about ACME — the account key, the JWS, the order
- * flow, the trust store — lives in the separate `zclassic23-acme` worker and
+ * flow, the trust store — lives in the separate `z23-acme` worker and
  * is proven by its own selftest, which tests/harness/src/test_acme_worker.c runs.
  */
 

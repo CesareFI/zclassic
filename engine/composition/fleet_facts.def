@@ -249,7 +249,7 @@ FLEET_FACT("lane", "refuses_when", "git-stash", "doctrine", "DOCTRINE",
 FLEET_FACT("lane", "refuses_when", "root-temp-file", "doctrine", "DOCTRINE",
            "a temp at checkout root, as generate-compdb.sh did with mktemp, trips check-no-stray-root-files in every overlapping proof; temps live under build, .cache or the state scratch directory, never at a proof-scanned tree root")
 FLEET_FACT("check-capability-closure", "requires", "full-build-epoch", "lane_state:train", "DOCTRINE",
-           "the closure and inventory checks read the whole package epoch (build/bin/zclassic23-package-verify-dev), not dev-bin; on a dev-bin-only tree they report a stale epoch, which is not a closure failure")
+           "the closure and inventory checks read the whole package epoch (build/bin/z23-package-verify-dev), not dev-bin; on a dev-bin-only tree they report a stale epoch, which is not a closure failure")
 FLEET_FACT("landing-worktree", "max", "one-driver", "lane_state:train", "DOCTRINE",
            "native queue and step locks serialize landing mutations; preserve active leases and the frozen landing tree, use a candidate-qualified producer, and never infer authority from a host or permanent lead")
 FLEET_FACT("live-datadir", "refuses_when", "bulk-copy-while-serving", "box:any", "DOCTRINE",

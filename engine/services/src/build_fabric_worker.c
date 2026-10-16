@@ -147,9 +147,14 @@ static struct zcl_result bfw_worker_path_from_executable(
     *slash = '\0';
     const char *roots[] = {exe, workspace, "."};
     const char *mids[] = {"/", "/build/bin/", "/build/bin/"};
-    const char *development_names[] = {"zclassic23-package-verify-dev",
+    /* New z23-* names first; the zclassic23-* names are the migration
+     * symlinks, and the only names inside already-shipped release trees. */
+    const char *development_names[] = {"z23-package-verify-dev",
+                                       "zclassic23-package-verify-dev",
+                                       "z23-package-verify",
                                        "zclassic23-package-verify"};
-    const char *release_names[] = {"zclassic23-package-verify"};
+    const char *release_names[] = {"z23-package-verify",
+                                   "zclassic23-package-verify"};
     const char *const *names = release_image ? release_names : development_names;
     const size_t name_count = release_image
         ? sizeof(release_names) / sizeof(release_names[0])

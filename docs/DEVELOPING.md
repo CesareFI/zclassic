@@ -122,7 +122,7 @@ make tor-full                          # or `make tor-ready` beside a sibling ch
 ```
 
 **`make z23-dev` is a separate line on purpose.** `all` — what plain `make`
-builds — is `test_zcl zclassic23 zcl-rpc zclassic23-package-verify` plus the
+builds — is `test_zcl zclassic23 zcl-rpc z23-package-verify` plus the
 POSIX-only binaries (for the portable Unix interface) and the adapter
 runner. `z23-dev` is not in it and never
 has been. Every development command in this document is spelled
@@ -287,22 +287,32 @@ discovering it at push time.
 ### The names: `z23`, `zclassic23`, and `~/.local/state/zclassic23`
 
 The product and every binary are **`z23`**. You will still see `zclassic23`
-in three places, and all three are aliases or history, not a second thing:
+in a few places, and all of them are aliases or history, not a second thing:
 
 - the `zclassic23` make target is a one-line alias for `z23`
-  (`Makefile:6913`), and `ZCLASSIC23_BIN` already points at `build/bin/z23`;
+  (`Makefile:6913`), and `Z23_BIN` points at `build/bin/z23`; the old
+  `ZCLASSIC23_*` make variables remain as `= $(Z23_*)` aliases;
 - `build/bin/zclassic23` and `build/bin/zclassic23-dev` are migration
   symlinks to `build/bin/z23` and `build/bin/z23-dev`;
+- the helper binaries are `z23-*` (`z23-acme`, `z23-package-verify`,
+  `z23-package-verify-dev`, `z23-package-sign`, `z23-chaos`,
+  `z23-engine-unit`, `z23-zcode-adapter-runner`,
+  `z23-zcode-app-server-benchmark`, `z23-market-acceptance-helper`); the old
+  `zclassic23-*` names are migration symlinks created by the same make rule
+  (and by `make install`), and the old make target names still work. Release
+  tarballs, `SHA256SUMS`, `tools/ship.sh` fleet directories and
+  `tools/scripts/install_z23.sh` still carry the old member names, so the
+  package-verifier lookups accept both names;
 - the maintainer's host keeps state under `~/.local/state/zclassic23/` and
   the canonical checkout under a `zclassic23` path, both predating the rename.
 
-Nothing is broken by this and nothing needs renaming to work. A full rename
-is deliberately not attempted piecemeal: it would touch the make targets and
-their aliases, the `ZCLASSIC23_*` variables, every tracked unit filename
-under `platform/deploy/`, the state and datadir paths those units name, the
-installed units on every host already running them, and the `docs/` pages
-that cite those paths — so it is one coordinated change or it is a broken
-fleet, never a lane's side errand.
+Nothing is broken by this and nothing needs renaming to work. The state and
+datadir paths, the unit filenames under `platform/deploy/`, the installed
+units on every host already running them, and the P2P user agent are a
+separate coordinated change: it would touch every tracked unit filename, the
+state and datadir paths those units name, the installed units on every host
+already running them, and the `docs/` pages that cite those paths — so it is
+one coordinated change or it is a broken fleet, never a lane's side errand.
 
 ## 1. Orient
 
@@ -1390,6 +1400,9 @@ one driver steps that queue at a time, since `step` holds a per-queue lock for
 its whole run and a second driver that finds it held gets `STEP_BUSY`
 (retryable) and steps again shortly rather than racing the first driver's
 rebase and lint against the shared landing worktree.
+`hold` and `release` do not take that lock: they rewrite the row's
+`publication_hold` atomically under the queue file lock, so a hold is admissible
+while a step runs, and the step re-reads it before its push checkpoint.
 
 The queue codec reserves a strict, exact predecessor tuple and an internal
 classifier distinguishes pending anchors from divergence. Submit and scheduler

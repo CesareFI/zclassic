@@ -1,34 +1,18 @@
 /* Copyright 2026 Rhett Creighton - Apache License 2.0
  *
- * The store: one chainlog per box, one index over all of them.
+ * One chainlog per box, with bounded indexes over verified rows.
+ * Chainlog operations hold exclusive whole-file locks only during the
+ * operation; ledger handles retain neither an open chainlog nor its lock.
+ * Append re-reads the tail under that lock before assigning the next sequence.
  *
- * NO FILE IS HELD OPEN.
- * ---------------------
- * A chainlog takes an EXCLUSIVE whole-file lock that WAITS. That is exactly
- * right for a log with one writer, and exactly wrong for a handle kept for
- * the life of a process: the node would hold the lock forever and the
- * owner's `z23 fleet usage` would block on it until the node stopped.
+ * Opening verifies every held chain. load_us measures that work separately
+ * from index_us, which measures the subsequent in-memory query.
  *
- * So every operation here opens, does its one thing, and closes. The node's
- * mesh service and an operator's command are two processes over one store,
- * and the lock is what makes them safe rather than what makes one of them
- * wait for the other's lifetime. An append re-reads the chain's tail INSIDE
- * that lock, so two processes appending at once produce two dense rows
- * rather than two rows claiming the same sequence number.
- *
- * The cost is that opening the ledger reads every chain once. That cost is
- * reported (`load_us`) and kept apart from the query cost (`index_us`),
- * because "the answer is instant" is a claim about the second number and
- * saying so honestly means never adding them together.
- *
- * THE INDEX IS BOUNDED, AND SAYS WHEN IT IS.
- * ------------------------------------------
- * Per-day detail is kept for ZCL_FLEET_INDEX_DAYS days per series; older
- * days are folded into that series' remainder, which keeps every TOTAL
- * exact while the per-day table stays a fixed size. A row that could not be
- * given a cell because the pool was full is still counted in its remainder
- * and is also counted in `index_overflow`, so a per-day answer that is
- * incomplete can be printed as incomplete instead of as a smaller number.
+ * The day index retains ZCL_FLEET_INDEX_DAYS of detail. Older cells fold
+ * into series remainders. Rows without a free day cell also enter their
+ * remainder and increment index_overflow, exposing incomplete daily detail.
+ * Latest-vitals slots retain row sequence, timestamp and explicit absence
+ * independently of day aggregation.
  */
 
 #include "fleetledger/fleet_ledger.h"
@@ -140,6 +124,8 @@ struct zcl_fleet_ledger {
     struct fleet_experiment_event *experiment;
     uint32_t experiment_count;
     uint64_t experiment_overflow;
+    struct zcl_fleet_vital_latest *latest;
+    size_t latest_subjects;
     uint32_t newest_day;
     uint64_t overflow;
 };
@@ -295,9 +281,33 @@ static void index_age_out(struct zcl_fleet_ledger *l)
             cell_fold(l, &l->cell[i]);
 }
 
+static void latest_index_row(struct zcl_fleet_ledger *l, uint8_t box,
+                              const struct zcl_fleet_row *row)
+{
+    if (row->kind == ZCL_FLEET_KIND_VITALS &&
+        row->subject < l->latest_subjects && box < ZCL_FLEET_BOXES_MAX) {
+        struct zcl_fleet_vital_latest *v =
+            &l->latest[(size_t)box * l->latest_subjects + row->subject];
+        if (row->seq > v->seq) {
+            memset(v, 0, sizeof *v);
+            memcpy(v->box_id, row->box_id, sizeof v->box_id);
+            v->subject = row->subject;
+            v->seq = row->seq;
+            v->ts_unix = row->ts_unix;
+            for (size_t i = 0; i < row->pair_count; i++) {
+                if (row->pair[i].key == ZCL_FLEET_PAIR_VALUE) {
+                    v->present = true;
+                    v->value = row->pair[i].value;
+                }
+            }
+        }
+    }
+}
+
 static void index_row(struct zcl_fleet_ledger *l, uint8_t box,
                       const struct zcl_fleet_row *row, bool *cellular)
 {
+    latest_index_row(l, box, row);
     uint32_t day = zcl_fleet_day_of(row->ts_unix);
     if (day > l->newest_day) {
         l->newest_day = day;
@@ -645,7 +655,10 @@ static struct zcl_fleet_ledger *ledger_allocate(struct zcl_fleet_report *report)
                            "fleet_ledger_series");
     l->experiment = zcl_calloc(FLEET_EXPERIMENT_EVENTS_MAX,
                                sizeof *l->experiment, "fleet_experiment_events");
-    if (!l->cell || !l->series || !l->experiment) {
+    l->latest_subjects = zcl_fleet_vital_count();
+    l->latest = zcl_calloc(ZCL_FLEET_BOXES_MAX * l->latest_subjects,
+                           sizeof *l->latest, "fleet_vitals_latest");
+    if (!l->cell || !l->series || !l->experiment || !l->latest) {
         report->status = ZCL_FLEET_IO;
         zcl_fleet_ledger_close(l);
         return NULL;
@@ -726,6 +739,7 @@ void zcl_fleet_ledger_close(struct zcl_fleet_ledger *ledger)
 {
     if (!ledger)
         return;
+    free(ledger->latest);
     free(ledger->cell);
     free(ledger->series);
     free(ledger->experiment);
@@ -1433,4 +1447,46 @@ enum zcl_fleet_status zcl_fleet_ledger_experiment_rows(
         experiment_row_fill(&out[(*count)++], e);
     }
     return status;
+}
+
+static enum zcl_fleet_status latest_box_rows(
+    const struct zcl_fleet_ledger *ledger, size_t box, int subject,
+    struct zcl_fleet_vital_latest *out, size_t cap, size_t *count)
+{
+    for (size_t s = 0; s < ledger->latest_subjects; s++) {
+        if (subject >= 0 && s != (size_t)subject)
+            continue;
+        const struct zcl_fleet_vital_latest *v =
+            &ledger->latest[box * ledger->latest_subjects + s];
+        if (!v->seq)
+            continue;
+        if (*count == cap)
+            return ZCL_FLEET_FULL;
+        out[(*count)++] = *v;
+    }
+    return ZCL_FLEET_OK;
+}
+
+/* The dense box/catalog product has a slot for every admitted series. */
+enum zcl_fleet_status zcl_fleet_ledger_vitals_latest(
+    const struct zcl_fleet_ledger *ledger, const uint8_t *box_id, int subject,
+    struct zcl_fleet_vital_latest *out, size_t cap, size_t *count)
+{
+    if (count)
+        *count = 0;
+    if (!ledger || !count || (cap && !out) || subject < -1)
+        return ZCL_FLEET_ARGUMENT;
+    if (subject >= 0 && (size_t)subject >= ledger->latest_subjects)
+        return ZCL_FLEET_VITAL_UNKNOWN;
+    for (size_t b = 0; b < ZCL_FLEET_BOXES_MAX; b++) {
+        if (!ledger->box[b].used ||
+            (box_id && memcmp(box_id, ledger->box[b].id,
+                              ZCL_FLEET_ID_BYTES) != 0))
+            continue;
+        enum zcl_fleet_status status =
+            latest_box_rows(ledger, b, subject, out, cap, count);
+        if (status != ZCL_FLEET_OK)
+            return status;
+    }
+    return ZCL_FLEET_OK;
 }

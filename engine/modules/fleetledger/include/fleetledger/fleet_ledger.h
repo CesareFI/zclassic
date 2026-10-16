@@ -552,6 +552,24 @@ enum zcl_fleet_status zcl_fleet_ledger_replicate(
     const uint8_t peer_signer[ZCL_FLEET_ID_BYTES], const uint8_t *rows,
     size_t len, size_t *accepted);
 
+/* Latest recorded vitals retain row provenance independently of aggregation.
+ * Missing VALUE replaces an older measurement with explicit absence. */
+struct zcl_fleet_vital_latest {
+    uint8_t box_id[ZCL_FLEET_ID_BYTES];
+    uint16_t subject;
+    uint64_t seq;
+    int64_t ts_unix;
+    bool present;
+    int64_t value;
+};
+
+/* NULL box selects all held chains; subject = -1 selects every metric.
+ * Returns FULL with count entries filled when cap is insufficient.
+ * cap=0 permits out=NULL. No clock, file, or network access occurs. */
+enum zcl_fleet_status zcl_fleet_ledger_vitals_latest(
+    const struct zcl_fleet_ledger *ledger, const uint8_t *box_id, int subject,
+    struct zcl_fleet_vital_latest *out, size_t cap, size_t *count);
+
 /* ── Querying ────────────────────────────────────────────────────────── */
 
 /* What one box's chain looks like from here. `age_s` is how old the newest

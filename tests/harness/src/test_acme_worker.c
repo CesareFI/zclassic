@@ -3,7 +3,7 @@
  * The certificate worker, graded from outside.
  *
  * WHY THIS GROUP RUNS A BINARY INSTEAD OF CALLING FUNCTIONS. Issuance lives
- * in `zclassic23-acme` (tools/acme) because talking to a certificate
+ * in `z23-acme` (tools/acme) because talking to a certificate
  * authority means being a TLS client with a CA trust store, and the node
  * refuses that property — test_cold_join_sovereign P2 asserts that no
  * Z23-authored object outside lib/test carries an undefined reference to a
@@ -36,7 +36,7 @@
     else { printf("FAIL\n"); failures++; }               \
 } while (0)
 
-static const char WORKER_BIN[] = "build/bin/zclassic23-acme";
+static const char WORKER_BIN[] = "build/bin/z23-acme";
 
 static bool binary_present(void)
 {

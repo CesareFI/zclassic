@@ -8,8 +8,8 @@
  * The node refuses that property outright — test_cold_join_sovereign P2
  * asserts that no Z23-authored object the node links carries an undefined
  * reference to any TLS-client or trust-store entry point — so issuance
- * lives in a separate program (tools/acme, `zclassic23-acme`), the same way
- * package verification lives in `zclassic23-package-verify`.
+ * lives in a separate program (tools/acme, `z23-acme`), the same way
+ * package verification lives in `z23-package-verify`.
  *
  * That is the right place for the trust boundary, not a compromise. A public
  * CA is only ever consulted for the OPTIONAL clearnet convenience surface:

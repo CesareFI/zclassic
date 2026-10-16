@@ -63,7 +63,7 @@ run_verifier()
     if [[ -n $extra ]]; then extra_args+=("$extra"); fi
     mkdir -p "$emit"
     { TIMEFORMAT='%R %U %S'; time \
-        "$root/build/bin/zclassic23-package-verify" "$source_root" \
+        "$root/build/bin/z23-package-verify" "$source_root" \
         --zbuild-package-source="$source" \
         --zbuild-package-recipe="$output/recipe.libm" \
         --zbuild-package-name=qualification/skycombat-aircraft \

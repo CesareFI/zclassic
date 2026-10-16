@@ -100,7 +100,7 @@ int t_canonical_deploy_proof_binding_contract(void)
             deploy_recipe,
             "install -m 755 \"/proc/$$mainpid/exe\" \"$$prior_tmp\"");
         const char *forced_relink = strstr(deploy_recipe,
-                                           "rm -f $(ZCLASSIC23_BIN)");
+                                           "rm -f $(Z23_BIN)");
         ASSERT(prior_capture != NULL);
         ASSERT(forced_relink != NULL);
         ASSERT(prior_capture < forced_relink);

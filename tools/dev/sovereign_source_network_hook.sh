@@ -357,8 +357,8 @@ ssn_insert_after_include_blank \
 # Offline publisher identity and detached signature. The secret is a 32-byte
 # mode-0600 file used only through inherited descriptors; it never reaches a
 # command JSON body or daemon datadir.
-SIGNER="$REPO_ROOT/build/bin/zclassic23-package-sign"
-[ -x "$SIGNER" ] || ssn_die "offline zclassic23-package-sign is not built"
+SIGNER="$REPO_ROOT/build/bin/z23-package-sign"
+[ -x "$SIGNER" ] || ssn_die "offline z23-package-sign is not built"
 PUBLISH_KEY="$DHT_WORK/source-publisher.key"
 PUBLISHER_PUBKEY="$($SIGNER --generate "$PUBLISH_KEY")"
 WORK_DATADIR="/tmp/zclassic23-zcode-workspaces/$(id -u)/$TASK_ROOT/zbuild"

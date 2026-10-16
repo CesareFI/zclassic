@@ -90,7 +90,7 @@ MinGW sysroot (target headers and libraries) to link and audit an x86-64 PE:
 
 ```bash
 VENDOR_TARGET=x86_64-w64-mingw32 tools/scripts/build_vendor.sh
-make ZCL_TARGET=windows-x86_64 -j"$(nproc)" z23 zclassic23-acme
+make ZCL_TARGET=windows-x86_64 -j"$(nproc)" z23 z23-acme
 platform/packaging/release/build_release.sh --platform windows-x86_64
 ```
 
@@ -127,7 +127,7 @@ under `vendor/cross/x86_64-w64-mingw32`:
 
 ```bash
 make ZCL_TARGET=windows-x86_64 tor-full
-make ZCL_TARGET=windows-x86_64 -j"$(nproc)" z23 zclassic23-acme
+make ZCL_TARGET=windows-x86_64 -j"$(nproc)" z23 z23-acme
 ```
 
 Native, from UCRT64, once `make vendor` has produced the host archives:

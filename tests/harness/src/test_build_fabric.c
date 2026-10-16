@@ -99,10 +99,10 @@ static int test_bf_production_verifier_selection(void)
         ASSERT(snprintf(bin, sizeof(bin), "%s/bin", build) > 0 &&
                strlen(bin) < sizeof(bin) - 1u);
         ASSERT(mkdir(build, 0700) == 0 && mkdir(bin, 0700) == 0);
-        ASSERT(snprintf(release, sizeof(release), "%s/zclassic23-package-verify",
+        ASSERT(snprintf(release, sizeof(release), "%s/z23-package-verify",
                         bin) > 0 && strlen(release) < sizeof(release) - 1u);
         ASSERT(snprintf(development, sizeof(development),
-                        "%s/zclassic23-package-verify-dev", bin) > 0 &&
+                        "%s/z23-package-verify-dev", bin) > 0 &&
                strlen(development) < sizeof(development) - 1u);
         ASSERT(bf_fake_executable(release) && bf_fake_executable(development));
         ASSERT(build_fabric_worker_verifier_path_for_test(
@@ -128,6 +128,16 @@ static int test_bf_production_verifier_selection(void)
         ASSERT(build_fabric_worker_verifier_path_for_test(
             "/isolated/bin/z23-dev", dir, selected, sizeof(selected)).ok);
         ASSERT_STR_EQ(selected, development);
+        /* A release tree shipped before the z23-* rename carries only the
+         * zclassic23-* names; both resolve. */
+        char legacy[448];
+        ASSERT(unlink(development) == 0);
+        ASSERT(snprintf(legacy, sizeof(legacy), "%s/zclassic23-package-verify",
+                        bin) > 0 && strlen(legacy) < sizeof(legacy) - 1u);
+        ASSERT(bf_fake_executable(legacy));
+        ASSERT(build_fabric_worker_verifier_path_for_test(
+            "/isolated/bin/z23", dir, selected, sizeof(selected)).ok);
+        ASSERT_STR_EQ(selected, legacy);
         test_rm_rf(dir);
         PASS();
     } _test_next:;

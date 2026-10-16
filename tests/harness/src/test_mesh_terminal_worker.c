@@ -515,6 +515,122 @@ static int test_mesh_terminal_worker_platform_arm(void)
 
 #else /* __linux__ */
 
+/* Live: the shell's exit status reaches the worker record. */
+static int live_exit_status(void)
+{
+    int failures = 0;
+    /* ── live: the remote status survives to the worker record ─────── */
+    {
+        static const struct {
+            const char *line;
+            int exit_code;
+            int signal;
+            const char *label;
+        } cases[] = {
+            { "exit 3\n", 3, 0, "exit 3 -> exit_code 3, no signal" },
+            { "kill -KILL $$\n", 137, 9,
+              "SIGKILL death -> exit_code 137, signal 9" },
+            { "exit 143\n", 143, 0,
+              "exit 143 is a code, not a signal" },
+        };
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            struct mesh_terminal_worker_config cfg;
+            struct mesh_terminal_worker w;
+            live_config(&cfg);
+            int64_t t0 = (int64_t)platform_time_wall_time_t();
+            struct zcl_result r = mesh_terminal_worker_spawn(&cfg, t0, &w);
+            failures = check(failures, r.ok, "spawn for exit status");
+            if (r.ok) {
+                r = mesh_terminal_worker_input(
+                    &w, (const uint8_t *)cases[i].line,
+                    strlen(cases[i].line), t0 + 1);
+                failures = check(failures, r.ok && wait_exit(&w, 5) &&
+                                     w.close_reason ==
+                                         MESH_TERMINAL_CLOSE_WORKER_EXITED &&
+                                     w.exit_code == cases[i].exit_code &&
+                                     w.term_signal == cases[i].signal,
+                                 cases[i].label);
+            }
+            mesh_terminal_worker_kill(&w);
+        }
+    }
+
+    return failures;
+}
+
+/* Live: 2 MiB of output under the service byte budget. */
+static int live_two_mib_output(void)
+{
+    int failures = 0;
+    /* ── live: 2 MiB of output under the service budget ────────────── */
+    {
+        struct mesh_terminal_worker_config cfg;
+        struct mesh_terminal_worker w;
+        live_config(&cfg);
+        cfg.max_bytes_out = UINT64_C(1) << 30; /* the service default */
+        cfg.max_bytes_in = UINT64_C(16) << 20;
+        int64_t t0 = (int64_t)platform_time_wall_time_t();
+        struct zcl_result r = mesh_terminal_worker_spawn(&cfg, t0, &w);
+        failures = check(failures, r.ok, "spawn for 2 MiB output");
+        if (r.ok) {
+            const uint8_t line[] =
+                "a=0123456789abcdef;a=$a$a;a=$a$a;a=$a$a;a=$a$a;a=$a$a;a=$a$a;"
+                "i=0;while [ $i -lt 2100 ];do echo $a;i=$((i+1));done;"
+                "echo ZZZ$((1+1))END\n";
+            r = mesh_terminal_worker_input(&w, line, sizeof line - 1, t0 + 1);
+            failures = check(failures, r.ok, "2 MiB command input accepted");
+            size_t total = 0, biggest = 0;
+            bool end_seen = false, failed = false;
+            char tail[16] = "";
+            time_t deadline = platform_time_wall_time_t() + 30;
+            while (!end_seen && !failed &&
+                   platform_time_wall_time_t() < deadline) {
+                uint8_t chunk[MESH_TERMINAL_WORKER_IO_CHUNK];
+                size_t n = 0;
+                r = mesh_terminal_worker_output(
+                    &w, chunk, sizeof chunk, &n,
+                    (int64_t)platform_time_wall_time_t());
+                if (!r.ok && r.code != MESH_TERMINAL_WORKER_ERR_NONE) {
+                    failed = true;
+                    break;
+                }
+                if (n == 0) {
+                    usleep(2000);
+                    continue;
+                }
+                total += n;
+                if (n > biggest)
+                    biggest = n;
+                char probe[sizeof tail * 2];
+                size_t keep = strlen(tail);
+                memcpy(probe, tail, keep);
+                size_t take = n < sizeof tail - 1 ? n : sizeof tail - 1;
+                memcpy(probe + keep, chunk + n - take, take);
+                probe[keep + take] = '\0';
+                end_seen = strstr(probe, "ZZZ2END") != NULL;
+                size_t tl = keep + take < sizeof tail - 1 ? keep + take
+                                                          : sizeof tail - 1;
+                memmove(tail, probe + keep + take - tl, tl);
+                tail[tl] = '\0';
+            }
+            failures = check(failures, !failed && end_seen,
+                             "2 MiB session was not ended by byte-limit");
+            failures = check(failures, total >= 2097152 &&
+                                 w.close_reason !=
+                                     MESH_TERMINAL_CLOSE_BYTE_LIMIT,
+                             "2 MiB of output delivered, reason not "
+                             "byte-limit");
+            failures = check(failures, biggest <= (size_t)(
+                                 MESH_TERMINAL_WORKER_IO_CHUNK),
+                             "memory bounded: every read fits the fixed "
+                             "chunk");
+        }
+        mesh_terminal_worker_kill(&w);
+    }
+
+    return failures;
+}
+
 static int test_mesh_terminal_worker_platform_arm(void)
 {
     printf("\n=== mesh terminal worker tests ===\n");
@@ -657,6 +773,9 @@ static int test_mesh_terminal_worker_platform_arm(void)
         }
         mesh_terminal_worker_kill(&w);
     }
+
+    failures += live_exit_status();
+    failures += live_two_mib_output();
 
     /* ── live: input byte budget ───────────────────────────────────── */
     {

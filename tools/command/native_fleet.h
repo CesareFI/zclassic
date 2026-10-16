@@ -7,6 +7,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 struct zcl_command_request;
 struct zcl_command_reply;
@@ -62,6 +63,9 @@ void zcl_native_handle_fleet_steer_send(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);
 void zcl_native_handle_fleet_steer_mailbox(
+    const struct zcl_command_request *request,
+    struct zcl_command_reply *reply);
+void zcl_native_handle_fleet_mission_board(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);
 void zcl_native_handle_fleet_steer_evidence(
@@ -241,9 +245,43 @@ void zcl_fmc_cand_emit(const struct zcl_fmc_cand_reg *reg,
                        struct json_value *out, struct json_value *summary,
                        struct json_value *missing);
 
+/* fleet.doctor (tools/command/native_fleet_doctor.c): the read-only setup
+ * checklist. */
+void zcl_native_handle_fleet_doctor(const struct zcl_command_request *request,
+                                    struct zcl_command_reply *reply);
+
+/* Host facts shared by fleet.vitals.sample and fleet.vitals.read: one
+ * measurement, so both leaves report the same numbers. Index order is the
+ * sample catalog order (load1 centi, cores, cores free, ram used MiB, ram
+ * total MiB, disk free GiB, disk free pct, uptime s, node rss MiB). `path`
+ * names the filesystem whose space is reported. */
+#define ZCL_FLEET_HOST_N 9
+void zcl_fleet_host_snapshot(const char *path, int64_t v[ZCL_FLEET_HOST_N],
+                             bool p[ZCL_FLEET_HOST_N]);
+
+/* What fleet.vitals.read reports; -1 is a fact this platform cannot give. */
+struct zcl_fleet_vitals_now {
+    char host[65];
+    int64_t cpus, load1_centi, load5_centi, load15_centi;
+    int64_t mem_total_mib, mem_avail_mib, mem_used_mib;
+    int64_t disk_total_mib, disk_used_mib, disk_free_mib;
+    int64_t uptime_s;
+};
+void zcl_fleet_vitals_measure(struct zcl_fleet_vitals_now *out);
+
 /* z23-toolgen:begin handlers - generated, do not edit */
 /* fleet.nodes.table (tools/command/native_fleet_nodes_table.c) */
 void zcl_native_handle_fleet_nodes_table(
+    const struct zcl_command_request *request,
+    struct zcl_command_reply *reply);
+
+/* fleet.vitals.read (tools/command/native_fleet_vitals_read.c) */
+void zcl_native_handle_fleet_vitals_read(
+    const struct zcl_command_request *request,
+    struct zcl_command_reply *reply);
+
+/* fleet.vitals.table (tools/command/native_fleet_vitals_table.c) */
+void zcl_native_handle_fleet_vitals_table(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);
 /* z23-toolgen:end handlers */

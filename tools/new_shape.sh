@@ -504,7 +504,7 @@ EOF
 NEXT — fill in the TODO header, tune simnet_nodes/honest= and the
 mint/relay/deliver/partition/heal sequence for what you're proving, then
 run it standalone:
-  build/bin/zclassic23-chaos --scenario="$out"
+  build/bin/z23-chaos --scenario="$out"
 It is picked up automatically by \`make chaos\` (every
 tools/sim/scenarios/*.scenario must pass) — no registry edit needed.
 EOF

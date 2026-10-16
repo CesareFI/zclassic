@@ -18,6 +18,7 @@
  */
 
 #include "command/native_command.h"
+#include "command/native_fleet.h"
 
 #include "base/hex.h"
 #include "base/safe_alloc.h"
@@ -508,7 +509,7 @@ void zcl_native_handle_fleet_usage(const struct zcl_command_request *request,
 
 /* ── fleet vitals sample ─────────────────────────────────────────────── */
 
-enum { FLEET_HOST_N = 9 };
+enum { FLEET_HOST_N = ZCL_FLEET_HOST_N };
 static const char *const k_host_ids[FLEET_HOST_N] = {
     "box.load1", "box.cores", "box.cores_free_for_qedc", "box.ram_used_mib",
     "box.ram_total_mib", "box.disk_free_gib", "box.disk_free_pct",
@@ -523,8 +524,8 @@ static int fleet_host_index(const char *id)
     return -1;
 }
 
-static void fleet_snapshot(const char *datadir, int64_t v[FLEET_HOST_N],
-                           bool p[FLEET_HOST_N])
+void zcl_fleet_host_snapshot(const char *datadir, int64_t v[ZCL_FLEET_HOST_N],
+                              bool p[ZCL_FLEET_HOST_N])
 {
     const int64_t mib = 1024 * 1024, gib = mib * 1024;
     int64_t load = os_proc_load1_centi();
@@ -610,7 +611,7 @@ void zcl_native_handle_fleet_vitals_sample(
 
     int64_t values[FLEET_HOST_N];
     bool present[FLEET_HOST_N];
-    fleet_snapshot(zcl_native_command_datadir(), values, present);
+    zcl_fleet_host_snapshot(zcl_native_command_datadir(), values, present);
     uint64_t first = 0, last = 0;
     size_t wrote = 0;
     for (size_t i = 0; i < nids; i++) {

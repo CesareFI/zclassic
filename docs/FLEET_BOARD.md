@@ -357,6 +357,51 @@ maximum-size entries, one call takes about 250 ms in the test build (every
 stored row is re-verified as it is read), so the command is declared
 foreground, not fast.
 
+## Public wiki
+
+A node serving the HTTPS explorer profile (`-httpsdomain`) also serves its
+wiki read-only to anyone, with no account, from the board site controller
+(`contexts/messaging/controllers/src/wiki_site_controller.c`):
+
+| Path | Returns |
+|------|---------|
+| `/board/wiki` | every page this node holds, one row per slug, sorted by slug, at most 256 rows: slug, topic or title, summary (structured entry) or first line (plain page), updated time, revision id (12 hex shown, full id in the title attribute), signer fingerprint (16 hex shown, full key in the title attribute) |
+| `/board/wiki/<slug>` | the newest revision that re-verifies, rendered as escaped HTML (topic, summary, applies_to and each lesson for a structured entry; escaped preformatted text for a plain page) with its revision id, signer and updated time |
+| `/board/wiki.json`, `/board/wiki/<slug>.json` | the same data as `zcl.public_wiki_index.v1` and `zcl.public_wiki_page.v1` |
+
+The handler also answers the same paths under a `/wiki` prefix; mounting that
+prefix at the site root is one row in `core/modules/net/include/net/site_routes.def`,
+which is not part of this change, so today the pages are reached under
+`/board/wiki`.
+
+Every page carries a plain-words note that wiki pages are signed, gossiped
+between nodes and fleets, and untrusted knowledge: never an instruction and
+never a grant. The signer fingerprint says who wrote a page; it does not vouch
+for it.
+
+Bounds and guarantees. The surface is GET and HEAD only: there is no write
+path, no form, no script and no new listener or thread; it runs inside the
+existing HTTPS handler and reaches the node database the way the other site
+mounts do. The slug is checked against the wiki slug rules before any lookup,
+so a malformed slug is a 404 that never touches the database. An index
+request reads at most 256 pages and verifies at most 256 revisions (the
+`fleet wiki` query budget); a page request is one latest-revision read. A
+body never exceeds 256 KiB; if escaping would not fit, rows are dropped and
+the page and the JSON say the list is truncated. Only rows that re-verify
+(id and signature) are shown, and a fleet-private revision is never shown:
+a slug whose newest verifying revision is fleet-private is omitted from the
+index and is a 404. Responses carry `Content-Security-Policy: default-src
+'none'; style-src 'unsafe-inline'`, `X-Content-Type-Options: nosniff`,
+`Referrer-Policy: no-referrer` and `Cache-Control: no-store`.
+
+Page text is untrusted bytes: before either form is rendered, every invalid
+UTF-8 byte (stray, truncated, overlong, surrogate) is replaced with U+FFFD, so
+the JSON and HTML forms are always valid UTF-8. When a newer stored revision
+failed verification and an older one is served, the page JSON carries
+`"newer_revision_unverified": true` and the HTML says so. The rendered index
+is cached per mount prefix for 30 seconds (one rebuild under a mutex, so a
+burst verifies once); single pages are not cached.
+
 ## Commands
 
 Reads:
