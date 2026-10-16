@@ -398,6 +398,30 @@ static bool artifact_command_call(const struct json_value *input, bool admit,
     return ok;
 }
 
+static bool artifact_registry_denied(const struct json_value *envelope,
+    enum zcl_command_exit code)
+{
+    const struct json_value *error = json_get(envelope, "error");
+    const char *error_code = json_get_str(json_get(error, "code"));
+    const char *status = json_get_str(json_get(envelope, "status"));
+    const struct json_value *mutated = json_get(error, "mutated");
+    return code == ZCL_COMMAND_EXIT_DENIED && error_code &&
+        strcmp(error_code, "AUTHORITY_DENIED") == 0 && status &&
+        strcmp(status, "blocked") == 0 && mutated &&
+        mutated->type == JSON_BOOL && !json_get_bool(mutated);
+}
+
+static bool artifact_registry_success(const struct json_value *envelope,
+    enum zcl_command_exit code, bool admit, uint8_t root[32])
+{
+    const struct json_value *data = json_get(envelope, "data");
+    const char *hex = json_get_str(json_get(data, "manifest_root"));
+    const char *stage = json_get_str(json_get(data, "stage"));
+    return code == ZCL_COMMAND_EXIT_OK && hex &&
+        zcl_hex_decode_lower(hex, root, 32) && stage &&
+        strcmp(stage, admit ? "admitted" : "prepared") == 0;
+}
+
 static bool artifact_registry_call(const struct json_value *input, bool admit,
     enum zcl_command_authority ceiling, bool denied, uint8_t root[32])
 {
@@ -414,23 +438,8 @@ static bool artifact_registry_call(const struct json_value *input, bool admit,
     struct json_value envelope = {0};
     bool ok = len > 0 && len < sizeof(wire) &&
         json_read(&envelope, wire, len);
-    if (denied) {
-        const struct json_value *error = json_get(&envelope, "error");
-        const char *error_code = json_get_str(json_get(error, "code"));
-        const char *status = json_get_str(json_get(&envelope, "status"));
-        const struct json_value *mutated = json_get(error, "mutated");
-        ok = ok && code == ZCL_COMMAND_EXIT_DENIED && error_code &&
-            strcmp(error_code, "AUTHORITY_DENIED") == 0 && status &&
-            strcmp(status, "blocked") == 0 && mutated &&
-            mutated->type == JSON_BOOL && !json_get_bool(mutated);
-    } else {
-        const struct json_value *data = json_get(&envelope, "data");
-        const char *hex = json_get_str(json_get(data, "manifest_root"));
-        const char *stage = json_get_str(json_get(data, "stage"));
-        ok = ok && code == ZCL_COMMAND_EXIT_OK && hex &&
-            zcl_hex_decode_lower(hex, root, 32) && stage &&
-            strcmp(stage, admit ? "admitted" : "prepared") == 0;
-    }
+    ok = ok && (denied ? artifact_registry_denied(&envelope, code) :
+        artifact_registry_success(&envelope, code, admit, root));
     if (!ok) fprintf(stderr, "artifact registry dispatch code=%d response=%.512s\n",
         (int)code, len ? wire : "no response");
     json_free(&envelope);
@@ -487,6 +496,35 @@ static int artifact_authority_test(void)
     return failures;
 }
 
+static int artifact_direct_schema_test(const char *program_path,
+    const char *license_path, const char *datadir)
+{
+    int failures = 0;
+    TEST_CASE("direct artifact handlers reject undeclared inputs before effects") {
+        const char *keys[] = {"program_hex", "license_hex"};
+        for (size_t i = 0; i < 2; ++i) {
+            for (unsigned admit = 0; admit < 2; ++admit) {
+                struct json_value input = {0};
+                uint8_t root[32];
+                ASSERT(artifact_command_input(&input, admit ? datadir : NULL,
+                    program_path, license_path));
+                ASSERT(json_push_kv_str(&input, keys[i], "00"));
+                ASSERT(artifact_command_call(&input, admit != 0,
+                    "ARTIFACT_INPUT_REFUSED", root));
+                json_free(&input);
+            }
+        }
+        struct json_value input = {0};
+        uint8_t root[32];
+        ASSERT(artifact_command_input(&input, datadir, program_path, license_path));
+        ASSERT(artifact_command_call(&input, false, "ARTIFACT_INPUT_REFUSED", root));
+        struct stat st;
+        ASSERT(stat(datadir, &st) != 0 && errno == ENOENT);
+        json_free(&input);
+    } TEST_END
+    return failures;
+}
+
 static int artifact_command_test(void)
 {
     int failures = 0;
@@ -502,6 +540,7 @@ static int artifact_command_test(void)
             sizeof(artifact_program)));
         ASSERT(artifact_write_snapshot(license_path, artifact_license,
             sizeof(artifact_license) - 1u));
+        failures += artifact_direct_schema_test(program_path, license_path, datadir);
         ASSERT(artifact_command_input(&input, NULL, program_path, license_path));
         ASSERT(artifact_registry_call(&input, false,
             ZCL_COMMAND_AUTH_OWNER, false, prepared));
@@ -526,7 +565,7 @@ static int artifact_command_test(void)
             ZCL_COMMAND_AUTH_OWNER, false, admitted));
         ASSERT(memcmp(prepared, admitted, 32) == 0);
         json_free(&input);
-        ASSERT(artifact_command_input(&input, datadir, program_path, license_path));
+        ASSERT(artifact_command_input(&input, NULL, program_path, license_path));
         struct json_value *digest = (struct json_value *)json_get(&input,
             "program_sha3_256");
         ASSERT(digest != NULL);

@@ -16,6 +16,11 @@
 bool zcl_native_package_artifact_read(const struct json_value *input,
     const char *hex_key, const char *file_key, const char *digest_key,
     size_t maximum, uint8_t **bytes, size_t *length);
+/* File-only variant: the command validates its canonical input schema first.
+ * Retains the same descriptor, snapshot, size and exact digest policy. */
+bool zcl_native_package_artifact_read_file(const struct json_value *input,
+    const char *file_key, const char *digest_key, size_t maximum,
+    uint8_t **bytes, size_t *length);
 bool zcl_native_package_artifact_absolute(const char *path,
     char *absolute, size_t capacity);
 void zcl_native_package_artifact_digest(uint8_t digest[32], const uint8_t *bytes, size_t length);

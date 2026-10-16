@@ -1,3 +1,4 @@
+/* purpose: Declare native inert release artifact preparation and admission commands. */
 /* Copyright 2026 Rhett Creighton. SPDX-License-Identifier: Apache-2.0 */
 #ifndef ZCL_NATIVE_ZCODE_RELEASE_ARTIFACT_COMMAND_H
 #define ZCL_NATIVE_ZCODE_RELEASE_ARTIFACT_COMMAND_H

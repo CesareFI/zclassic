@@ -1,3 +1,4 @@
+/* purpose: Declare inert release artifact metadata and verified carrier admission. */
 /* Copyright 2026 Rhett Creighton. SPDX-License-Identifier: Apache-2.0 */
 #ifndef ZCL_VCS_RELEASE_ARTIFACT_H
 #define ZCL_VCS_RELEASE_ARTIFACT_H

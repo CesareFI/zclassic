@@ -113,3 +113,14 @@ bool zcl_native_package_artifact_read(const struct json_value *input,
     return has_file && has_digest && artifact_file(artifact_string(input, file_key),
         artifact_string(input, digest_key), maximum, bytes, length);
 }
+
+bool zcl_native_package_artifact_read_file(const struct json_value *input,
+    const char *file_key, const char *digest_key, size_t maximum,
+    uint8_t **bytes, size_t *length)
+{
+    if (!bytes || !length) return false;
+    *bytes = NULL; *length = 0;
+    if (!input || !maximum || !file_key || !digest_key) return false;
+    return artifact_file(artifact_string(input, file_key),
+        artifact_string(input, digest_key), maximum, bytes, length);
+}

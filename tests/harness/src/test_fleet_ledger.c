@@ -328,6 +328,31 @@ static bool fl_provision(const char *datadir, uint8_t box_id[32],
     return true;
 }
 
+static int fl_host_uptime_test(const char *datadir)
+{
+    int failures = 0;
+    TEST("fleet vitals snapshot: box uptime follows the machine clock") {
+        /* Bracket the production snapshot rather than assuming how long the
+         * machine or this collector has been running. Process age is a
+         * different clock and cannot stand in for the boot-relative fact. */
+        int64_t before = os_proc_system_uptime_seconds();
+        int64_t values[ZCL_FLEET_HOST_N];
+        bool present[ZCL_FLEET_HOST_N];
+        zcl_fleet_host_snapshot(datadir, values, present);
+        int64_t after = os_proc_system_uptime_seconds();
+        if (before >= 0 && after >= 0) {
+            ASSERT(present[7]);
+            ASSERT(values[7] >= before);
+            ASSERT(values[7] <= after);
+        } else if (before < 0 && after < 0) {
+            ASSERT(!present[7]);
+        }
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
 static void fl_sample(struct json_value *input, struct zcl_command_reply *reply)
 {
     struct zcl_command_request request = { .input = input };
@@ -1001,24 +1026,7 @@ int test_fleet_ledger(void)
     ASSERT(fl_provision(sample_dd, sample_box, sample_signer));
     zcl_native_bridge_bind_rpc(sample_dd, 0);
 
-    TEST("fleet vitals snapshot: box uptime follows the machine clock") {
-        /* Bracket the production snapshot rather than assuming how long the
-         * machine or this collector has been running. Process age is a
-         * different clock and cannot stand in for the boot-relative fact. */
-        int64_t before = os_proc_system_uptime_seconds();
-        int64_t values[ZCL_FLEET_HOST_N];
-        bool present[ZCL_FLEET_HOST_N];
-        zcl_fleet_host_snapshot(sample_dd, values, present);
-        int64_t after = os_proc_system_uptime_seconds();
-        if (before >= 0 && after >= 0) {
-            ASSERT(present[7]);
-            ASSERT(values[7] >= before);
-            ASSERT(values[7] <= after);
-        } else if (before < 0 && after < 0) {
-            ASSERT(!present[7]);
-        }
-        PASS();
-    }
+    failures += fl_host_uptime_test(sample_dd);
 
     TEST("fleet vitals sample: catalog ids measured-or-ABSENT; unknown id "
          "refuses by name; second sample appends a new seq") {

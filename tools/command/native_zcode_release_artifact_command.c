@@ -1,8 +1,11 @@
+/* purpose: Prepare and admit bounded inert release artifacts without signing or execution. */
 /* Copyright 2026 Rhett Creighton. SPDX-License-Identifier: Apache-2.0 */
 #include "command/native_zcode_release_artifact_command.h"
 #include "command/native_package_artifact.h"
 #include "base/hex.h"
 #include "json/json.h"
+#include "kernel/command_registry.h"
+#include "config/command_catalog.h"
 #include "util/safe_alloc.h"
 #include "vcs/release_artifact.h"
 #include "vcs/package_release.h"
@@ -54,13 +57,12 @@ static bool release_read(const struct json_value *input,
         !release_label(input, "abi", in->labels.abi, sizeof(in->labels.abi)) ||
         !release_label(input, "isa", in->labels.isa, sizeof(in->labels.isa)) ||
         !release_string(input, "program_file") ||
-        !release_string(input, "license_file") ||
-        json_get(input, "program_hex") || json_get(input, "license_hex"))
+        !release_string(input, "license_file"))
         return false;
-    return zcl_native_package_artifact_read(input, "program_hex", "program_file",
+    return zcl_native_package_artifact_read_file(input, "program_file",
         "program_sha3_256", VCS_PACKAGE_STORE_MAX_PACKAGE_BYTES,
         &in->program, &in->program_len) &&
-        zcl_native_package_artifact_read(input, "license_hex", "license_file",
+        zcl_native_package_artifact_read_file(input, "license_file",
             "license_sha3_256", VCS_PACKAGE_RELEASE_LICENSE_TEXT_MAX_BYTES,
             &in->license, &in->license_len);
 }
@@ -103,7 +105,7 @@ static bool release_output(struct json_value *out, const struct release_inputs *
 }
 
 static void release_handle(const struct zcl_command_request *request,
-    struct zcl_command_reply *reply, bool admit)
+    struct zcl_command_reply *reply, bool admit, const char *datadir)
 {
     if (!reply) return;
     struct release_inputs in = {0};
@@ -129,7 +131,6 @@ static void release_handle(const struct zcl_command_request *request,
         goto done;
     }
     if (admit) {
-        const char *datadir = release_string(input, "datadir");
         if (!datadir || !datadir[0]) {
             release_fail(reply, "ARTIFACT_DATADIR_REQUIRED",
                 "Admission requires an explicit package-store datadir", false);
@@ -152,14 +153,34 @@ done:
     free(in.license);
 }
 
+/* Direct callers obey the same closed input contract as registry dispatch. */
+static bool release_input_validate(const struct zcl_command_request *request,
+    struct zcl_command_reply *reply, const char *path)
+{
+    const struct zcl_command_spec *spec =
+        zcl_command_registry_find(zcl_command_catalog(), path, NULL);
+    char why[512] = {0};
+    if (request && spec && zcl_command_registry_input_validate(spec,
+            request->input, why, sizeof(why)))
+        return true;
+    release_fail(reply, "ARTIFACT_INPUT_REFUSED",
+        "Input must match the declared release artifact command schema", false);
+    return false;
+}
+
 void zcl_native_handle_zcode_release_artifact_prepare(
     const struct zcl_command_request *request, struct zcl_command_reply *reply)
 {
-    release_handle(request, reply, false);
+    if (!reply || !release_input_validate(request, reply,
+            "zcode.release.artifact.prepare")) return;
+    release_handle(request, reply, false, NULL);
 }
 
 void zcl_native_handle_zcode_release_artifact_admit(
     const struct zcl_command_request *request, struct zcl_command_reply *reply)
 {
-    release_handle(request, reply, true);
+    if (!reply || !release_input_validate(request, reply,
+            "zcode.release.artifact.admit")) return;
+    const char *datadir = release_string(request->input, "datadir");
+    release_handle(request, reply, true, datadir);
 }

@@ -1,3 +1,4 @@
+/* purpose: Prepare and verify inert release artifact carriers in the existing package store. */
 /* Copyright 2026 Rhett Creighton. SPDX-License-Identifier: Apache-2.0 */
 #include "vcs/release_artifact.h"
 

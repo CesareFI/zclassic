@@ -1330,6 +1330,10 @@ REMOTE_COMMAND_CLASS("fleet.link.probe", REMOTE_CLASS_NEVER, "")
  * it is never offered to a peer. */
 REMOTE_COMMAND_CLASS("fleet.mission.board", REMOTE_CLASS_NEVER, "")
 
+/* Inert artifact commands inspect operator-selected local files and stores. */
+REMOTE_COMMAND_CLASS("zcode.release.artifact.prepare", REMOTE_CLASS_NEVER, "")
+REMOTE_COMMAND_CLASS("zcode.release.artifact.admit", REMOTE_CLASS_NEVER, "")
+
 /* z23-toolgen:begin remote-classes - generated, do not edit */
 /* fleet.nodes.table: readonly-local-v1 fixes this leaf to never remote. */
 REMOTE_COMMAND_CLASS("fleet.nodes.table", REMOTE_CLASS_NEVER, "")
