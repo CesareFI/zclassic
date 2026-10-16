@@ -748,6 +748,46 @@ static int live_custody_order(void)
     return failures;
 }
 
+/* Live: a descriptor the launcher left open without CLOEXEC must not reach the
+ * confined program. The shell tests the planted number: a redirect to an open
+ * descriptor succeeds, to a closed one it fails. */
+static int live_inherited_fd_closed(void)
+{
+    /* dash's redirect syntax takes one digit, so plant in 3..9 (no O_CLOEXEC:
+     * dup2 clears it, on purpose). */
+    int planted = -1;
+    int src = open("/dev/null", O_RDWR);
+    for (int fd = 3; src >= 0 && fd <= 9 && planted < 0; fd++)
+        if (fcntl(fd, F_GETFD) < 0 && dup2(src, fd) == fd)
+            planted = fd;
+    if (src >= 0)
+        close(src);
+    if (planted < 0)
+        return check(0, false, "inherited fd: plant a descriptor");
+    char script[160];
+    snprintf(script, sizeof script,
+             "if { :; } >&%d; then echo FD_STILL_OPEN; "
+             "else echo FD_CLOSED; fi", planted);
+    const char *const run[] = { "/bin/sh", "-c", script, NULL };
+    int failures = 0;
+    struct mesh_terminal_worker_config cfg;
+    struct mesh_terminal_worker w;
+    live_config(&cfg);
+    cfg.argv = run;
+    struct zcl_result r = mesh_terminal_worker_spawn(
+        &cfg, (int64_t)platform_time_wall_time_t(), &w);
+    failures = check(failures, r.ok, "inherited fd: spawn");
+    if (r.ok) {
+        char saw[256] = "";
+        bool closed = drain_until(&w, "FD_CLOSED", 5, NULL, saw, sizeof saw);
+        failures = check(failures, closed && !strstr(saw, "FD_STILL_OPEN"),
+                         "inherited fd: a launcher descriptor is closed before the shell runs");
+    }
+    mesh_terminal_worker_kill(&w);
+    close(planted);
+    return failures;
+}
+
 /* Live: 2 MiB of output under the service byte budget. */
 static int live_two_mib_output(void)
 {
@@ -969,6 +1009,7 @@ static int test_mesh_terminal_worker_platform_arm(void)
     failures += live_dynamic_argv();
     failures += live_orphan_descendant();
     failures += live_custody_order();
+    failures += live_inherited_fd_closed();
     failures += live_two_mib_output();
 
     /* ── live: input byte budget ───────────────────────────────────── */

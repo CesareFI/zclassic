@@ -19,6 +19,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <termios.h> /* struct winsize */
 #include <unistd.h>
@@ -288,6 +289,30 @@ static size_t tw_grant_rules(const struct mesh_terminal_worker_config *cfg,
     return n;
 }
 
+/* Pre-exit stage report: the parent names this failure from its own EOF read. */
+[[noreturn]] static void tw_fail(int stage_fd, uint8_t stage, int code)
+{
+    ssize_t reported = write(stage_fd, &stage, 1);
+    (void)reported;
+    _exit(code);
+}
+
+/* The confined program inherits only 0/1/2 (the pty slave) and the O_CLOEXEC
+ * staging pipe: anything else the launcher left open (a database handle, a
+ * socket, a pipe to the node) must not reach the shell. close_range(2) closes
+ * everything except stage_fd; where the kernel lacks it a bounded loop does. */
+static void tw_close_inherited(int keep)
+{
+    for (int upper = 0; upper < 2; upper++) {
+        unsigned lo = upper ? (unsigned)keep + 1u : 3u;
+        unsigned hi = upper ? ~0u : (unsigned)keep - 1u;
+        if (lo > hi || (long)syscall(SYS_close_range, lo, hi, 0u) == 0)
+            continue;
+        for (unsigned fd = lo; fd <= hi && fd < 65536u; fd++)
+            (void)close((int)fd);
+    }
+}
+
 /* The child half of spawn: never returns; stages failures by name. */
 static void tw_child(const struct mesh_terminal_worker_config *cfg,
                      const char *slave_path, int master, int stage_fd)
@@ -296,29 +321,19 @@ static void tw_child(const struct mesh_terminal_worker_config *cfg,
      * path ends in _exit. */
     close(master);
 
-    if (setsid() < 0)
-        goto tty_fail;
+    if (setsid() < 0) goto tty_fail;
     int slave = open(slave_path, O_RDWR);
-    if (slave < 0)
-        goto tty_fail;
+    if (slave < 0) goto tty_fail;
     /* The shell wants a controlling terminal for job control. */
-    if (ioctl(slave, TIOCSCTTY, NULL) < 0)
-        goto tty_fail;
+    if (ioctl(slave, TIOCSCTTY, NULL) < 0) goto tty_fail;
     struct winsize ws = { .ws_col = cfg->cols, .ws_row = cfg->rows };
-    if (ioctl(slave, TIOCSWINSZ, &ws) < 0)
-        goto tty_fail;
-    if (dup2(slave, STDIN_FILENO) < 0 || dup2(slave, STDOUT_FILENO) < 0 ||
-        dup2(slave, STDERR_FILENO) < 0)
-        goto tty_fail;
-    if (slave > STDERR_FILENO)
-        close(slave);
+    if (ioctl(slave, TIOCSWINSZ, &ws) < 0) goto tty_fail;
+    if (dup2(slave, STDIN_FILENO) < 0 || dup2(slave, STDOUT_FILENO) < 0 || dup2(slave, STDERR_FILENO) < 0) goto tty_fail;
+    if (slave > STDERR_FILENO) close(slave);
 
-    if (chdir(cfg->workdir) < 0) {
-        uint8_t stage = TW_STAGE_CHDIR;
-        ssize_t reported = write(stage_fd, &stage, 1); /* pre-exit stage report: the parent names this failure from its own EOF read */
-        (void)reported;
-        _exit(126);
-    }
+    tw_close_inherited(stage_fd);
+
+    if (chdir(cfg->workdir) < 0) tw_fail(stage_fd, TW_STAGE_CHDIR, 126);
 
     /* The grant IS the filesystem: the per-terminal workdir (the child's
      * cwd and HOME) plus the one granted binary (and, for an explicit argv,
@@ -329,14 +344,8 @@ static void tw_child(const struct mesh_terminal_worker_config *cfg,
         os_sandbox_terminal_worker_profile(rules, n_rules);
     /* An explicit argv may be dynamically linked: let ld.so map libraries
      * (file-backed PROT_EXEC mmap) while anonymous/mprotect exec stays killed. */
-    if (cfg->argv)
-        profile.seccomp_deny_exec_mmap = OS_SANDBOX_WX_FILE_EXEC;
-    if (!os_sandbox_enter(&profile).ok) {
-        uint8_t stage = TW_STAGE_CONFINEMENT;
-        ssize_t reported = write(stage_fd, &stage, 1); /* pre-exit stage report: the parent names this failure from its own EOF read */
-        (void)reported;
-        _exit(126);
-    }
+    if (cfg->argv) profile.seccomp_deny_exec_mmap = OS_SANDBOX_WX_FILE_EXEC;
+    if (!os_sandbox_enter(&profile).ok) tw_fail(stage_fd, TW_STAGE_CONFINEMENT, 126);
 
     /* Deliberately minimal environment: no PATH to leak a search order,
      * HOME/PWD pinned to the grant so no rc file outside it is read. */
@@ -348,20 +357,10 @@ static void tw_child(const struct mesh_terminal_worker_config *cfg,
     char *const *exec_argv = cfg->argv ? (char *const *)cfg->argv : default_argv;
     execve(tw_binary(cfg), exec_argv, envp);
 
-    {
-        uint8_t stage = TW_STAGE_EXEC;
-        ssize_t reported = write(stage_fd, &stage, 1); /* pre-exit stage report: the parent names this failure from its own EOF read */
-        (void)reported;
-    }
-    _exit(127);
+    tw_fail(stage_fd, TW_STAGE_EXEC, 127);
 
 tty_fail:
-    {
-        uint8_t stage = TW_STAGE_TTY;
-        ssize_t reported = write(stage_fd, &stage, 1); /* pre-exit stage report: the parent names this failure from its own EOF read */
-        (void)reported;
-    }
-    _exit(126);
+    tw_fail(stage_fd, TW_STAGE_TTY, 126);
 }
 
 static struct zcl_result mesh_terminal_worker_spawn_platform_arm(
