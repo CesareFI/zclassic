@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include "gate_capability_closure_priv.h"
 #include "lintc.h"
@@ -518,12 +519,93 @@ static int cgs_case_r(const struct ccs_fx *fx)
     return cgs_check(fx, "r", &cfg, 0, need, "R: an object whose source is absent is foreign, counted, and not graded");
 }
 
+/* A symlink to /proc/self/mem opens, then every read fails with EIO. */
+static int cgs_mem_reads_fail(void)
+{
+    FILE *f = fopen("/proc/self/mem", "r");
+    int broke;
+    if (!f)
+        return 0;
+    (void)fgetc(f);
+    broke = ferror(f) != 0;
+    fclose(f);
+    return broke;
+}
+
+static int cgs_skip_root(const char *label)
+{
+    if (geteuid() != 0)
+        return 0;
+    printf("  SKIP %s: running as root, chmod 000 does not deny the read\n", label);
+    return 1;
+}
+
+/* S. an object subdirectory that cannot be opened is FATAL: its objects were
+ * not scanned, so a clean verdict would be a guess. Q-like control: case D. */
+static int cgs_case_s(const struct ccs_fx *fx)
+{
+    struct ccg_cfg cfg;
+    char row[CCD_PATH], dir[CCD_PATH];
+    const char *const need[] = { "FATAL", "cannot open directory", "Permission denied", NULL };
+    int f;
+    if (cgs_skip_root("S: unreadable object subdirectory"))
+        return 0;
+    cgs_cfg(&cfg);
+    if (cgs_base(fx, "s", cgs_row(row, sizeof row, "fixture_src/declared_user.c", "CAP_NETWORK")) != 0
+        || cgs_unit(fx, "s", "fixture_src/declared_user.c", k_use, NULL) != 0)
+        return ccs_say(0, "S: fixture");
+    ccs_path(fx, "s/build/dev-obj/epochs/fx0/fixture_src", dir);
+    if (chmod(dir, 0) != 0)
+        return ccs_say(0, "S: chmod");
+    f = cgs_check(fx, "s", &cfg, 2, need, "S: an unopenable object subdirectory is FATAL, never an empty one");
+    return f + (chmod(dir, 0755) != 0);
+}
+
+/* T. a tracked source the ban cannot open is FATAL, never skipped. */
+static int cgs_case_t(const struct ccs_fx *fx)
+{
+    struct ccg_cfg cfg;
+    char src[CCD_PATH];
+    const char *const need[] = { "FATAL", "cannot scan fixture_src/raw_user.c", "Permission denied", NULL };
+    int f;
+    if (cgs_skip_root("T: unreadable source"))
+        return 0;
+    cgs_cfg(&cfg);
+    if (cgs_base(fx, "t", "") != 0
+        || ccs_put(fx, "t/fixture_src/raw_user.c", "long raw_use(void) { return sys" "call(0); }\n") != 0)
+        return ccs_say(0, "T: fixture");
+    ccs_path(fx, "t/fixture_src/raw_user.c", src);
+    if (chmod(src, 0) != 0)
+        return ccs_say(0, "T: chmod");
+    f = cgs_check(fx, "t", &cfg, 2, need, "T: an unreadable source cannot escape the raw syscall ban");
+    return f + (chmod(src, 0644) != 0);
+}
+
+/* U. a source that opens but fails to read is FATAL (ferror), never a clean file. */
+static int cgs_case_u(const struct ccs_fx *fx)
+{
+    struct ccg_cfg cfg;
+    char src[CCD_PATH];
+    const char *const need[] = { "FATAL", "cannot scan fixture_src/mem_user.c", "Input/output error", NULL };
+    if (!cgs_mem_reads_fail()) {
+        puts("  SKIP U: /proc/self/mem does not fail reads on this host");
+        return 0;
+    }
+    cgs_cfg(&cfg);
+    if (cgs_base(fx, "u", "") != 0 || ccs_put(fx, "u/fixture_src/seed.txt", "x\n") != 0)
+        return ccs_say(0, "U: fixture");
+    ccs_path(fx, "u/fixture_src/mem_user.c", src);
+    if (symlink("/proc/self/mem", src) != 0)
+        return ccs_say(0, "U: symlink");
+    return cgs_check(fx, "u", &cfg, 2, need, "U: a source that fails to read is FATAL, never clean");
+}
+
 static int cgs_cases(const struct ccs_fx *fx)
 {
     return cgs_case_a(fx) + cgs_case_b(fx) + cgs_case_c(fx) + cgs_case_d(fx) + cgs_case_e(fx) + cgs_case_f(fx) +
            cgs_case_g(fx) + cgs_case_h() + cgs_case_i(fx) + cgs_case_j(fx) + cgs_case_k(fx) + cgs_case_l() +
            cgs_case_m(fx) + cgs_case_n1(fx) + cgs_case_n2(fx) + cgs_case_o(fx) + cgs_case_p(fx) + cgs_case_q(fx) +
-           cgs_case_r(fx);
+           cgs_case_r(fx) + cgs_case_s(fx) + cgs_case_t(fx) + cgs_case_u(fx);
 }
 
 int check_capability_closure_selftest(void)

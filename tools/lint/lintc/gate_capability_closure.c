@@ -10,6 +10,7 @@
  */
 #define _POSIX_C_SOURCE 200809L
 #include <dirent.h>
+#include <errno.h>
 #include <regex.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -131,35 +132,64 @@ static void ccg_c_of(const char *obj, char *out, size_t cap)
         snprintf(out, cap, "%s", obj);
 }
 
-static int ccg_walk(const char *base, const char *rel, const char *suffix, struct ccd_map *out);
+/* ccg_walk result for a failure already reported to the gate's output (the
+ * remaining nonzero result, -1, is an allocation failure). */
+enum { CCG_REPORTED = 2 };
+
+static int ccg_walk_fail(const struct ccg_scan *s, const char *what, const char *path, int err)
+{
+    ccg_say(s, "check_capability_closure: FATAL " CCG_DASH " %s %s: %s\n", what, path,
+            err ? strerror(err) : "path too long");
+    return CCG_REPORTED;
+}
+
+static int ccg_walk(const struct ccg_scan *s, const char *base, const char *rel,
+                    const char *suffix, struct ccd_map *out);
 
 /* One directory entry: recurse into a directory, take a name with the suffix.
- * Symbolic links are not followed. */
-static int ccg_walk_entry(const char *base, const char *rel, const char *name, const char *suffix,
-                          struct ccd_map *out)
+ * Symbolic links are not followed. A name that cannot be pathed or typed is
+ * FATAL, never skipped: a skipped entry is an unscanned object. */
+static int ccg_walk_entry(const struct ccg_scan *s, const char *base, const char *rel,
+                          const char *name, const char *suffix, struct ccd_map *out)
 {
     char r[CCD_PATH], p[CCD_PATH];
     struct stat st;
     if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
         return 0;
     if (snprintf(r, sizeof r, "%s%s%s", rel, rel[0] ? "/" : "", name) >= (int)sizeof r
-        || snprintf(p, sizeof p, "%s/%s", base, r) >= (int)sizeof p || lstat(p, &st) != 0)
-        return 0;
+        || snprintf(p, sizeof p, "%s/%s", base, r) >= (int)sizeof p)
+        return ccg_walk_fail(s, "path too long under", base, 0);
+    if (lstat(p, &st) != 0)
+        return ccg_walk_fail(s, "cannot stat", p, errno);
     if (S_ISDIR(st.st_mode))
-        return ccg_walk(base, r, suffix, out);
+        return ccg_walk(s, base, r, suffix, out);
     return ccg_has_suffix(name, suffix) ? ccd_map_put(out, r, "") : 0;
 }
 
-/* Collects the base-relative names under base/rel that end in suffix. */
-static int ccg_walk(const char *base, const char *rel, const char *suffix, struct ccd_map *out)
+/* Collects the base-relative names under base/rel that end in suffix. An
+ * open, stat, path or readdir error is FATAL, never an empty directory. */
+static int ccg_walk(const struct ccg_scan *s, const char *base, const char *rel,
+                    const char *suffix, struct ccd_map *out)
 {
     char dir[CCD_PATH];
     DIR *d;
     int rc = 0;
-    if (snprintf(dir, sizeof dir, "%s/%s", base, rel) >= (int)sizeof dir || !(d = opendir(dir)))
-        return 0;
-    for (struct dirent *e; rc == 0 && (e = readdir(d));)
-        rc = ccg_walk_entry(base, rel, e->d_name, suffix, out);
+    if (snprintf(dir, sizeof dir, "%s/%s", base, rel) >= (int)sizeof dir)
+        return ccg_walk_fail(s, "path too long under", base, 0);
+    if (!(d = opendir(dir)))
+        return ccg_walk_fail(s, "cannot open directory", dir, errno);
+    for (;;) {
+        errno = 0;
+        struct dirent *e = readdir(d);
+        if (!e) {
+            if (errno)
+                rc = ccg_walk_fail(s, "cannot read directory", dir, errno);
+            break;
+        }
+        rc = ccg_walk_entry(s, base, rel, e->d_name, suffix, out);
+        if (rc != 0)
+            break;
+    }
     closedir(d);
     return rc;
 }
@@ -240,10 +270,12 @@ static int ccg_objects(struct ccg_scan *s)
                    "  re-run. Never treat an absent object tree as zero violations.\n");
         return 2;
     }
-    rc = ccg_walk(s->epoch, "", ".o", &rel);
+    rc = ccg_walk(s, s->epoch, "", ".o", &rel);
     for (size_t i = 0; rc == 0 && i < rel.n; i++)
         rc = ccg_grade_object(s, rel.ent[i].key);
     ccd_map_free(&rel);
+    if (rc == CCG_REPORTED)
+        return 2;
     if (rc != 0)
         return ccg_fatal(s, "out of memory scanning", s->epoch);
     ccg_foreign_report(s);
@@ -331,17 +363,23 @@ static int ccg_nm(struct ccg_scan *s)
     return rc ? 2 : 0;
 }
 
-static void ccg_coverage_scan(struct ccg_scan *s)
+/* -1 when a name cannot be recorded (out of memory). Counts first: a failed
+ * add must never leave the unobserved total under-counted. */
+static int ccg_coverage_scan(struct ccg_scan *s)
 {
     for (size_t i = 0; i < s->mods.raw.n; i++) {
         const char *path = s->mods.raw.ent[i].key;
         if (!ccg_is_file(s->root, path))
             continue;
-        if (!ccd_coverage_applicable(s->cfg->os, path))
+        if (!ccd_coverage_applicable(s->cfg->os, path)) {
             s->c.excluded++;
-        else if (!ccd_map_get(&s->compiled, path) && ccg_list_add(&s->unobs, path) == 0)
+        } else if (!ccd_map_get(&s->compiled, path)) {
             s->c.unobserved++;
+            if (ccg_list_add(&s->unobs, path) != 0)
+                return -1;
+        }
     }
+    return 0;
 }
 
 /* A partial epoch (a z23-dev-only rebuild) holds thousands of objects yet
@@ -349,7 +387,8 @@ static void ccg_coverage_scan(struct ccg_scan *s)
  * a scan that did not happen. */
 static int ccg_coverage_floor(struct ccg_scan *s)
 {
-    ccg_coverage_scan(s);
+    if (ccg_coverage_scan(s) != 0)
+        return ccg_fatal(s, "out of memory recording unobserved rows in", s->epoch);
     if (s->c.unobserved <= s->cfg->baseline)
         return 0;
     ccg_say(s, "check_capability_closure: UNPROVEN " CCG_DASH " %d module_capabilities.def\n"
@@ -539,30 +578,50 @@ static void ccg_stale_baseline(struct ccg_scan *s)
 static const char k_ccg_raw[] = "(^|[^A-Za-z0-9_])syscall\\(|int[[:space:]]+\\$0x80|svc[[:space:]]+#"
                                 "|\"[[:space:]]*syscall[[:space:]\\\\]";
 
-static void ccg_ban_file(struct ccg_scan *s, const regex_t *re, const char *rel)
+struct ccg_ban {
+    struct ccg_scan *s;
+    const regex_t *re;
+    const char *rel;
+    size_t no;
+    int hit;
+};
+
+/* lc_each_line callback: one source line, newline stripped, against the ban. */
+static int ccg_ban_line(void *vctx, const char *raw, size_t len)
 {
-    char path[CCD_PATH], *line = NULL;
-    size_t cap = 0, no = 0;
-    ssize_t n;
-    int hit = 0;
-    FILE *f;
-    if (snprintf(path, sizeof path, "%s/%s", s->root, rel) >= (int)sizeof path || !(f = fopen(path, "r")))
-        return;
-    while ((n = getline(&line, &cap, f)) >= 0) {
-        no++;
-        if (n > 0 && line[n - 1] == '\n')
-            line[n - 1] = '\0';
-        if (regexec(re, line, 0, NULL, 0) != 0)
-            continue;
-        if (!hit++)
-            ccg_say(s, "check_capability_closure: VIOLATION " CCG_DASH " %s reaches the kernel through a\n"
-                       "  raw syscall or inline-asm trap with no CAP_PRIVILEGE declaration:\n", rel);
-        ccg_say(s, "    %zu:%s\n", no, line);
+    struct ccg_ban *b = vctx;
+    char *line = zcl_strdup(raw, "ccg_ban line");
+    if (!line)
+        return -1;
+    b->no++;
+    if (len > 0 && line[len - 1] == '\n')
+        line[len - 1] = '\0';
+    if (regexec(b->re, line, 0, NULL, 0) == 0) {
+        if (!b->hit++)
+            ccg_say(b->s, "check_capability_closure: VIOLATION " CCG_DASH " %s reaches the kernel through a\n"
+                          "  raw syscall or inline-asm trap with no CAP_PRIVILEGE declaration:\n", b->rel);
+        ccg_say(b->s, "    %zu:%s\n", b->no, line);
     }
     free(line);
-    fclose(f);
-    s->c.syscall += hit != 0;
+    return 0;
 }
+
+/* 0 scanned, 2 FATAL: an unreadable tracked source must never escape the ban. */
+static int ccg_ban_file(struct ccg_scan *s, const regex_t *re, const char *rel)
+{
+    char path[CCD_PATH];
+    struct ccg_ban b = { s, re, rel, 0, 0 };
+    if (snprintf(path, sizeof path, "%s/%s", s->root, rel) >= (int)sizeof path)
+        return ccg_walk_fail(s, "path too long under", s->root, 0);
+    if (lc_each_line(path, ccg_ban_line, &b, 0) != 0) {
+        ccg_say(s, "check_capability_closure: FATAL " CCG_DASH " cannot scan %s for raw syscalls: %s\n",
+                rel, strerror(errno));
+        return 2;
+    }
+    s->c.syscall += b.hit != 0;
+    return 0;
+}
+
 
 /* Tracked C sources outside vendor/; a tree without a usable index is walked.
  * 1 when a termination signal arrived, -1 when out of memory. */
@@ -580,14 +639,14 @@ static int ccg_sources(const struct ccg_scan *s, struct ccg_list *out)
     if (rc > 0)
         return 1;
     if (rc == 0 && out->n == 0)
-        rc = ccg_walk(s->root, "", ".c", &walked);
+        rc = ccg_walk(s, s->root, "", ".c", &walked);
     for (size_t i = 0; rc == 0 && i < walked.n; i++) {
         const char *k = walked.ent[i].key;
         if (strncmp(k, "build/", 6) && strncmp(k, "vendor/", 7) && strncmp(k, ".git/", 5))
             rc = ccg_list_add(out, k);
     }
     ccd_map_free(&walked);
-    return rc < 0 ? -1 : 0;
+    return rc < 0 ? -1 : rc == CCG_REPORTED ? 2 : 0;
 }
 
 /* Item 5: files that declared CAP_PRIVILEGE on any target have told a reviewer
@@ -600,7 +659,7 @@ static int ccg_syscall_ban(struct ccg_scan *s)
     for (size_t i = 0; rc == 0 && i < src.n; i++) {
         const char *uni = ccd_map_get(&s->mods.uni, src.s[i]);
         if (!uni || !ccd_grants(uni, "CAP_PRIVILEGE"))
-            ccg_ban_file(s, &re, src.s[i]);
+            rc = ccg_ban_file(s, &re, src.s[i]);
     }
     regfree(&re);
     ccg_list_free(&src);

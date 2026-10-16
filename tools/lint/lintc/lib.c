@@ -86,6 +86,51 @@ int each_zpath(const char *cmd, int (*fn)(const char *, void *), void *ctx)
     return each_zpath_st(cmd, 0, fn, ctx);
 }
 
+/* Checked line reader. Calls cb(ctx, line, len) for every line of path
+ * (len includes any trailing newline). cb returns 0 to continue, 1 to stop
+ * early successfully, anything else is a callback error. Returns 0 when
+ * read to EOF or stopped, 1 when the file is absent (only when missing_ok
+ * and errno==ENOENT), 2 FATAL (message names path and strerror) on an
+ * open failure, a read error (ferror) or a callback error. On 2 errno is
+ * the open or read error. */
+int lc_each_line(const char *path,
+                 int (*cb)(void *ctx, const char *line, size_t len),
+                 void *ctx, int missing_ok)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        int e = errno;
+        if (missing_ok && e == ENOENT)
+            return 1;
+        fprintf(stderr, "z23-lint: cannot open %s: %s\n", path, strerror(e));
+        errno = e;
+        return 2;
+    }
+    char *buf = NULL;
+    size_t cap = 0;
+    int rc = 0;
+    ssize_t n;
+    while (rc == 0 && (n = getline(&buf, &cap, f)) >= 0) {
+        int r = cb(ctx, buf, (size_t)n);
+        if (r == 1)
+            break;
+        if (r != 0) {
+            fprintf(stderr, "z23-lint: line handler failed reading %s\n", path);
+            rc = 2;
+        }
+    }
+    if (rc == 0 && ferror(f)) {
+        int e = errno;
+        fprintf(stderr, "z23-lint: read failed: %s: %s\n", path, strerror(e));
+        rc = 2;
+    }
+    int saved = errno;
+    free(buf);
+    fclose(f);
+    errno = saved; /* callers may report why a FATAL 2 happened */
+    return rc;
+}
+
 /* ── native git index (".git/index", DIRC) enumeration ──────────────────
  * The no-subprocess successor to each_zpath("git ls-files -z ..."). Reads
  * the index file directly and invokes fn(path, stage, ctx) per entry in
