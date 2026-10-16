@@ -94,7 +94,62 @@ static int abr_unit_manifest(const char *tmp)
         return abr_st_fail("the manifest does not list the four files of the fake bundle");
     if ((rc = abr_pathf(gm, "%s/content.g", tmp)) || (rc = abr_pathf(bm, "%s/content.b", tmp)))
         return rc;
+    char *msg = NULL;
+    rc = abr_compare_captured(gm, gm, &msg);
+    free(msg);
+    if (rc != ABR_OK)
+        return abr_st_fail("the manifest compare REJECTED two identical manifests");
     return abr_st_tamper(gm, bm);
+}
+
+/* Writes an executable stub script (body is the sh text after the shebang). */
+static int abr_unit_stub(const char *tmp, const char *name, const char *body, char exe[ABR_PATH])
+{
+    char text[256];
+    int rc = abr_pathf(exe, "%s/%s", tmp, name);
+    if (rc || (rc = abr_pathf(text, "#!/bin/sh\n%s\n", body))
+        || (rc = abr_write_file(exe, text, strlen(text))))
+        return rc;
+    return chmod(exe, 0755) == 0 ? ABR_OK : abr_fatal("cannot chmod %s", exe);
+}
+
+/* Exit status, and the --bin non-empty-output rule without --probe-expect. */
+static int abr_unit_bin(const char *tmp)
+{
+    struct abr_ctx c = { .app = "x" };
+    char exe[ABR_PATH];
+    int rc = abr_unit_stub(tmp, "exit3.sh", "echo hello-bundle; exit 3", exe);
+    if (rc)
+        return rc;
+    if (abr_probe(&c, exe, "/dev/null", NULL) != ABR_FAIL)
+        return abr_st_fail("the launch probe ACCEPTED a nonzero exit with the right output");
+    c.bin = exe;
+    c.probe_expect = ABR_PROBE_EXPECT;
+    if (abr_probe(&c, exe, "/dev/null", NULL) != ABR_FAIL)
+        return abr_st_fail("the --bin probe ACCEPTED a nonzero exit with the right output");
+    c.probe_expect = NULL;
+    if (abr_probe(&c, exe, "/dev/null", NULL) != ABR_FAIL)
+        return abr_st_fail("the --bin probe ACCEPTED a nonzero exit without --probe-expect");
+    if ((rc = abr_unit_stub(tmp, "hello.sh", "echo hello-bundle", exe)))
+        return rc;
+    c.bin = exe;
+    c.probe_expect = "absent-token";
+    if (abr_probe(&c, exe, "/dev/null", NULL) != ABR_FAIL)
+        return abr_st_fail("the --bin probe ACCEPTED output without the expected string");
+    c.probe_expect = ABR_PROBE_EXPECT;
+    if (abr_probe(&c, exe, "/dev/null", NULL) != ABR_OK)
+        return abr_st_fail("the --bin probe rejected output containing the expected string");
+    c.probe_expect = NULL;
+    if ((rc = abr_unit_stub(tmp, "silent.sh", "exit 0", exe)))
+        return rc;
+    c.bin = exe;
+    if (abr_probe(&c, exe, "/dev/null", NULL) != ABR_FAIL)
+        return abr_st_fail("the --bin probe ACCEPTED empty output without --probe-expect");
+    if ((rc = abr_unit_stub(tmp, "noisy.sh", "echo anything", exe)))
+        return rc;
+    c.bin = exe;
+    return abr_probe(&c, exe, "/dev/null", NULL) == ABR_OK
+        ? ABR_OK : abr_st_fail("the --bin probe rejected non-empty output without --probe-expect");
 }
 
 static int abr_unit_probe(const char *tmp)
@@ -114,10 +169,7 @@ static int abr_unit_probe(const char *tmp)
         return abr_st_fail("the launch probe ACCEPTED a wrong probe value");
     if (abr_probe(&c, exe, right, NULL) != ABR_OK)
         return abr_st_fail("the launch probe now rejects a CORRECT probe value");
-    c.bin = exe;
-    c.probe_expect = "absent-token";
-    return abr_probe(&c, exe, right, NULL) == ABR_FAIL
-        ? ABR_OK : abr_st_fail("the --bin probe ACCEPTED output without the expected string");
+    return abr_unit_bin(tmp);
 }
 
 static int abr_unit_mode(void)
@@ -133,7 +185,7 @@ static int abr_unit_mode(void)
 static int abr_unit_run(void)
 {
     char tmp[ABR_PATH];
-    const char *base = env_or("TMPDIR", "test-tmp");
+    const char *base = env_or("TMPDIR", ABR_TMP_DEFAULT);
     int rc = csr_mkdirs(base) != 0 ? abr_fatal("could not create a temp dir")
                                    : abr_pathf(tmp, "%s/zcl-app-bundle-unit.XXXXXX", base);
     if (rc || !mkdtemp(tmp))

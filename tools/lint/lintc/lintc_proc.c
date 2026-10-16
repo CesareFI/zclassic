@@ -62,6 +62,8 @@ static void lcp_child(const struct lcp_spec *s, int wfd)
         int in = open(s->stdin_path, O_RDONLY);
         if (in < 0 || dup2(in, 0) < 0)
             _exit(127);
+        if (in != 0)
+            close(in);
     }
     lcp_redirect(s->mode, wfd);
     execvp(s->argv[0], s->argv);

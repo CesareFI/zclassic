@@ -240,15 +240,15 @@ static void abr_pass(const struct abr_ctx *c)
 static int abr_work(struct abr_ctx *c, int selftest)
 {
     int rc;
-    const char *tmpdir = env_or("TMPDIR", "test-tmp");
-    if (csr_mkdirs(tmpdir) != 0 || abr_pathf(c->tmp, "%s/zcl-app-bundle-repro.XXXXXX", tmpdir))
+    char tmpl[ABR_PATH];
+    const char *tmpdir = env_or("TMPDIR", ABR_TMP_DEFAULT);
+    if (csr_mkdirs(tmpdir) != 0 || abr_pathf(tmpl, "%s/zcl-app-bundle-repro.XXXXXX", tmpdir))
         return abr_fatal("could not create a temp dir");
     if (lsc_install() != 0)
         return abr_fatal("could not install the signal handlers");
-    if (!mkdtemp(c->tmp)) {
-        c->tmp[0] = '\0';
+    if (!mkdtemp(tmpl))
         return abr_fatal("could not create a temp dir");
-    }
+    memcpy(c->tmp, tmpl, sizeof c->tmp);
     rc = selftest ? abr_selftest_darwin(c) : abr_prove(c);
     if (rc == ABR_OK && !selftest)
         abr_pass(c);

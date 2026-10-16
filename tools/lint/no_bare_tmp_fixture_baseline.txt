@@ -145,6 +145,7 @@ tools/command/native_zcode_source_bundle_command.c 1
 tools/command/native_zcode_work_command.c 1
 tools/command/native_zcode_work_run_command.c 1
 tools/command/native_zcode_work_run_preflight.c 1
+tools/lint/lintc/gate_app_bundle_reproducible_priv.h 1
 tools/lint/lintc/gate_authority_fences.c 3
 tools/lint/lintc/gate_blocker_escape.c 1
 tools/lint/lintc/gate_blocker_remedy.c 2

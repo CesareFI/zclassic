@@ -19,6 +19,7 @@
 #define ABR_PATH 4096
 #define ABR_NAME 256
 #define ABR_GRACE_MS 2000
+#define ABR_TMP_DEFAULT "/tmp" /* scratch root when TMPDIR is unset */
 
 /* Step results; ABR_SIG means a termination signal stopped a child and the
  * main path must clean up and re-raise it. */
