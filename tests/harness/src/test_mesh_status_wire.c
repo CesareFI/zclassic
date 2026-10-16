@@ -410,6 +410,29 @@ static int mpl_case_absent_and_two(const char *dir)
                        ida, 16) == 0);
         json_free(&doc);
 
+        /* (d) corrupt current link: the row must report what the read
+         * found ("corrupt"), never an empty prefix — an empty id is a
+         * fact only for OK/MISSING slot reads (plugin_store.h contract),
+         * and surfacing nothing here is the wrong fact this block exists
+         * to avoid. */
+        snprintf(home, sizeof(home), "%s/plugins_corrupt", dir);
+        mpl_gen_id(ida, 7);
+        ASSERT(mpl_store_plugin(home, "alpha", ida, NULL));
+        {
+            char linkp[PATH_MAX];
+            snprintf(linkp, sizeof(linkp),
+                     "%s/.z23/plugins/alpha/current", home);
+            unlink(linkp);
+            ASSERT(symlink("bogus-target", linkp) == 0);
+        }
+        mesh_status_plugins_read(home, &plugins);
+        ASSERT(plugins.available);
+        ASSERT_EQ(plugins.count, 1u);
+        ASSERT_EQ(plugins.listed, 1u);
+        ASSERT_STR_EQ(plugins.items[0].name, "alpha");
+        ASSERT_STR_EQ(plugins.items[0].current, "corrupt");
+        ASSERT_STR_EQ(plugins.items[0].last_good, "");
+
     } TEST_END
     return failures;
 }

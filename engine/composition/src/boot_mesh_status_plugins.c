@@ -40,6 +40,21 @@ static void plugins_prefix(char out[MESH_STATUS_PLUGIN_PREFIX + 1],
     out[n] = '\0';
 }
 
+/* An empty id is a fact only when the slot read said OK or MISSING
+ * (plugin_store.h); an unreadable or corrupt read must not surface as an
+ * empty prefix — report what the read actually found. */
+static void plugins_prefix_state(char out[MESH_STATUS_PLUGIN_PREFIX + 1],
+                                 const char *id,
+                                 enum plugin_slot_state state)
+{
+    if (state == PLUGIN_SLOT_UNREADABLE || state == PLUGIN_SLOT_CORRUPT) {
+        snprintf(out, MESH_STATUS_PLUGIN_PREFIX + 1, "%s",
+                 plugin_slot_state_name(state));
+        return;
+    }
+    plugins_prefix(out, id);
+}
+
 void mesh_status_plugins_read(const char *home,
                               struct mesh_status_plugins *out)
 {
@@ -68,8 +83,10 @@ void mesh_status_plugins_read(const char *home,
     for (size_t i = 0; i < out->listed; i++) {
         snprintf(out->items[i].name, sizeof(out->items[i].name), "%s",
                  infos[i].name);
-        plugins_prefix(out->items[i].current, infos[i].current);
-        plugins_prefix(out->items[i].last_good, infos[i].last_good);
+        plugins_prefix_state(out->items[i].current, infos[i].current,
+                             infos[i].current_state);
+        plugins_prefix_state(out->items[i].last_good, infos[i].last_good,
+                             infos[i].last_good_state);
     }
     plugin_store_list_free(infos, count);
 }
