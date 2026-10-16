@@ -867,15 +867,27 @@ static int test_integrity_ap_pair_check_table(void)
     bad.read_ok = false;
     struct ap_pair_identity ovl = a;
     ovl.overlay_active = true;
-    struct ap_pair_identity aba = pair_id(100, 0xBB, 7);   /* same height+gen, new hash */
+    struct ap_pair_identity changed_hash = pair_id(100, 0xBB, 7);   /* same height+gen, new hash */
     struct ap_pair_identity gen = pair_id(100, 0xAA, 8);
     struct ap_pair_identity mov = pair_id(101, 0xAA, 7);
     struct ap_pair_identity h99 = pair_id(99, 0xAA, 7);
     struct ap_pair_identity nohash = pair_id(100, 0, 7);
     struct ap_pair_identity reorg = pair_id(100, 0xCC, 7);
     struct ap_pair_identity h99nohash = pair_id(99, 0, 7);
+    struct ap_pair_identity zero_hash = nohash;
+    zero_hash.has_tip_hash = true; /* present bytes, not an absent hash */
     const struct pair_case cases[] = {
         { "all equal with hashes", {a, a, a, a}, -1, AP_PAIR_COMPARABLE },
+        { "stable unequal side-local generations", {a, gen, a, gen}, -1, AP_PAIR_COMPARABLE },
+        { "present zero hash", {zero_hash, zero_hash, zero_hash, zero_hash}, -1,
+          AP_PAIR_COMPARABLE },
+        { "present zero hash versus absent", {zero_hash, nohash, zero_hash, nohash}, -1,
+          AP_PAIR_BRANCH_UNKNOWN },
+        /* A hidden A->B->A with unchanged/reused generation has these same
+         * endpoints. Only the caller's producer guarantees can exclude it. */
+        { "ABA limitation: indistinguishable endpoints", {a, a, a, a}, -1,
+          AP_PAIR_COMPARABLE },
+
         { "read_ok false auth_before", {bad, a, a, a}, -1, AP_PAIR_READ_ERROR },
         { "read_ok false proj_before", {a, bad, a, a}, -1, AP_PAIR_READ_ERROR },
         { "read_ok false auth_after", {a, a, bad, a}, -1, AP_PAIR_READ_ERROR },
@@ -885,18 +897,19 @@ static int test_integrity_ap_pair_check_table(void)
         { "NULL auth_after", {a, a, a, a}, 2, AP_PAIR_READ_ERROR },
         { "NULL proj_after", {a, a, a, a}, 3, AP_PAIR_READ_ERROR },
         { "overlay active", {a, ovl, a, a}, -1, AP_PAIR_OVERLAY_ACTIVE },
-        { "ABA tip hash changed", {a, a, aba, a}, -1, AP_PAIR_MOVED },
-        { "ABA on projection", {a, a, a, aba}, -1, AP_PAIR_MOVED },
+        { "authority final hash changed", {a, a, changed_hash, a}, -1, AP_PAIR_MOVED },
+        { "projection final hash changed", {a, a, a, changed_hash}, -1, AP_PAIR_MOVED },
         { "generation bump", {a, a, a, gen}, -1, AP_PAIR_MOVED },
         { "height moved", {a, a, mov, a}, -1, AP_PAIR_MOVED },
         { "hash appeared mid-window", {a, nohash, a, a}, -1, AP_PAIR_MOVED },
+        { "hash disappeared mid-window", {a, a, a, nohash}, -1, AP_PAIR_MOVED },
         { "height mismatch", {a, h99, a, h99}, -1, AP_PAIR_HEIGHT_MISMATCH },
         { "projection lacks hash", {a, nohash, a, nohash}, -1, AP_PAIR_BRANCH_UNKNOWN },
         { "authority lacks hash", {nohash, a, nohash, a}, -1, AP_PAIR_BRANCH_UNKNOWN },
         { "equal height different hash", {a, reorg, a, reorg}, -1, AP_PAIR_BRANCH_MISMATCH },
         { "overlay beats height mismatch", {ovl, h99, ovl, h99}, -1, AP_PAIR_OVERLAY_ACTIVE },
         { "read error beats overlay", {bad, ovl, a, a}, -1, AP_PAIR_READ_ERROR },
-        { "moved beats branch unknown", {a, nohash, aba, nohash}, -1, AP_PAIR_MOVED },
+        { "moved beats branch unknown", {a, nohash, changed_hash, nohash}, -1, AP_PAIR_MOVED },
         { "moved beats height mismatch", {a, h99, mov, h99}, -1, AP_PAIR_MOVED },
         { "height mismatch beats branch unknown", {a, h99nohash, a, h99nohash}, -1,
           AP_PAIR_HEIGHT_MISMATCH },

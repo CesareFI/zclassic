@@ -1,24 +1,28 @@
 /* Copyright 2026 Rhett Creighton - Apache License 2.0
  *
- * authority_projection_pair — PURE contract deciding whether an
- * authority (coins_kv) snapshot and a projection (utxos) snapshot may be
- * compared as the SAME chain state by authority_projection_audit.
+ * authority_projection_pair — PURE endpoint-predicate classifier.
+ * COMPARABLE means only that the supplied identities satisfy the checks below;
+ * it does not prove common capture, snapshot coherence or ABA exclusion.
+ * No I/O, globals or locks; this helper is not wired into any service.
  *
- * Each side is sampled twice (before and after the recompute window). The
- * pair is comparable only if both reads succeeded, no overlay is active, no
- * side moved across the window (height, tip hash, generation), the two sides
- * agree on height, and both carry a tip hash that is byte-identical (so an
- * equal-height pair on different branches is never compared).
+ * Caller prerequisites, not established by this function:
+ * - read_ok certifies successful reads and valid, available height/generation
+ *   fields. Zero generation may be valid, but must not mean unavailable.
+ *   Hash presence is represented only by has_tip_hash, not its byte contents.
+ * - Both sides use one explicitly agreed frontier convention and hash binding.
+ *   This helper chooses neither last-applied versus next-unapplied height nor
+ *   the corresponding block. Actual production semantics remain OPEN.
+ * - Scanned rows and metadata belong to the claimed pinned snapshots, and
+ *   before/after samples bracket the scans.
+ * - Each side's generation changes on every relevant mutation, including
+ *   reorg/reversal, without reuse or wrap within the observation window.
+ *   Generations are side-local and need not equal each other.
  *
- * No I/O, no globals, no locks: unit-testable and not wired into any service.
- *
- * LIVE STATUS: AP_PAIR_COMPARABLE is UNREACHABLE live until (OPEN follow-ups)
- *   1. the projection cursor records its block hash in the same transaction
- *      as the mirror sync, and
- *   2. the authority exposes a reorg-bound identity (tip hash for its applied
- *      height).
- * Until both land, live callers can only build has_tip_hash=false identities,
- * so live verdicts are AP_PAIR_BRANCH_UNKNOWN BY DESIGN. */
+ * A hidden A->B->A with identical endpoint identities cannot be detected here.
+ * LIVE STATUS: no runtime acceptance is claimed. OPEN producer work includes
+ * transactional projection branch identity, authority identity bound to the
+ * durable frontier, and the snapshot/generation guarantees above. Missing
+ * branch hashes yield BRANCH_UNKNOWN only when no earlier rule wins. */
 
 #ifndef ZCL_SERVICES_AUTHORITY_PROJECTION_PAIR_H
 #define ZCL_SERVICES_AUTHORITY_PROJECTION_PAIR_H
