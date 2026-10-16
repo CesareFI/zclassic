@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include "gate_accel_oracle_pinned_priv.h"
 #include "lintc.h"
@@ -32,10 +33,14 @@ struct aops_file { const char *path; const char *text; };
 
 #define AOPS_SHA "core/modules/crypto/src/sha.c"
 #define AOPS_FAST "core/modules/crypto/src/fast_avx.c"
+#define AOPS_LATE "core/modules/crypto/src/late_priv.h"
 #define AOPS_HW "platform/modules/util/src/hw_profile.c"
 #define AOPS_REG "tools/lint/accel_oracle_registry.txt"
 #define AOPS_CAT "tools/dev/test_group_catalog.def"
 
+static const char k_aops_sha_late[] =
+    "#include \"crypto/fast.h\"\n#include \"sha_priv.h\"\n#include \"late_priv.h\"\n"
+    "int sha_digest(int x) {\n    return fast_hash(x);\n}\n";
 static const char k_aops_reg_sha[] =
     "# registry\n" AOPS_SHA " tests/sha_oracle.c sha_group\n";
 static const char k_aops_reg_full[] =
@@ -229,6 +234,87 @@ static int aops_case(const struct aops_case *k)
     return 0;
 }
 
+/* Runs the gate on the current fixture and checks exit code and needle. */
+static int aops_expect(const char *name, int want_rc, const char *needle)
+{
+    char out[AOPS_OUT];
+    int rc = aops_run(&k_aops_cfg, out, sizeof out);
+    if (rc != want_rc) {
+        fprintf(stderr, "%s", out);
+        return aops_fail(name, "unexpected exit code");
+    }
+    if (!strstr(out, needle)) {
+        fprintf(stderr, "%s", out);
+        return aops_fail(name, "expected message missing");
+    }
+    return 0;
+}
+
+/* A symlink to /proc/self/mem opens, then every read
+ * fails with EIO. Returns 0 when this host really behaves so, else 1. */
+static int aops_mem_probe(void)
+{
+    FILE *f = fopen("/proc/self/mem", "r");
+    int broke;
+    if (!f)
+        return 1;
+    (void)fgetc(f);
+    broke = ferror(f) != 0;
+    fclose(f);
+    return broke ? 0 : 1;
+}
+
+/* Swaps the file at path for an empty directory (opens, then read fails). */
+static int aops_swap_dir(const char *path)
+{
+    return unlink(path) != 0 ? -1 : mkdir(path, 0755);
+}
+
+static int aops_restore_dir(const char *path)
+{
+    return rmdir(path) != 0 ? -1 : aops_put_base(path);
+}
+
+/* Unreadable-file cases that a text mutation cannot express. Every case
+ * runs so that one red case does not hide the others. */
+static int aops_fs_cases(void)
+{
+    static const char orc[] = "tests/sha_oracle.c";
+    int bad = 0;
+    if (geteuid() == 0) {
+        fprintf(stderr, "check_accel_oracle_pinned: SKIP permission-denied "
+                "case: running as root, chmod 000 does not deny the read\n");
+    } else {
+        if (chmod(orc, 0) != 0)
+            return aops_fail("unreadable oracle", "cannot chmod the fixture");
+        bad |= aops_expect("an unreadable oracle (chmod 000)", 2,
+                           "tests/sha_oracle.c: Permission denied");
+        if (chmod(orc, 0644) != 0)
+            return aops_fail("unreadable oracle", "cannot restore the mode");
+    }
+    if (aops_swap_dir(orc) != 0)
+        return aops_fail("oracle that fails to read", "cannot swap in a directory");
+    bad |= aops_expect("an oracle that opens but fails to read", 2,
+                       "tests/sha_oracle.c: Is a directory");
+    if (aops_restore_dir(orc) != 0)
+        return aops_fail("oracle that fails to read", "cannot restore the fixture");
+    if (aops_mem_probe() != 0) {
+        fprintf(stderr, "check_accel_oracle_pinned: SKIP ISA read-error case: "
+                "/proc/self/mem does not fail reads on this host\n");
+        return bad;
+    }
+    /* An untracked private header the sha.c scan list picks up (core/ seed
+     * reads only see tracked files): it opens, then every read fails. */
+    if (csr_write(AOPS_SHA, k_aops_sha_late) != 0
+        || symlink("/proc/self/mem", AOPS_LATE) != 0)
+        return aops_fail("header that fails to read", "cannot build the fixture");
+    bad |= aops_expect("a scanned header that opens but fails to read", 2,
+                       "FATAL — grep failed (exit 2) for: " AOPS_LATE);
+    if (unlink(AOPS_LATE) != 0 || aops_put_base(AOPS_SHA) != 0)
+        return aops_fail("header that fails to read", "cannot restore the fixture");
+    return bad;
+}
+
 static int aops_cases(void)
 {
     for (size_t i = 0; i < sizeof k_aops_cases / sizeof k_aops_cases[0]; i++) {
@@ -236,7 +322,7 @@ static int aops_cases(void)
         if (rc || lsc_pending())
             return rc;
     }
-    return 0;
+    return aops_fs_cases();
 }
 
 static int aops_in_fixture(const char *dir)
@@ -279,6 +365,6 @@ int check_accel_oracle_pinned_selftest(void)
              "malformed row, stale row, missing marker, unregistered group, "
              "unwired oracle, static-only oracle, unreached row, row without ISA dispatch, "
              "missing oracle file, hw_profile.c skip, ordered diagnostics, collapsed floors, "
-             "missing registry)");
+             "missing registry, unreadable oracle, read-failing oracle, read-failing ISA file)");
     return rc;
 }

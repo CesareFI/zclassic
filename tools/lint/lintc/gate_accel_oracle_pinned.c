@@ -287,9 +287,16 @@ static int aop_add_impls(struct aop_ent *e, const char *libdir, const char *stem
     int rc = 0;
     if (ovf(snprintf(pat, sizeof pat, "%s/src/%s*.c", libdir, stem), sizeof pat))
         return 2;
-    if (glob(pat, 0, NULL, &g) != 0) {
+    int gr = glob(pat, 0, NULL, &g);
+    if (gr == GLOB_NOMATCH) {
         globfree(&g);
         return 0;
+    }
+    if (gr != 0) {
+        globfree(&g);
+        fprintf(stderr, "z23-lint: glob failed for %s (%s)\n", pat,
+                gr == GLOB_NOSPACE ? "out of memory" : "read error");
+        return 2;
     }
     for (size_t i = 0; rc == 0 && i < g.gl_pathc; i++)
         if (aop_is_file(g.gl_pathv[i]))
@@ -410,27 +417,38 @@ static int aop_build_closure(struct aop_ctx *c)
 
 /* ── leg 1b: ISA-dispatched closure members ────────────────────────────── */
 
-/* 1 when any line of the listed files matches the ISA pattern; a read
- * failure is FATAL (never a quiet "no match"), as a grep error was. */
+struct aop_isa_ctx { const regex_t *re; int hit; };
+
+/* lc_each_line callback: stops at the first ISA line; a regexec result
+ * other than match/no-match is an error, never a quiet "no match". */
+static int aop_isa_line(void *vctx, const char *line, size_t len)
+{
+    struct aop_isa_ctx *x = vctx;
+    int r = regexec(x->re, line, 0, NULL, 0);
+    (void)len;
+    if (r == REG_NOMATCH)
+        return 0;
+    if (r != 0)
+        return -1;
+    x->hit = 1;
+    return 1;
+}
+
+/* 1 when any line of the listed files matches the ISA pattern; an open or
+ * read failure is FATAL (never a quiet "no match"), as a grep error was. */
 static int aop_files_isa(struct aop_ctx *c, const struct aop_vec *files, int *hit)
 {
-    *hit = 0;
-    for (size_t i = 0; i < files->n && !*hit; i++) {
-        FILE *f = fopen(files->v[i], "r");
-        char *line = NULL;
-        size_t cap = 0;
-        if (!f) {
+    struct aop_isa_ctx x = { &c->re_isa, 0 };
+    for (size_t i = 0; i < files->n && !x.hit; i++) {
+        if (lc_each_line(files->v[i], aop_isa_line, &x, 0) != 0) {
             fprintf(stderr, "gate_grep: FATAL — grep failed (exit 2) for: %s\n"
                     "  A grep error (bad flag, unreadable file, regex unsupported by\n"
                     "  this grep) was about to be masked as 'no match'. Refusing to\n"
                     "  report 'clean' off a broken scan.\n", files->v[i]);
             return 2;
         }
-        while (!*hit && getline(&line, &cap, f) >= 0)
-            *hit = regexec(&c->re_isa, line, 0, NULL, 0) == 0;
-        free(line);
-        fclose(f);
     }
+    *hit = x.hit;
     return 0;
 }
 
@@ -614,21 +632,23 @@ static void aop_leg_stale(struct aop_ctx *c)
 
 /* ── legs 3 and 4 ──────────────────────────────────────────────────────── */
 
-/* Whole file as a NUL-terminated string; NULL when unreadable. */
+/* Whole file as a NUL-terminated string; NULL when unreadable, with errno
+ * set to why (ENOENT only when the file is absent). */
 static char *aop_slurp(const char *path)
 {
-    FILE *f = fopen(path, "r");
     char *buf = NULL;
     size_t len = 0, cap = 0, n;
+    int err = 0;
+    errno = 0;
+    FILE *f = fopen(path, "r");
     if (!f)
         return NULL;
     for (;;) {
         if (len + 4097 > cap) {
             char *nb = realloc(buf, cap = cap ? cap * 2 : 8192); // raw-alloc-ok:lint-runtime
             if (!nb) {
-                free(buf);
-                fclose(f);
-                return NULL;
+                err = ENOMEM;
+                break;
             }
             buf = nb;
         }
@@ -637,13 +657,16 @@ static char *aop_slurp(const char *path)
         if (n == 0)
             break;
     }
-    if (ferror(f)) {
+    if (!err && ferror(f))
+        err = errno ? errno : EIO;
+    if (err) {
         free(buf);
         buf = NULL;
     } else {
         buf[len] = '\0';
     }
     fclose(f);
+    errno = err;
     return buf;
 }
 
@@ -737,18 +760,23 @@ static int aop_any_export(const char *oracle_text, const struct aop_vec *syms)
     return 0;
 }
 
-static void aop_check_pair(struct aop_ctx *c, const char *impl,
+static int aop_check_pair(struct aop_ctx *c, const char *impl,
                            const struct aop_pair *p, const struct aop_vec *syms,
                            const char *catalog)
 {
     char marker[RS_PATH + 32], group[RS_NAME + 32];
     char *text = aop_slurp(p->oracle);
     if (!text) {
+        if (errno != ENOENT) {
+            fprintf(stderr, "z23-lint: cannot read %s: %s\n", p->oracle,
+                    errno == ENOMEM ? "out of memory" : strerror(errno));
+            return 2;
+        }
         aop_bad(c, "%s is pinned by '%s', which does not exist. An\n"
                 "      accelerator under sealed core/ with no oracle is unprotected: nothing\n"
                 "      else in the tree checks it against a portable reference.",
                 impl, p->oracle);
-        return;
+        return 0;
     }
     snprintf(marker, sizeof marker, "ACCEL-ORACLE: %s", impl);
     snprintf(group, sizeof group, "ZCL_TEST_GROUP(%s)", p->group);
@@ -766,6 +794,7 @@ static void aop_check_pair(struct aop_ctx *c, const char *impl,
                 "      nominal only — a renamed entry point would leave this oracle green while\n"
                 "      testing code the node no longer calls.", p->oracle, impl);
     free(text);
+    return 0;
 }
 
 static int aop_leg_oracles(struct aop_ctx *c)
@@ -782,9 +811,14 @@ static int aop_leg_oracles(struct aop_ctx *c)
             free(catalog);
             return 2;
         }
-        for (size_t k = 0; k < c->row[i].n; k++)
-            aop_check_pair(c, c->row[i].impl, &c->row[i].p[k], &syms, catalog);
+        int rc = 0;
+        for (size_t k = 0; rc == 0 && k < c->row[i].n; k++)
+            rc = aop_check_pair(c, c->row[i].impl, &c->row[i].p[k], &syms, catalog);
         aop_vec_free(&syms);
+        if (rc) {
+            free(catalog);
+            return rc;
+        }
     }
     free(catalog);
     return 0;
