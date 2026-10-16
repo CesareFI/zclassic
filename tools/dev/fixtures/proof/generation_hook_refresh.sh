@@ -30,7 +30,10 @@ run_refresh() {
         ZCL_GIT_HOOK_NATIVE_BIN="$rebuilt" "$refresh"
 }
 # Reused-bundle helper path: git-hook rebuild calls REFRESH, not INSTALLER.
-! cmp -s "$rebuilt" "$generation/build/githooks/z23-git-hook"
+if cmp -s "$rebuilt" "$generation/build/githooks/z23-git-hook"; then
+    echo 'generation hook fixture: expected stale installed hook bytes' >&2
+    exit 1
+fi
 run_refresh
 cmp -s "$rebuilt" "$generation/build/githooks/z23-git-hook"
 [ "$(git -C "$generation" config --worktree --get core.hooksPath)" = build/githooks ]
