@@ -10,6 +10,7 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -19,7 +20,7 @@
 #include "base/hex.h"
 #include "gate_app_bundle_reproducible_priv.h"
 
-enum { ABR_DEPTH = 64, ABR_CHUNK = 65536 };
+enum { ABR_CHUNK = 65536 };
 
 void abr_text_free(struct abr_text *t)
 {
@@ -97,24 +98,74 @@ static int abr_abs(char *out, const char *root, const char *rel)
 static int abr_walk_entry(const char *root, const char *rel, const char *name,
                           struct abr_list *files, struct abr_list *dirs, int depth);
 
+#ifdef ZCL_TESTING
+struct abr_seam abr_seam;
+
+/* Counts directory handles and injects enumeration faults for the selftest. */
+static DIR *abr_opendir(const char *path)
+{
+    DIR *d = opendir(path);
+    abr_seam.opened += d != NULL;
+    return d;
+}
+
+static void abr_closedir(DIR *d)
+{
+    abr_seam.closed++;
+    closedir(d);
+}
+
+static struct dirent *abr_readdir(DIR *d)
+{
+    struct dirent *e = readdir(d);
+    long n = ++abr_seam.reads;
+    if (n == abr_seam.fail_at) {
+        errno = EIO;
+        return NULL;
+    }
+    if (n == abr_seam.dirty_at)
+        errno = ENOENT;
+    return e;
+}
+#else
+#define abr_opendir opendir
+#define abr_closedir closedir
+#define abr_readdir readdir
+#endif
+
+/* Reads every entry of d; a NULL readdir with errno set is an enumeration
+ * failure, never the end of the directory. */
+static int abr_walk_dir(DIR *d, const char *dir, const char *root, const char *rel,
+                        struct abr_list *files, struct abr_list *dirs, int depth)
+{
+    int rc = ABR_OK;
+    while (!rc) {
+        errno = 0;
+        struct dirent *e = abr_readdir(d);
+        if (!e)
+            return errno ? abr_fatal("cannot enumerate directory %s", dir) : ABR_OK;
+        if (strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0)
+            rc = abr_walk_entry(root, rel, e->d_name, files, dirs, depth);
+    }
+    return rc;
+}
+
 /* Collects regular files and directories below rel, find(1) style: symbolic
  * links are neither followed nor listed. */
 static int abr_walk(const char *root, const char *rel, struct abr_list *files,
                     struct abr_list *dirs, int depth)
 {
     char dir[ABR_PATH];
-    struct dirent *e;
     int rc = abr_abs(dir, root, rel);
-    DIR *d = rc ? NULL : opendir(dir);
     if (rc)
         return rc;
-    if (!d || depth > ABR_DEPTH)
+    if (depth > ABR_DEPTH)
+        return abr_fatal("directory nesting too deep at %s", dir);
+    DIR *d = abr_opendir(dir);
+    if (!d)
         return abr_fatal("cannot read directory %s", dir);
-    while (!rc && (e = readdir(d)) != NULL) {
-        if (strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0)
-            rc = abr_walk_entry(root, rel, e->d_name, files, dirs, depth);
-    }
-    closedir(d);
+    rc = abr_walk_dir(d, dir, root, rel, files, dirs, depth);
+    abr_closedir(d);
     return rc;
 }
 

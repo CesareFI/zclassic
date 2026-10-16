@@ -14948,6 +14948,16 @@ build/lintc-obj/gate_object_reproducible_xlink.o \
 build/lintc-obj/gate_riscv64_universal.o: \
     tools/lint/lintc/gate_object_reproducible_priv.h
 
+# The app-bundle gate's directory-walk seam exists only under ZCL_TESTING.
+build/lintc-obj/gate_app_bundle_reproducible_manifest.o \
+build/lintc-obj/gate_app_bundle_reproducible_selftest.o: \
+    LINTC_CFLAGS += -DZCL_TESTING
+build/lintc-obj/gate_app_bundle_reproducible_manifest.o \
+build/lintc-obj/gate_app_bundle_reproducible_selftest.o \
+build/lintc-obj/gate_app_bundle_reproducible.o \
+build/lintc-obj/gate_app_bundle_reproducible_proof.o: \
+    tools/lint/lintc/gate_app_bundle_reproducible_priv.h
+
 build/lintc-obj/%.o: tools/lint/lintc/%.c tools/lint/lintc/lintc.h
 	@mkdir -p $(dir $@)
 	$(CC) $(LINTC_CFLAGS) -c -o $@ $<

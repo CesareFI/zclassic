@@ -18,6 +18,7 @@
 #define ABR_PROBE_JSON "{\"a\":{\"b\":\"hello-bundle\"}}"
 #define ABR_PATH 4096
 #define ABR_NAME 256
+#define ABR_DEPTH 64 /* deepest directory nesting the manifest walk accepts */
 #define ABR_GRACE_MS 2000
 #define ABR_TMP_DEFAULT "/tmp" /* scratch root when TMPDIR is unset */
 
@@ -44,6 +45,17 @@ struct abr_text {
     char *p;
     size_t n, cap;
 };
+
+#ifdef ZCL_TESTING
+/* Selftest seam of the directory walk: read counts are 1-based and a zero
+ * trigger is off. fail_at makes that readdir fail with EIO; dirty_at makes it
+ * succeed but leave errno set. */
+struct abr_seam {
+    long reads, fail_at, dirty_at;
+    long opened, closed;
+};
+extern struct abr_seam abr_seam;
+#endif
 
 /* gate_app_bundle_reproducible.c */
 int abr_fatal(const char *fmt, ...);

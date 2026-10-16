@@ -4,13 +4,15 @@
  * abr_unit_checks runs on every host: it plants a tampered file in a fake
  * bundle tree and requires the manifest compare to name it, requires a probe
  * printing the wrong value (or exiting nonzero) to be rejected and the right
- * one accepted, and pins the mode string. abr_selftest_darwin is the bash
+ * one accepted, pins the mode string, and drives the directory walk through
+ * an injected readdir error and an over-deep tree. abr_selftest_darwin is the bash
  * gate's --selftest on a real signed bundle: tampered PkgInfo named, flipped
  * Mach-O byte rejected by codesign, wrong probe value rejected.
  */
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #endif
+#include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
@@ -182,6 +184,156 @@ static int abr_unit_mode(void)
     return strcmp(m, "-rwSr--r--") == 0 ? ABR_OK : abr_st_fail("setuid mode string is wrong");
 }
 
+#ifdef ZCL_TESTING
+/* Redirects stderr into file for the duration of one call; abr_err_read
+ * restores it and returns the captured text (caller frees). */
+static int abr_err_redirect(const char *file, int *saved)
+{
+    int fd = open(file, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    fflush(stderr);
+    *saved = fd < 0 ? -1 : dup(STDERR_FILENO);
+    if (*saved >= 0)
+        dup2(fd, STDERR_FILENO);
+    if (fd >= 0)
+        close(fd);
+    return *saved >= 0 ? ABR_OK : abr_fatal("cannot capture diagnostics");
+}
+
+static char *abr_err_read(const char *file, int saved)
+{
+    char *text = calloc(1, ABR_PATH);
+    FILE *f;
+    fflush(stderr);
+    dup2(saved, STDERR_FILENO);
+    close(saved);
+    f = text ? fopen(file, "r") : NULL;
+    if (f) {
+        size_t n = fread(text, 1, ABR_PATH - 1, f);
+        text[n] = '\0';
+        fclose(f);
+    }
+    return text;
+}
+
+/* Walks root with the seam armed; the diagnostics land in *msg. */
+static int abr_unit_walk(const char *root, const char *tmp, const char *tag, struct abr_seam arm,
+                         char **msg)
+{
+    char log[ABR_PATH];
+    int saved, lines, rc = abr_pathf(log, "%s/walk.log", tmp);
+    char sha[ZSHA256_HEX_LEN];
+    if (rc || (rc = abr_err_redirect(log, &saved)))
+        return rc;
+    abr_seam = arm;
+    rc = abr_manifest_tree(root, tmp, tag, &lines, sha);
+    *msg = abr_err_read(log, saved);
+    return rc;
+}
+
+static int abr_unit_no_manifest(const char *tmp, const char *tag)
+{
+    char p[ABR_PATH];
+    int rc = abr_pathf(p, "%s/content.%s", tmp, tag);
+    if (rc)
+        return rc;
+    return access(p, F_OK) != 0 ? ABR_OK
+        : abr_st_fail("a refused walk left a partial content manifest");
+}
+
+static int abr_unit_balanced(void)
+{
+    return abr_seam.opened == abr_seam.closed ? ABR_OK
+        : abr_st_fail("the walk leaked a directory handle");
+}
+
+static int abr_unit_walk_tree(const char *tmp, char root[ABR_PATH])
+{
+    char p[ABR_PATH];
+    int rc = abr_pathf(root, "%s/walk", tmp);
+    if (rc || (mkdir(root, 0777) != 0))
+        return rc ? rc : abr_fatal("cannot create %s", root);
+    for (const char *n = "ab"; *n; n++) {
+        if ((rc = abr_pathf(p, "%s/%c", root, *n)) || (rc = abr_write_file(p, "x", 1)))
+            return rc;
+    }
+    return ABR_OK;
+}
+
+/* A readdir that fails mid-listing must refuse the walk, name the directory
+ * and leave no manifest; one that succeeds with errno left set must not. */
+static int abr_unit_readdir(const char *tmp)
+{
+    char root[ABR_PATH], *msg = NULL;
+    int rc = abr_unit_walk_tree(tmp, root);
+    if (rc)
+        return rc;
+    rc = abr_unit_walk(root, tmp, "e", (struct abr_seam){ .fail_at = 2 }, &msg);
+    if (rc != ABR_FATAL)
+        rc = abr_st_fail("a readdir error mid-listing did not refuse the walk");
+    else if (!msg || !strstr(msg, root))
+        rc = abr_st_fail("the readdir refusal does not name the directory");
+    else if (!(rc = abr_unit_no_manifest(tmp, "e")))
+        rc = abr_unit_balanced();
+    free(msg);
+    if (rc)
+        return rc;
+    rc = abr_unit_walk(root, tmp, "s", (struct abr_seam){ .dirty_at = 1 }, &msg);
+    free(msg);
+    if (rc != ABR_OK)
+        return abr_st_fail("a stale errno at the end of a listing refused a good walk");
+    return abr_unit_balanced();
+}
+
+/* Builds root/d/d/... levels deep. */
+static int abr_unit_chain(const char *root, int levels)
+{
+    char p[ABR_PATH];
+    int rc = abr_pathf(p, "%s", root);
+    for (int i = 0; !rc && i < levels; i++) {
+        size_t n = strlen(p);
+        if (n + 3 >= sizeof p)
+            return abr_fatal("path too long");
+        memcpy(p + n, "/d", 3);
+        if (mkdir(p, 0777) != 0)
+            return abr_fatal("cannot create %s", p);
+    }
+    return rc;
+}
+
+/* Past ABR_DEPTH the walk refuses before opening a directory. */
+static int abr_unit_depth(const char *tmp)
+{
+    char root[ABR_PATH], *msg = NULL;
+    int rc = abr_pathf(root, "%s/deep", tmp);
+    if (rc || mkdir(root, 0777) != 0 || (rc = abr_unit_chain(root, ABR_DEPTH + 2)))
+        return rc ? rc : abr_fatal("cannot create %s", root);
+    rc = abr_unit_walk(root, tmp, "d", (struct abr_seam){ 0 }, &msg);
+    free(msg);
+    if (rc != ABR_FATAL)
+        return abr_st_fail("a tree nested past the depth limit was not refused");
+    if (abr_seam.opened != ABR_DEPTH + 1)
+        return abr_st_fail("the walk opened a directory past the depth limit");
+    if (!(rc = abr_unit_no_manifest(tmp, "d")))
+        rc = abr_unit_balanced();
+    return rc;
+}
+
+static int abr_unit_walks(const char *tmp)
+{
+    int rc = abr_unit_readdir(tmp);
+    if (!rc)
+        rc = abr_unit_depth(tmp);
+    abr_seam = (struct abr_seam){ 0 };
+    return rc;
+}
+#else
+static int abr_unit_walks(const char *tmp)
+{
+    (void)tmp;
+    return abr_st_fail("built without ZCL_TESTING: the walk seam cases cannot run");
+}
+#endif
+
 static int abr_unit_run(void)
 {
     char tmp[ABR_PATH];
@@ -191,6 +343,8 @@ static int abr_unit_run(void)
     if (rc || !mkdtemp(tmp))
         return rc ? rc : abr_fatal("could not create a temp dir");
     rc = abr_unit_mode();
+    if (!rc)
+        rc = abr_unit_walks(tmp);
     if (!rc)
         rc = abr_unit_manifest(tmp);
     if (!rc)
