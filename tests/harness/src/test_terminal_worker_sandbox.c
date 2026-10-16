@@ -357,28 +357,28 @@ static int c_tw_nofile_budget(void)
 static int c_tw_io_uring_killed(void)
 {
     if (tw_enter(false) != 0) return 70;
-    syscall(TW_NR_URING_SETUP_T, 1, NULL);
+    os_sandbox_raw_syscall_for_testing(TW_NR_URING_SETUP_T, 1, 0, 0);
     return 13; /* reached only if io_uring_setup was not denied */
 }
 
 static int c_tw_memfd_killed(void)
 {
     if (tw_enter(false) != 0) return 70;
-    syscall(__NR_memfd_create, "p", 0);
+    os_sandbox_raw_syscall_for_testing(__NR_memfd_create, (long)"p", 0, 0);
     return 14;
 }
 
 static int c_tw_tgkill_killed(void)
 {
     if (tw_enter(false) != 0) return 70;
-    syscall(__NR_tgkill, getppid(), getppid(), 0);
+    os_sandbox_raw_syscall_for_testing(__NR_tgkill, getppid(), getppid(), 0);
     return 15;
 }
 
 static int c_tw_pidfd_send_killed(void)
 {
     if (tw_enter(false) != 0) return 70;
-    syscall(TW_NR_PIDFD_SEND_T, -1, 0, NULL, 0);
+    os_sandbox_raw_syscall_for_testing(TW_NR_PIDFD_SEND_T, -1, 0, 0);
     return 16;
 }
 
