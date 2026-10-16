@@ -6,6 +6,7 @@
 #include "test/public_shape_fixture.h"
 #include "plugin/plugin_pack.h"
 #include "plugin/plugin_store.h"
+#include "plugin/plugin_run.h"
 #include "vcs/package_checkout.h"
 #include "vcs/package_public_shape.h"
 
@@ -15,8 +16,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <time.h>
 
-#define PP_CAP 4096u
+#define PP_CAP (4u * VCS_PACKAGE_CHUNK_BYTES)
 
 struct pp_fixture {
     struct sw_node publisher, receiver;
@@ -24,6 +26,7 @@ struct pp_fixture {
     char trust[1200], checkout[1200], manifest[1400], current[1400];
     struct plugin_pack_result packed;
     uint8_t root[32];
+    unsigned capabilities;
 };
 
 static bool pp_path(char *out, size_t cap, const char *base, const char *leaf)
@@ -78,7 +81,7 @@ static void pp_close(struct pp_fixture *f)
 }
 
 static bool pp_add_file(struct vcs_package_manifest *m, const char *directory,
-                        const char *leaf, uint8_t bytes[PP_CAP], size_t *length)
+                        const char *leaf, uint8_t **bytes, size_t *length)
 {
     char path[1400];
     if (!pp_path(path, sizeof(path), directory, leaf))
@@ -86,14 +89,27 @@ static bool pp_add_file(struct vcs_package_manifest *m, const char *directory,
     FILE *file = fopen(path, "rb");
     if (!file)
         return false;
-    *length = fread(bytes, 1, PP_CAP, file);
+    *bytes = malloc(PP_CAP);
+    if (!*bytes) {
+        (void)fclose(file);
+        return false;
+    }
+    *length = fread(*bytes, 1, PP_CAP, file);
     bool ok = !ferror(file) && *length > 0 && *length < PP_CAP;
     ok = fclose(file) == 0 && ok;
-    uint8_t digest[32];
+    uint8_t digests[4 * 32];
+    uint32_t chunks = (uint32_t)((*length + VCS_PACKAGE_CHUNK_BYTES - 1) /
+                                  VCS_PACKAGE_CHUNK_BYTES);
+    for (uint32_t i = 0; i < chunks && ok; i++) {
+        size_t offset = (size_t)i * VCS_PACKAGE_CHUNK_BYTES;
+        size_t chunk_length = *length - offset;
+        if (chunk_length > VCS_PACKAGE_CHUNK_BYTES)
+            chunk_length = VCS_PACKAGE_CHUNK_BYTES;
+        ok = vcs_package_chunk_hash(*bytes + offset, chunk_length, digests + i * 32);
+    }
     uint32_t mode = strcmp(leaf, "demo") == 0
         ? VCS_PACKAGE_MODE_EXECUTABLE : VCS_PACKAGE_MODE_FILE;
-    return ok && vcs_package_chunk_hash(bytes, *length, digest) &&
-        vcs_package_manifest_add(m, leaf, mode, *length, digest, 1);
+    return ok && vcs_package_manifest_add(m, leaf, mode, *length, digests, chunks);
 }
 
 static bool pp_publish(struct pp_fixture *f, unsigned version)
@@ -101,7 +117,8 @@ static bool pp_publish(struct pp_fixture *f, unsigned version)
     struct plugin_pack_request request = {
         .exe_path = f->executable, .name = "demo",
         .version = version == 1 ? "1.0.0" : "2.0.0",
-        .key_path = f->signing, .out_dir = f->source
+        .key_path = f->signing, .out_dir = f->source,
+        .capabilities = f->capabilities
     };
     if (plugin_pack(&request, &f->packed) != PLUGIN_OK)
         return false;
@@ -114,19 +131,27 @@ static bool pp_publish(struct pp_fixture *f, unsigned version)
     };
     struct vcs_package_manifest manifest;
     vcs_package_manifest_init(&manifest);
-    uint8_t bytes[4][PP_CAP];
-    size_t lengths[4];
+    uint8_t *bytes[4] = {0};
+    size_t lengths[4] = {0};
     bool ok = true;
     for (size_t i = 0; i < 4 && ok; i++)
-        ok = pp_add_file(&manifest, f->source, leaves[i], bytes[i], &lengths[i]);
+        ok = pp_add_file(&manifest, f->source, leaves[i], &bytes[i], &lengths[i]);
     uint8_t *wire = NULL;
     size_t wire_len = 0;
     ok = ok && vcs_package_manifest_serialize(&manifest, &wire, &wire_len) &&
         vcs_package_store_put_manifest(f->publisher.store, wire, wire_len,
                                         f->root) == VCS_PACKAGE_STORE_OK;
-    for (size_t i = 0; i < 4 && ok; i++)
-        ok = vcs_package_store_put_chunk(f->publisher.store, f->root, leaves[i],
-                                        0, bytes[i], lengths[i]) == VCS_PACKAGE_STORE_OK;
+    for (size_t i = 0; i < 4 && ok; i++) {
+        for (size_t offset = 0; offset < lengths[i] && ok;
+             offset += VCS_PACKAGE_CHUNK_BYTES) {
+            size_t length = lengths[i] - offset;
+            if (length > VCS_PACKAGE_CHUNK_BYTES) length = VCS_PACKAGE_CHUNK_BYTES;
+            ok = vcs_package_store_put_chunk(f->publisher.store, f->root, leaves[i],
+                    (uint32_t)(offset / VCS_PACKAGE_CHUNK_BYTES), bytes[i] + offset,
+                    length) == VCS_PACKAGE_STORE_OK;
+        }
+    }
+    for (size_t i = 0; i < 4; i++) free(bytes[i]);
     free(wire);
     vcs_package_manifest_free(&manifest);
     return ok && sw_publish_release(f->publisher.store, f->root,
@@ -165,7 +190,7 @@ static bool pp_fetch(struct pp_fixture *f)
         return false;
     const uint64_t provider = 11;
     if (vcs_swarm_engine_fetch_from_bounded(f->receiver.engine, f->root,
-            SW_DAY, 1, &provider, 1, 16384) != VCS_SWARM_FETCH_OK)
+            SW_DAY, 1, &provider, 1, 4u * PP_CAP) != VCS_SWARM_FETCH_OK)
         return false;
     for (uint64_t now = 2; now < 34; now++) {
         vcs_swarm_engine_tick(f->receiver.engine, SW_DAY, now);
@@ -245,6 +270,137 @@ static int pp_round(struct pp_fixture *f, unsigned version, char first[129])
     return failures;
 }
 
+#if defined(__linux__)
+/* Patch the existing protocol-speaking executable, retaining a bounded trailing
+ * pad so this journey exercises more than one canonical package chunk. */
+static bool pp_runtime_image(struct pp_fixture *f, const char *mode)
+{
+    if (!mode || strlen(mode) > 16) return false;
+    FILE *image = fopen("build/fixtures/plugin_run_child", "rb");
+    if (!image) return false;
+    uint8_t *bytes = calloc(1, PP_CAP);
+    if (!bytes) {
+        (void)fclose(image);
+        return false;
+    }
+    size_t length = fread(bytes, 1, PP_CAP, image);
+    bool ok = !ferror(image) && length > 0 && length < PP_CAP;
+    ok = fclose(image) == 0 && ok;
+    static const char marker[] = "PRC-VARIANT:";
+    bool patched = false;
+    for (size_t i = 0; ok && i + sizeof(marker) - 1 + 16 <= length; i++) {
+        if (memcmp(bytes + i, marker, sizeof(marker) - 1) == 0) {
+            uint8_t *field = bytes + i + sizeof(marker) - 1;
+            memset(field, ' ', 16);
+            memcpy(field, mode, strlen(mode));
+            patched = true;
+            break;
+        }
+    }
+    if (length <= VCS_PACKAGE_CHUNK_BYTES) length = VCS_PACKAGE_CHUNK_BYTES + 1;
+    ok = ok && patched && pp_write(f->executable, (const char *)bytes, length);
+    free(bytes);
+    return ok;
+}
+
+static bool pp_runtime_receive(struct pp_fixture *f, unsigned version,
+                               char generation[129])
+{
+    if (!pp_publish(f, version) || !pp_fetch(f) ||
+        !pp_path(f->checkout, sizeof(f->checkout), f->base,
+                 version == 1 ? "runtime-good" : "runtime-bad"))
+        return false;
+    struct vcs_package_checkout_metrics metrics;
+    if (vcs_package_checkout(f->receiver.store, f->root, f->checkout, &metrics) !=
+            VCS_PACKAGE_CHECKOUT_OK || metrics.files != 4 ||
+        !pp_path(f->manifest, sizeof(f->manifest), f->checkout, "demo.plugin.json") ||
+        !pp_trust(f->trust, f->packed.public_key))
+        return false;
+    struct plugin_manifest installed;
+    int present = -1;
+    if (plugin_store_install(f->trust, f->manifest, &installed, &present) != PLUGIN_OK ||
+        present != 0 || strcmp(installed.generation, f->packed.generation) != 0)
+        return false;
+    char exe[1400], digest[129];
+    struct stat image_stat;
+    if (!pp_path(exe, sizeof(exe), f->checkout, "demo") ||
+        stat(exe, &image_stat) != 0 || !S_ISREG(image_stat.st_mode) ||
+        (image_stat.st_mode & 0111) == 0 ||
+        image_stat.st_size <= VCS_PACKAGE_CHUNK_BYTES ||
+        plugin_hash_file(exe, digest) != PLUGIN_OK ||
+        strcmp(installed.exe_sha3, digest) != 0)
+        return false;
+    memcpy(generation, installed.generation, 129);
+    return true;
+}
+
+static bool pp_runtime_healthy(struct plugin_run *run, const char *generation,
+                               bool fallback)
+{
+    struct timespec start, now;
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) return false;
+    for (;;) {
+        if (plugin_run_poll(run) != PLUGIN_RUN_OK) return false;
+        struct plugin_run_info info;
+        plugin_run_info_get(run, &info);
+        if (info.state == PLUGIN_RUN_STATE_RUNNING && info.pings_ok > 0 &&
+            info.fell_back == fallback && strcmp(info.generation, generation) == 0)
+            return true;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
+            now.tv_sec - start.tv_sec >= 20)
+            return false;
+        struct timespec tick = {.tv_nsec = 5000000L};
+        (void)nanosleep(&tick, NULL);
+    }
+}
+
+static int pp_runtime_journey(void)
+{
+    int failures = 0;
+    struct pp_fixture f = {0};
+    struct plugin_run *run = NULL;
+    bool ready = pp_open(&f);
+    TEST("plugin package: received executable runs healthy and automatically restores healthy last-good") {
+        char good[129], bad[129], last_good[1400], target[160];
+        ASSERT(ready);
+        ASSERT(plugin_capability_add("fs.write", 8, &f.capabilities));
+        ASSERT(plugin_capability_add("clock", 5, &f.capabilities));
+        ASSERT(pp_runtime_image(&f, "normal"));
+        ASSERT(pp_runtime_receive(&f, 1, good));
+        ASSERT(pp_selection(&f, NULL));
+        ASSERT_EQ(plugin_store_switch(f.trust, "demo", good), PLUGIN_OK);
+        struct plugin_run_options options = {
+            .root = f.trust, .name = "demo", .ping_interval_ms = 40,
+            .ping_deadline_ms = 500, .ping_miss_limit = 2,
+            .backoff_initial_ms = 20, .backoff_max_ms = 2000,
+            .stable_ms = 60000, .crash_limit = 3
+        };
+        ASSERT_EQ(plugin_run_open(&options, &run, NULL), PLUGIN_RUN_OK);
+        ASSERT(pp_runtime_healthy(run, good, false));
+        plugin_run_close(run);
+        run = NULL;
+        ASSERT(pp_runtime_image(&f, "crash"));
+        ASSERT(pp_runtime_receive(&f, 2, bad));
+        ASSERT(strcmp(good, bad) != 0);
+        ASSERT(pp_selection(&f, good));
+        ASSERT_EQ(plugin_store_switch(f.trust, "demo", bad), PLUGIN_OK);
+        ASSERT(pp_selection(&f, bad));
+        ASSERT(pp_path(last_good, sizeof(last_good), f.trust, "demo/last-good"));
+        ssize_t n = readlink(last_good, target, sizeof(target));
+        ASSERT_EQ(n, 12 + PLUGIN_HEX_SHA3_512);
+        ASSERT(memcmp(target, "generations/", 12) == 0);
+        ASSERT(memcmp(target + 12, good, PLUGIN_HEX_SHA3_512) == 0);
+        ASSERT_EQ(plugin_run_open(&options, &run, NULL), PLUGIN_RUN_OK);
+        ASSERT(pp_runtime_healthy(run, good, true));
+        ASSERT(pp_selection(&f, good));
+        PASS();
+    } _test_next:;
+    plugin_run_close(run);
+    pp_close(&f);
+    return failures;
+}
+#endif
+
 int test_plugin_package(void)
 {
     struct pp_fixture fixture = {0};
@@ -258,5 +414,8 @@ int test_plugin_package(void)
     if (!failures)
         failures += pp_round(&fixture, 2, first);
     pp_close(&fixture);
+#if defined(__linux__)
+    failures += pp_runtime_journey();
+#endif
     return failures;
 }
