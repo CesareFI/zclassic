@@ -105,6 +105,43 @@ static const char *bsw_body(const char *resp)
     return p ? p + 4 : "";
 }
 
+/* The id of the first site route row that would dispatch `path` under the
+ * DATADIR boundary the HTTPS and onion listeners apply (prefix match, then
+ * NUL, '/' or '?'), or NULL when no row takes it and the request 404s
+ * before any handler runs. */
+static const char *bsw_routed_row(const char *path)
+{
+    for (size_t i = 0; i < g_zcl_site_routes_count; i++) {
+        const struct zcl_site_route *r = &g_zcl_site_routes[i];
+        size_t n = strlen(r->prefix);
+        if (strncmp(path, r->prefix, n) != 0)
+            continue;
+        if (strcmp(r->flavor, "PLAIN") == 0 || path[n] == '\0' ||
+            path[n] == '/' || path[n] == '?')
+            return r->id;
+    }
+    return NULL;
+}
+
+/* Copy the href of the page's "JSON form" link into out. */
+static bool bsw_json_link(const char *html, char *out, size_t cap)
+{
+    const char *end = strstr(html, "'>JSON form</a>");
+    if (!end)
+        return false;
+    const char *p = end;
+    while (p > html && strncmp(p, "href='", 6) != 0)
+        p--;
+    if (strncmp(p, "href='", 6) != 0)
+        return false;
+    size_t n = (size_t)(end - (p + 6));
+    if (n == 0 || n >= cap)
+        return false;
+    memcpy(out, p + 6, n);
+    out[n] = '\0';
+    return true;
+}
+
 static bool bsw_add(struct node_db *db, const uint8_t seed[32],
                     const uint8_t pk[32], const char *slug, const char *title,
                     const char *agent, const char *text, uint8_t scope,
@@ -233,7 +270,13 @@ static int test_board_site_wiki(void)
         ASSERT(!strstr(resp, "FLEETONLY-MARKER"));
         ASSERT(!strstr(resp, "broken-only"));
         ASSERT(strstr(resp, "href='/wiki/half-broken'"));
-        ASSERT(strstr(resp, "/wiki.json"));
+        /* The emitted JSON link must clear the real mount boundary: a dot
+         * straight after the "/wiki" prefix is refused, so it must not be
+         * "/wiki.json". */
+        char jl[64];
+        ASSERT(bsw_json_link(resp, jl, sizeof(jl)));
+        ASSERT(bsw_routed_row(jl) != NULL);
+        ASSERT(bsw_routed_row("/wiki.json") == NULL);
 
         /* The same index mounted under /board/wiki links to itself. */
         ASSERT(strstr(bsw_get("GET", "/board/wiki"),
@@ -243,7 +286,7 @@ static int test_board_site_wiki(void)
 
         /* Index JSON. */
         struct json_value doc;
-        resp = bsw_get("GET", "/wiki.json");
+        resp = bsw_get("GET", jl);
         ASSERT(strstr(resp, "Content-Type: application/json"));
         ASSERT(bsw_json(resp, &doc));
         ASSERT_EQ(strcmp(json_get_str(json_get(&doc, "schema")),

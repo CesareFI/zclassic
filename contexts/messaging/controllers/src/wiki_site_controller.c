@@ -384,8 +384,11 @@ static size_t ws_index_html(char *buf, size_t cap, const struct ws_row *rows,
     off += site_emit_global_nav(buf + off, cap - off, NULL);
     SITE_APPEND(off, buf, cap, "<main id='content'><h1>Wiki</h1><p>%s</p>",
                 WS_NOTICE);
+    /* Fixed to the board mount on both prefixes: a dot straight after the
+     * "/wiki" row prefix fails the DATADIR boundary, so "/wiki.json"
+     * would 404 before reaching this handler. */
     SITE_APPEND(off, buf, cap,
-        "<p><a href='%s.json'>JSON form</a></p>", base);
+        "<p><a href='/board/wiki.json'>JSON form</a></p>");
     if (shown == 0) {
         SITE_APPEND(off, buf, cap,
             "<div class='card'><p>This node holds no wiki pages.</p></div>");
