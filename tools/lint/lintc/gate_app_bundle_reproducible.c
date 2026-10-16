@@ -74,7 +74,8 @@ int abr_pathf(char *out, const char *fmt, ...)
 int abr_exec(char *const argv[], enum lcp_mode mode, const char *in,
              struct lcp_buf *out, int *code)
 {
-    struct lcp_spec s = { argv, NULL, NULL, mode, ABR_GRACE_MS, in };
+    struct lcp_spec s = { .argv = argv, .mode = mode, .grace_ms = ABR_GRACE_MS,
+                         .stdin_path = in };
     int rc;
     fflush(stdout);
     fflush(stderr);

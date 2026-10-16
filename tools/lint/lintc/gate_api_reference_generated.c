@@ -144,7 +144,7 @@ void arg_indent(FILE *out, const char *data, size_t limit)
 static int arg_exec(char *const *argv, enum lcp_mode mode, struct lcp_buf *out,
                     int *code)
 {
-    struct lcp_spec s = { argv, NULL, NULL, mode, ARG_GRACE_MS };
+    struct lcp_spec s = { .argv = argv, .mode = mode, .grace_ms = ARG_GRACE_MS };
     int rc = lcp_run(&s, out, code);
     return rc < 0 ? 2 : rc;
 }
