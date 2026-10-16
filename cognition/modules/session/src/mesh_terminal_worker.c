@@ -7,6 +7,7 @@
 
 #include "session/mesh_terminal_worker.h"
 #include "platform/os_proc.h"
+#include "mesh_terminal_worker_spawn.h"
 
 #if defined(__linux__)
 #include "platform/os_sandbox.h"
@@ -57,15 +58,6 @@
  * under it. */
 #define MESH_TERMINAL_WORKER_MAX_PROCESSES 32u
 
-/* Child-side failure stages, staged back through the close-on-exec pipe
- * so spawn() can refuse BY NAME instead of "the child went away". */
-enum {
-    TW_STAGE_TTY = 1,        /* slave open / ctty / winsize / dup2 */
-    TW_STAGE_CHDIR = 2,      /* workdir chdir */
-    TW_STAGE_CONFINEMENT = 3,/* sandbox enter */
-    TW_STAGE_EXEC = 4,       /* execve */
-    TW_STAGE_PIDNS = 5,      /* PID namespace unshare */
-};
 
 const char *mesh_terminal_worker_error_string(
     enum mesh_terminal_worker_error error)
@@ -321,15 +313,7 @@ static void tw_child(const struct mesh_terminal_worker_config *cfg,
         tw_fail(stage_fd, TW_STAGE_CONFINEMENT, 126);
     close(master);
 
-    if (setsid() < 0) goto tty_fail;
-    int slave = open(slave_path, O_RDWR);
-    if (slave < 0) goto tty_fail;
-    /* The shell wants a controlling terminal for job control. */
-    if (ioctl(slave, TIOCSCTTY, NULL) < 0) goto tty_fail;
-    struct winsize ws = { .ws_col = cfg->cols, .ws_row = cfg->rows };
-    if (ioctl(slave, TIOCSWINSZ, &ws) < 0) goto tty_fail;
-    if (dup2(slave, STDIN_FILENO) < 0 || dup2(slave, STDOUT_FILENO) < 0 || dup2(slave, STDERR_FILENO) < 0) goto tty_fail;
-    if (slave > STDERR_FILENO) close(slave);
+    if (!twx_tty_setup(cfg, slave_path)) tw_fail(stage_fd, TW_STAGE_TTY, 126);
 
     if (!os_proc_close_inherited_fds_except(stage_fd))
         tw_fail(stage_fd, TW_STAGE_CONFINEMENT, 126);
@@ -363,9 +347,6 @@ static void tw_child(const struct mesh_terminal_worker_config *cfg,
     execve(tw_binary(cfg), exec_argv, envp);
 
     tw_fail(stage_fd, TW_STAGE_EXEC, 127);
-
-tty_fail:
-    tw_fail(stage_fd, TW_STAGE_TTY, 126);
 }
 
 static struct zcl_result mesh_terminal_worker_spawn_platform_arm(
@@ -449,13 +430,8 @@ static struct zcl_result mesh_terminal_worker_spawn_platform_arm(
     int restore_error = sigprocmask(SIG_SETMASK, &original_mask, NULL) == 0 ? 0 : errno;
     if (pid < 0 || restore_error) {
         /* A restore failure cannot discard ownership of a successfully forked
-         * child. Keep its PID unreaped until the existing settled-wait cleanup. */
-        if (pid > 0) {
-            (void)kill(-pid, SIGKILL);
-            (void)kill(pid, SIGKILL);
-            int status = 0;
-            (void)tw_wait_settled(pid, &status);
-        }
+         * child: it is killed and reaped here, never leaked. */
+        twx_abandon_child(pid);
         close(master);
         close(stage_pipe[0]);
         close(stage_pipe[1]);
@@ -471,20 +447,7 @@ static struct zcl_result mesh_terminal_worker_spawn_platform_arm(
     /* Residual window: a stop before this store sees slot 0 and skips the killpg;
      * the session's SIGKILL then hangs the worker up (see hub_server.c). */
     tw_slot(cfg->pgid_slot, pid);
-    uint8_t stage = 0;
-    for (;;) {
-        ssize_t n = read(stage_pipe[0], &stage, 1);
-        if (n > 0)
-            break;
-        if (n == 0) {
-            stage = 0;
-            break;
-        }
-        if (errno != EINTR) {
-            stage = 0;
-            break;
-        }
-    }
+    uint8_t stage = twx_read_stage(stage_pipe[0]);
     close(stage_pipe[0]);
 
     if (stage != 0) {
@@ -492,20 +455,7 @@ static struct zcl_result mesh_terminal_worker_spawn_platform_arm(
         tw_slot(cfg->pgid_slot, 0);
         (void)tw_wait_settled(pid, &status);
         close(master);
-        static const struct { uint8_t stage; enum mesh_terminal_worker_error code; const char *what; } k[] = {
-            { TW_STAGE_TTY, MESH_TERMINAL_WORKER_ERR_TTY, "pty slave/ctty/winsize setup" },
-            { TW_STAGE_CHDIR, MESH_TERMINAL_WORKER_ERR_CONFIG, "workdir chdir" },
-            { TW_STAGE_CONFINEMENT, MESH_TERMINAL_WORKER_ERR_CONFINEMENT, "sandbox enter" },
-            { TW_STAGE_EXEC, MESH_TERMINAL_WORKER_ERR_EXEC, "execve" },
-            { TW_STAGE_PIDNS, MESH_TERMINAL_WORKER_ERR_PIDNS_UNAVAILABLE,
-              "TERMINAL_PIDNS_UNAVAILABLE: user+PID namespace refused; no unconfined fallback" },
-        };
-        enum mesh_terminal_worker_error code = MESH_TERMINAL_WORKER_ERR_SPAWN;
-        const char *what = "unknown stage";
-        for (size_t i = 0; i < sizeof k / sizeof k[0]; i++)
-            if (k[i].stage == stage) { code = k[i].code; what = k[i].what; }
-        return ZCL_ERR(code, "worker child failed at %s (stage %u)",
-                       what, (unsigned)stage);
+        return twx_stage_error(stage);
     }
 
     /* Best effort: pin the child's group even if setsid lost the race

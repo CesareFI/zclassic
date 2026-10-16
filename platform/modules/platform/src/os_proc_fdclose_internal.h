@@ -1,4 +1,6 @@
-/* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0
+ * Purpose: shared Linux descriptor closure for freshly forked children (the
+ * terminal worker and the confined resident launcher). */
 #ifndef ZCL_OS_PROC_FDCLOSE_INTERNAL_H
 #define ZCL_OS_PROC_FDCLOSE_INTERNAL_H
 #include <stdbool.h>

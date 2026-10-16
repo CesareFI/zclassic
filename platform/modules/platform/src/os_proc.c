@@ -840,6 +840,27 @@ static bool op_fd_census(int own, const int *keep, size_t n)
     return false;
 }
 
+/* close_range(2) over the gaps between retained descriptors; false means the
+ * kernel lacks it (or refused) and the proc census must finish the job. */
+static bool op_fd_range_close(const int *keep, size_t n)
+{
+#if defined(SYS_close_range)
+    unsigned next = 0;
+    bool swept = true;
+    for (size_t i = 0; swept && i < n; ++i) {
+        if (keep[i] < 0 || (unsigned)keep[i] < next) continue;
+        if ((unsigned)keep[i] > next)
+            swept = syscall(SYS_close_range, next, (unsigned)keep[i] - 1u, 0u) == 0;
+        next = (unsigned)keep[i] + 1u;
+    }
+    return swept && syscall(SYS_close_range, next, UINT_MAX, 0u) == 0;
+#else
+    (void)keep;
+    (void)n;
+    return false;
+#endif
+}
+
 /* Sorted retained descriptors permit range closure; proc is the older-kernel
  * fallback. Both paths operate on this child only, without libc streams. */
 bool os_proc_linux_close_fds_kept(const int *keep, size_t n, bool try_range)
@@ -847,20 +868,7 @@ bool os_proc_linux_close_fds_kept(const int *keep, size_t n, bool try_range)
     if (!keep || !n || n > 48u) { errno = EINVAL; return false; }
     for (size_t i = 1; i < n; ++i)
         if (keep[i] < keep[i - 1]) { errno = EINVAL; return false; }
-    unsigned next = 0;
-    bool swept = try_range;
-#if defined(SYS_close_range)
-    for (size_t i = 0; swept && i < n; ++i) {
-        if (keep[i] < 0 || (unsigned)keep[i] < next) continue;
-        if ((unsigned)keep[i] > next)
-            swept = syscall(SYS_close_range, next, (unsigned)keep[i] - 1u, 0u) == 0;
-        next = (unsigned)keep[i] + 1u;
-    }
-    swept = swept && syscall(SYS_close_range, next, UINT_MAX, 0u) == 0;
-#else
-    swept = false;
-#endif
-    if (swept) return true;
+    if (try_range && op_fd_range_close(keep, n)) return true;
     int own = os_proc_fd_dir_open();
     if (own < 0) return false;
     bool ok = op_fd_census(own, keep, n);
