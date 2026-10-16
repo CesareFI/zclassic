@@ -7,10 +7,12 @@
 #include "mesh_terminal_hub_io.h"
 
 #include "platform/time_compat.h"
+#include "util/log_macros.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <limits.h>
 #include <sys/stat.h>
@@ -65,11 +67,17 @@ void hub_wfd_open(struct hub_wfd *w, int fd)
         w->mode = HUB_WFD_SOCKET;
     else if (S_ISREG(st.st_mode))
         w->mode = HUB_WFD_PLAIN;
+    else if (S_ISFIFO(st.st_mode))
+        w->fifo = true;
+    else
+        w->mode = HUB_WFD_POLLED; /* tty/pty/char device: RWF_NOWAIT is not worth probing */
 }
 
-/* poll(POLLOUT, 0) then at most PIPE_BUF: the room a ready descriptor is
- * guaranteed to take. A second writer can still win the readiness on a file
- * that has no RWF_NOWAIT; the audit sink and the screen are pipes, which do. */
+/* poll(POLLOUT, 0) then a chunk the ready descriptor is guaranteed to take:
+ * PIPE_BUF for a pipe, ONE byte for anything else (POLLOUT on a tty can mean
+ * a single free byte, and a bigger write would block past the caller's
+ * deadline). A second writer can still win the readiness on a file that has
+ * no RWF_NOWAIT; the audit sink and the screen pipes do have it. */
 static ssize_t hub_wfd_try_polled(const struct hub_wfd *w, const void *buf, size_t n)
 {
     struct pollfd pfd = { .fd = w->fd, .events = POLLOUT };
@@ -77,7 +85,8 @@ static ssize_t hub_wfd_try_polled(const struct hub_wfd *w, const void *buf, size
         errno = EAGAIN;
         return -1;
     }
-    return write(w->fd, buf, n < PIPE_BUF ? n : PIPE_BUF);
+    size_t cap = w->fifo ? PIPE_BUF : 1;
+    return write(w->fd, buf, n < cap ? n : cap);
 }
 
 ssize_t hub_wfd_try(struct hub_wfd *w, const void *buf, size_t n)
@@ -92,6 +101,10 @@ ssize_t hub_wfd_try(struct hub_wfd *w, const void *buf, size_t n)
         ssize_t k = pwritev2(w->fd, &iov, 1, -1, RWF_NOWAIT);
         if (k >= 0 || (errno != EOPNOTSUPP && errno != EINVAL && errno != ENOSYS))
             return k;
+        static atomic_flag warned = ATOMIC_FLAG_INIT;
+        if (!atomic_flag_test_and_set(&warned))
+            LOG_WARN("hub_io", "fd %d takes no RWF_NOWAIT (errno=%d): writes degrade to poll+%s chunks",
+                     w->fd, errno, w->fifo ? "PIPE_BUF" : "1-byte");
         w->mode = HUB_WFD_POLLED; /* this file takes no RWF_NOWAIT */
     }
     return hub_wfd_try_polled(w, buf, n);

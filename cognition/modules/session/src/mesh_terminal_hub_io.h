@@ -32,13 +32,18 @@ bool hub_io_send(int fd, const uint8_t *frame, size_t total);
  * SIGKILLed. So every attempt is non-blocking by itself: send(MSG_DONTWAIT)
  * on a socket; pwritev2(RWF_NOWAIT) on a pipe (the kernel refuses to wait
  * for room, however many writers share it); and where the file does not take
- * RWF_NOWAIT (a tty), poll(POLLOUT, 0) followed by a chunk of at most
- * PIPE_BUF, the amount a ready descriptor is guaranteed to take. Regular
- * files are plain writes. */
+ * RWF_NOWAIT (a tty or pty, any non-pipe), poll(POLLOUT, 0) followed by ONE
+ * byte: POLLOUT on a tty can mean a single free byte (XOFF, a full pty
+ * buffer), so only one byte is guaranteed not to block. Only a pipe
+ * guarantees PIPE_BUF to a ready descriptor, so only a pipe that lacks
+ * RWF_NOWAIT (an old kernel) polls with PIPE_BUF chunks. Regular files are
+ * plain writes. The screen on a tty therefore costs a poll and a write per
+ * byte; the pipe and socket paths are unchanged. */
 enum hub_wfd_mode { HUB_WFD_NOWAIT, HUB_WFD_SOCKET, HUB_WFD_POLLED, HUB_WFD_PLAIN };
 struct hub_wfd {
     int fd;
     enum hub_wfd_mode mode;
+    bool fifo; /* decided once at open: only a pipe guarantees PIPE_BUF to a ready fd */
 };
 void hub_wfd_open(struct hub_wfd *w, int fd);
 

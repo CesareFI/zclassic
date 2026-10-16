@@ -11,6 +11,7 @@
 
 #include "test/test_core.h"
 #include "session/mesh_terminal_hub.h"
+#include "../../../cognition/modules/session/src/mesh_terminal_hub_io.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +21,7 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
@@ -667,6 +669,50 @@ static int natural_stop_case(void)
     return failures;
 }
 
+/* hub_wfd on a tty: POLLOUT can mean one free byte, so a pty whose reader has
+ * stopped must not hold a write past its deadline. The writer runs in a child
+ * so a regression (a PIPE_BUF write blocking in the tty) fails by timeout
+ * instead of hanging the group. Also pins the mode choice: a pipe keeps the
+ * RWF_NOWAIT path, a pty is polled one byte at a time. */
+static int pty_write_case(void)
+{
+    int failures = 0;
+    int master = posix_openpt(O_RDWR | O_NOCTTY);
+    int slave = -1;
+    if (master >= 0 && grantpt(master) == 0 && unlockpt(master) == 0) {
+        char *name = ptsname(master);
+        slave = name ? open(name, O_RDWR | O_NOCTTY) : -1;
+    }
+    failures = check(failures, slave >= 0, "pty write: open a pty pair");
+    if (slave < 0)
+        return failures;
+    int pp[2];
+    struct hub_wfd wp, wt;
+    failures = check(failures, pipe(pp) == 0, "pty write: pipe");
+    hub_wfd_open(&wp, pp[1]);
+    hub_wfd_open(&wt, slave);
+    failures = check(failures, wp.mode == HUB_WFD_NOWAIT && wp.fifo,
+                     "pty write: a pipe keeps the RWF_NOWAIT path");
+    failures = check(failures, wt.mode == HUB_WFD_POLLED && !wt.fifo,
+                     "pty write: a pty is polled, not trusted with PIPE_BUF");
+    close(pp[0]);
+    close(pp[1]);
+    pid_t pid = fork();
+    if (pid == 0) {
+        static uint8_t big[1u << 20];
+        memset(big, 'x', sizeof big);
+        /* nobody reads the master: this must give up at the deadline */
+        _exit(hub_wfd_write(&wt, big, sizeof big, now_ms() + 300) ? 1 : 0);
+    }
+    int status = 0;
+    bool done = pid > 0 && exits_within(pid, 3000, &status);
+    failures = check(failures, done && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                     "pty write: a stopped pty reader cannot hold the write past its deadline");
+    close(slave);
+    close(master);
+    return failures;
+}
+
 int test_mesh_terminal_hub_bounds(const char *fbsh, const char *dir)
 {
     g_fbsh = fbsh;
@@ -674,7 +720,8 @@ int test_mesh_terminal_hub_bounds(const char *fbsh, const char *dir)
     signal(SIGPIPE, SIG_IGN);
     return stop_orphan_case() + audit_race_case() + client_stop_case() +
            client_tail_case() + busy_count_case() +
-           stale_slot_case() + wedged_stop_case() + natural_stop_case();
+           stale_slot_case() + wedged_stop_case() + natural_stop_case() +
+           pty_write_case();
 }
 
 #else /* __linux__ */
