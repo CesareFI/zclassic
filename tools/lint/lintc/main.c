@@ -251,6 +251,8 @@ static const struct lint_gate k_gates[] = {
       check_verification_coverage_selftest },
     { "check-hosted-suite-verdict", check_hosted_suite_verdict_run,
       check_hosted_suite_verdict_selftest },
+    { "check-command-input-keys", check_command_input_keys_run,
+      check_command_input_keys_selftest },
     { "check-no-real-clock-test-deadline",
       check_no_real_clock_test_deadline_run,
       check_no_real_clock_test_deadline_selftest },

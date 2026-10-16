@@ -321,7 +321,7 @@ gate_command() {
         check-tor-provenance)              echo './tools/lint/check_tor_provenance.sh' ;;
         check-command-contract)            echo './tools/lint/check_command_contract.sh' ;;
         check-command-availability-truthful) echo './build/bin/z23-lint check-command-availability-truthful' ;;
-        check-command-input-keys)          echo './tools/lint/check_command_input_keys.sh' ;;
+        check-command-input-keys)          echo './build/bin/z23-lint check-command-input-keys --selftest && ./build/bin/z23-lint check-command-input-keys' ;;
         check-read-leaf-no-boot-ceremony)  echo './tools/lint/check_read_leaf_no_boot_ceremony.sh' ;;
         check-telemetry-ontology)          echo './tools/lint/check_telemetry_ontology.sh' ;;
         check-privileged-transition-receipt) echo './tools/lint/check_privileged_transition_receipt.sh' ;;

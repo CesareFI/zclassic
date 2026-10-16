@@ -6505,6 +6505,8 @@ LINTC_SRCS = $(LINTC_LIVE_DATADIR_SRCS) tools/lint/lintc/lib.c tools/lint/lintc/
     tools/lint/lintc/gate_command_input_keys_diff.c \
     tools/lint/lintc/gate_command_input_keys_extract.c \
     tools/lint/lintc/gate_command_input_keys_index.c \
+    tools/lint/lintc/gate_command_input_keys_run.c \
+    tools/lint/lintc/gate_command_input_keys_selftest.c \
     tools/lint/lintc/gate_command_input_keys_support.c \
     tools/lint/lintc/gate_no_real_clock_test_deadline.c \
     tools/lint/lintc/gate_no_real_clock_test_deadline_selftest.c \
@@ -14260,9 +14262,9 @@ check-command-availability-truthful: $(LINTC_TOOL)
 # never declared it: pass it -> INVALID_INPUT, omit it -> RECIPE_MISSING).
 # Reads the .def AND the C it binds; check-command-contract is a different
 # predicate (see that script's header) and neither subsumes the other.
-check-command-input-keys:
+check-command-input-keys: $(LINTC_TOOL)
 	@echo "══ LINT: command input_keys vs. handler reads ══"
-	@./tools/lint/check_command_input_keys.sh
+	@./build/bin/z23-lint check-command-input-keys --selftest && ./build/bin/z23-lint check-command-input-keys
 
 # Gate — a leaf declared READ may not reach the datadir BOOT CEREMONY.
 # `app service access` was READY_READ/AUTH_PUBLIC/IDEMPOTENT and called
