@@ -608,6 +608,40 @@ static int live_explicit_argv(void)
     return failures;
 }
 
+/* Live: a dynamically linked program runs in the cage (ld.so maps its
+ * libraries with file-backed PROT_EXEC mmap); exit codes propagate. */
+static int live_dynamic_argv(void)
+{
+    static const struct { const char *path; int code; } progs[] = {
+        { "/usr/bin/true", 0 }, { "/usr/bin/false", 1 },
+    };
+    int failures = 0;
+    for (size_t i = 0; i < sizeof progs / sizeof progs[0]; i++) {
+        struct stat st;
+        if (stat(progs[i].path, &st) != 0 || (st.st_mode & S_IXUSR) == 0) {
+            printf("mesh_terminal_worker: SKIP dynamic argv %s (absent)\n",
+                   progs[i].path);
+            continue;
+        }
+        const char *const run[] = { progs[i].path, NULL };
+        struct mesh_terminal_worker_config cfg;
+        struct mesh_terminal_worker w;
+        live_config(&cfg);
+        cfg.argv = run;
+        int64_t t0 = (int64_t)platform_time_wall_time_t();
+        struct zcl_result r = mesh_terminal_worker_spawn(&cfg, t0, &w);
+        failures = check(failures, r.ok, "dynamic argv: spawn");
+        if (r.ok)
+            failures = check(failures, wait_exit(&w, 5) &&
+                             w.term_signal == 0 && w.exit_code == progs[i].code &&
+                             w.close_reason == MESH_TERMINAL_CLOSE_WORKER_EXITED,
+                             progs[i].code ? "dynamic argv: /usr/bin/false exits 1"
+                                           : "dynamic argv: /usr/bin/true exits 0");
+        mesh_terminal_worker_kill(&w);
+    }
+    return failures;
+}
+
 /* Live: 2 MiB of output under the service byte budget. */
 static int live_two_mib_output(void)
 {
@@ -826,6 +860,7 @@ static int test_mesh_terminal_worker_platform_arm(void)
 
     failures += live_exit_status();
     failures += live_explicit_argv();
+    failures += live_dynamic_argv();
     failures += live_two_mib_output();
 
     /* ── live: input byte budget ───────────────────────────────────── */

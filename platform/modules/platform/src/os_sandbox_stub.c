@@ -391,7 +391,7 @@ const int *os_sandbox_node_confine_serving_allowed_syscalls(size_t *count)
 }
 
 struct zcl_result os_sandbox_seccomp_deny_ext(
-    const int *denied, size_t n_denied, bool deny_exec_mmap,
+    const int *denied, size_t n_denied, enum os_sandbox_wx deny_exec_mmap,
     const int *enosys, size_t n_enosys, bool clone_threads_only)
 {
     (void)enosys;

@@ -577,40 +577,39 @@ const int *os_sandbox_node_steady_denied_syscalls(size_t *count_out)
 #ifdef ZCL_HAVE_SECCOMP
 #ifdef __NR_pkey_mprotect
 #define SC_WX_INSNS 15u
+#define SC_NR_PKEY __NR_pkey_mprotect
 #else
 #define SC_WX_INSNS 10u
+#define SC_NR_PKEY (-1)
 #endif
-/* W^X: mmap/mprotect/pkey_mprotect with PROT_EXEC (args[2]) is killed; each
- * block reloads nr. Emitted before the plain denies (accumulator = nr). */
-static void sc_emit_wx(struct sock_filter *filt, size_t *kp)
+/* W^X: PROT_EXEC (args[2]) on mmap/mprotect/pkey_mprotect is killed; each block
+ * reloads nr. WX_FILE_EXEC's mmap block kills only anonymous / fd -1 maps. */
+#define SC_ARG(n) offsetof(struct seccomp_data, args[n])
+#define SC_KILL BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS)
+#define SC_LD(off) BPF_STMT(BPF_LD | BPF_W | BPF_ABS, (off))
+static void sc_emit_wx(struct sock_filter *filt, size_t *kp,
+                       enum os_sandbox_wx mode)
 {
-    size_t k = *kp;
-    const int wx[3] = {
-        __NR_mmap, __NR_mprotect,
-#ifdef __NR_pkey_mprotect
-        __NR_pkey_mprotect,
-#else
-        -1,
-#endif
-    };
+    const int wx[3] = { __NR_mmap, __NR_mprotect, SC_NR_PKEY };
     for (int i = 0; i < 3; i++) {
         if (wx[i] < 0) continue;
-        /* if nr != wx -> skip the 4-instr check block (land on reload) */
-        filt[k++] = (struct sock_filter)BPF_JUMP(
-            BPF_JMP | BPF_JEQ | BPF_K, (uint32_t)wx[i], 0, 4);
-        /* load low 32 bits of args[2] (prot); PROT_EXEC fits the low word */
-        filt[k++] = (struct sock_filter)BPF_STMT(
-            BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[2]));
-        /* if (prot & PROT_EXEC) -> next instr (kill); else skip it */
-        filt[k++] = (struct sock_filter)BPF_JUMP(
-            BPF_JMP | BPF_JSET | BPF_K, 0x4 /*PROT_EXEC*/, 0, 1);
-        filt[k++] = (struct sock_filter)BPF_STMT(
-            BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
-        /* reload nr for the following comparisons */
-        filt[k++] = (struct sock_filter)BPF_STMT(
-            BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr));
+        const uint32_t nr = (uint32_t)wx[i];
+        const struct sock_filter strict[5] = {
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, nr, 0, 4), SC_LD(SC_ARG(2)),
+            BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, 0x4 /*PROT_EXEC*/, 0, 1),
+            SC_KILL, SC_LD(offsetof(struct seccomp_data, nr)) };
+        const struct sock_filter fexec[10] = {
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, nr, 0, 8), SC_LD(SC_ARG(2)),
+            BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, 0x4 /*PROT_EXEC*/, 0, 6),
+            SC_LD(SC_ARG(3)),
+            BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, 0x20 /*MAP_ANONYMOUS*/, 0, 1),
+            SC_KILL, SC_LD(SC_ARG(4)),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0xffffffffu /*fd -1*/, 0, 1),
+            SC_KILL, SC_LD(offsetof(struct seccomp_data, nr)) };
+        bool fe = wx[i] == __NR_mmap && mode == OS_SANDBOX_WX_FILE_EXEC;
+        memcpy(filt + *kp, fe ? fexec : strict, (fe ? 10u : 5u) * sizeof *strict);
+        *kp += fe ? 10u : 5u;
     }
-    *kp = k;
 }
 
 /* Syscalls that fail with ENOSYS instead of killing (clone3: libc then falls
@@ -739,7 +738,7 @@ static struct zcl_result sc_install(struct sock_filter *filt, size_t k)
 #endif /* ZCL_HAVE_SECCOMP */
 
 struct zcl_result os_sandbox_seccomp_deny_ext(
-    const int *denied, size_t n_denied, bool deny_exec_mmap,
+    const int *denied, size_t n_denied, enum os_sandbox_wx deny_exec_mmap,
     const int *enosys, size_t n_enosys, bool clone_threads_only)
 {
 #ifndef ZCL_HAVE_SECCOMP
@@ -757,6 +756,7 @@ struct zcl_result os_sandbox_seccomp_deny_ext(
     enum { MAX_FILTER = 512 };
     size_t extra = 4u + SC_ABI_GUARD_INSNS + 1u +
                    (deny_exec_mmap ? SC_WX_INSNS : 0u) +
+                   (deny_exec_mmap == OS_SANDBOX_WX_FILE_EXEC ? 5u : 0u) +
                    (clone_threads_only ? SC_CLONE_THREAD_INSNS : 0u);
     size_t cap = (MAX_FILTER - extra) / 2; /* counts are checked by subtraction: no wrap */
     if (n_denied > cap || n_enosys > cap - n_denied)
@@ -770,7 +770,7 @@ struct zcl_result os_sandbox_seccomp_deny_ext(
     sc_emit_preamble(filt, &k);
 
     sc_emit_abi_guard(filt, &k);
-    if (deny_exec_mmap) sc_emit_wx(filt, &k);
+    if (deny_exec_mmap) sc_emit_wx(filt, &k, deny_exec_mmap);
     sc_emit_enosys(filt, &k, enosys, n_enosys);
     if (clone_threads_only) sc_emit_clone_threads(filt, &k);
     sc_emit_deny(filt, &k, denied, n_denied);

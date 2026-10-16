@@ -63,6 +63,7 @@ int test_exec_tier_pure_cases(void);
 #include <unistd.h>
 #if !defined(_WIN32)
 #include <netinet/in.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -626,6 +627,48 @@ static int c_seccomp_exec(void)
     execve("/bin/true", (char *const[]){"/bin/true", NULL}, (char *const[]){NULL});
     return 5; /* reached only if the filter failed to block execve */
 }
+
+/* W^X variants. mode 1 = strict, 2 = file-backed exec allowed. Each child
+ * installs the filter, then performs ONE memory call; kind selects which. */
+enum { WXK_FILE_EXEC, WXK_ANON_EXEC, WXK_MPROTECT_EXEC, WXK_NOFD_EXEC, WXK_PLAIN };
+static int sb_wx(int mode, int kind)
+{
+    int fd = open("/proc/self/exe", O_RDONLY);
+    if (fd < 0 || !os_sandbox_no_new_privs()) return 70;
+    if (!os_sandbox_seccomp_deny_ext(NULL, 0, (enum os_sandbox_wx)mode,
+                                     NULL, 0, false).ok)
+        return 71;
+    void *p = MAP_FAILED;
+    switch (kind) {
+    case WXK_FILE_EXEC:
+        p = mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+        break;
+    case WXK_ANON_EXEC:
+        p = mmap(NULL, 4096, PROT_READ | PROT_EXEC,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        break;
+    case WXK_MPROTECT_EXEC:
+        p = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p != MAP_FAILED && mprotect(p, 4096, PROT_READ | PROT_EXEC) != 0)
+            return 72;
+        break;
+    case WXK_NOFD_EXEC:
+        p = mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, -1, 0);
+        break;
+    default:
+        p = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        break;
+    }
+    return p == MAP_FAILED ? 73 : 0;
+}
+static int c_wx_strict_file(void) { return sb_wx(1, WXK_FILE_EXEC); }
+static int c_wx_file_file(void) { return sb_wx(2, WXK_FILE_EXEC); }
+static int c_wx_file_anon(void) { return sb_wx(2, WXK_ANON_EXEC); }
+static int c_wx_file_mprot(void) { return sb_wx(2, WXK_MPROTECT_EXEC); }
+static int c_wx_file_nofd(void) { return sb_wx(2, WXK_NOFD_EXEC); }
+static int c_wx_file_plain(void) { return sb_wx(2, WXK_PLAIN); }
 
 static int c_seccomp_socket(void)
 {
@@ -1468,6 +1511,18 @@ int test_os_sandbox(void)
     /* seccomp: normal code runs, denied syscalls SIGSYS-kill the process */
     SB_CHECK("seccomp deny: execve -> SIGSYS", sb_run_child(c_seccomp_exec) == -SIGSYS);
     SB_CHECK("seccomp deny: socket -> SIGSYS", sb_run_child(c_seccomp_socket) == -SIGSYS);
+    SB_CHECK("seccomp W^X strict: file-backed PROT_EXEC mmap -> SIGSYS",
+             sb_run_child(c_wx_strict_file) == -SIGSYS);
+    SB_CHECK("seccomp W^X file-exec: file-backed PROT_EXEC mmap allowed",
+             sb_run_child(c_wx_file_file) == 0);
+    SB_CHECK("seccomp W^X file-exec: anonymous PROT_EXEC mmap -> SIGSYS",
+             sb_run_child(c_wx_file_anon) == -SIGSYS);
+    SB_CHECK("seccomp W^X file-exec: mprotect PROT_EXEC -> SIGSYS",
+             sb_run_child(c_wx_file_mprot) == -SIGSYS);
+    SB_CHECK("seccomp W^X file-exec: PROT_EXEC mmap with fd -1 -> SIGSYS",
+             sb_run_child(c_wx_file_nofd) == -SIGSYS);
+    SB_CHECK("seccomp W^X file-exec: non-exec anonymous mmap unaffected",
+             sb_run_child(c_wx_file_plain) == 0);
 #if defined(__x86_64__) && defined(__linux__)
     if (!os_sandbox_seccomp_supported()) {
         printf("os_sandbox: SKIP x32/reserved ABI cases (seccomp unavailable in this build)\n");

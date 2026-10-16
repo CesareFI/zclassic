@@ -274,7 +274,8 @@ static const char *tw_binary(const struct mesh_terminal_worker_config *cfg)
 
 /* The cage's filesystem grants: the workdir read/write, the one binary
  * read/execute, and for an explicit argv the standard library directories
- * that exist, read/execute. The seccomp set is unchanged. */
+ * that exist, read/execute. The seccomp set is unchanged except that W^X
+ * becomes "file-backed exec allowed" for an explicit argv. */
 static size_t tw_grant_rules(const struct mesh_terminal_worker_config *cfg,
                              struct os_sandbox_path_rule *rules)
 {
@@ -331,6 +332,10 @@ static void tw_child(const struct mesh_terminal_worker_config *cfg,
     size_t n_rules = tw_grant_rules(cfg, rules);
     struct os_sandbox_profile profile =
         os_sandbox_terminal_worker_profile(rules, n_rules);
+    /* An explicit argv may be dynamically linked: let ld.so map libraries
+     * (file-backed PROT_EXEC mmap) while anonymous/mprotect exec stays killed. */
+    if (cfg->argv)
+        profile.seccomp_deny_exec_mmap = OS_SANDBOX_WX_FILE_EXEC;
     if (!os_sandbox_enter(&profile).ok) {
         uint8_t stage = TW_STAGE_CONFINEMENT;
         ssize_t reported = write(stage_fd, &stage, 1); /* pre-exit stage report: the parent names this failure from its own EOF read */

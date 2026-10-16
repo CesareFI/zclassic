@@ -196,6 +196,17 @@ struct os_sandbox_rlimits {
     uint64_t nofile;       /* RLIMIT_NOFILE— open fd ceiling                 */
     uint64_t core_bytes;   /* RLIMIT_CORE  — core dump size (0 = disabled)   */
 };
+/* W^X mode for the seccomp filter. true/false convert to STRICT/OFF.
+ * FILE_EXEC additionally lets mmap(PROT_EXEC) through when it maps a file
+ * (MAP_ANONYMOUS clear and fd != -1) so ld.so can load shared libraries;
+ * anonymous PROT_EXEC mmap and every mprotect/pkey_mprotect PROT_EXEC stay
+ * killed. */
+enum os_sandbox_wx {
+    OS_SANDBOX_WX_OFF = 0,
+    OS_SANDBOX_WX_STRICT = 1,
+    OS_SANDBOX_WX_FILE_EXEC = 2,
+};
+
 
 /* A named, composable confinement recipe. os_sandbox_enter() applies the
  * enabled builders in the ONE correct order (see the ordering invariant on
@@ -217,7 +228,7 @@ struct os_sandbox_profile {
     bool seccomp;                               /* install the deny-list     */
     const int *denied_syscalls;                 /* array of __NR_* values    */
     size_t n_denied;
-    bool seccomp_deny_exec_mmap;                /* also W^X: PROT_EXEC mmap/mprotect */
+    enum os_sandbox_wx seccomp_deny_exec_mmap;  /* W^X mode (OFF/STRICT/FILE_EXEC); true == STRICT */
     const int *enosys_syscalls;                 /* fail ENOSYS, not KILL      */
     size_t n_enosys;
     bool seccomp_clone_threads_only;            /* clone only with CLONE_THREAD */
@@ -365,7 +376,7 @@ struct zcl_result os_sandbox_seccomp_deny(const int *denied, size_t n_denied,
  * clone_threads_only clone is permitted ONLY when the low 32 bits of args[0]
  * carry CLONE_THREAD (x86_64). Threads die with the process-group kill. */
 struct zcl_result os_sandbox_seccomp_deny_ext(
-    const int *denied, size_t n_denied, bool deny_exec_mmap,
+    const int *denied, size_t n_denied, enum os_sandbox_wx deny_exec_mmap,
     const int *enosys, size_t n_enosys, bool clone_threads_only);
 
 /* The RESIDENT NODE's -confine ALLOW-list: the empirically-derived steady-state

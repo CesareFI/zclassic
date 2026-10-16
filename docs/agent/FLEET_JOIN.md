@@ -379,11 +379,12 @@ binary or live inside the workdir.
 in the same cage: `argv[0]` becomes the one granted binary (read and
 execute), the standard library directories that exist (`/lib`, `/lib64`,
 `/usr/lib`, `/usr/lib64`) are granted read and execute, the workdir is
-read-write, and the seccomp set is unchanged. Because W^X denies executable
-file mappings, a dynamically linked program dies there (measured:
-`/usr/bin/true` is killed by SIGSYS and `connect` exits 159, so the library
-directory grants do nothing until the seccomp set changes); a statically
-linked program (such as `fbsh -c '...'`) runs. A program the server
+read-write, and the seccomp set is unchanged except for W^X, which for an
+explicit argv allows file-backed executable mappings only (`mmap` with
+`PROT_EXEC` needs a real fd and no `MAP_ANONYMOUS`); anonymous executable
+mappings and any `mprotect` to executable stay killed by SIGSYS. So a
+dynamically linked program (such as `/usr/bin/true`) runs, and so does a
+statically linked program (such as `fbsh -c '...'`). A program the server
 cannot run (relative path, missing, not a regular executable file) is refused
 by name before any process starts: `EXEC_REFUSED`, exit 2. A write outside the
 workdir fails inside the cage with the program's own error.
