@@ -71,6 +71,8 @@ static int tcp_connect(uint16_t port)
 /* Waits for a child to exit on its own; kills it when it does not. */
 static bool exits_within(pid_t pid, int ms, int *status)
 {
+    if (pid <= 1)
+        return false;
     for (int waited = 0; waited <= ms; waited += 20) {
         if (waitpid(pid, status, WNOHANG) == pid)
             return true;
@@ -174,8 +176,10 @@ static bool cl_start(struct cl *c, int net_fd, int drop_fd, const char *const *a
 static void cl_end(struct cl *c)
 {
     int st;
-    kill(c->pid, SIGKILL);
-    waitpid(c->pid, &st, 0);
+    if (c->pid > 1) {
+        kill(c->pid, SIGKILL);
+        waitpid(c->pid, &st, 0);
+    }
     close(c->keys_w); close(c->screen_r); close(c->res_r); close(c->ev_w);
 }
 
@@ -306,7 +310,7 @@ static int stop_orphan_case(void)
                      "worker stop: SIGTERM ends the supervisor although the session ignores it");
     bool gone = said && group_gone(leader);
     failures = check(failures, gone, "worker stop: the WORKER group is gone, not only the supervisor");
-    if (said && !gone)
+    if (said && !gone && leader > 1)
         kill(-leader, SIGKILL);
     rig_end(&c, up, net, cfg.audit_fd);
     return failures;
@@ -517,7 +521,7 @@ static int stale_slot_case(void)
                      "stale slot: the supervisor still stops when a session died from outside");
     failures = check(failures, said && group_running(leader) >= 1,
                      "stale slot: a group named only by a dead session's slot is not killed");
-    if (said)
+    if (said && leader > 1)
         kill(-leader, SIGKILL);
     rig_end(&c, up, net, cfg.audit_fd);
     return failures;

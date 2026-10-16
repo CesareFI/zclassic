@@ -246,7 +246,7 @@ static int test_interrupted_reaping(void)
     pid_t got = waitpid(pid, &status, WNOHANG);
     failures = check(failures, got == -1 && errno == ECHILD,
                      "kill actually reaped the child");
-    if (got == 0) { (void)kill(pid, SIGKILL); (void)tw_wait_settled(pid, &status); }
+    if (got == 0 && pid > 1) { (void)kill(pid, SIGKILL); (void)tw_wait_settled(pid, &status); }
     return failures;
 }
 static int test_interrupted_startup_reaping(void)
@@ -645,6 +645,23 @@ static int live_dynamic_argv(void)
     return failures;
 }
 
+/* Signal only a pid or group this test owns: never 0, -1 or init, so a failed
+ * fork (-1) or an unset slot (0) can never become a broadcast kill. */
+static void kill_owned_group(pid_t pgid)
+{
+    if (pgid > 1)
+        (void)kill(-pgid, SIGKILL);
+}
+
+static void kill_owned_pid(pid_t pid, bool reap)
+{
+    if (pid <= 1)
+        return;
+    (void)kill(pid, SIGKILL);
+    if (reap)
+        (void)waitpid(pid, NULL, 0);
+}
+
 /* Members of a process group that are still running (zombies awaiting their
  * parent do not count: they are already dead). */
 static unsigned group_running(pid_t pgid)
@@ -707,7 +724,7 @@ static int live_orphan_descendant(void)
     }
     failures = check(failures, left == 0, "orphan: ending the session kills the descendant");
     if (left)
-        (void)kill(-w.pgid, SIGKILL);
+        kill_owned_group(w.pgid);
     return failures;
 }
 
@@ -751,7 +768,7 @@ static int live_custody_order(void)
     }
     failures = check(failures, left == 0, "custody: the descendant died with the group");
     if (left)
-        (void)kill(-w.pgid, SIGKILL);
+        kill_owned_group(w.pgid);
     return failures;
 }
 
@@ -798,6 +815,8 @@ static int live_pid_namespace(void)
         for (;;)
             pause();
     }
+    if (sibling < 0)
+        return check(0, false, "pidns: fixture sibling fork");
     char script[512];
     snprintf(script, sizeof script,
              "kill -0 %ld; S=$?; kill -0 %ld; P=$?; "
@@ -829,11 +848,9 @@ static int live_pid_namespace(void)
         failures = check(failures, other > 0 && kill(other, 0) != 0,
                          "pidns: ending the session takes the out-of-group job down with the namespace");
         failures = check(failures, kill(sibling, 0) == 0, "pidns: the outside sibling was not touched");
-        if (other > 0 && kill(other, 0) == 0)
-            (void)kill(other, SIGKILL);
+        kill_owned_pid(other, false);
     }
-    (void)kill(sibling, SIGKILL);
-    (void)waitpid(sibling, NULL, 0);
+    kill_owned_pid(sibling, true);
     return failures;
 }
 

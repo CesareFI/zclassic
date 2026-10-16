@@ -686,10 +686,11 @@ static void mesh_terminal_worker_kill_platform_arm(struct mesh_terminal_worker *
 
     /* Whole group first, while the leader (running or a zombie) holds the id;
      * only then is the leader reaped. */
-    (void)kill(-w->pgid, SIGKILL);
+    if (w->pgid > 1)
+        (void)kill(-w->pgid, SIGKILL);
     TW_MARK(g_tw_killpg_seq);
     tw_slot(w->pgid_slot, 0);
-    if (w->running)
+    if (w->running && w->pid > 1)
         (void)kill(w->pid, SIGKILL);
     tw_reap_leader(w);
 }
