@@ -168,7 +168,7 @@ ZCL_COMMAND_READY_COMMAND(
     ZCL_COMMAND_RESULT_BUDGET,
     "plugin,run,supervise,confined,restart,backoff,ping,landlock,seccomp",
     "zcl.plugin_run.input.v1", "zcl.plugin_run.v1",
-    "name,seconds", "name",
+    "name,seconds", "name,seconds",
     "z23 plugin run hello",
     ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_EFFECT_MUTATE,
     ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_LOCAL,

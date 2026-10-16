@@ -1129,6 +1129,9 @@ static int prt_case_command(void)
         ASSERT_STR_EQ(json_get_str(json_get(&r.data, "generation")), gen);
         ASSERT(json_get_int(json_get(&r.data, "pings_ok")) >= 1);
         zcl_command_reply_free(&r);
+        const char *cli_args[] = {"run", "alpha", "1"};
+        ASSERT_EQ(zcl_native_command_main("plugin", cli_args, 3, e.base, 0,
+                                         CHAIN_MAIN, true), ZCL_COMMAND_EXIT_OK);
         ASSERT(prt_call("{\"name\":\"nothing\"}", &r));
         ASSERT_STR_EQ(r.error.code, "PLUGIN_NOT_INSTALLED");
         zcl_command_reply_free(&r);

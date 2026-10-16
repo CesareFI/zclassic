@@ -1858,7 +1858,7 @@ represented by its children's sections.
 | `plugin status` | ready | read / read / operator · fast/low | **`name`** | `zcl.plugin_status.v1` | `z23 plugin status hello` | Show one installed plugin's current, last-good and generation count |
 | `plugin switch` | ready | mutate / app-write / **owner** · fast/low | **`name`**, **`generation`** | `zcl.plugin_switch.v1` | `z23 plugin switch hello <128-hex generation>` | Make an installed plugin generation current |
 | `plugin rollback` | ready | mutate / app-write / **owner** · fast/low | **`name`** | `zcl.plugin_rollback.v1` | `z23 plugin rollback hello` | Restore the last-good plugin generation as current |
-| `plugin run` | ready | mutate / app-write / **owner** · persistent/low | **`name`**, `seconds` | `zcl.plugin_run.v1` | `z23 plugin run hello` | Run an installed plugin confined, health-checked and restarted on failure |
+| `plugin run` | ready | mutate / app-write / **owner** · persistent/low | **`name`**, **`seconds`** | `zcl.plugin_run.v1` | `z23 plugin run hello` | Run an installed plugin confined, health-checked and restarted on failure |
 
 ### `story` — Rooted causal views of development work
 
