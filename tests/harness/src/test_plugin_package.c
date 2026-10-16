@@ -112,6 +112,21 @@ static bool pp_add_file(struct vcs_package_manifest *m, const char *directory,
     return ok && vcs_package_manifest_add(m, leaf, mode, *length, digests, chunks);
 }
 
+static bool pp_store_file_chunks(struct pp_fixture *f, const char *leaf,
+                                 const uint8_t *bytes, size_t length)
+{
+    for (size_t offset = 0; offset < length; offset += VCS_PACKAGE_CHUNK_BYTES) {
+        size_t chunk_length = length - offset;
+        if (chunk_length > VCS_PACKAGE_CHUNK_BYTES)
+            chunk_length = VCS_PACKAGE_CHUNK_BYTES;
+        if (vcs_package_store_put_chunk(f->publisher.store, f->root, leaf,
+                (uint32_t)(offset / VCS_PACKAGE_CHUNK_BYTES), bytes + offset,
+                chunk_length) != VCS_PACKAGE_STORE_OK)
+            return false;
+    }
+    return true;
+}
+
 static bool pp_publish(struct pp_fixture *f, unsigned version)
 {
     struct plugin_pack_request request = {
@@ -141,16 +156,8 @@ static bool pp_publish(struct pp_fixture *f, unsigned version)
     ok = ok && vcs_package_manifest_serialize(&manifest, &wire, &wire_len) &&
         vcs_package_store_put_manifest(f->publisher.store, wire, wire_len,
                                         f->root) == VCS_PACKAGE_STORE_OK;
-    for (size_t i = 0; i < 4 && ok; i++) {
-        for (size_t offset = 0; offset < lengths[i] && ok;
-             offset += VCS_PACKAGE_CHUNK_BYTES) {
-            size_t length = lengths[i] - offset;
-            if (length > VCS_PACKAGE_CHUNK_BYTES) length = VCS_PACKAGE_CHUNK_BYTES;
-            ok = vcs_package_store_put_chunk(f->publisher.store, f->root, leaves[i],
-                    (uint32_t)(offset / VCS_PACKAGE_CHUNK_BYTES), bytes[i] + offset,
-                    length) == VCS_PACKAGE_STORE_OK;
-        }
-    }
+    for (size_t i = 0; i < 4 && ok; i++)
+        ok = pp_store_file_chunks(f, leaves[i], bytes[i], lengths[i]);
     for (size_t i = 0; i < 4; i++) free(bytes[i]);
     free(wire);
     vcs_package_manifest_free(&manifest);
@@ -303,6 +310,19 @@ static bool pp_runtime_image(struct pp_fixture *f, const char *mode)
     return ok;
 }
 
+static bool pp_runtime_verify_executable(const struct pp_fixture *f,
+                                         const struct plugin_manifest *installed)
+{
+    char exe[1400], digest[129];
+    struct stat image_stat;
+    return pp_path(exe, sizeof(exe), f->checkout, "demo") &&
+        stat(exe, &image_stat) == 0 && S_ISREG(image_stat.st_mode) &&
+        (image_stat.st_mode & 0111) != 0 &&
+        image_stat.st_size > VCS_PACKAGE_CHUNK_BYTES &&
+        plugin_hash_file(exe, digest) == PLUGIN_OK &&
+        strcmp(installed->exe_sha3, digest) == 0;
+}
+
 static bool pp_runtime_receive(struct pp_fixture *f, unsigned version,
                                char generation[129])
 {
@@ -321,14 +341,7 @@ static bool pp_runtime_receive(struct pp_fixture *f, unsigned version,
     if (plugin_store_install(f->trust, f->manifest, &installed, &present) != PLUGIN_OK ||
         present != 0 || strcmp(installed.generation, f->packed.generation) != 0)
         return false;
-    char exe[1400], digest[129];
-    struct stat image_stat;
-    if (!pp_path(exe, sizeof(exe), f->checkout, "demo") ||
-        stat(exe, &image_stat) != 0 || !S_ISREG(image_stat.st_mode) ||
-        (image_stat.st_mode & 0111) == 0 ||
-        image_stat.st_size <= VCS_PACKAGE_CHUNK_BYTES ||
-        plugin_hash_file(exe, digest) != PLUGIN_OK ||
-        strcmp(installed.exe_sha3, digest) != 0)
+    if (!pp_runtime_verify_executable(f, &installed))
         return false;
     memcpy(generation, installed.generation, 129);
     return true;
