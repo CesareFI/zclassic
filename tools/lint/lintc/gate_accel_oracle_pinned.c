@@ -120,6 +120,12 @@ static int aop_cmp(const void *a, const void *b)
     return strcmp(*(char *const *)a, *(char *const *)b);
 }
 
+static int aop_row_cmp(const void *a, const void *b)
+{
+    return strcmp(((const struct aop_row *)a)->impl,
+                  ((const struct aop_row *)b)->impl);
+}
+
 /* Sorts byte-wise and drops duplicates. */
 static void aop_vec_sort_uniq(struct aop_vec *s)
 {
@@ -844,6 +850,7 @@ static int aop_scan(struct aop_ctx *c)
     if (rc == 0)
         rc = aop_load_registry(c);
     if (rc == 0) {
+        qsort(c->row, c->n_row, sizeof *c->row, aop_row_cmp);
         aop_leg_unregistered(c);
         aop_leg_stale(c);
         rc = aop_leg_oracles(c);

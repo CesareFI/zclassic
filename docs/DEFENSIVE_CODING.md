@@ -744,7 +744,7 @@ assert green).
   but never dispatched proves nothing), and an oracle that references no
   symbol the implementation exports. Each oracle carries the marker
   `ACCEL-ORACLE: <impl path>`. Impl:
-  `tools/lint/check_accel_oracle_pinned.sh`.
+  `tools/lint/lintc/gate_accel_oracle_pinned.c` (`z23-lint check-accel-oracle-pinned`).
 
 - **`check-no-adx-overclaim`** (HARD) — the companion to the gate above. The
   accel oracle proves an accelerator computes the RIGHT answer; this one proves

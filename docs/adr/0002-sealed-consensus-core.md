@@ -155,7 +155,7 @@ ritual in front of every optimisation — turning a ritual that should mark a
 consensus decision into routine paperwork, which is how rituals stop being
 read. They are pinned by **property** instead of by bytes.
 
-`check-accel-oracle-pinned` (`tools/lint/check_accel_oracle_pinned.sh`,
+`check-accel-oracle-pinned` (`tools/lint/lintc/gate_accel_oracle_pinned.c` via `z23-lint check-accel-oracle-pinned`,
 registry `tools/lint/accel_oracle_registry.txt`) recomputes the include-closure
 of `core/` from source, keeps the members carrying a runtime ISA dispatch, and
 requires each to be pinned by a differential oracle that runs in the suite and

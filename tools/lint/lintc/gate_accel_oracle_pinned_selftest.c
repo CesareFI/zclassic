@@ -4,9 +4,13 @@
  * repository (two ISA-dispatched implementations reached from core/, their
  * oracles, a registry and a test group catalog) in a scratch directory,
  * proves it passes, then proves each failure class is rejected: an
- * unregistered ISA file, a malformed row, a stale row, a missing marker, an
- * unregistered test group, an oracle naming no export, and a collapsed scan
- * floor or missing registry (exit 2). The scratch directory is removed on
+ * unregistered ISA file, a malformed row, stale rows, a missing marker, an
+ * unregistered test group, an oracle naming no export (including one naming
+ * only a static function), a row for a file the core no longer reaches or that
+ * lost its ISA dispatch, a missing oracle file, diagnostics out of
+ * implementation order, and each collapsed scan floor or a missing registry
+ * (exit 2). The unregistered hw_profile.c carrying an ISA dispatch must not
+ * fail the passing case. The scratch directory is removed on
  * exit and after SIGINT, SIGTERM or SIGHUP.
  */
 #ifndef _POSIX_C_SOURCE
@@ -28,6 +32,7 @@ struct aops_file { const char *path; const char *text; };
 
 #define AOPS_SHA "core/modules/crypto/src/sha.c"
 #define AOPS_FAST "core/modules/crypto/src/fast_avx.c"
+#define AOPS_HW "platform/modules/util/src/hw_profile.c"
 #define AOPS_REG "tools/lint/accel_oracle_registry.txt"
 #define AOPS_CAT "tools/dev/test_group_catalog.def"
 
@@ -37,8 +42,25 @@ static const char k_aops_reg_full[] =
     "# registry\n" AOPS_SHA " tests/sha_oracle.c sha_group\n"
     AOPS_FAST " tests/fast_oracle.c fast_group  # trailing comment\n";
 
+static const char k_aops_reg_unreached[] =
+    "# registry\n" AOPS_SHA " tests/sha_oracle.c sha_group\n"
+    AOPS_FAST " tests/fast_oracle.c fast_group\n"
+    "tests/fast_oracle.c tests/fast_oracle.c fast_group\n";
+static const char k_aops_reg_noorc[] =
+    "# registry\n" AOPS_SHA " tests/sha_oracle.c sha_group\n"
+    AOPS_FAST " tests/absent_oracle.c fast_group\n";
+static const char k_aops_reg_unsorted[] =
+    "# registry\n"
+    "core/modules/crypto/src/z_gone.c tests/gone.c g\n"
+    AOPS_SHA " tests/sha_oracle.c sha_group\n"
+    "core/modules/crypto/src/a_gone.c tests/gone.c g\n"
+    AOPS_FAST " tests/fast_oracle.c fast_group\n";
+
 static const struct aops_file k_aops_base[] = {
-    { "core/consensus/src/a.c", "#include \"crypto/sha.h\"\nint a(void) { return 0; }\n" },
+    { "core/consensus/src/a.c", "#include \"crypto/sha.h\"\n#include \"util/hw_profile.h\"\n"
+                                "int a(void) { return 0; }\n" },
+    { "platform/modules/util/include/util/hw_profile.h", "int hw_probe(void);\n" },
+    { AOPS_HW, "int hw_probe(void) {\n    return __builtin_cpu_supports(\"avx2\");\n}\n" },
     { "core/modules/crypto/include/crypto/sha.h", "int sha_digest(int x);\n" },
     { "core/modules/crypto/include/crypto/fast.h", "int fast_hash(int x);\n" },
     { AOPS_SHA, "#include \"crypto/fast.h\"\n#include \"sha_priv.h\"\n"
@@ -62,32 +84,60 @@ struct aops_case {
     const struct aop_cfg *cfg;
     int want_rc;
     const char *needle;
+    const char *after;
 };
 
 static const struct aop_cfg k_aops_cfg = { AOPS_REG, AOPS_CAT, 2, 2, 2, 2, 1 };
 static const struct aop_cfg k_aops_cfg_hollow = { AOPS_REG, AOPS_CAT, 100, 2, 2, 2, 1 };
+static const struct aop_cfg k_aops_cfg_work = { AOPS_REG, AOPS_CAT, 2, 100, 2, 2, 1 };
+static const struct aop_cfg k_aops_cfg_closure = { AOPS_REG, AOPS_CAT, 2, 2, 100, 2, 1 };
+static const struct aop_cfg k_aops_cfg_isa = { AOPS_REG, AOPS_CAT, 2, 2, 2, 100, 1 };
+static const struct aop_cfg k_aops_cfg_isa1 = { AOPS_REG, AOPS_CAT, 2, 2, 2, 1, 1 };
+static const struct aop_cfg k_aops_cfg_rows = { AOPS_REG, AOPS_CAT, 2, 2, 2, 2, 100 };
 static const struct aop_cfg k_aops_cfg_nolist = { "tools/lint/absent.txt", AOPS_CAT, 2, 2, 2, 2, 1 };
 
 static const struct aops_case k_aops_cases[] = {
-    { "the synthetic tree passes", NULL, NULL, &k_aops_cfg, 0, "OK: 2 ISA-dispatched" },
+    { "the synthetic tree passes", NULL, NULL, &k_aops_cfg, 0,
+      "OK: 2 ISA-dispatched file(s) reachable from sealed core/ (closure 3 files)", NULL },
     { "an unregistered ISA file", AOPS_REG, k_aops_reg_sha, &k_aops_cfg, 1,
-      AOPS_FAST " is ISA-dispatched and reachable" },
+      AOPS_FAST " is ISA-dispatched and reachable", NULL },
     { "a malformed row", AOPS_REG, "# registry\n" AOPS_SHA " tests/sha_oracle.c sha_group\nbad.c oracle.c\n",
-      &k_aops_cfg, 1, "malformed row" },
+      &k_aops_cfg, 1, "malformed row", NULL },
     { "a stale row", AOPS_REG,
       "# registry\n" AOPS_SHA " tests/sha_oracle.c sha_group\n"
       AOPS_FAST " tests/fast_oracle.c fast_group\n"
       "core/modules/crypto/src/gone.c tests/gone.c g\n",
-      &k_aops_cfg, 1, "gone.c', which does not exist" },
+      &k_aops_cfg, 1, "gone.c', which does not exist", NULL },
     { "a missing marker", "tests/fast_oracle.c", "int t(void) { return fast_hash(1); }\n",
-      &k_aops_cfg, 1, "does not carry the marker line" },
+      &k_aops_cfg, 1, "does not carry the marker line", NULL },
     { "an unregistered group", AOPS_CAT, "ZCL_TEST_GROUP(sha_group)\n",
-      &k_aops_cfg, 1, "test group 'fast_group'" },
+      &k_aops_cfg, 1, "test group 'fast_group'", NULL },
     { "an oracle naming no export", "tests/sha_oracle.c",
       "/* ACCEL-ORACLE: " AOPS_SHA " */\nint t(void) { return sha_digestx(1); }\n",
-      &k_aops_cfg, 1, "references no function exported" },
-    { "a collapsed header floor", NULL, NULL, &k_aops_cfg_hollow, 2, "FATAL" },
-    { "a missing registry", NULL, NULL, &k_aops_cfg_nolist, 2, "FATAL — missing" },
+      &k_aops_cfg, 1, "references no function exported", NULL },
+    { "a collapsed header floor", NULL, NULL, &k_aops_cfg_hollow, 2, "FATAL", NULL },
+    { "a collapsed implementation floor", NULL, NULL, &k_aops_cfg_work, 2,
+      "resolved to almost no lib implementation files", NULL },
+    { "a collapsed closure floor", NULL, NULL, &k_aops_cfg_closure, 2,
+      "include closure collapsed", NULL },
+    { "a collapsed ISA floor", NULL, NULL, &k_aops_cfg_isa, 2,
+      "no ISA-dispatched file found", NULL },
+    { "a collapsed registry floor", NULL, NULL, &k_aops_cfg_rows, 2,
+      "registry lost rows", NULL },
+    { "a missing registry", NULL, NULL, &k_aops_cfg_nolist, 2, "FATAL — missing", NULL },
+    { "an oracle naming only a static function", "tests/sha_oracle.c",
+      "/* ACCEL-ORACLE: " AOPS_SHA " */\nint t(void) { return sha_helper(); }\n",
+      &k_aops_cfg, 1, "references no function exported", NULL },
+    { "a row for a file the core no longer reaches", AOPS_REG, k_aops_reg_unreached,
+      &k_aops_cfg, 1, "which sealed core/ no longer reaches", NULL },
+    { "a row for a file that lost its ISA dispatch", AOPS_FAST,
+      "int fast_hash(int x) {\n    return x;\n}\n",
+      &k_aops_cfg_isa1, 1, "which no longer carries an ISA dispatch", NULL },
+    { "a missing oracle file", AOPS_REG, k_aops_reg_noorc, &k_aops_cfg, 1,
+      "'tests/absent_oracle.c', which does not exist", NULL },
+    { "stale rows reported in implementation order", AOPS_REG, k_aops_reg_unsorted,
+      &k_aops_cfg, 1, "src/a_gone.c', which does not exist",
+      "src/z_gone.c', which does not exist" },
 };
 
 static int aops_fail(const char *what, const char *detail)
@@ -167,9 +217,14 @@ static int aops_case(const struct aops_case *k)
         fprintf(stderr, "%s", out);
         return aops_fail(k->name, "unexpected exit code");
     }
-    if (!strstr(out, k->needle)) {
+    const char *hit = strstr(out, k->needle);
+    if (!hit) {
         fprintf(stderr, "%s", out);
         return aops_fail(k->name, "expected message missing");
+    }
+    if (k->after && !strstr(hit + 1, k->after)) {
+        fprintf(stderr, "%s", out);
+        return aops_fail(k->name, "messages out of order");
     }
     return 0;
 }
@@ -222,6 +277,8 @@ int check_accel_oracle_pinned_selftest(void)
     if (rc == 0)
         puts("check_accel_oracle_pinned: selftest OK (pass, unregistered ISA file, "
              "malformed row, stale row, missing marker, unregistered group, "
-             "unwired oracle, collapsed floor, missing registry)");
+             "unwired oracle, static-only oracle, unreached row, row without ISA dispatch, "
+             "missing oracle file, hw_profile.c skip, ordered diagnostics, collapsed floors, "
+             "missing registry)");
     return rc;
 }

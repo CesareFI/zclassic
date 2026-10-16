@@ -1,7 +1,7 @@
 # accel_oracle_registry.txt — every ISA-dispatched implementation file that the
 # sealed consensus core reaches, and the differential oracle that pins it to a
-# portable reference. Enforced by tools/lint/check_accel_oracle_pinned.sh
-# (make lint gate `check-accel-oracle-pinned`).
+# portable reference. Enforced by tools/lint/lintc/gate_accel_oracle_pinned.c
+# (z23-lint check-accel-oracle-pinned; make lint gate `check-accel-oracle-pinned`).
 #
 # WHY THIS FILE EXISTS
 # core/{consensus,chainparams,params,math} is byte-sealed by core/MANIFEST.sha3.
