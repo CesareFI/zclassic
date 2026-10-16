@@ -5216,17 +5216,13 @@ static void generation_zcc_bootstrap(const char *generation)
     (void)unsetenv("ZCL_BIN_DIR");
 }
 
-/* `git worktree add` copies the submitting checkout's worktree-scoped
- * core.hooksPath verbatim into a fresh generation's own config.worktree, so
- * a freshly materialized generation still names the checkout's
- * build/githooks rather than the copy generation_prepare() just
- * materialized. check-git-hooks-installed then compares
- * expected=<generation>/build/githooks against
- * actual=<submitting checkout>/build/githooks and fails closed on every
- * proof that runs the full gate set. A generation must be judged against
- * the hooks it carries, so point its own worktree config at its own copy;
- * failing that reconfiguration fails the generation closed rather than
- * judging it against someone else's checkout. */
+/* Arm only this generation's own worktree scope with the same relative
+ * spelling used by install_git_hooks.sh and refresh_git_hooks_if_armed.sh.
+ * Git resolves hooks from the invoking worktree root; git_capture below
+ * executes in `generation`. Relative arming both isolates the copied hooks
+ * and permits a later native-hook rebuild to refresh that installed copy.
+ * An absolute generation-local spelling would isolate lookup but silently
+ * fail the refresher's exact relative-arming guard. */
 static bool generation_hooks_configure(const char *generation, char *why,
                                        size_t why_len)
 {
@@ -5237,7 +5233,7 @@ static bool generation_hooks_configure(const char *generation, char *why,
         return false;
     }
     const char *hooks_argv[] = {"git", "config", "--worktree",
-                                "core.hooksPath", hooks_path, NULL};
+                                "core.hooksPath", "build/githooks", NULL};
     char hooks_output[ZCL_DEVLOOP_OUTPUT_MAX];
     if (!git_capture(generation, hooks_argv, hooks_output,
                      sizeof(hooks_output))) {

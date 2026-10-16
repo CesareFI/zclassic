@@ -9354,6 +9354,47 @@ static int test_ic_capsule_argv_use(void)
 }
 #endif
 
+#if !defined(_WIN32)
+static bool ic_generation_hook_rebuild_refresh(const char *donor,
+                                               const char *generation)
+{
+    char source[4096];
+    if (!getcwd(source, sizeof(source))) return false;
+    const char *argv[] = {
+        "sh", "tools/dev/fixtures/proof/generation_hook_refresh.sh",
+        source, donor, generation, NULL
+    };
+    struct zcl_devloop_process_result run = {0};
+    bool ok = zcl_devloop_process_run(".", argv, 30000, &run) &&
+              run.exit_code == 0 && run.term_signal == 0 && !run.timed_out &&
+              !run.cancelled && !run.output_truncated;
+    if (!ok) fprintf(stderr, "generation hook refresh fixture failed: %s\n", run.output);
+    return ok;
+}
+static int ic_generation_hook_cleanup(const char *donor, const char *generation,
+                                      bool donor_owned, bool generation_owned)
+{
+    int failures = 0;
+    if (generation_owned) {
+        const char *remove[] = {"git", "-C", donor, "worktree", "remove",
+                                "--force", generation, NULL};
+        struct zcl_devloop_process_result run = {0};
+        bool enabled = setenv("ZCL_DEVLOOP_TEST_PROCESS", "1", 1) == 0;
+        bool removed = enabled && zcl_devloop_process_run(".", remove, 5000, &run) &&
+                       run.exit_code == 0 && run.term_signal == 0 &&
+                       !run.timed_out && !run.cancelled && !run.output_truncated;
+        (void)unsetenv("ZCL_DEVLOOP_TEST_PROCESS");
+        if (!removed) {
+            failures++;
+            if (test_rm_rf_recursive(generation) != 0) failures++;
+        }
+    }
+    if (donor_owned && test_rm_rf_recursive(donor) != 0) failures++;
+    return failures;
+}
+
+#endif
+
 /* `git worktree add` copies the submitting checkout's worktree-scoped
  * core.hooksPath verbatim into the new worktree's own config.worktree.
  * generation_prepare() materializes its own build/githooks copy, then calls
@@ -9365,13 +9406,17 @@ static int test_ic_capsule_argv_use(void)
 static int test_ic_generation_hooks_configure_points_at_its_own_copy(void)
 {
     int failures = 0;
+#if !defined(_WIN32)
+    char donor[4096] = {0}, generation[4096] = {0}, cmd[8192];
+    bool donor_owned = false, generation_owned = false;
+#endif
     TEST("proof generation: hooks reconfiguration points a generation at "
         "its own build/githooks, not the submitting checkout's") {
 #if defined(_WIN32)
         ASSERT(true);
 #else
-        char donor[4096], generation[4096], cmd[8192];
-        test_make_tmpdir(donor, sizeof(donor), "gen_hooks", "donor");
+        ASSERT(test_mkdtemp(donor, sizeof(donor), "gen_hooks_donor") != NULL);
+        donor_owned = true;
         ASSERT(snprintf(generation, sizeof(generation), "%s-gen", donor) <
               (int)sizeof(generation));
 
@@ -9395,6 +9440,7 @@ static int test_ic_generation_hooks_configure_points_at_its_own_copy(void)
             "git -C %s worktree add --quiet --detach %s >/dev/null 2>&1",
             donor, generation) < sizeof(cmd));
         ASSERT(system(cmd) == 0);
+        generation_owned = true;
 
         /* Before the fix runs, the generation still names the donor's
          * hooks -- the defect this test exists for. */
@@ -9425,8 +9471,11 @@ static int test_ic_generation_hooks_configure_points_at_its_own_copy(void)
         ASSERT(setenv("ZCL_DEVLOOP_TEST_PROCESS", "1", 1) == 0);
         bool configured = zcl_dev_proof_test_generation_hooks_configure(
             generation, why, sizeof(why));
+        bool refreshed = configured &&
+            ic_generation_hook_rebuild_refresh(donor, generation);
         (void)unsetenv("ZCL_DEVLOOP_TEST_PROCESS");
         ASSERT(configured);
+        ASSERT(refreshed);
 
         char gen_hooks_path[4096];
         ASSERT(snprintf(gen_hooks_path, sizeof(gen_hooks_path),
@@ -9446,18 +9495,31 @@ static int test_ic_generation_hooks_configure_points_at_its_own_copy(void)
             after[--after_len] = 0;
         /* The generation is now judged against the hooks it carries, not
          * the submitting checkout's. */
-        ASSERT(strcmp(after, gen_hooks_path) == 0);
+        ASSERT(strcmp(after, "build/githooks") == 0);
         ASSERT(strcmp(after, hooks_path) != 0);
-
-        ASSERT((size_t)snprintf(
-            cmd, sizeof(cmd),
-            "git -C %s worktree remove --force %s >/dev/null 2>&1", donor,
+        /* This exact relative value is also the rebuild refresher's
+         * arming contract. Verify real Git resolves it to THIS generation,
+         * preserving isolation rather than merely checking a config token. */
+        ASSERT((size_t)snprintf(cmd, sizeof(cmd),
+            "git -C %s rev-parse --path-format=absolute --git-path hooks/pre-push",
             generation) < sizeof(cmd));
-         TEST_DISCARD(system(cmd));
-        ASSERT(test_rm_rf_recursive(donor) == 0);
+        p = popen(cmd, "r");
+        ASSERT(p != NULL);
+        ASSERT(fgets(after, sizeof(after), p) != NULL);
+        ASSERT(pclose(p) == 0);
+        after[strcspn(after, "\r\n")] = 0;
+        ASSERT((size_t)snprintf(cmd, sizeof(cmd), "%s/pre-push",
+                                gen_hooks_path) < sizeof(cmd));
+        char canonical_hook[4096];
+        ASSERT(realpath(cmd, canonical_hook) != NULL);
+        ASSERT(strcmp(after, canonical_hook) == 0);
 #endif
         PASS();
     } _test_next:;
+#if !defined(_WIN32)
+    (void)unsetenv("ZCL_DEVLOOP_TEST_PROCESS");
+    failures += ic_generation_hook_cleanup(donor, generation, donor_owned, generation_owned);
+#endif
     return failures;
 }
 
