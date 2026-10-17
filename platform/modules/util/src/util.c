@@ -350,7 +350,18 @@ void GetDefaultDataDir(char *out, size_t out_size)
 {
 #ifdef _WIN32
     char path[MAX_PATH];
-    if (SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, path) == S_OK)
+    typedef HRESULT (WINAPI *folder_fn)(HWND, int, HANDLE, DWORD, LPSTR);
+    /* Avoid eager Shell32 loading before a confined selfexec reaches main. */
+    HMODULE shell = LoadLibraryExW(L"shell32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    folder_fn folder = NULL;
+    FARPROC symbol = shell ? GetProcAddress(shell, "SHGetFolderPathA") : NULL;
+    static_assert(sizeof(folder) == sizeof(symbol), "Windows folder symbol width");
+    memcpy(&folder, &symbol, sizeof(folder));
+    if (!folder)
+        fprintf(stderr, "util: Windows roaming-folder API unavailable\n");
+    HRESULT status = folder ? folder(NULL, CSIDL_APPDATA, NULL, 0, path) : E_FAIL;
+    if (shell) FreeLibrary(shell);
+    if (status == S_OK)
         snprintf(out, out_size, "%s\\ZClassic", path);
     else
         snprintf(out, out_size, "ZClassic");

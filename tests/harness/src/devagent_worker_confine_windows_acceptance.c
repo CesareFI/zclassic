@@ -16,6 +16,11 @@
  *   fail    executor rc 3 -> failed verdict, receipt rc 1;
  *   refuse  the child entry run OUTSIDE the confinement runs nothing.
  *
+ * The link also retains the actual state-root and default-datadir folder
+ * helpers to catch eager GUI imports that prevent this image starting under
+ * confinement. These helpers are not invoked in the child; this does not
+ * qualify full-node execution or folder lookup from a confined process.
+ *
  * Exit 77 is an honest runtime refusal (Wine, or a host where the backend
  * cannot arm, named on stdout). Run natively from MSYS2 UCRT64:
  *   make build/tests/windows/devagent_worker_confine.exe && \

@@ -90,13 +90,31 @@ static bool state_root_ensure_private(const char *path)
 
 static bool state_root_base_from_known_folder(char base[32768])
 {
+    typedef HRESULT (WINAPI *folder_fn)(REFKNOWNFOLDERID, DWORD, HANDLE, PWSTR *);
+    typedef void (WINAPI *free_fn)(LPVOID);
+    /* Shell32 must stay unloaded until folder discovery is actually needed:
+     * UI-restricted selfexec children otherwise fail before reaching main. */
+    HMODULE shell = LoadLibraryExW(L"shell32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    HMODULE ole = LoadLibraryExW(L"ole32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    folder_fn folder = NULL;
+    free_fn release = NULL;
+    FARPROC get_symbol = shell ? GetProcAddress(shell, "SHGetKnownFolderPath") : NULL;
+    FARPROC free_symbol = ole ? GetProcAddress(ole, "CoTaskMemFree") : NULL;
+    static_assert(sizeof(folder) == sizeof(get_symbol), "Windows folder symbol width");
+    static_assert(sizeof(release) == sizeof(free_symbol), "Windows allocator symbol width");
+    memcpy(&folder, &get_symbol, sizeof(folder));
+    memcpy(&release, &free_symbol, sizeof(release));
+    if (!folder || !release)
+        fprintf(stderr, "state_root: Windows folder API unavailable\n");
     PWSTR wide = NULL;
-    if (FAILED(SHGetKnownFolderPath(&FOLDERID_LocalAppData, KF_FLAG_DEFAULT,
-                                    NULL, &wide)))
-        return false;
-    int n = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide, -1,
+    int n = 0;
+    if (folder && release &&
+        SUCCEEDED(folder(&FOLDERID_LocalAppData, KF_FLAG_DEFAULT, NULL, &wide)))
+        n = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide, -1,
                                 base, 32768, NULL, NULL);
-    CoTaskMemFree(wide);
+    if (wide && release) release(wide);
+    if (ole) FreeLibrary(ole);
+    if (shell) FreeLibrary(shell);
     return n > 1;
 }
 
