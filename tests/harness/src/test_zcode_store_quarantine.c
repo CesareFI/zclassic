@@ -133,6 +133,39 @@ static int zsq_case_damage(const char *label, bool zero_length)
     return failures;
 }
 
+/* A record this build refuses for a reader-dependent rule (a newer schema
+ * version here) may be a valid release from a later build: the open fails and
+ * the record stays where it is. */
+static int zsq_case_newer_schema_refuses(void)
+{
+    int failures = 0;
+    struct zsq_fixture fx;
+    ZS_CHECK("quarantine: schema fixture prepares", zsq_setup(&fx, "quarschema"));
+    uint8_t *wire = NULL;
+    size_t wire_len = 0;
+    bool written = vcs_package_release_serialize(&fx.b, &wire, &wire_len) ==
+        VCS_PACKAGE_RELEASE_OK &&
+        wire_len > VCS_PACKAGE_RELEASE_WIRE_MAGIC_BYTES + 2u;
+    if (written) {
+        wire[VCS_PACKAGE_RELEASE_WIRE_MAGIC_BYTES] =
+            (uint8_t)(VCS_PACKAGE_RELEASE_VERSION + 1u);
+        wire[VCS_PACKAGE_RELEASE_WIRE_MAGIC_BYTES + 1u] = 0;
+        written = zsq_rewrite(fx.path_b, wire, wire_len);
+    }
+    free(wire);
+    ZS_CHECK("quarantine: newer-schema record written", written);
+    struct vcs_package_store *s = vcs_package_store_open(fx.dd, 1000000u);
+    ZS_CHECK("quarantine: newer-schema release refuses open", s == NULL);
+    if (s) vcs_package_store_close(s);
+    char quarantine[512];
+    zs_store_path(quarantine, sizeof(quarantine), fx.dd,
+                  "quarantine/releases");
+    ZS_CHECK("quarantine: newer-schema release is not moved aside",
+             zs_path_exists(fx.path_b) && zsq_count_entries(quarantine) == 0u);
+    test_rm_rf_recursive(fx.dd);
+    return failures;
+}
+
 static int zsq_case_io_refuses(bool use_mode)
 {
     int failures = 0;
@@ -164,6 +197,7 @@ int t_store_release_quarantine(void)
     failures += zsq_case_damage("quarantine: zero-length fixture", true);
     failures += zsq_case_damage("quarantine: digest-mismatch fixture", false);
     failures += zsq_case_io_refuses(false);
+    failures += zsq_case_newer_schema_refuses();
     if (geteuid() == 0)
         printf("  zcode_store: quarantine: chmod 000 case needs a non-root "
                "user... SKIP (1 skipped)\n");

@@ -971,14 +971,40 @@ static enum store_release_read store_release_read(const char *path,
 
 /* NULL when the bytes are the release named by the file; else the reason
  * they are provably not. */
+/* Only proof that the bytes are not the release they name counts as damage:
+ * a broken wire structure, a signature that fails over a schema this binary
+ * reads, or a digest that differs from the file name. A refusal that depends
+ * on the reader (schema version, licence allowlist, field grammar) may be a
+ * valid release from a newer build, so it fails the open instead. */
+static bool store_release_error_is_damage(enum vcs_package_release_error e)
+{
+    switch (e) {
+    case VCS_PACKAGE_RELEASE_ERR_WIRE_MAGIC:
+    case VCS_PACKAGE_RELEASE_ERR_WIRE_OVERSIZE:
+    case VCS_PACKAGE_RELEASE_ERR_WIRE_TRUNCATED:
+    case VCS_PACKAGE_RELEASE_ERR_WIRE_TRAILING:
+    case VCS_PACKAGE_RELEASE_ERR_SIG_LOW_S:
+    case VCS_PACKAGE_RELEASE_ERR_SIG_VERIFY:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static const char *store_release_damage(const uint8_t *wire, size_t wire_len,
                                         const char *name,
-                                        struct store_release_row *row)
+                                        struct store_release_row *row,
+                                        enum vcs_package_release_error *refused)
 {
-    if (vcs_package_release_parse(wire, wire_len, &row->release) !=
-            VCS_PACKAGE_RELEASE_OK ||
-        vcs_package_release_id(&row->release, row->id) !=
-            VCS_PACKAGE_RELEASE_OK)
+    enum vcs_package_release_error e =
+        vcs_package_release_parse(wire, wire_len, &row->release);
+    if (e == VCS_PACKAGE_RELEASE_OK)
+        e = vcs_package_release_id(&row->release, row->id);
+    if (e != VCS_PACKAGE_RELEASE_OK && !store_release_error_is_damage(e)) {
+        *refused = e;
+        return NULL;
+    }
+    if (e != VCS_PACKAGE_RELEASE_OK)
         return "unparseable release";
     char id_hex[65];
     zcl_hex_encode(row->id, sizeof(row->id), id_hex);
@@ -1085,10 +1111,14 @@ static bool store_release_row_add(struct store_replay *rp, const char *name)
         LOG_FAIL(STORE_LOG, "unreadable persisted release %s: %s", name,
                  strerror(errno));
     struct store_release_row row = {0};
+    enum vcs_package_release_error refused = VCS_PACKAGE_RELEASE_OK;
     const char *damage = read == STORE_RELEASE_READ_DAMAGED
         ? "zero length or oversize"
-        : store_release_damage(wire, wire_len, name, &row);
+        : store_release_damage(wire, wire_len, name, &row, &refused);
     free(wire);
+    if (refused != VCS_PACKAGE_RELEASE_OK)
+        LOG_FAIL(STORE_LOG, "persisted release %s is refused by this build: %s",
+                 name, vcs_package_release_error_string(refused));
     if (damage)
         return store_release_quarantine(rp, name, damage);
     return store_release_row_push(rp, &row);
