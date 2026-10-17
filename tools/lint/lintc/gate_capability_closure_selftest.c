@@ -353,6 +353,40 @@ static int ccs_case_epoch(const struct ccs_fx *fx)
                    "epoch: the newest directory wins, dot directories are ignored, ties take the smaller name");
 }
 
+static int ccs_case_epoch_refusal(struct ccs_fx *fx)
+{
+    char root[CCD_PATH], out[CCD_PATH], linkp[CCD_PATH];
+    ccs_path(fx, "r", root);
+    if (ccs_put(fx, "r/build/dev-obj/epochs/stale/x", "x") != 0)
+        return ccs_say(0, "epoch refusal: fixture setup");
+    /* The newest entry is a dangling symlink: stat(2) fails. A partial
+     * epoch census must refuse, never silently freeze on the older
+     * epoch and grade it as newest. */
+    ccs_path(fx, "r/build/dev-obj/epochs/fresh", linkp);
+    if (symlink("no-such-target", linkp) != 0)
+        return ccs_say(0, "epoch refusal: fixture symlink");
+    int rc = ccd_find_epoch(root, out, sizeof out);
+    return ccs_say(rc == -2,
+                   "epoch: an unstatable newest entry refuses (-2), never silently freezes on an older epoch");
+}
+
+static int ccs_case_epoch_unreadable(struct ccs_fx *fx)
+{
+    char root[CCD_PATH], out[CCD_PATH], dir[CCD_PATH];
+    if (geteuid() == 0)
+        return ccs_say(1, "epoch: an unreadable epochs directory refuses (-2), never reads as none "
+                          "(SKIPPED as root: chmod 0000 does not deny the read)");
+    ccs_path(fx, "u", root);
+    if (ccs_put(fx, "u/build/dev-obj/epochs/sub/x", "x") != 0)
+        return ccs_say(0, "epoch unreadable: fixture setup");
+    ccs_path(fx, "u/build/dev-obj/epochs", dir);
+    if (chmod(dir, 0000) != 0)
+        return ccs_say(0, "epoch unreadable: fixture chmod");
+    int rc = ccd_find_epoch(root, out, sizeof out);
+    chmod(dir, 0755);
+    return ccs_say(rc == -2, "epoch: an unreadable epochs directory refuses (-2), never reads as none");
+}
+
 int capability_closure_data_selftest(void)
 {
     struct ccs_fx fx;
@@ -361,7 +395,8 @@ int capability_closure_data_selftest(void)
         return 2;
     }
     int fails = ccs_case_parse() + ccs_case_nm(&fx) + ccs_case_symbols(&fx) + ccs_case_platform(&fx)
-              + ccs_case_scan(&fx) + ccs_case_sidecar(&fx) + ccs_case_long_class(&fx) + ccs_case_sets() + ccs_case_coverage() + ccs_case_epoch(&fx);
+              + ccs_case_scan(&fx) + ccs_case_sidecar(&fx) + ccs_case_long_class(&fx) + ccs_case_sets() + ccs_case_coverage() + ccs_case_epoch(&fx)
+              + ccs_case_epoch_refusal(&fx) + ccs_case_epoch_unreadable(&fx);
     lsc_unblock();
     rap_rm_rf(fx.base);
     puts(fails == 0 ? "== selftest: PASS ==" : "== selftest: FAIL ==");

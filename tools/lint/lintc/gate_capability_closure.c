@@ -265,6 +265,12 @@ static int ccg_objects(struct ccg_scan *s)
 {
     struct ccd_map rel = { 0 };
     int rc = ccd_find_epoch(s->root, s->epoch, sizeof s->epoch);
+    if (rc == -2) {
+        ccg_say(s, "check_capability_closure: FATAL " CCG_DASH " cannot read %s/build/dev-obj/epochs "
+                   "completely (%s).\n  A partial epoch census is never graded.\n",
+                s->root, strerror(errno));
+        return 2;
+    }
     if (rc <= 0) {
         ccg_say(s, "check_capability_closure: UNPROVEN " CCG_DASH " no build/dev-obj/epochs/* found.\n"
                    "  Populate it with the normal dev build (e.g. 'make z23-dev') and\n"
@@ -668,7 +674,9 @@ static int ccg_syscall_ban(struct ccg_scan *s)
 {
     struct ccg_list src = { 0 };
     regex_t re;
-    int rc = regcomp(&re, k_ccg_raw, REG_EXTENDED | REG_NOSUB) ? -1 : ccg_sources(s, &src);
+    if (regcomp(&re, k_ccg_raw, REG_EXTENDED | REG_NOSUB) != 0)
+        return -1; /* regfree on a failed regcomp would free an undefined regex_t */
+    int rc = ccg_sources(s, &src);
     for (size_t i = 0; rc == 0 && i < src.n; i++) {
         const char *uni = ccd_map_get(&s->mods.uni, src.s[i]);
         if (!uni || !ccd_grants(uni, "CAP_PRIVILEGE"))

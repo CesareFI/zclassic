@@ -26,7 +26,11 @@ void ccd_map_free(struct ccd_map *m);
 
 /* Zero when the declared source is not part of this host's complete epoch. */
 int ccd_coverage_applicable(enum ccd_os os, const char *path);
-/* Newest build/dev-obj/epochs/<hash> under root: 1 and out set, 0 for none, -1 on overflow. */
+/* Newest build/dev-obj/epochs/<hash> under root: 1 and out set, 0 when the
+ * epochs directory does not exist or holds no epoch, -1 on path overflow,
+ * -2 (errno set) when the directory cannot be opened for another reason,
+ * read completely, or an entry cannot be stat'ed — a partial census must
+ * never pick an older epoch while calling it newest. */
 int ccd_find_epoch(const char *root, char *out, size_t cap);
 
 /* One nm record, "path\0type\0name\0" in a single block. */

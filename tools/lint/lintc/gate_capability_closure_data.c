@@ -122,26 +122,54 @@ int ccd_coverage_applicable(enum ccd_os os, const char *path)
     return 1;
 }
 
+/* One epochs entry. 0 when it is skipped or considered, -1 on path overflow
+ * (never skipped silently), -2 (errno set) when it cannot be stat'ed. */
+static int ccd_epoch_consider(const char *base, const char *name, char *best, size_t best_cap, struct stat *bst)
+{
+    char path[CCD_PATH];
+    struct stat st;
+    if (name[0] == '.')
+        return 0;
+    if (snprintf(path, sizeof path, "%s/%s", base, name) >= (int)sizeof path)
+        return -1;
+    if (stat(path, &st) != 0)
+        return -2;
+    if (!S_ISDIR(st.st_mode))
+        return 0;
+    if (!best[0] || st.st_mtime > bst->st_mtime
+        || (st.st_mtime == bst->st_mtime && strcmp(name, best) < 0)) {
+        snprintf(best, best_cap, "%s", name);
+        *bst = st;
+    }
+    return 0;
+}
+
 int ccd_find_epoch(const char *root, char *out, size_t cap)
 {
-    char base[CCD_PATH], path[CCD_PATH], best[256] = "";
-    struct stat st, bst = { 0 };
+    char base[CCD_PATH], best[256] = "";
+    struct stat bst = { 0 };
     DIR *d;
+    int rc = 0;
     if (snprintf(base, sizeof base, "%s/build/dev-obj/epochs", root) >= (int)sizeof base)
         return -1;
     if (!(d = opendir(base)))
-        return 0;
-    for (struct dirent *e; (e = readdir(d));) {
-        if (e->d_name[0] == '.' || snprintf(path, sizeof path, "%s/%s", base, e->d_name) >= (int)sizeof path
-            || stat(path, &st) != 0 || !S_ISDIR(st.st_mode))
-            continue;
-        if (!best[0] || st.st_mtime > bst.st_mtime
-            || (st.st_mtime == bst.st_mtime && strcmp(e->d_name, best) < 0)) {
-            snprintf(best, sizeof best, "%s", e->d_name);
-            bst = st;
+        return errno == ENOENT ? 0 : -2;      /* only a missing epochs dir means "none" */
+    for (;;) {
+        errno = 0;                             /* cleared before EVERY readdir, as ccd_walk does */
+        struct dirent *e = readdir(d);
+        if (!e) {
+            if (errno)
+                rc = -2;
+            break;
         }
+        if ((rc = ccd_epoch_consider(base, e->d_name, best, sizeof best, &bst)) != 0)
+            break;
     }
+    int saved = errno;
     closedir(d);
+    errno = saved;
+    if (rc != 0)
+        return rc;
     return best[0] ? (snprintf(out, cap, "%s/%s", base, best) >= (int)cap ? -1 : 1) : 0;
 }
 
