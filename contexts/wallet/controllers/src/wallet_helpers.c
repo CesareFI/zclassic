@@ -356,6 +356,13 @@ int64_t parse_amount(const struct json_value *v)
         if (val > INT64_MAX / ZATOSHI_PER_ZCL ||
             val < INT64_MIN / ZATOSHI_PER_ZCL)
             LOG_ERR("wallet", "parse_amount: amount out of range");
+        /* Money range, matching the string path below: without this, a
+         * whole-coin int inside the int64 range (e.g. 92233720368) parsed
+         * to ~9.2e18 sats and z_sendmany's total_amount += then signed-
+         * overflowed (UB) with two recipients. */
+        if (val > MAX_MONEY / ZATOSHI_PER_ZCL ||
+            val < -(MAX_MONEY / ZATOSHI_PER_ZCL))
+            LOG_ERR("wallet", "parse_amount: amount exceeds money range");
         return val * ZATOSHI_PER_ZCL;
     }
 

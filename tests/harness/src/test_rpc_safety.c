@@ -157,6 +157,44 @@ static int t_parse_amount_bounds(void)
     return failures;
 }
 
+/* w38 follow-up (independent-review finding on the w23 guard): the
+ * JSON_INT path had no money-range bound, so a whole-coin int inside
+ * the int64 range — 92233720368 — parsed to 9.2e18 sats, and
+ * z_sendmany's total_amount += then signed-overflowed (UB) with two
+ * recipients. The int path must refuse beyond supply exactly like
+ * the string path. */
+static int t_parse_amount_int_money_range(void)
+{
+    int failures = 0;
+    struct json_value v;
+
+    printf("rpc_safety: parse_amount JSON_INT money-range bound... ");
+    {
+        json_init(&v); json_set_int(&v, 92233720368);
+        bool ok = parse_amount(&v) == -1;
+        json_free(&v);
+        json_init(&v); json_set_int(&v, -92233720368);
+        ok = ok && parse_amount(&v) == -1;
+        json_free(&v);
+        json_init(&v); json_set_int(&v, 21000000);
+        ok = ok && parse_amount(&v) == MAX_MONEY;
+        json_free(&v);
+        json_init(&v); json_set_int(&v, 21000001);
+        ok = ok && parse_amount(&v) == -1;
+        json_free(&v);
+        json_init(&v); json_set_int(&v, -21000000);
+        ok = ok && parse_amount(&v) == -MAX_MONEY;
+        json_free(&v);
+        json_init(&v); json_set_int(&v, -21000001);
+        ok = ok && parse_amount(&v) == -1;
+        json_free(&v);
+        if (ok) printf("OK\n");
+        else { printf("FAIL\n"); failures++; }
+    }
+
+    return failures;
+}
+
 static bool result_is_chainstate_guard_error(const struct json_value *result,
                                              const char *method)
 {
@@ -430,6 +468,7 @@ int test_rpc_safety(void)
     int failures = 0;
 
     failures += t_parse_amount_bounds();
+    failures += t_parse_amount_int_money_range();
 
     printf("rpc_safety: wallet freshness follows authoritative H*... ");
     {
