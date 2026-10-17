@@ -719,6 +719,106 @@ static void fb_op_wiki_chunk(struct node_db *ndb, const struct json_value *in,
     fb_wiki_chunk_render(&row, start, (size_t)count, (size_t)cap, result);
 }
 
+/* Envelope allowance for the native bridge plus the continuation hint. */
+#define FB_WIKI_READ_MARGIN 1536
+
+/* Every temporary owns its copy; allocation failure is never a size result. */
+static bool fb_wiki_read_trial(const struct json_value *base, const char *text,
+                               const struct json_value *entry, bool partial,
+                               size_t offset, struct json_value *trial)
+{
+    json_init(trial);
+    bool ok = json_copy_checked(trial, base) &&
+        json_push_kv_str(trial, "text", text);
+    if (ok && entry)
+        ok = json_push_kv(trial, "entry", entry);
+    if (ok && partial)
+        ok = json_push_kv_bool(trial, "truncated", true) &&
+            json_push_kv_int(trial, "next_offset", (int64_t)offset);
+    return ok;
+}
+
+/* Search byte limits, rounding each candidate down to a UTF-8 boundary.
+ * Include escaped text and continuation fields in every sizing observation. */
+static bool fb_wiki_read_prefix(const struct db_fleet_board_post *row,
+                                size_t room, struct json_value *result)
+{
+    char *copy = zcl_malloc(row->post.text_len + 1,
+                            "fleet_board.rpc.wiki_prefix");
+    if (!copy) return false;
+    memcpy(copy, row->post.text, row->post.text_len);
+    copy[row->post.text_len] = 0;
+    /* A partial body must leave at least one byte for continuation. */
+    size_t low = 1, high = row->post.text_len ? row->post.text_len - 1 : 0, best = 0;
+    bool ok = true;
+    while (low <= high) {
+        size_t mid = low + (high - low) / 2, n = mid;
+        while (n > 0 && ((uint8_t)row->post.text[n] & 0xC0) == 0x80) n--;
+        char saved = copy[n];
+        copy[n] = 0;
+        struct json_value trial;
+        ok = fb_wiki_read_trial(result, copy, NULL, true, n, &trial);
+        copy[n] = saved;
+        bool fits = ok && json_write(&trial, NULL, 0) <= room;
+        json_free(&trial);
+        if (!ok) break;
+        if (fits) {
+            best = n;
+            low = mid + 1;
+        } else {
+            high = mid - 1;
+        }
+    }
+    if (ok && best > 0) {
+        copy[best] = 0;
+        struct json_value trial;
+        ok = fb_wiki_read_trial(result, copy, NULL, true, best, &trial);
+        if (ok) {
+            json_free(result);
+            *result = trial;
+        } else {
+            json_free(&trial);
+        }
+    } else if (ok) {
+        fb_error(result, "READ_BUDGET",
+                 "page metadata and a whole body character do not fit the response budget");
+    }
+    free(copy);
+    return ok;
+}
+
+/* Preserve the established full text plus parsed-entry representation when
+ * it fits. Larger bodies use an explicitly partial raw-text projection. */
+static void fb_wiki_read_body(const struct db_fleet_board_post *row,
+                              int64_t cap, struct json_value *result)
+{
+    struct json_value entry;
+    json_init(&entry);
+    enum fleet_wiki_parse_status parsed = fleet_wiki_entry_parse_checked(
+        row->post.text, row->post.text_len, &entry, NULL);
+    if (parsed == FLEET_WIKI_PARSE_ALLOC_FAILED) {
+        json_free(&entry);
+        fb_error(result, "READ_PROJECTION_FAILED", "cannot allocate the parsed page entry");
+        return;
+    }
+    struct json_value trial;
+    bool ok = fb_wiki_read_trial(result, row->post.text,
+        parsed == FLEET_WIKI_PARSE_ENTRY ? &entry : NULL, false, 0, &trial);
+    size_t room = cap > FB_WIKI_READ_MARGIN
+        ? (size_t)cap - FB_WIKI_READ_MARGIN : 0;
+    if (ok && (cap <= 0 || json_write(&trial, NULL, 0) <= room)) {
+        json_free(result);
+        *result = trial;
+    } else {
+        json_free(&trial);
+        if (ok) ok = fb_wiki_read_prefix(row, room, result);
+    }
+    json_free(&entry);
+    if (!ok)
+        fb_error(result, "READ_PROJECTION_FAILED",
+                 "cannot faithfully construct the bounded page projection");
+}
+
 static void fb_op_wiki_read(struct node_db *ndb, const struct json_value *in,
                             struct json_value *result)
 {
@@ -737,13 +837,12 @@ static void fb_op_wiki_read(struct node_db *ndb, const struct json_value *in,
         return;
     }
     json_set_object(result);
-    json_push_kv_bool(result, "ok", true);
-    fb_render_post(result, &row);
-    struct json_value entry;
-    if (fleet_wiki_entry_parse(row.post.text, row.post.text_len, &entry, NULL)) {
-        (void)json_push_kv(result, "entry", &entry);
-        json_free(&entry);
+    if (!json_push_kv_bool(result, "ok", true) ||
+        !fb_render_post_fields(result, &row, false)) {
+        fb_error(result, "READ_PROJECTION_FAILED", "cannot faithfully construct page metadata");
+        return;
     }
+    fb_wiki_read_body(&row, fb_int(in, "response_budget", 0), result);
 }
 
 static void fb_op_wiki_list(struct node_db *ndb, struct json_value *result)

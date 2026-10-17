@@ -682,15 +682,49 @@ static bool fb_chunk_values(const struct json_value *input,
     return *offset >= 0 && *offset <= 16384 && *bytes >= 1 && *bytes <= 1024;
 }
 
+static size_t fb_wiki_response_cap(const struct zcl_command_request *request)
+{
+    size_t cap = request->spec && request->spec->budget_bytes > 0
+        ? (size_t)request->spec->budget_bytes : ZCL_COMMAND_RESULT_BUDGET;
+    if (request->budget_bytes && request->budget_bytes < cap)
+        cap = request->budget_bytes;
+    return cap;
+}
+
+/* A truncated slug read names the exact chunk route that resumes it. The
+ * registry refuses a self-referential next entry, so the hint is data. */
+static void fb_wiki_read_next(struct zcl_command_reply *reply)
+{
+    const struct json_value *t = json_get(&reply->data, "truncated");
+    if (!t || !json_get_bool(t))
+        return;
+    struct json_value cont, input;
+    json_init(&cont);
+    json_init(&input);
+    json_set_object(&cont);
+    json_set_object(&input);
+    bool ok = json_push_kv_str(&input, "id",
+                  json_get_str(json_get(&reply->data, "id"))) &&
+        json_push_kv_int(&input, "offset",
+                  json_get_int(json_get(&reply->data, "next_offset"))) &&
+        json_push_kv_int(&input, "bytes", 1024) &&
+        json_push_kv_str(&cont, "command", "fleet.wiki.read") &&
+        json_push_kv(&cont, "input", &input) &&
+        json_push_kv(&reply->data, "continue", &cont);
+    json_free(&input);
+    json_free(&cont);
+    if (!ok)
+        fb_fail(reply, ZCL_COMMAND_STATUS_FAILED, ZCL_COMMAND_EXIT_FAILED,
+            "BOARD_PROJECTION_FAILED", "execute", false,
+            "cannot faithfully build the continuation hint", "fleet.board");
+}
+
 static bool fb_wiki_chunk_request(const struct zcl_command_request *request,
                                   struct zcl_command_reply *reply,
                                   struct json_value *out)
 {
     int64_t offset, bytes;
-    size_t cap = request->spec && request->spec->budget_bytes > 0
-        ? (size_t)request->spec->budget_bytes : ZCL_COMMAND_RESULT_BUDGET;
-    if (request->budget_bytes && request->budget_bytes < cap)
-        cap = request->budget_bytes;
+    size_t cap = fb_wiki_response_cap(request);
     if (!fb_chunk_values(request->input, &offset, &bytes) || cap < 2048 ||
         json_get(request->input, "slug")) {
         fb_fail(reply, ZCL_COMMAND_STATUS_FAILED, ZCL_COMMAND_EXIT_INVALID,
@@ -720,7 +754,7 @@ void zcl_native_handle_fleet_wiki_read(
     struct json_value out;
     json_init(&out);
     json_set_object(&out);
-    (void)json_push_kv_str(&out, "op", "wiki_read");
+    bool prepared = json_push_kv_str(&out, "op", "wiki_read");
     if (chunk) {
         if (!fb_wiki_chunk_request(request, reply, &out)) {
             json_free(&out);
@@ -734,7 +768,15 @@ void zcl_native_handle_fleet_wiki_read(
             json_free(&out);
             return;
         }
-        (void)json_push_kv_str(&out, "slug", slug);
+        prepared = prepared && json_push_kv_str(&out, "slug", slug) &&
+            json_push_kv_int(&out, "response_budget", (int64_t)fb_wiki_response_cap(request));
+    }
+    if (!prepared) {
+        fb_fail(reply, ZCL_COMMAND_STATUS_FAILED, ZCL_COMMAND_EXIT_FAILED,
+            "BOARD_PROJECTION_FAILED", "prepare", false,
+            "cannot faithfully build the wiki read request", "fleet.board");
+        json_free(&out);
+        return;
     }
 
     struct json_value body;
@@ -744,6 +786,8 @@ void zcl_native_handle_fleet_wiki_read(
     if (!ok)
         return;
     fb_project_object(reply, &body);
+    if (!chunk && reply->status == ZCL_COMMAND_STATUS_PASSED)
+        fb_wiki_read_next(reply);
     json_free(&body);
 }
 

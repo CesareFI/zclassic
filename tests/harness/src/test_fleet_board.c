@@ -4472,6 +4472,244 @@ static bool fb_chunk_scope_roundtrip(struct fb_rpc_env *e, uint8_t scope,
         fb_chunk_reassemble_as(e, id, &post, true, 4096);
 }
 
+/* Read a page by slug through the registry path the CLI uses. */
+static bool fb_slug_envelope_as(struct fb_rpc_env *e, const char *slug,
+                             size_t budget, bool expect_ok, struct json_value *envelope)
+{
+    struct json_value input;
+    json_init(&input); json_set_object(&input);
+    (void)json_push_kv_str(&input, "slug", slug);
+    const struct zcl_command_registry *reg = zcl_command_catalog();
+    const struct zcl_command_spec *spec = zcl_command_registry_find(reg,
+        "fleet.wiki.read", NULL);
+    struct zcl_command_context ctx = {.registry = reg,
+        .granted_capabilities = ~(uint64_t)0,
+        .authority_ceiling = ZCL_COMMAND_AUTH_OWNER};
+    fb_native_test_table = &e->table;
+    node_rpc_client_set_test_hook(fb_native_rpc);
+    char wire[8193];
+    enum zcl_command_exit rc;
+    size_t n = zcl_command_registry_execute_json(reg, spec, &ctx, &input,
+        false, "fleet.wiki.read", "full", budget, 0, NULL, wire, sizeof(wire), &rc);
+    node_rpc_client_set_test_hook(NULL);
+    fb_native_test_table = NULL;
+    json_free(&input);
+    json_init(envelope);
+    return (rc == ZCL_COMMAND_EXIT_OK) == expect_ok && n <= budget &&
+        json_read(envelope, wire, strlen(wire));
+}
+
+static bool fb_slug_envelope(struct fb_rpc_env *e, const char *slug,
+                             size_t budget, struct json_value *envelope)
+{
+    return fb_slug_envelope_as(e, slug, budget, true, envelope);
+}
+
+/* Append the hex chunks from `offset` to the end of the body. */
+static bool fb_chunks_append(struct fb_rpc_env *e, const char *id,
+                             int64_t offset, char *out, size_t cap)
+{
+    size_t len = (size_t)offset;
+    for (;;) {
+        struct json_value env;
+        if (!fb_chunk_envelope(e, id, (int64_t)len, &env)) {
+            json_free(&env);
+            return false;
+        }
+        const struct json_value *d = json_get(&env, "data");
+        const char *hex = json_get_str(json_get(d, "data_hex"));
+        if (!hex) { json_free(&env); return false; }
+        size_t n = strlen(hex) / 2;
+        bool done = json_get_bool(json_get(d, "complete"));
+        bool ok = len + n < cap && zcl_hex_decode(hex, (uint8_t *)out + len, n);
+        json_free(&env);
+        if (!ok) return false;
+        len += n;
+        if (done) break;
+        if (!n) return false;
+    }
+    out[len] = '\0';
+    return true;
+}
+
+/* ok:true, id present, and either the full text or a truncated prefix whose
+ * continuation hint resumes exactly where it stopped. */
+static bool fb_slug_read_check(struct fb_rpc_env *e, const char *slug,
+                               const char *text, const char *id, size_t budget)
+{
+    struct json_value env;
+    if (!fb_slug_envelope(e, slug, budget, &env)) {
+        json_free(&env);
+        return false;
+    }
+    const struct json_value *d = json_get(&env, "data");
+    static char full[FLEET_BOARD_WIKI_TEXT_MAX + 1];
+    const char *got = json_get_str(json_get(d, "text"));
+    const char *got_id = json_get_str(json_get(d, "id"));
+    bool ok = got && got_id && json_get_bool(json_get(&env, "ok")) &&
+        !strcmp(got_id, id) &&
+        json_get_int(json_get(d, "text_len")) == (int64_t)strlen(text);
+    if (ok && json_get_bool(json_get(d, "truncated"))) {
+        size_t n = strlen(got);
+        const struct json_value *hint = json_get(d, "continue");
+        const struct json_value *in = json_get(hint, "input");
+        const char *command = json_get_str(json_get(hint, "command"));
+        const char *hint_id = json_get_str(json_get(in, "id"));
+        ok = command && hint_id && n > 0 && n < strlen(text) && !memcmp(got, text, n) &&
+            ((uint8_t)text[n] & 0xC0) != 0x80 &&
+            json_get_int(json_get(d, "next_offset")) == (int64_t)n &&
+            !strcmp(command, "fleet.wiki.read") &&
+            !strcmp(hint_id, id) &&
+            json_get_int(json_get(in, "offset")) == (int64_t)n;
+        if (ok) {
+            memcpy(full, got, n);
+            ok = fb_chunks_append(e, id, (int64_t)n, full, sizeof(full)) &&
+                !strcmp(full, text);
+        }
+    } else if (ok) {
+        ok = !strcmp(got, text);
+    }
+    json_free(&env);
+    return ok;
+}
+
+static bool fb_slug_read_sizes(struct fb_rpc_env *e, int64_t now)
+{
+    static const size_t sizes[] = {6000, 7900};
+    static char text[8000];
+    for (size_t s = 0; s < 2; s++) {
+        char slug[24];
+        (void)snprintf(slug, sizeof(slug), "big-page-%zu", sizes[s]);
+        for (size_t i = 0; i < sizes[s]; i++)
+            text[i] = "\303\251\"\\\n"[i % 5];
+        text[sizes[s]] = '\0';
+        struct db_fleet_board_post row;
+        if (!fb_test_ingest_page(&e->db, slug, text, (int)s, now) ||
+            !db_fleet_board_wiki_read(&e->db, slug, &row))
+            return false;
+        char id[65]; fleet_board_id_to_hex(row.post.id, id);
+        if (!fb_slug_read_check(e, slug, text, id, 8192) ||
+            !fb_slug_read_check(e, slug, text, id, 4096))
+            return false;
+    }
+    return true;
+}
+
+/* Full structured reads retain both established representations. */
+static bool fb_slug_structured_compat(struct fb_rpc_env *e, int64_t now)
+{
+    char text[512];
+    fb_entry_json(text, sizeof(text), "budget compatibility", FB_ONE_LESSON,
+                   "\"kernel\"");
+    if (!fb_test_ingest_page(&e->db, "budget-structured", text, 9, now))
+        return false;
+    struct json_value env;
+    bool ok = fb_slug_envelope(e, "budget-structured", 8192, &env);
+    const struct json_value *data = json_get(&env, "data");
+    const char *raw = json_get_str(json_get(data, "text"));
+    const struct json_value *entry = json_get(data, "entry");
+    ok = ok && raw && strcmp(raw, text) == 0 && entry && entry->type == JSON_OBJ;
+    json_free(&env);
+    return ok;
+}
+
+/* Faults are armed at the RPC boundary, after request construction. */
+static bool fb_slug_projection_fault(struct fb_rpc_env *e, const char *slug,
+    const char *label, unsigned nth)
+{
+    struct json_value input;
+    json_init(&input); json_set_object(&input);
+    (void)json_push_kv_str(&input, "slug", slug);
+    struct zcl_command_request request = {.input = &input, .budget_bytes = 4096};
+    struct zcl_command_reply reply;
+    zcl_command_reply_init(&reply, "zcl.fleet_wiki_read.v1");
+    size_t before = json_test_live_blocks();
+    fb_native_test_table = &e->table;
+    fb_native_projection_fault = label; fb_native_projection_nth = nth;
+    node_rpc_client_set_test_hook(fb_native_rpc);
+    zcl_native_handle_fleet_wiki_read(&request, &reply);
+    node_rpc_client_set_test_hook(NULL); fb_native_test_table = NULL;
+    bool hit = zcl_alloc_fault_armed_label() == NULL;
+    fb_native_projection_fault = NULL;
+    zcl_alloc_fault_clear();
+    bool ok = hit && reply.status != ZCL_COMMAND_STATUS_PASSED && reply.error.code[0];
+    zcl_command_reply_free(&reply);
+    ok = ok && json_test_live_blocks() == before;
+    json_free(&input);
+    return ok;
+}
+
+static bool fb_slug_prepare_fault(struct fb_rpc_env *e, const char *label, unsigned nth)
+{
+    struct json_value input;
+    json_init(&input); json_set_object(&input);
+    (void)json_push_kv_str(&input, "slug", "big-page-6000");
+    struct zcl_command_request request = {.input = &input, .budget_bytes = 4096};
+    struct zcl_command_reply reply;
+    zcl_command_reply_init(&reply, "zcl.fleet_wiki_read.v1");
+    size_t before = json_test_live_blocks();
+    fb_native_test_table = &e->table; fb_native_rpc_calls = 0;
+    node_rpc_client_set_test_hook(fb_native_rpc);
+    zcl_alloc_fault_fail_nth(label, nth);
+    zcl_native_handle_fleet_wiki_read(&request, &reply);
+    bool hit = zcl_alloc_fault_armed_label() == NULL;
+    zcl_alloc_fault_clear();
+    node_rpc_client_set_test_hook(NULL); fb_native_test_table = NULL;
+    bool ok = hit && fb_native_rpc_calls == 0 &&
+        reply.status != ZCL_COMMAND_STATUS_PASSED &&
+        !strcmp(reply.error.code, "BOARD_PROJECTION_FAILED");
+    zcl_command_reply_free(&reply);
+    ok = ok && json_test_live_blocks() == before;
+    json_free(&input);
+    return ok;
+}
+
+static bool fb_slug_projection_checks(struct fb_rpc_env *e)
+{
+    if (!fb_slug_prepare_fault(e, "json_set_str", 2) ||
+        !fb_slug_prepare_fault(e, "json_push_kv_key", 3) ||
+        !fb_slug_projection_fault(e, "budget-structured", "json_string", 1)) return false;
+    const char *labels[] = {"fleet_board.rpc.wiki_prefix", "json_copy_children",
+        "json_copy_keys", "json_copy_key", "json_copy_str", "json_set_str"};
+    for (size_t i = 0; i < sizeof(labels) / sizeof(labels[0]); i++)
+        if (!fb_slug_projection_fault(e, "big-page-6000", labels[i], 1)) return false;
+    size_t before = json_test_live_blocks();
+    for (unsigned i = 0; i < 8; i++) {
+        struct json_value env;
+        bool ok = fb_slug_envelope(e, i % 2 ? "budget-structured" : "big-page-6000",
+            4096, &env);
+        json_free(&env);
+        if (!ok || json_test_live_blocks() != before) return false;
+    }
+    return true;
+}
+
+static int test_fleet_wiki_slug_budget(void)
+{
+    int failures = 0;
+    static struct fb_rpc_env e;
+    bool opened = false;
+    TEST("fleet wiki: bounded slug reads preserve compatible full bodies or "
+        "resume a nonempty shorter prefix; insufficient budgets refuse") {
+        ASSERT(fb_rpc_env_open(&e)); opened = true;
+        ASSERT(fb_slug_read_sizes(&e, (int64_t)platform_time_wall_time_t()));
+        ASSERT(fb_slug_structured_compat(&e, (int64_t)platform_time_wall_time_t()));
+        ASSERT(fb_slug_projection_checks(&e));
+        struct json_value refusal;
+        bool parsed = fb_slug_envelope_as(&e, "big-page-6000", 2048, false, &refusal);
+        const char *code = parsed
+            ? json_get_str(json_get(json_get(&refusal, "error"), "code")) : NULL;
+        bool budget_refused = parsed && !json_get_bool(json_get(&refusal, "ok")) &&
+            code && strcmp(code, "READ_BUDGET") == 0;
+        json_free(&refusal);
+        ASSERT(budget_refused);
+        PASS();
+    } _test_next:;
+    node_rpc_client_set_test_hook(NULL);
+    if (opened) fb_rpc_env_close(&e);
+    return failures;
+}
+
 static int test_fleet_wiki_chunks(void)
 {
     int failures = 0;
@@ -6106,6 +6344,7 @@ static int test_fleet_board_public_no_grant_needed(void)
     failures += test_fleet_wiki_find_and_read();
     failures += test_fleet_wiki_entry_rejections();
     failures += test_fleet_wiki_chunks();
+    failures += test_fleet_wiki_slug_budget();
     failures += test_fleet_wiki_chunk_grants();
     failures += test_fleet_wiki_write_grants();
     failures += test_fleet_wiki_write_lifecycle();
