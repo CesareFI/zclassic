@@ -509,15 +509,30 @@ admission; all heavy work runs through `devbuild --wait` and native locks.
 
 ## Routing and context qualification
 
-Freeze candidate profiles: GPT-6 Luna low for bounded extraction/navigation/
-classification/triage; Luna medium for scoped routine changes; GPT-6.1 Sol medium
-for baseline implementation and independent review; Sol high for diagnosis and
-escalation. These are hypotheses, not proven suitability. Changed effective
-configuration requires renewed qualification.
+Freeze candidate profiles: GPT-6 Luna low for bounded extraction, navigation,
+classification and triage; Luna medium for routine edits with clear bounded scope,
+named tests and no sensitive changes. For operator-directed work using this
+tiered profile, use
+Luna to prepare the packet, GPT-6.1 Sol low to implement, and GPT-6 Astra as the
+non-author reviewer. Where Claude peers are available and authorized, use Haiku
+for extraction, Sonnet for scoped implementation, and a non-author reviewer.
+Escalate ambiguity, failed acceptance or exceeded bounds to Sol medium/high or
+Astra; trivial tasks need no mandatory hop through every model. These profiles
+are hypotheses, not proven suitability. Explicit operator-directed dispatch does
+not promote an automatic route. Changed effective configuration requires renewed
+qualification; Sol medium remains the paired baseline below.
 
-Start with shadow recommendations only. For a qualified routine class, allow
-one Luna attempt then Sol escalation, with at most two repair cycles across the
-workflow and all work inside its budget. Sensitive consensus, custody,
+Keep each handoff packet at most 2 KiB: exact task/ref/base; owner and editable
+files; evidence references; acceptance commands; invariants and authority limits;
+budget and deadline; escalation conditions. Preserve one writer per worktree and
+component, and use existing task/action/receipt authorities. Measure total
+accepted-task cost, including unusable packets, repair, review and failed
+attempts; unknown cost remains unknown. Report measured savings only with the
+supporting complete-workflow evidence.
+
+Automatic routing starts with shadow recommendations only. For a qualified
+routine class, allow one Luna attempt then Sol escalation, with at most two repair
+cycles across the workflow and all work inside its budget. Sensitive consensus, custody,
 authorization and recovery changes use Sol with independent review and existing
 owner gates. Model agreement and confidence cannot substitute for acceptance.
 
