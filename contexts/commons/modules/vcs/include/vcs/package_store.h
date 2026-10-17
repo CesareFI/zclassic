@@ -576,8 +576,9 @@ bool vcs_package_store_cache_counts(struct vcs_package_store *store,
 
 /* Persisted release records moved to <store>/quarantine/releases at open
  * because they were provably not valid releases (zero length, oversize,
- * unparseable, or an id that differs from the file name). I/O errors are
- * never counted here: they refuse the open. Zero for a null store. */
+ * broken wire structure, or an id that differs from the file name). I/O
+ * errors are never counted here: they refuse the open. Zero for a null
+ * store. */
 uint64_t vcs_package_store_quarantined_releases(
     struct vcs_package_store *store);
 

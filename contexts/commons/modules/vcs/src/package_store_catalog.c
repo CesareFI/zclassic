@@ -969,13 +969,12 @@ static enum store_release_read store_release_read(const char *path,
     return STORE_RELEASE_READ_OK;
 }
 
-/* NULL when the bytes are the release named by the file; else the reason
- * they are provably not. */
 /* Only proof that the bytes are not the release they name counts as damage:
- * a broken wire structure, a signature that fails over a schema this binary
- * reads, or a digest that differs from the file name. A refusal that depends
- * on the reader (schema version, licence allowlist, field grammar) may be a
- * valid release from a newer build, so it fails the open instead. */
+ * a broken wire structure or a digest that differs from the file name. A
+ * refusal that depends on the reader (schema version, licence allowlist,
+ * field grammar) may be a valid release from a newer build, so it fails the
+ * open instead. Signatures are checked later by acceptance, whose refusal
+ * also fails the open. */
 static bool store_release_error_is_damage(enum vcs_package_release_error e)
 {
     switch (e) {
@@ -983,8 +982,6 @@ static bool store_release_error_is_damage(enum vcs_package_release_error e)
     case VCS_PACKAGE_RELEASE_ERR_WIRE_OVERSIZE:
     case VCS_PACKAGE_RELEASE_ERR_WIRE_TRUNCATED:
     case VCS_PACKAGE_RELEASE_ERR_WIRE_TRAILING:
-    case VCS_PACKAGE_RELEASE_ERR_SIG_LOW_S:
-    case VCS_PACKAGE_RELEASE_ERR_SIG_VERIFY:
         return true;
     default:
         return false;
