@@ -7238,6 +7238,43 @@ static int test_fleet_board_roster_lifetime(void)
     return failures;
 }
 
+/* Revocation is persistent: it does not depend on a live roster note. When
+ * every note has expired the gate falls back to UNARMED (today's pairing
+ * behaviour), and a key the trusted head revokes is still refused there. */
+static int test_fleet_board_roster_revoked_after_lapse(void)
+{
+    int failures = 0;
+    TEST("fleet roster: after the roster notes expire, a key the trusted "
+         "head revokes is still refused in the UNARMED fallback and any "
+         "other key behaves as before") {
+        struct node_db db;
+        uint8_t member[32], other[32];
+        char line[FLEET_ENROL_MACHINE_TEXT_MAX];
+        const int64_t now = 1000000;
+        const int64_t gone = now + (int64_t)FLEET_BOARD_TTL_MAX + 4000;
+        memset(&db, 0, sizeof db);
+        ASSERT(node_db_open(&db, ":memory:"));
+        fbr_install(FBR_ROOT, false);
+        fbr_key(FBR_MEMBER, member);
+        fbr_key(FBR_PEER, other);
+        ASSERT(fbr_line(FBR_ROOT, "m5", FBR_MEMBER, line, sizeof line));
+        ASSERT(fbr_store_row(&db, 1, line, now, FLEET_BOARD_TTL_MAX));
+        g_fbr.head.state = ZCL_FLEET_HEAD_OK;
+        g_fbr.head.count = 1;
+        memcpy(g_fbr.head.revoked[0], member, 32);
+        boot_fleet_roster_invalidate();
+        ASSERT_EQ(boot_fleet_roster_check(&db, member, gone),
+                  BOOT_FLEET_ROSTER_NOT_MEMBER);
+        boot_fleet_roster_invalidate();
+        ASSERT_EQ(boot_fleet_roster_check(&db, other, gone),
+                  BOOT_FLEET_ROSTER_UNARMED);
+        fbr_uninstall();
+        node_db_close(&db);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_fleet_board_roster_bounds(void)
 {
     int failures = 0;
@@ -8119,6 +8156,7 @@ int test_fleet_board(void)
     failures += test_fleet_board_roster_root_standing();
     failures += test_fleet_board_roster_refused_root_no_notes();
     failures += test_fleet_board_roster_lifetime();
+    failures += test_fleet_board_roster_revoked_after_lapse();
     failures += test_fleet_board_roster_bounds();
     failures += test_fleet_board_roster_row_is_an_old_row();
     failures += test_fleet_board_roster_p2p_ingress();

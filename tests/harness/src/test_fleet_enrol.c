@@ -2382,6 +2382,222 @@ static int test_fe_head_sequence(void)
     return failures;
 }
 
+/* The interleaving the lock closes: a second import lands while the first is
+ * between its sequence check and its write. */
+static char g_fe_race_line[FLEET_ENROL_HEAD_TEXT_MAX];
+static uint8_t g_fe_race_op[32];
+static bool g_fe_race_ok;
+static const char *g_fe_race_why;
+
+static void fe_race_hook(void)
+{
+    static struct fleet_head inner;
+    bool replaced = false;
+    fleet_enrol_test_after_check = NULL; /* the inner import must not recurse */
+    g_fe_race_why = NULL;
+    g_fe_race_ok = fleet_head_import(g_fe_race_line, g_fe_race_op, false,
+                                     &inner, &replaced, &g_fe_race_why);
+}
+
+static int test_fe_head_lock_race(void)
+{
+    int failures = 0;
+    TEST("fleet head import: two imports cannot interleave between the "
+         "sequence check and the write, so a lower head never overwrites a "
+         "higher one") {
+        static char h5[FLEET_ENROL_HEAD_TEXT_MAX], h6[FLEET_ENROL_HEAD_TEXT_MAX];
+        static char h7[FLEET_ENROL_HEAD_TEXT_MAX];
+        static struct fleet_head out, held;
+        uint8_t op_seed[32], op_pub[32];
+        const uint8_t one[1] = { 0x82 }, two[2] = { 0x82, 0x83 };
+        const char *why = NULL;
+        bool replaced = false;
+        fe_isolate("head-race");
+        fe_key(0x81, op_seed, op_pub);
+        memcpy(g_fe_race_op, op_pub, 32);
+        ASSERT(fe_head_line(0x81, 5, one, 1, h5, sizeof(h5)));
+        ASSERT(fe_head_line(0x81, 6, two, 2, h6, sizeof(h6)));
+        ASSERT(fe_head_line(0x81, 7, two, 2, h7, sizeof(h7)));
+        ASSERT(fleet_head_import(h5, op_pub, false, &out, &replaced, &why));
+
+        /* While h6 is between its check and its write, h7 is offered. */
+        (void)snprintf(g_fe_race_line, sizeof(g_fe_race_line), "%s", h7);
+        fleet_enrol_test_lock_wait_ms = 60;
+        fleet_enrol_test_after_check = fe_race_hook;
+        ASSERT(fleet_head_import(h6, op_pub, false, &out, &replaced, &why));
+        fleet_enrol_test_after_check = NULL;
+        fleet_enrol_test_lock_wait_ms = 5000;
+        /* The inner import must have been refused by name, not run. */
+        ASSERT(!g_fe_race_ok);
+        ASSERT_STR_EQ(fe_s(g_fe_race_why), FLEET_ENROL_WHY_STATE_LOCK);
+        ASSERT_EQ(fleet_head_load(op_pub, &held, &why), FLEET_HEAD_OK);
+        ASSERT_EQ(held.seq, (uint64_t)6);
+
+        /* Retried after the lock is free, the higher head lands and the
+         * lower one is stale: the stored sequence is the maximum. */
+        ASSERT(fleet_head_import(h7, op_pub, false, &out, &replaced, &why));
+        ASSERT(!fleet_head_import(h6, op_pub, false, &out, &replaced, &why));
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_HEAD_STALE);
+        ASSERT_EQ(fleet_head_load(op_pub, &held, &why), FLEET_HEAD_OK);
+        ASSERT_EQ(held.seq, (uint64_t)7);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_fe_head_corrupt_no_rollback(void)
+{
+    int failures = 0;
+    TEST("fleet head import: a corrupted held head cannot be replaced by an "
+         "older valid head; a higher one repairs it; a missing or damaged "
+         "sequence record fails closed") {
+        static char h4[FLEET_ENROL_HEAD_TEXT_MAX], h6[FLEET_ENROL_HEAD_TEXT_MAX];
+        static char h9[FLEET_ENROL_HEAD_TEXT_MAX];
+        static struct fleet_head out, held;
+        char path[PATH_MAX];
+        uint8_t op_seed[32], op_pub[32];
+        const uint8_t two[2] = { 0x82, 0x83 };
+        const char *why = NULL;
+        bool replaced = false;
+        fe_isolate("head-corrupt");
+        fe_key(0x81, op_seed, op_pub);
+        ASSERT(fe_head_line(0x81, 4, two, 1, h4, sizeof(h4)));
+        ASSERT(fe_head_line(0x81, 6, two, 2, h6, sizeof(h6)));
+        ASSERT(fe_head_line(0x81, 9, two, 2, h9, sizeof(h9)));
+        ASSERT(fleet_head_import(h6, op_pub, false, &out, &replaced, &why));
+
+        /* Corrupt the held head: older is refused, a higher one repairs. */
+        ASSERT(fe_put_leaf("roster.head", "garbage\n"));
+        ASSERT_EQ(fleet_head_load(op_pub, &held, &why), FLEET_HEAD_BAD);
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_HEAD_TORN);
+        ASSERT(!fleet_head_import(h4, op_pub, false, &out, &replaced, &why));
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_HEAD_STALE);
+        ASSERT_EQ(fleet_head_load(op_pub, &held, &why), FLEET_HEAD_BAD);
+        ASSERT(fleet_head_import(h9, op_pub, false, &out, &replaced, &why));
+        ASSERT_EQ(fleet_head_load(op_pub, &held, &why), FLEET_HEAD_OK);
+        ASSERT_EQ(held.seq, (uint64_t)9);
+
+        /* The record unreadable, or gone beside a head: refuse, never 0. */
+        ASSERT(fe_put_leaf("roster.head.seq", "not a record\n"));
+        ASSERT(!fleet_head_import(h9, op_pub, false, &out, &replaced, &why));
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_HEAD_HWM);
+        ASSERT_EQ(fleet_head_load(op_pub, &held, &why), FLEET_HEAD_BAD);
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_HEAD_HWM);
+        ASSERT(fleet_enrol_state_path("roster.head.seq", path, sizeof(path)));
+        ASSERT_EQ(remove(path), 0);
+        ASSERT(!fleet_head_import(h9, op_pub, false, &out, &replaced, &why));
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_HEAD_HWM);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_fe_head_torn_crash(void)
+{
+    int failures = 0;
+    TEST("fleet head import: a crash between the sequence record and the "
+         "head leaves a torn state that admits nobody; the same head or a "
+         "higher one repairs it and an older one is refused") {
+        static char h4[FLEET_ENROL_HEAD_TEXT_MAX], h5[FLEET_ENROL_HEAD_TEXT_MAX];
+        static char h6[FLEET_ENROL_HEAD_TEXT_MAX], h8[FLEET_ENROL_HEAD_TEXT_MAX];
+        static struct fleet_head out, held;
+        uint8_t op_seed[32], op_pub[32];
+        const uint8_t two[2] = { 0x82, 0x83 };
+        const char *why = NULL;
+        bool replaced = false;
+        fe_isolate("head-torn");
+        fe_key(0x81, op_seed, op_pub);
+        ASSERT(fe_head_line(0x81, 4, two, 1, h4, sizeof(h4)));
+        ASSERT(fe_head_line(0x81, 5, two, 1, h5, sizeof(h5)));
+        ASSERT(fe_head_line(0x81, 6, two, 2, h6, sizeof(h6)));
+        ASSERT(fe_head_line(0x81, 8, two, 2, h8, sizeof(h8)));
+        ASSERT(fleet_head_import(h5, op_pub, false, &out, &replaced, &why));
+
+        fleet_enrol_test_crash_before_head = true;
+        ASSERT(!fleet_head_import(h6, op_pub, false, &out, &replaced, &why));
+        fleet_enrol_test_crash_before_head = false;
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_IMPORT_PARTIAL);
+        ASSERT(!replaced);
+        ASSERT_EQ(fleet_head_load(op_pub, &held, &why), FLEET_HEAD_BAD);
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_HEAD_TORN);
+
+        /* Older (and the previous head) refused; the same head repairs. */
+        ASSERT(!fleet_head_import(h4, op_pub, false, &out, &replaced, &why));
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_HEAD_STALE);
+        ASSERT(!fleet_head_import(h5, op_pub, false, &out, &replaced, &why));
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_HEAD_STALE);
+        ASSERT_EQ(fleet_head_load(op_pub, &held, &why), FLEET_HEAD_BAD);
+        ASSERT(fleet_head_import(h6, op_pub, false, &out, &replaced, &why));
+        ASSERT(replaced);
+        ASSERT_EQ(fleet_head_load(op_pub, &held, &why), FLEET_HEAD_OK);
+        ASSERT_EQ(held.seq, (uint64_t)6);
+
+        /* Torn again: a higher head repairs it too. */
+        fleet_enrol_test_crash_before_head = true;
+        ASSERT(!fleet_head_import(h8, op_pub, false, &out, &replaced, &why));
+        fleet_enrol_test_crash_before_head = false;
+        ASSERT_EQ(fleet_head_load(op_pub, &held, &why), FLEET_HEAD_BAD);
+        ASSERT(!fleet_head_import(h6, op_pub, false, &out, &replaced, &why));
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_HEAD_STALE);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_fe_import_partial_is_honest(void)
+{
+    int failures = 0;
+    TEST("fleet import: when the pin or sequence record moved and the rest "
+         "did not finish, the reply says mutated with the partial state "
+         "named; a failure before any change says mutated false") {
+        static char h1[FLEET_ENROL_HEAD_TEXT_MAX];
+        char dd[PATH_MAX], body[PATH_MAX + FLEET_ENROL_HEAD_TEXT_MAX + 64];
+        char row[FLEET_ENROL_MACHINE_TEXT_MAX];
+        struct fleet_machine machine;
+        struct zcl_command_reply reply;
+        uint8_t seed[32], pub[32];
+        const char *why = NULL;
+        bool appended = false;
+        fe_isolate("import-partial");
+        ASSERT(fe_manager_key(seed, pub));
+        ASSERT(fe_datadir(dd, sizeof(dd), "import-partial-dd"));
+        ASSERT(fleet_head_mint(1, FE_NOW, NULL, 0, seed, pub, h1, sizeof(h1),
+                               &why));
+        (void)snprintf(body, sizeof(body), "{\"line\":\"%s\",\"datadir\":\"%s\"}",
+                       h1, dd);
+
+        /* Pin first: the pin write fails, nothing has changed. */
+        fleet_enrol_test_fail_pin_write = true;
+        ASSERT(fe_leaf_call("fleet.import", "zcl.fleet.import.v1", body, &reply));
+        ASSERT_STR_EQ(reply.error.evidence, FLEET_ENROL_WHY_ROSTER_UNWRITABLE);
+        ASSERT(!reply.error.mutated);
+        zcl_command_reply_free(&reply);
+        fleet_enrol_test_fail_pin_write = false;
+
+        /* Pin and sequence record written, head not: partial, mutated. */
+        fleet_enrol_test_crash_before_head = true;
+        ASSERT(fe_leaf_call("fleet.import", "zcl.fleet.import.v1", body, &reply));
+        fleet_enrol_test_crash_before_head = false;
+        ASSERT_STR_EQ(reply.error.evidence, FLEET_ENROL_WHY_IMPORT_PARTIAL);
+        ASSERT(reply.error.mutated);
+        zcl_command_reply_free(&reply);
+
+        /* A row appended and then the pin fails: partial too. */
+        fe_isolate("import-partial-row");
+        ASSERT(fe_manager_key(seed, pub));
+        ASSERT(fe_manager_row("studio", 0x84, seed, pub, FLEET_ENROL_PORT_FIRST,
+                              row, sizeof(row)));
+        fleet_enrol_test_fail_pin_write = true;
+        ASSERT(!fleet_roster_import_pinned(row, pub, false, &machine,
+                                           &appended, &why));
+        fleet_enrol_test_fail_pin_write = false;
+        ASSERT(appended);
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_IMPORT_PARTIAL);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_fe_head_revokes_import(void)
 {
     int failures = 0;
@@ -2429,7 +2645,8 @@ static int test_fe_head_fails_closed(void)
          "never read as nothing-revoked; import and the gate provider both "
          "fail closed by name") {
         char row[FLEET_ENROL_MACHINE_TEXT_MAX];
-        static char foreign[FLEET_ENROL_HEAD_TEXT_MAX];
+        static char foreign[FLEET_ENROL_HEAD_TEXT_MAX], good[FLEET_ENROL_HEAD_TEXT_MAX];
+        bool replaced = false;
         static struct fleet_head out;
         struct fleet_machine machine;
         const struct zcl_fleet_roster_provider *p =
@@ -2450,15 +2667,18 @@ static int test_fe_head_fails_closed(void)
         p->head(op_pub, &seam, p->ctx);
         ASSERT_EQ(seam.state, ZCL_FLEET_HEAD_NONE);
 
+        /* A trusted head and its record first, then damage the head. */
+        ASSERT(fe_head_line(0x81, 1, one, 1, good, sizeof(good)));
+        ASSERT(fleet_head_import(good, op_pub, false, &out, &replaced, &why));
         const char *bad[] = { "\n", "garbage not a head\n", foreign };
         for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); ++i) {
             ASSERT(fe_put_leaf("roster.head", bad[i]));
             why = NULL;
             ASSERT_EQ(fleet_head_load(op_pub, &out, &why), FLEET_HEAD_BAD);
-            ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_HEAD_UNREADABLE);
+            ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_HEAD_TORN);
             ASSERT(!fleet_roster_import(row, op_pub, &machine, &appended,
                                         &why));
-            ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_HEAD_UNREADABLE);
+            ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_HEAD_TORN);
             p->head(op_pub, &seam, p->ctx);
             ASSERT_EQ(seam.state, ZCL_FLEET_HEAD_FAILED);
             ASSERT_EQ(seam.count, 0u);
@@ -2643,6 +2863,10 @@ int test_fleet_enrol(void)
     failures += test_fe_roster_gate_provider();
     failures += test_fe_head_codec();
     failures += test_fe_head_sequence();
+    failures += test_fe_head_lock_race();
+    failures += test_fe_head_corrupt_no_rollback();
+    failures += test_fe_head_torn_crash();
+    failures += test_fe_import_partial_is_honest();
     failures += test_fe_head_revokes_import();
     failures += test_fe_head_fails_closed();
     failures += test_fe_operator_pin();

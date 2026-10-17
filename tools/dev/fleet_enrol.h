@@ -169,6 +169,19 @@ enum {
 #define FLEET_ENROL_WHY_BOX_REVOKED "fleet_box_revoked"
 #define FLEET_ENROL_WHY_ROOT_CHANGED "fleet_root_changed"
 #define FLEET_ENROL_WHY_PIN_UNREADABLE "fleet_operator_pin_unreadable"
+/* Another import holds the fleet state lock (or it cannot be taken): the
+ * import is refused rather than racing the head or the pin. */
+#define FLEET_ENROL_WHY_STATE_LOCK "fleet_state_locked"
+/* The head sequence high-water mark is missing beside a head, or cannot be
+ * read: owner repair, never read as zero. */
+#define FLEET_ENROL_WHY_HEAD_HWM "fleet_head_hwm_unreadable"
+/* A sequence record exists but the head it vouches for is missing, corrupt
+ * or does not match: nobody is admitted. Re-importing the same head or a
+ * higher one repairs it. */
+#define FLEET_ENROL_WHY_HEAD_TORN "fleet_head_torn"
+/* An import changed some state files and then failed: the pin or the
+ * sequence record moved but the head did not. */
+#define FLEET_ENROL_WHY_IMPORT_PARTIAL "fleet_import_partial"
 
 /* ── the three records ──────────────────────────────────────────────────── */
 
@@ -483,6 +496,16 @@ bool fleet_head_import(const char *line,
                        const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES],
                        bool confirm_operator_change, struct fleet_head *out,
                        bool *replaced, const char **why);
+
+#ifdef ZCL_TESTING
+/* Test seams: how long a state-lock wait lasts, a call made inside the
+ * head import after the sequence check and before anything is written, and
+ * a simulated crash between the sequence record and the head. */
+extern int fleet_enrol_test_lock_wait_ms;
+extern void (*fleet_enrol_test_after_check)(void);
+extern bool fleet_enrol_test_crash_before_head;
+extern bool fleet_enrol_test_fail_pin_write;
+#endif
 
 /* Visit every line of this box's own machine roster file, verbatim and in
  * file order, without parsing it: the lines the manager publishes onto the

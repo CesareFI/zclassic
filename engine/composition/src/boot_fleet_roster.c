@@ -51,6 +51,9 @@ struct roster_snap {
     bool disabled;          /* -fleetrostergate=0: not enforced on this box */
     enum snap_state state;
     size_t count;
+    struct zcl_fleet_head head; /* the trusted head this snapshot was built
+                                 * under: revocation outlives the roster
+                                 * notes, so UNARMED still applies it */
     uint8_t keys[BOOT_FLEET_ROSTER_MAX][32];
 };
 
@@ -453,6 +456,7 @@ static enum snap_state scan_fold(const struct db_fleet_board_post *rows, int n,
     acc->snap = snap;
     acc->rv = rv;
     acc->memo_ok = memo_matches(&g_memo, rv);
+    snap->head = acc->head;
     for (int i = 0; i < n; i++)
         scan_row(&rows[i].post, acc);
     bool full = n >= BOOT_FLEET_ROSTER_SCAN_ROWS;
@@ -602,7 +606,8 @@ static enum boot_fleet_roster_verdict snap_verdict(const struct roster_snap *s,
 {
     static const uint8_t none[32];
     if (s->state == SNAP_UNARMED)
-        return BOOT_FLEET_ROSTER_UNARMED;
+        return head_revokes(&s->head, key) ? BOOT_FLEET_ROSTER_NOT_MEMBER
+                                           : BOOT_FLEET_ROSTER_UNARMED;
     if (s->state != SNAP_READY)
         return BOOT_FLEET_ROSTER_UNVERIFIABLE;
     if (memcmp(key, none, 32) == 0)

@@ -41,12 +41,20 @@
 /* One pasted token or receipt, plus the command word around it. */
 #define FE_LINE_MAX (FLEET_ENROL_MACHINE_TEXT_MAX + 64)
 
+static void fe_fail_mut(struct zcl_command_reply *reply, const char *code,
+                        const char *stage, const char *message,
+                        const char *why, bool mutated)
+{
+    zcl_command_reply_fail(reply, ZCL_COMMAND_STATUS_FAILED,
+                           ZCL_COMMAND_EXIT_INVALID, code, stage, false,
+                           mutated, message,
+                           why ? why : FLEET_ENROL_WHY_ARGUMENTS);
+}
+
 static void fe_fail(struct zcl_command_reply *reply, const char *code,
                     const char *stage, const char *message, const char *why)
 {
-    zcl_command_reply_fail(reply, ZCL_COMMAND_STATUS_FAILED,
-                           ZCL_COMMAND_EXIT_INVALID, code, stage, false, false,
-                           message, why ? why : FLEET_ENROL_WHY_ARGUMENTS);
+    fe_fail_mut(reply, code, stage, message, why, false);
 }
 
 static int64_t fe_now(void) { return clock_now_wall_ms() / 1000; }
@@ -722,6 +730,21 @@ static const struct {
       "this box holds a roster head it cannot trust (unreadable, corrupt or "
       "not sealed by its operator). It fails closed: import a good head, or "
       "remove the file by hand if you know it is stale." },
+    { FLEET_ENROL_WHY_HEAD_TORN, "FLEET_HEAD_TORN",
+      "the roster head on this box does not match its sequence record (a "
+      "crash mid-import, or a damaged file), so it admits nobody. Paste the "
+      "same head again, or a newer one, to repair it." },
+    { FLEET_ENROL_WHY_HEAD_HWM, "FLEET_HEAD_HWM_UNREADABLE",
+      "the sequence record beside the roster head is missing or unreadable. "
+      "This box will not guess it was zero: repair or remove the head by "
+      "hand, then import the newest head." },
+    { FLEET_ENROL_WHY_STATE_LOCK, "FLEET_STATE_LOCKED",
+      "another import holds the fleet state lock; nothing was changed. Try "
+      "again." },
+    { FLEET_ENROL_WHY_IMPORT_PARTIAL, "FLEET_IMPORT_PARTIAL",
+      "the import changed some fleet state and then failed. The operator pin "
+      "or sequence record moved but the head or row did not finish; read "
+      "the state, then repeat the same import to complete it." },
     { FLEET_ENROL_WHY_PIN_UNREADABLE, "FLEET_OPERATOR_PIN_UNREADABLE",
       "the recorded operator pin cannot be read, so this box will not guess "
       "which fleet root it pinned." },
@@ -733,8 +756,9 @@ static void fe_import_refuse(struct zcl_command_reply *reply, const char *why)
                                       sizeof(fe_import_refusals[0]); ++i) {
         if (strcmp(why, fe_import_refusals[i].why) != 0)
             continue;
-        fe_fail(reply, fe_import_refusals[i].code, "authorize",
-                fe_import_refusals[i].message, why);
+        fe_fail_mut(reply, fe_import_refusals[i].code, "authorize",
+                fe_import_refusals[i].message, why,
+                strcmp(why, FLEET_ENROL_WHY_IMPORT_PARTIAL) == 0);
         return;
     }
     fe_fail(reply, "FLEET_IMPORT_REFUSED", "authorize",
