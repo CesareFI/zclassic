@@ -23,7 +23,7 @@ static char *ccg_make_cflags(const struct ccg_cfg *cfg, const char *root)
     char rec[CCD_PATH + 32];
     char *argv[7] = { (char *)"sh", (char *)"-c", (char *)"cd \"$0\" && exec make -s \"$@\"", (char *)root,
                       (char *)"print-CFLAGS" };
-    struct lcp_spec sp = { argv, set, NULL, LCP_OUT, CCD_GRACE_MS };
+    struct lcp_spec sp = { argv, set, NULL, LCP_OUT, CCD_GRACE_MS, NULL };
     struct lcp_buf out = { 0 };
     int code = 1;
     char *text = NULL;

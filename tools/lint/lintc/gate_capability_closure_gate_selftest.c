@@ -45,7 +45,7 @@ static int cgs_cc_once(const char *src, const char *obj, const char *flag, int c
 {
     char *argv[8] = { (char *)"cc" };
     int k = 1, code = 1;
-    struct lcp_spec sp = { argv, NULL, NULL, LCP_QUIET, 1000 };
+    struct lcp_spec sp = { argv, NULL, NULL, LCP_QUIET, 1000, NULL };
     if (c23)
         argv[k++] = (char *)"-std=c23";
     if (flag)
