@@ -519,7 +519,7 @@ contexts/commons/modules/vcs/src/zcode_dht.c:vcs_zcode_dht_contacts_parse:28
 contexts/commons/modules/vcs/src/zcode_dht.c:vcs_zcode_dht_contacts_serialize:17
 contexts/commons/modules/vcs/src/zcode_dht.c:vcs_zcode_dht_error_string:20
 contexts/commons/modules/vcs/src/zcode_dht.c:vcs_zcode_dht_table_add_contact:19
-contexts/commons/modules/vcs/src/zcode_dht_delegation.c:vcs_zcode_dht_delegation_verify:18
+contexts/commons/modules/vcs/src/zcode_dht_delegation.c:vcs_zcode_dht_delegation_verify:16
 contexts/commons/modules/vcs/src/zcode_dht_msgs.c:selector_valid:17
 contexts/commons/modules/vcs/src/zcode_dht_msgs.c:vcs_zcode_dht_msg_parse:62
 contexts/commons/modules/vcs/src/zcode_dht_msgs.c:vcs_zcode_dht_msg_serialize_nodes:16

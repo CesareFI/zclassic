@@ -206,6 +206,76 @@ static int test_roster_cross_mode(void)
     return failures;
 }
 
+static int test_unknown_mode_refused(void)
+{
+    int failures = 0;
+    TEST("zcode dht delegation: unknown mode values are refused everywhere") {
+        static const uint8_t bad_modes[] = {2, 255};
+        for (size_t i = 0; i < sizeof(bad_modes); i++) {
+            struct vcs_zcode_dht_delegation c, r;
+            uint8_t id[32];
+            uint8_t cw[VCS_ZCODE_DHT_DELEGATION_WIRE_BYTES];
+            uint8_t rw[VCS_ZCODE_DHT_DELEGATION_ROSTER_WIRE_BYTES];
+            ASSERT(make_delegation(&c, 1, 1000, 2000, 0x22));
+            ASSERT_EQ(vcs_zcode_dht_delegation_verify(&c, NULL, NULL, 0, NULL,
+                                                      1000),
+                      VCS_ZCODE_DHT_DELEGATION_OK);
+            c.mode = bad_modes[i];
+            ASSERT_EQ(vcs_zcode_dht_delegation_verify(&c, NULL, NULL, 0, NULL,
+                                                      1000),
+                      VCS_ZCODE_DHT_DELEGATION_MODE_UNKNOWN);
+            ASSERT(!vcs_zcode_dht_delegation_node_id(id, &c));
+            ASSERT_EQ(vcs_zcode_dht_delegation_encode(&c, cw),
+                      VCS_ZCODE_DHT_DELEGATION_MODE_UNKNOWN);
+            ASSERT_EQ(vcs_zcode_dht_delegation_roster_check(&c, NULL, NULL, 1000),
+                      VCS_ZCODE_DHT_DELEGATION_MODE_UNKNOWN);
+            ASSERT_EQ(vcs_zcode_dht_delegation_roster_encode(&c, rw),
+                      VCS_ZCODE_DHT_DELEGATION_MODE_UNKNOWN);
+            ASSERT(make_roster(&r, 1, 1000, 2000, 0x22, 0x55));
+            r.mode = bad_modes[i];
+            ASSERT_EQ(vcs_zcode_dht_delegation_verify(&r, NULL, NULL, 0, NULL,
+                                                      1000),
+                      VCS_ZCODE_DHT_DELEGATION_MODE_UNKNOWN);
+            ASSERT(!vcs_zcode_dht_delegation_node_id(id, &r));
+        }
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_roster_cache_bound_to_body(void)
+{
+    int failures = 0;
+    TEST("zcode dht delegation: roster cached fields must equal the signed body") {
+        struct vcs_zcode_dht_delegation base, d;
+        ASSERT(make_roster(&base, 1, 1000, 1000 + 86400, 0x22, 0x55));
+        ASSERT_EQ(vcs_zcode_dht_delegation_roster_check(&base, NULL, NULL, 1000),
+                  VCS_ZCODE_DHT_DELEGATION_OK);
+        d = base; d.network_genesis[0] ^= 1;
+        ASSERT_EQ(vcs_zcode_dht_delegation_roster_check(&d, NULL, NULL, 1000),
+                  VCS_ZCODE_DHT_DELEGATION_PROJECTION);
+        d = base; d.online_pubkey[5] ^= 1;
+        ASSERT_EQ(vcs_zcode_dht_delegation_roster_check(&d, NULL, NULL, 1000),
+                  VCS_ZCODE_DHT_DELEGATION_PROJECTION);
+        d = base; d.noise_static_pubkey[31] ^= 1;
+        ASSERT_EQ(vcs_zcode_dht_delegation_roster_check(&d, NULL, NULL, 1000),
+                  VCS_ZCODE_DHT_DELEGATION_PROJECTION);
+        d = base; d.not_before += 1;
+        ASSERT_EQ(vcs_zcode_dht_delegation_roster_check(&d, NULL, NULL, 1000),
+                  VCS_ZCODE_DHT_DELEGATION_PROJECTION);
+        /* master and expiry live only in the signed doc: tampering fails the
+         * signature (or the window) instead. */
+        d = base; d.doc.master_pubkey[0] ^= 1;
+        ASSERT(vcs_zcode_dht_delegation_roster_check(&d, NULL, NULL, 1000) !=
+               VCS_ZCODE_DHT_DELEGATION_OK);
+        d = base; d.doc.expiry += 1;
+        ASSERT(vcs_zcode_dht_delegation_roster_check(&d, NULL, NULL, 1000) !=
+               VCS_ZCODE_DHT_DELEGATION_OK);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_roster_validity_window(void)
 {
     int failures = 0;
@@ -417,6 +487,8 @@ int test_zcode_dht_delegation(void)
     failures += test_roster_node_id_and_beacon();
     failures += test_roster_cross_mode();
     failures += test_roster_validity_window();
+    failures += test_unknown_mode_refused();
+    failures += test_roster_cache_bound_to_body();
     failures += test_roster_refused_by_verify_paths();
     failures += test_delegation_windows_and_binding();
     failures += test_delegation_stable_node_id();

@@ -10,6 +10,17 @@
 
 #include <string.h>
 
+static const char *roster_error_string(
+    enum vcs_zcode_dht_delegation_error error)
+{
+    switch (error) {
+    case VCS_ZCODE_DHT_DELEGATION_ROSTER_MODE: return "roster-mode-unsupported";
+    case VCS_ZCODE_DHT_DELEGATION_MODE_UNKNOWN: return "unknown-delegation-mode";
+    case VCS_ZCODE_DHT_DELEGATION_PROJECTION: return "projection-mismatch";
+    default: return "unknown";
+    }
+}
+
 const char *vcs_zcode_dht_delegation_error_string(
     enum vcs_zcode_dht_delegation_error error)
 {
@@ -26,7 +37,7 @@ const char *vcs_zcode_dht_delegation_error_string(
     case VCS_ZCODE_DHT_DELEGATION_NOISE_KEY: return "noise-key-mismatch";
     case VCS_ZCODE_DHT_DELEGATION_BEACON: return "beacon-mismatch";
     case VCS_ZCODE_DHT_DELEGATION_EXPIRED: return "expired";
-    case VCS_ZCODE_DHT_DELEGATION_ROSTER_MODE: return "roster-mode-unsupported";
+    default: return roster_error_string(error);
     }
     return "unknown";
 }
@@ -90,11 +101,37 @@ enum vcs_zcode_dht_delegation_error vcs_zcode_dht_delegation_sign(
     return delegation_decode_body(out);
 }
 
+/* Mode dispatch is explicit: a value that is neither CHAIN nor ROSTER is
+ * refused by name, a known-but-wrong mode is a body mismatch. */
+static enum vcs_zcode_dht_delegation_error mode_refusal(uint8_t mode)
+{
+    return mode == VCS_ZCODE_DHT_DELEGATION_MODE_CHAIN ||
+                   mode == VCS_ZCODE_DHT_DELEGATION_MODE_ROSTER
+        ? VCS_ZCODE_DHT_DELEGATION_BODY
+        : VCS_ZCODE_DHT_DELEGATION_MODE_UNKNOWN;
+}
+
+static enum vcs_zcode_dht_delegation_error chain_precheck(
+    const struct vcs_zcode_dht_delegation *d)
+{
+    /* Roster mode is codec-only until a later unit adds acceptance. */
+    if (d->mode == VCS_ZCODE_DHT_DELEGATION_MODE_ROSTER)
+        return VCS_ZCODE_DHT_DELEGATION_ROSTER_MODE;
+    if (d->mode != VCS_ZCODE_DHT_DELEGATION_MODE_CHAIN)
+        return VCS_ZCODE_DHT_DELEGATION_MODE_UNKNOWN;
+    if (d->doc.body_len != VCS_ZCODE_DHT_DELEGATION_BODY_BYTES ||
+        memcmp(d->doc.body, VCS_ZCODE_DHT_DELEGATION_TAG, 4) != 0)
+        return VCS_ZCODE_DHT_DELEGATION_BODY;
+    return VCS_ZCODE_DHT_DELEGATION_OK;
+}
+
 enum vcs_zcode_dht_delegation_error vcs_zcode_dht_delegation_encode(
     const struct vcs_zcode_dht_delegation *delegation,
     uint8_t out[VCS_ZCODE_DHT_DELEGATION_WIRE_BYTES])
 {
     if (!delegation || !out) return VCS_ZCODE_DHT_DELEGATION_NULL;
+    if (delegation->mode != VCS_ZCODE_DHT_DELEGATION_MODE_CHAIN)
+        return mode_refusal(delegation->mode);
     if (delegation->doc.body_len != VCS_ZCODE_DHT_DELEGATION_BODY_BYTES)
         return VCS_ZCODE_DHT_DELEGATION_BODY;
     size_t n = zid_doc_encode(out, VCS_ZCODE_DHT_DELEGATION_WIRE_BYTES,
@@ -133,12 +170,8 @@ enum vcs_zcode_dht_delegation_error vcs_zcode_dht_delegation_verify(
     const uint8_t expected_beacon_hash[32], uint64_t now_unix)
 {
     if (!delegation) return VCS_ZCODE_DHT_DELEGATION_NULL;
-    /* Roster mode is codec-only until a later unit adds acceptance. */
-    if (delegation->mode == VCS_ZCODE_DHT_DELEGATION_MODE_ROSTER)
-        return VCS_ZCODE_DHT_DELEGATION_ROSTER_MODE;
-    if (delegation->doc.body_len != VCS_ZCODE_DHT_DELEGATION_BODY_BYTES ||
-        memcmp(delegation->doc.body, VCS_ZCODE_DHT_DELEGATION_TAG, 4) != 0)
-        return VCS_ZCODE_DHT_DELEGATION_BODY;
+    enum vcs_zcode_dht_delegation_error pre = chain_precheck(delegation);
+    if (pre != VCS_ZCODE_DHT_DELEGATION_OK) return pre;
     if (!chain_fields_present(delegation))
         return VCS_ZCODE_DHT_DELEGATION_ZERO_KEY;
     if (zendp_window_check(delegation->not_before,
@@ -171,12 +204,14 @@ bool vcs_zcode_dht_delegation_node_id(
     uint8_t out[32], const struct vcs_zcode_dht_delegation *delegation)
 {
     if (!out || !delegation) return false;
-    if (delegation->mode == VCS_ZCODE_DHT_DELEGATION_MODE_ROSTER)
-        return vcs_zcode_dht_roster_node_id(out, delegation->network_genesis,
-                                            delegation->doc.master_pubkey);
-    return vcs_zcode_dht_node_id(out, delegation->network_genesis,
-                                 delegation->doc.master_pubkey,
-                                 delegation->beacon_hash);
+    if (delegation->mode == VCS_ZCODE_DHT_DELEGATION_MODE_CHAIN)
+        return vcs_zcode_dht_node_id(out, delegation->network_genesis,
+                                     delegation->doc.master_pubkey,
+                                     delegation->beacon_hash);
+    if (delegation->mode != VCS_ZCODE_DHT_DELEGATION_MODE_ROSTER)
+        return false;
+    return vcs_zcode_dht_roster_node_id(out, delegation->network_genesis,
+                                        delegation->doc.master_pubkey);
 }
 
 /* ---- Roster mode (codec only). Chain code above is untouched. ---- */
@@ -262,8 +297,9 @@ enum vcs_zcode_dht_delegation_error vcs_zcode_dht_delegation_roster_encode(
     uint8_t out[VCS_ZCODE_DHT_DELEGATION_ROSTER_WIRE_BYTES])
 {
     if (!delegation || !out) return VCS_ZCODE_DHT_DELEGATION_NULL;
-    if (delegation->mode != VCS_ZCODE_DHT_DELEGATION_MODE_ROSTER ||
-        delegation->doc.body_len !=
+    if (delegation->mode != VCS_ZCODE_DHT_DELEGATION_MODE_ROSTER)
+        return mode_refusal(delegation->mode);
+    if (delegation->doc.body_len !=
             VCS_ZCODE_DHT_DELEGATION_ROSTER_BODY_BYTES)
         return VCS_ZCODE_DHT_DELEGATION_BODY;
     size_t n = zid_doc_encode(out, VCS_ZCODE_DHT_DELEGATION_ROSTER_WIRE_BYTES,
@@ -285,16 +321,35 @@ enum vcs_zcode_dht_delegation_error vcs_zcode_dht_delegation_roster_decode(
     return roster_decode_body(out);
 }
 
+/* The signed doc.body is the only authority. Re-derive the canonical
+ * projection from it and require every cached field to equal it. */
+static bool roster_projection_matches(
+    const struct vcs_zcode_dht_delegation *d)
+{
+    struct vcs_zcode_dht_delegation p;
+    memset(&p, 0, sizeof(p));
+    p.doc.body_len = d->doc.body_len;
+    memcpy(p.doc.body, d->doc.body, sizeof(p.doc.body));
+    return roster_decode_body(&p) == VCS_ZCODE_DHT_DELEGATION_OK &&
+           memcmp(p.network_genesis, d->network_genesis, 32) == 0 &&
+           memcmp(p.online_pubkey, d->online_pubkey, 32) == 0 &&
+           memcmp(p.noise_static_pubkey, d->noise_static_pubkey, 32) == 0 &&
+           p.not_before == d->not_before;
+}
+
 static enum vcs_zcode_dht_delegation_error roster_structure_check(
     const struct vcs_zcode_dht_delegation *d)
 {
-    if (d->mode != VCS_ZCODE_DHT_DELEGATION_MODE_ROSTER ||
-        d->doc.body_len != VCS_ZCODE_DHT_DELEGATION_ROSTER_BODY_BYTES ||
+    if (d->mode != VCS_ZCODE_DHT_DELEGATION_MODE_ROSTER)
+        return mode_refusal(d->mode);
+    if (d->doc.body_len != VCS_ZCODE_DHT_DELEGATION_ROSTER_BODY_BYTES ||
         memcmp(d->doc.body, VCS_ZCODE_DHT_DELEGATION_ROSTER_DOMAIN,
                ROSTER_DOMAIN_BYTES) != 0)
         return VCS_ZCODE_DHT_DELEGATION_BODY;
     if (d->beacon_height != 0 || zcl_bytes_any_set(d->beacon_hash, 32))
         return VCS_ZCODE_DHT_DELEGATION_BEACON;
+    if (!roster_projection_matches(d))
+        return VCS_ZCODE_DHT_DELEGATION_PROJECTION;
     if (!zcl_bytes_any_set(d->doc.master_pubkey, 32) ||
         !zcl_bytes_any_set(d->network_genesis, 32) ||
         !zcl_bytes_any_set(d->online_pubkey, 32) ||

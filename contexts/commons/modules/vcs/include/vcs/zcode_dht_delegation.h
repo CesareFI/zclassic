@@ -68,6 +68,10 @@ enum vcs_zcode_dht_delegation_error {
     VCS_ZCODE_DHT_DELEGATION_EXPIRED,
     /* A roster-mode delegation reached a chain verify path: refused. */
     VCS_ZCODE_DHT_DELEGATION_ROSTER_MODE,
+    /* mode is neither CHAIN nor ROSTER: refused everywhere, never defaulted. */
+    VCS_ZCODE_DHT_DELEGATION_MODE_UNKNOWN,
+    /* A cached struct field disagrees with the signed doc body. */
+    VCS_ZCODE_DHT_DELEGATION_PROJECTION,
 };
 
 const char *vcs_zcode_dht_delegation_error_string(
