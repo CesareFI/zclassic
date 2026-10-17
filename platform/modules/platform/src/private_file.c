@@ -31,11 +31,22 @@
 #endif
 #include <windows.h>
 #include <sddl.h>
+#include "private_acl_internal.h"
 
 static HANDLE pf_handle(const struct platform_private_file *file) {
   return (HANDLE)file->native;
 }
 
+static bool pf_validate_owner_private(
+    const struct platform_private_file *file) {
+  if (!file || pf_handle(file) == INVALID_HANDLE_VALUE ||
+      !platform_private_acl_validate_handle(pf_handle(file), false)) {
+    fprintf(stderr, "[private_file] retained owner/private ACL validation refused\n");
+    SetLastError(ERROR_ACCESS_DENIED);
+    return false;
+  }
+  return true;
+}
 static bool pf_wide(const char *utf8, wchar_t out[32768]) {
   if (!utf8 || !utf8[0])
     return false;
@@ -132,10 +143,13 @@ static bool pf_open(const char *path, DWORD creation, DWORD share,
                          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT |
                              FILE_FLAG_OVERLAPPED,
                          NULL);
+  DWORD open_error = h == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
   if (descriptor)
     LocalFree(descriptor);
-  if (h == INVALID_HANDLE_VALUE)
+  if (h == INVALID_HANDLE_VALUE) {
+    SetLastError(open_error);
     return false;
+  }
   BY_HANDLE_FILE_INFORMATION info = {0};
   if (!GetFileInformationByHandle(h, &info) ||
       (info.dwFileAttributes &
@@ -659,6 +673,21 @@ void platform_private_file_init(struct platform_private_file *f) {
 static int pf_fd(const struct platform_private_file *f) {
   return (int)f->native;
 }
+static bool pf_validate_owner_private(
+    const struct platform_private_file *file) {
+  struct stat info;
+  if (!file || pf_fd(file) < 0 || fstat(pf_fd(file), &info) != 0) {
+    fprintf(stderr, "[private_file] retained file privacy inspection failed\n");
+    return false;
+  }
+  if (!S_ISREG(info.st_mode) || info.st_uid != geteuid() ||
+      (info.st_mode & 07777) != 0600) {
+    fprintf(stderr, "[private_file] retained owner/mode0600 validation refused\n");
+    errno = EPERM;
+    return false;
+  }
+  return true;
+}
 bool platform_private_file_create(const char *p,
                                   struct platform_private_file *f) {
   int fd = open(p, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
@@ -989,4 +1018,10 @@ bool platform_private_file_open_observation(const char *path,
 bool platform_private_file_create_locked(const char *path,
                                          struct platform_private_file *file) {
   return pf_create_locked(path, file);
+}
+
+/* The public validator observes the same retained object on every platform. */
+bool platform_private_file_validate_owner_private(
+    const struct platform_private_file *file) {
+  return pf_validate_owner_private(file);
 }

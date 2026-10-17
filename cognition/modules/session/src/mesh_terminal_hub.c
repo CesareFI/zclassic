@@ -268,23 +268,91 @@ static bool hub_why(char *why, size_t cap, const char *text)
 }
 
 #if defined(_WIN32)
+#include "base/cleanse.h"
+#include "platform/private_file.h"
+#include <windows.h>
+
+static const char *hub_windows_key_read(struct platform_private_file *file,
+                                        uint8_t key[MESH_TERMINAL_HUB_KEY_BYTES])
+{
+    uint64_t size = 0;
+    if (!platform_private_file_validate_owner_private(file))
+        return "key file owner/private ACL refused";
+    if (!platform_private_file_size(file, &size))
+        return "key file cannot be inspected";
+    if (size != MESH_TERMINAL_HUB_KEY_BYTES)
+        return "key file must hold exactly 32 bytes";
+    if (!platform_private_file_read_at(file, key, MESH_TERMINAL_HUB_KEY_BYTES, 0))
+        return "key file read failed";
+    if (!platform_private_file_size(file, &size) ||
+        size != MESH_TERMINAL_HUB_KEY_BYTES ||
+        !platform_private_file_validate_owner_private(file))
+        return "key file size or private ACL changed during read";
+    return NULL;
+}
 
 static bool hub_key_load_arm(const char *path,
                                 uint8_t key[MESH_TERMINAL_HUB_KEY_BYTES],
                                 char *why, size_t why_cap)
 {
-    (void)path; (void)key;
-    return hub_why(why, why_cap, "terminal hub needs a POSIX key file");
+    if (key) memory_cleanse(key, MESH_TERMINAL_HUB_KEY_BYTES);
+    if (!path || !path[0] || !key)
+        return hub_why(why, why_cap, "key file path and output required");
+    struct platform_private_file file;
+    platform_private_file_init(&file);
+    const char *failure = "key file cannot be opened (missing, busy or a reparse point)";
+    if (platform_private_file_open_observation(path, &file))
+        failure = hub_windows_key_read(&file, key);
+    platform_private_file_close(&file);
+    if (!failure) return true;
+    memory_cleanse(key, MESH_TERMINAL_HUB_KEY_BYTES);
+    return hub_why(why, why_cap, failure);
+}
+
+static const char *hub_windows_key_write(struct platform_private_file *file,
+                                         uint8_t key[MESH_TERMINAL_HUB_KEY_BYTES])
+{
+    if (!platform_private_file_validate_owner_private(file))
+        return "created key file owner/private ACL refused";
+    if (!rng_fill(key, MESH_TERMINAL_HUB_KEY_BYTES))
+        return "key file RNG failed";
+    if (!platform_private_file_write_at(file, key, MESH_TERMINAL_HUB_KEY_BYTES, 0) ||
+        !platform_private_file_authority_flush(file))
+        return "key file write or durability observation failed";
+    if (!platform_private_file_validate_owner_private(file))
+        return "created key file owner/private ACL changed";
+    return NULL;
 }
 
 static bool hub_key_init_arm(const char *path,
                                 char fingerprint[MESH_TERMINAL_HUB_FINGERPRINT_HEX + 1],
                                 char *why, size_t why_cap)
 {
-    (void)path; (void)fingerprint;
-    return hub_why(why, why_cap, "terminal hub needs a POSIX key file");
+    if (fingerprint) fingerprint[0] = '\0';
+    if (!path || !path[0] || !fingerprint)
+        return hub_why(why, why_cap, "key file path and fingerprint required");
+    struct platform_private_file file;
+    struct platform_private_file_identity identity;
+    platform_private_file_init(&file);
+    if (!platform_private_file_create(path, &file)) {
+        DWORD error = GetLastError();
+        return hub_why(why, why_cap,
+            error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS
+                ? "key file already exists; it is never overwritten"
+                : "key file cannot be created");
+    }
+    uint8_t key[MESH_TERMINAL_HUB_KEY_BYTES] = {0};
+    bool identified = platform_private_file_identity(&file, &identity);
+    const char *failure = identified ? hub_windows_key_write(&file, key)
+        : "created key identity unavailable; private file requires owner reconciliation";
+    if (!failure)
+        mesh_terminal_hub_key_fingerprint(key, fingerprint);
+    else if (identified && !platform_private_file_retire_if_identity(&file, path, &identity))
+        failure = "key initialization failed; retained private file requires owner reconciliation";
+    memory_cleanse(key, sizeof(key));
+    platform_private_file_close(&file);
+    return failure ? hub_why(why, why_cap, failure) : true;
 }
-
 #else
 
 static bool hub_key_stat_ok(int fd, char *why, size_t cap)

@@ -78,15 +78,6 @@ const char *mesh_terminal_worker_error_string(
 /* ── Platform-neutral bookkeeping, shared by every arm below ───────────
  * Pure functions of primitive types: a Linux unit test proves them with no shell. */
 
-/* Bounds-check requested terminal geometry against the proto's wire limits.
- * Shared by the Linux and Windows arms; non-static so the stub-only build
- * (neither arm) does not trip -Wunused-function. */
-bool geometry_in_bounds(uint16_t cols, uint16_t rows)
-{
-    return cols != 0 && cols <= MESH_TERMINAL_MAX_COLS && rows != 0 &&
-           rows <= MESH_TERMINAL_MAX_ROWS;
-}
-
 /* True when accepting `n` more bytes on top of `used` already charged against
  * `max` would cross the budget. The Windows input path calls this; the POSIX
  * arm inlines the same test. Non-static and declared in the header so the

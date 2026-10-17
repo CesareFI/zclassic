@@ -39,6 +39,8 @@ ZCL_WINDOWS_ACCEPTANCE_TESTS := \
 	hotswap_elf_probe_refusal \
 	logical_cpu \
 	log_level \
+	mesh_terminal_hub_key \
+	mesh_terminal_hub_key_reparse \
 	mesh_terminal_worker \
 	mind_state \
 	mint_anchor_export_refusal \
@@ -126,6 +128,7 @@ ZCL_WINDOWS_ACCEPTANCE_consensus_bundle_marker_SOURCES := \
 	platform/modules/platform/src/private_destination.c \
 	platform/modules/platform/src/directory_compat.c \
 	platform/modules/platform/src/private_file.c \
+	platform/modules/platform/src/private_acl_internal.c \
 	platform/modules/platform/src/file_metadata.c \
 	platform/modules/platform/src/clock.c \
 	platform/modules/base/src/safe_alloc.c
@@ -150,6 +153,7 @@ ZCL_WINDOWS_ACCEPTANCE_consensus_install_refusal_SOURCES := \
 	tests/harness/src/consensus_install_windows_refusal_acceptance.c \
 	engine/composition/src/consensus_state_snapshot_install.c \
 	platform/modules/platform/src/private_file.c \
+	platform/modules/platform/src/private_acl_internal.c \
 	platform/modules/base/src/log_level.c \
 	platform/modules/base/src/result.c \
 	platform/modules/base/src/safe_alloc.c
@@ -231,6 +235,30 @@ ZCL_WINDOWS_ACCEPTANCE_codeindex_freshness_FLAGS := \
 ZCL_WINDOWS_ACCEPTANCE_codeindex_freshness_LIBS := \
 	-ladvapi32 $(ZCL_WINDOWS_ACCEPTANCE_PTHREAD_LIB)
 
+# Key lifecycle only: Windows serving/connecting still explicitly refuse.
+ZCL_WINDOWS_ACCEPTANCE_mesh_terminal_hub_key_SOURCES := \
+	tests/harness/src/mesh_terminal_hub_key_windows_acceptance.c \
+	cognition/modules/session/src/mesh_terminal_hub.c \
+	cognition/modules/session/src/mesh_terminal_shell_policy.c \
+	tools/command/native_mesh_terminal_hub_command.c \
+	tools/command/native_mesh_terminal_hub_connect.c \
+	platform/modules/platform/src/private_file.c \
+	platform/modules/platform/src/private_acl_internal.c \
+	platform/modules/platform/src/private_directory.c \
+	platform/modules/platform/src/rng.c \
+	platform/modules/sha3/src/sha3.c \
+	platform/modules/base/src/cleanse.c \
+	platform/modules/base/src/safe_alloc.c \
+	platform/modules/base/src/log_level.c
+ZCL_WINDOWS_ACCEPTANCE_mesh_terminal_hub_key_FLAGS := -Itools -Itools/command
+ZCL_WINDOWS_ACCEPTANCE_mesh_terminal_hub_key_LIBS := -ladvapi32 -lbcrypt
+
+# Same lifecycle checks; only the real reparse constructor differs. Keep the
+# original file-symlink target independent (it may refuse for missing privilege).
+ZCL_WINDOWS_ACCEPTANCE_mesh_terminal_hub_key_reparse_SOURCES := $(ZCL_WINDOWS_ACCEPTANCE_mesh_terminal_hub_key_SOURCES)
+ZCL_WINDOWS_ACCEPTANCE_mesh_terminal_hub_key_reparse_FLAGS := \
+	$(ZCL_WINDOWS_ACCEPTANCE_mesh_terminal_hub_key_FLAGS) -DMESH_TERMINAL_HUB_KEY_GUID_REPARSE
+ZCL_WINDOWS_ACCEPTANCE_mesh_terminal_hub_key_reparse_LIBS := $(ZCL_WINDOWS_ACCEPTANCE_mesh_terminal_hub_key_LIBS)
 ZCL_WINDOWS_ACCEPTANCE_mesh_terminal_worker_SOURCES := \
 	tests/harness/src/mesh_terminal_worker_windows_acceptance.c \
 	cognition/modules/session/src/mesh_terminal_worker.c \
@@ -506,6 +534,7 @@ ZCL_WINDOWS_ACCEPTANCE_os_proc_pid_image_SOURCES := \
 	platform/modules/platform/tests/os_proc_pid_image_windows_acceptance.c \
 	platform/modules/platform/src/os_proc.c \
 	platform/modules/platform/src/private_file.c \
+	platform/modules/platform/src/private_acl_internal.c \
 	platform/modules/base/src/safe_alloc.c
 ZCL_WINDOWS_ACCEPTANCE_os_proc_pid_image_LIBS := -ladvapi32 -lpsapi
 # The SELF-image row, separate from the pid-image row above on purpose: this
@@ -537,12 +566,14 @@ ZCL_WINDOWS_ACCEPTANCE_private_directory_LIBS := -ladvapi32
 ZCL_WINDOWS_ACCEPTANCE_private_file_SOURCES := \
 	platform/modules/platform/tests/private_file_windows_acceptance.c \
 	platform/modules/platform/src/private_file.c \
+	platform/modules/platform/src/private_acl_internal.c \
 	platform/modules/platform/src/positioned_file.c \
 	platform/modules/base/src/safe_alloc.c
 ZCL_WINDOWS_ACCEPTANCE_private_file_LIBS := -ladvapi32
 ZCL_WINDOWS_ACCEPTANCE_private_file_path_swap_SOURCES := \
 	platform/modules/platform/tests/private_file_path_swap_acceptance.c \
 	platform/modules/platform/src/private_file.c \
+	platform/modules/platform/src/private_acl_internal.c \
 	platform/modules/base/src/safe_alloc.c
 ZCL_WINDOWS_ACCEPTANCE_private_file_path_swap_LIBS := -ladvapi32
 ZCL_WINDOWS_ACCEPTANCE_process_group_exec_SOURCES := \
@@ -647,6 +678,7 @@ ZCL_WINDOWS_ACCEPTANCE_stale_lock_capability_SOURCES := \
 	tests/harness/src/stale_lock_capability_acceptance.c \
 	platform/modules/platform/src/os_proc.c \
 	platform/modules/platform/src/private_file.c \
+	platform/modules/platform/src/private_acl_internal.c \
 	platform/modules/base/src/safe_alloc.c
 ZCL_WINDOWS_ACCEPTANCE_stale_lock_capability_LIBS := -ladvapi32 -lpsapi
 ZCL_WINDOWS_ACCEPTANCE_state_root_SOURCES := \

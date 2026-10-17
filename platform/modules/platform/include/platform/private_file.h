@@ -44,6 +44,14 @@ bool platform_private_file_open_locked_create_wait(
  * Interoperates with waiting exclusive writers; never creates or retries. */
 bool platform_private_file_open_observation(const char *path,
                                            struct platform_private_file *file);
+/* Validate this retained regular file, without reopening a pathname or changing
+ * permissions: POSIX current owner and exactly mode0600; Windows current owner
+ * and protected owner+SYSTEM-only ACL, with no inherited/extra ACEs or reparse.
+ * This is a snapshot, not an ACL lock or a guarantee against later changes.
+ * Failure never repairs the file. Existing open/observation calls alone do not
+ * promise this privacy validation. */
+bool platform_private_file_validate_owner_private(
+    const struct platform_private_file *file);
 void platform_private_file_close(struct platform_private_file *file);
 bool platform_private_file_size(struct platform_private_file *file,
                                 uint64_t *size);

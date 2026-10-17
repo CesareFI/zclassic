@@ -16,14 +16,9 @@
 #include "session/mesh_terminal_worker.h"
 
 #include <errno.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
-#if !defined(_WIN32)
 
 static const struct {
     const char *flag;
@@ -122,6 +117,11 @@ static int hub_init_key(const struct hub_args *a)
     return ZCL_COMMAND_EXIT_OK;
 }
 
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 static bool hub_dir_ok(const char *path)
 {
     struct stat st;
@@ -178,6 +178,15 @@ static int hub_serve(const struct hub_args *a)
     return mesh_terminal_hub_listen_run(listener, &cfg) == 0 ? ZCL_COMMAND_EXIT_OK : ZCL_COMMAND_EXIT_INTERNAL;
 }
 
+#else
+static int hub_serve(const struct hub_args *a)
+{
+    (void)a;
+    return hub_refuse(ZCL_COMMAND_EXIT_BLOCKED, "PLATFORM_UNSUPPORTED",
+                      "the terminal hub needs a POSIX host");
+}
+#endif
+
 static bool hub_try_arm(const char *const *words, size_t count,
                                       size_t consumed, int *rc)
 {
@@ -194,22 +203,6 @@ static bool hub_try_arm(const char *const *words, size_t count,
         *rc = a.init_key ? hub_init_key(&a) : hub_serve(&a);
     return true;
 }
-
-#else /* _WIN32 */
-
-static bool hub_try_arm(const char *const *words, size_t count,
-                                      size_t consumed, int *rc)
-{
-    bool hub = consumed < count && words[consumed] &&
-               (!strcmp(words[consumed], "serve") || !strcmp(words[consumed], "connect"));
-    if (hub) {
-        fprintf(stderr, "z23: refused: PLATFORM_UNSUPPORTED: the terminal hub needs a POSIX host\n");
-        *rc = ZCL_COMMAND_EXIT_BLOCKED;
-    }
-    return hub;
-}
-
-#endif
 
 bool zcl_native_mesh_terminal_hub_try(const char *const *words, size_t count,
                                       size_t consumed, int *rc)

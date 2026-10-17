@@ -8,6 +8,15 @@
 
 #include <string.h>
 
+/* Bounds-check requested terminal geometry against the proto's wire limits.
+ * Shared by the Linux and Windows arms; non-static so the stub-only build
+ * (neither arm) does not trip -Wunused-function. */
+bool geometry_in_bounds(uint16_t cols, uint16_t rows)
+{
+    return cols != 0 && cols <= MESH_TERMINAL_MAX_COLS && rows != 0 &&
+           rows <= MESH_TERMINAL_MAX_ROWS;
+}
+
 static bool tw_win_separator(char c)
 {
     return c == '\\' || c == '/';

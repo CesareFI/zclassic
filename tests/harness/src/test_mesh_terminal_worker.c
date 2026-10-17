@@ -20,7 +20,6 @@
 #define _GNU_SOURCE /* pthread/posix bits, if any — must precede includes */
 
 #if defined(__linux__)
-#define geometry_in_bounds tw_fixture_geometry
 #define mesh_terminal_win_env_name tw_fixture_win_env_name
 #define mesh_terminal_worker_error_string tw_fixture_error_string
 #define mesh_terminal_worker_budget_would_overrun tw_fixture_budget_overrun
