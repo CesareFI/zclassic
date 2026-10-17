@@ -75,6 +75,25 @@ bool vcs_zcode_dht_node_id(uint8_t out[32], const uint8_t genesis[32],
     return true;
 }
 
+/* Roster mode: SHA3-256(ROSTER_NODE_ID_DOMAIN\0 || genesis || master). No
+ * beacon input, so every renewal of one master yields one id. */
+bool vcs_zcode_dht_roster_node_id(uint8_t out[32], const uint8_t genesis[32],
+                                  const uint8_t master[32])
+{
+    if (!out) return false;
+    memset(out, 0, 32);
+    if (!zcl_bytes_any_set(genesis, 32) || !zcl_bytes_any_set(master, 32))
+        return false;
+    struct sha3_256_ctx sha;
+    sha3_256_init(&sha);
+    sha3_256_write(&sha, (const uint8_t *)VCS_ZCODE_DHT_ROSTER_NODE_ID_DOMAIN,
+                   sizeof(VCS_ZCODE_DHT_ROSTER_NODE_ID_DOMAIN));
+    sha3_256_write(&sha, genesis, 32);
+    sha3_256_write(&sha, master, 32);
+    sha3_256_finalize(&sha, out);
+    return true;
+}
+
 void vcs_zcode_dht_xor_distance(const uint8_t a[32], const uint8_t b[32],
                                 uint8_t out[32])
 {

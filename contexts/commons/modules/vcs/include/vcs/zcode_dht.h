@@ -20,6 +20,10 @@
 #define VCS_ZCODE_DHT_ID_BYTES 32u
 #define VCS_ZCODE_DHT_BUCKET_COUNT 256u
 #define VCS_ZCODE_DHT_NODE_ID_DOMAIN "zcl.zcode.dht.nodeid.v1"
+/* Roster-mode node id tag. Chain hashes DOMAIN\0 (24 bytes) then 96 bytes;
+ * roster hashes this tag\0 (31 bytes) then 64 bytes. The tags differ at
+ * byte 21 (v vs r) and the lengths differ, so the inputs cannot collide. */
+#define VCS_ZCODE_DHT_ROSTER_NODE_ID_DOMAIN "zcl.zcode.dht.nodeid.roster.v1"
 
 #define VCS_ZCODE_DHT_CONTACTS_WIRE_VERSION 2u
 #define VCS_ZCODE_DHT_CONTACTS_HEADER_BYTES 78u
@@ -127,6 +131,9 @@ bool vcs_zcode_dht_node_id(uint8_t out[32],
                            const uint8_t network_genesis_root[32],
                            const uint8_t master_pubkey[32],
                            const uint8_t delayed_block_hash[32]);
+bool vcs_zcode_dht_roster_node_id(uint8_t out[32],
+                                  const uint8_t network_genesis_root[32],
+                                  const uint8_t master_pubkey[32]);
 void vcs_zcode_dht_xor_distance(const uint8_t a[32], const uint8_t b[32],
                                 uint8_t out[32]);
 int vcs_zcode_dht_bucket_index(const uint8_t distance[32]);
