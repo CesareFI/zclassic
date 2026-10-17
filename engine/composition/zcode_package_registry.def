@@ -51,13 +51,13 @@ ZCODE_PACKAGE("zclassic23/presentation", "contexts/explorer/modules/presentation
     "021492bc6a132ac91cb8b9f57d2b809dd2bdb8e1a294d3edbb6c6f7fc03bf11cac",
     "eacbb7e0ce38ddf0e2144461a9ef0a4a05b004a3add5025d357f5d5e78a16a142877d4e7428f54ce726c127f1202006f401c90ef6d753651ada148f87cd8246a")
 ZCODE_PACKAGE("zclassic23/platform", "platform/modules/platform", 7,
-    "0219c738aa9bd85ec95f2ebfd62e3c9834ab0ddaeb50ca9a403a852fae512112",
-    "b320e3edfa0197c7390ba15e3a852845114b29dbe9a279feeb989b07d3aa65f9",
+    "aa6415ffb3a7ce333ea6e40eab193d0c470ccf4c93a1cacfdc99efbf931afe60",
+    "a66ffcdc155b975688c2c833b630ef9089db351a7b1e7ed8b8d403adc036ce2e",
     "18dae8bfaf046ed7987b0decd5ced67476e4d9e8d189e39eef35fe23a053b8eb",
-    "f2be135121f25d06852e759ea460dbc6899c85eae14700be00a363c6a1fbd4c6",
+    "58f5c32f50bb9bee474bedb0a66583bb9ae309df29ec4f5abe8881799ecad2d1",
     "1017df6fcfc349d82b50652241dddfa266680924952dc76b28ddeb329ed9140e",
     "021492bc6a132ac91cb8b9f57d2b809dd2bdb8e1a294d3edbb6c6f7fc03bf11cac",
-    "1dd611d7d1f388f2aa41103ce7a5830468a4412b7cf20656b6f69eae692bd1d573a4e5138666d58a27e031baadbcd02a291a5455deae8e1beff8d01891cc4075")
+    "74fffd3d9a5627ed52201f5f111b6ecfba8bd1e5a42da159864916bcb99a0b924c0f7d6b430a6ebdbfa6410997d4d984ef9db5178d1cfa957d82b86fb9e75475")
 ZCODE_PACKAGE("zclassic23/crypto-sha3", "core/modules/crypto", 8,
     "156acd97ba4dbd06cb4e81aa9edf4ab3bf9832b71e37fb52aca85830e3b66faa",
     "c8dfd07d14904d4e876432db3d7f4707f9fdfcc51f48478febccb462a0e7d5eb",
