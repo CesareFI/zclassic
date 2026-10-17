@@ -280,6 +280,14 @@ static struct aop_ent *aop_ent_slot(struct aop_ctx *c, const char *key)
     return e;
 }
 
+/* An absent src directory is valid for a header-only module. All other
+ * traversal errors must abort glob instead of silently shrinking discovery. */
+static int aop_glob_error(const char *path, int error)
+{
+    (void)path;
+    return error != ENOENT;
+}
+
 static int aop_add_impls(struct aop_ent *e, const char *libdir, const char *stem)
 {
     char pat[RS_PATH * 2];
@@ -287,7 +295,7 @@ static int aop_add_impls(struct aop_ent *e, const char *libdir, const char *stem
     int rc = 0;
     if (ovf(snprintf(pat, sizeof pat, "%s/src/%s*.c", libdir, stem), sizeof pat))
         return 2;
-    int gr = glob(pat, 0, NULL, &g);
+    int gr = glob(pat, 0, aop_glob_error, &g);
     if (gr == GLOB_NOMATCH) {
         globfree(&g);
         return 0;

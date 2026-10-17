@@ -16,6 +16,8 @@
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #endif
+#include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
@@ -62,6 +64,9 @@ static const char k_aops_reg_unsorted[] =
     AOPS_FAST " tests/fast_oracle.c fast_group\n";
 
 static const struct aops_file k_aops_base[] = {
+    /* No src directory: header-only modules remain valid. */
+    { "engine/modules/header_only/include/header_only/empty.h", "int empty;\n" },
+    { "engine/modules/glob_probe/include/glob_probe/empty.h", "int empty;\n" },
     { "core/consensus/src/a.c", "#include \"crypto/sha.h\"\n#include \"util/hw_profile.h\"\n"
                                 "int a(void) { return 0; }\n" },
     { "platform/modules/util/include/util/hw_profile.h", "int hw_probe(void);\n" },
@@ -289,6 +294,46 @@ static int aops_header_cases(void)
     return bad;
 }
 
+/* Keep unrelated healthy implementations above every floor: denying an
+ * additional empty src directory must not be mistaken for genuine NOMATCH. */
+static int aops_glob_case(void)
+{
+    const char *dir = "engine/modules/glob_probe/src";
+    int bad = 0;
+    if (mkdir(dir, 0755) != 0)
+        return aops_fail("glob traversal", "cannot create src directory");
+    if (geteuid() == 0) {
+        fprintf(stderr, "check_accel_oracle_pinned: glob EACCES case "
+                "cannot run as root\n");
+        bad = aops_fail("glob traversal", "EACCES witness unqualified");
+    } else {
+        if (chmod(dir, 0) != 0)
+            return aops_fail("glob traversal", "cannot deny directory access");
+        errno = 0;
+        DIR *probe = opendir(dir);
+        int denied = !probe && errno == EACCES;
+        if (probe)
+            closedir(probe);
+        if (!denied) {
+            bad = aops_fail("glob traversal", "EACCES prerequisite not observed");
+        } else {
+            char out[AOPS_OUT];
+            int rc = aops_run(&k_aops_cfg, out, sizeof out);
+            if (rc != 2 || !strstr(out, "glob failed for") || strstr(out, "OK:"))
+                bad = aops_fail("glob traversal", "expected fatal without OK");
+        }
+        /* Restore before any return, including prerequisite/assertion failure. */
+        if (chmod(dir, 0755) != 0)
+            return aops_fail("glob traversal", "cannot restore directory mode");
+    }
+    if (!lsc_pending())
+        bad |= aops_expect("restored empty src and absent header-only src", 0,
+                       "OK: 2 ISA-dispatched file(s)");
+    if (rmdir(dir) != 0)
+        bad |= aops_fail("glob traversal", "cannot remove empty src directory");
+    return bad;
+}
+
 /* Unreadable-file cases that a text mutation cannot express. Every case
  * runs so that one red case does not hide the others. */
 static int aops_fs_cases(void)
@@ -322,7 +367,10 @@ static int aops_cases(void)
         if (rc || lsc_pending())
             return rc;
     }
-    return aops_fs_cases();
+    int rc = aops_fs_cases();
+    if (rc || lsc_pending())
+        return rc;
+    return aops_glob_case();
 }
 
 static int aops_in_fixture(const char *dir)
