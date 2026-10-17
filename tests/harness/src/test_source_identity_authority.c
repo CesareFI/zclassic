@@ -826,7 +826,7 @@ static int sia_digest_cache_absent_directory(void)
         ASSERT(sia_capture(cmd, out, sizeof(out)));
         ASSERT(strcmp(out, "status=0\n"
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad "
-            " input") == 0);
+            "*input") == 0);
         ASSERT(snprintf(path, sizeof(path), "%s/absent", work) < (int)sizeof(path));
         struct stat snapshot;
         ASSERT(lstat(path, &snapshot) != 0 && errno == ENOENT);

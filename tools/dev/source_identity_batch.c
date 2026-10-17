@@ -772,7 +772,7 @@ static const struct gitlink_state *find_gitlink(const struct token_run *run,
 
 /* Parse the `hash` mode's output (GNU sha256sum --binary --zero shape) into a
  * path-keyed digest table for the identity pass. */
-/* Read one `digest  path\0` row. Returns 1 on a row, 0 on clean EOF, -1 on
+/* Read one `digest *path\0` row. Returns 1 on a row, 0 on clean EOF, -1 on
  * a malformed row (diagnostic printed). `hex` receives 64 chars NUL-terminated
  * into 65 bytes; `path` grows through `capacity`. */
 static int read_digest_record(FILE *table, char hex[65], char **path,
