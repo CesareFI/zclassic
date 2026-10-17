@@ -373,9 +373,10 @@ static int ccs_case_epoch_refusal(struct ccs_fx *fx)
 static int ccs_case_epoch_unreadable(struct ccs_fx *fx)
 {
     char root[CCD_PATH], out[CCD_PATH], dir[CCD_PATH];
-    if (geteuid() == 0)
-        return ccs_say(1, "epoch: an unreadable epochs directory refuses (-2), never reads as none "
-                          "(SKIPPED as root: chmod 0000 does not deny the read)");
+    if (geteuid() == 0) {
+        printf("  SKIP epoch: unreadable epochs directory: running as root, chmod 0000 does not deny the read\n");
+        return 0;
+    }
     ccs_path(fx, "u", root);
     if (ccs_put(fx, "u/build/dev-obj/epochs/sub/x", "x") != 0)
         return ccs_say(0, "epoch unreadable: fixture setup");
