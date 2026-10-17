@@ -96,7 +96,7 @@ int ccs_put(const struct ccs_fx *fx, const char *rel, const char *text)
 static int ccs_cc(const struct ccs_fx *fx, const char *src, const char *obj)
 {
     char s[CCD_PATH], o[CCD_PATH], *argv[] = { (char *)"cc", (char *)"-std=c23", (char *)"-c", s, (char *)"-o", o, NULL };
-    struct lcp_spec sp = { argv, NULL, NULL, LCP_QUIET, 1000, NULL };
+    struct lcp_spec sp = { .argv = argv, .mode = LCP_QUIET, .grace_ms = 1000 };
     int code = 1;
     ccs_path(fx, src, s);
     ccs_path(fx, obj, o);

@@ -308,7 +308,7 @@ static int ccd_nm_take(const struct lcp_buf *out, const char *errpath, int strip
 static int ccd_nm_batch(char *const *objs, size_t n, int defined_only, int strip, struct ccd_nm *o)
 {
     char errpath[CCD_PATH], *argv[CCD_NM_BATCH + 8];
-    struct lcp_spec s = { argv, NULL, NULL, LCP_OUT, CCD_GRACE_MS, NULL };
+    struct lcp_spec s = { .argv = argv, .mode = LCP_OUT, .grace_ms = CCD_GRACE_MS };
     struct lcp_buf out = { 0 };
     int code = 0, rc, bad;
     if (ccd_errfile(errpath, sizeof errpath) != 0)

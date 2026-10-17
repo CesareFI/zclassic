@@ -642,7 +642,7 @@ static int ccg_sources(const struct ccg_scan *s, struct ccg_list *out)
 {
     char *argv[] = { (char *)"git", (char *)"-C", (char *)s->root, (char *)"ls-files", (char *)"-z",
                      (char *)"*.c", (char *)"--", (char *)":!:vendor/*", NULL };
-    struct lcp_spec sp = { argv, NULL, NULL, LCP_OUT, CCD_GRACE_MS, NULL };
+    struct lcp_spec sp = { .argv = argv, .mode = LCP_OUT, .grace_ms = CCD_GRACE_MS };
     struct lcp_buf buf = { 0 };
     struct ccd_map walked = { 0 };
     int code = 1, rc = lcp_run(&sp, &buf, &code);

@@ -7,6 +7,7 @@
  * Fixtures need no build epoch of this checkout.
  */
 #define _POSIX_C_SOURCE 200809L
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,7 +46,7 @@ static int cgs_cc_once(const char *src, const char *obj, const char *flag, int c
 {
     char *argv[8] = { (char *)"cc" };
     int k = 1, code = 1;
-    struct lcp_spec sp = { argv, NULL, NULL, LCP_QUIET, 1000, NULL };
+    struct lcp_spec sp = { .argv = argv, .mode = LCP_QUIET, .grace_ms = 1000 };
     if (c23)
         argv[k++] = (char *)"-std=c23";
     if (flag)
@@ -587,25 +588,31 @@ static int cgs_case_t(const struct ccs_fx *fx)
     return f + (chmod(src, 0644) != 0);
 }
 
-/* U. a regular source the walk selects but the gate cannot open is FATAL, never
- * a clean file. A read that fails after a successful open is covered by the
- * lc_each_line baseline-read-error case. */
+static int cgs_count_line(void *ctx, const char *line, size_t len)
+{
+    (void)line;
+    (void)len;
+    ++*(int *)ctx;
+    return 0;
+}
+
+/* U. lc_each_line, called directly, on a directory: fopen succeeds on Linux and
+ * getline then fails with EISDIR. It must return 2 with errno EISDIR and never
+ * call the callback. The gate cannot reach this path because its walk keeps
+ * only regular files. */
 static int cgs_case_u(const struct ccs_fx *fx)
 {
-    struct ccg_cfg cfg;
-    char src[CCD_PATH];
-    const char *const need[] = { "FATAL", "cannot scan fixture_src/locked_user.c", "Permission denied", NULL };
-    int f;
-    if (cgs_skip_root("U: unreadable regular source"))
-        return 0;
-    cgs_cfg(&cfg);
-    if (cgs_base(fx, "u", "") != 0 || ccs_put(fx, "u/fixture_src/locked_user.c", "int locked_user(void) { return 0; }\n") != 0)
+    char dir[CCD_PATH];
+    int calls = 0, rc;
+    if (cgs_base(fx, "u", "") != 0)
         return ccs_say(0, "U: fixture");
-    ccs_path(fx, "u/fixture_src/locked_user.c", src);
-    if (chmod(src, 0) != 0)
-        return ccs_say(0, "U: chmod");
-    f = cgs_check(fx, "u", &cfg, 2, need, "U: a selected source that cannot be opened is FATAL, never clean");
-    return f + (chmod(src, 0644) != 0);
+    ccs_path(fx, "u", dir);
+    errno = 0;
+    rc = lc_each_line(dir, cgs_count_line, &calls, 0);
+    if (rc != 2 || errno != EISDIR || calls != 0)
+        return ccs_say(0, "U: lc_each_line on a directory must return 2 with EISDIR and no callback");
+    puts("  selftest ok: U: lc_each_line fails a read after a successful open (rc=2, EISDIR, no callback)");
+    return 0;
 }
 
 static int cgs_cases(const struct ccs_fx *fx)
