@@ -1390,6 +1390,7 @@ ZCL_MODULE_CAPABILITY("tools/dev/test_group_catalog.c", CAP_FS_WRITE, "writes co
 ZCL_MODULE_CAPABILITY("tools/dev/test_group_host_need.c", CAP_FS_READ|CAP_FS_WRITE|CAP_PROCESS, "Stats declared host inputs, runs fixed root-owned C23 compiler probes, and writes table refusals to the diagnostic stream")
 ZCL_MODULE_CAPABILITY("tools/dev/test_group_weights.c", CAP_FS_READ|CAP_FS_WRITE, "reads the tracked test-group weights file and a timing artifact, and writes a regenerated weights file (temp file, then rename) only when the regeneration tool asks; the runner only reads")
 ZCL_MODULE_CAPABILITY("tools/dev/verify_store.c", CAP_FS_READ|CAP_FS_WRITE, "reads root-pinned verifier policy and immutable signer observations under a shared lock; writes only allocation-failure diagnostics to stderr")
+ZCL_MODULE_CAPABILITY("tools/dev/wiki_runtime.c", CAP_FS_WRITE|CAP_CLOCK, "reads the monotonic propagation deadline and emits diagnostics through bounded private-file observation and child-capture helpers")
 ZCL_MODULE_CAPABILITY("tools/mcp/mcp_identity.c", CAP_FS_READ|CAP_FS_WRITE|CAP_PROCESS, "spawns git with explicit argv to read the checkout top-level and status under a timeout, after unsetting the inherited GIT_* repository selectors")
 ZCL_MODULE_CAPABILITY("tools/mcp/mcp_rpc.c", CAP_FS_WRITE, "")
 ZCL_MODULE_CAPABILITY("tools/mcp/mcp_serve.c", CAP_FS_READ|CAP_FS_WRITE|CAP_PROCESS, "setenv()s ZCL_DEV_SOURCE_ROOT to the served checkout, which later child execs inherit; the FS classes are the stdin/stdout frame traffic and the chdir into the checkout")

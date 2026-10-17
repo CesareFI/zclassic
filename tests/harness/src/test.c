@@ -2088,6 +2088,7 @@ int main(int argc, char **argv)
     { extern int test_code_emitter(void); failures += test_code_emitter(); }
     { extern int test_fact_writers(void); failures += test_fact_writers(); }
     { extern int test_fleet_board(void); failures += test_fleet_board(); }
+    { extern int test_wiki_runtime(void); failures += test_wiki_runtime(); }
     { extern int test_fleet_wiki_mutation(void); failures += test_fleet_wiki_mutation(); }
     { extern int test_fleet_board_bridge(void); failures += test_fleet_board_bridge(); }
     { extern int test_board_site(void); failures += test_board_site(); }

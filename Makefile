@@ -958,6 +958,7 @@ DEV_STANDALONE_SRCS = tools/dev/hotswap_verify_so.c \
 	tools/dev/z23_git_hook.c \
 	tools/dev/z23_doctor.c \
 	tools/dev/fleet_observe_main.c \
+	tools/dev/wiki_runtime_main.c \
 	tools/dev/mvp_ledger_main.c \
 	tools/dev/test_group_weights_main.c \
 	tools/dev/action_root_reuse_study.c \
@@ -16487,3 +16488,15 @@ $(BIN_DIR)/native-tunnel-export: $(TUNNEL_EXPORT_HELPER_SRCS) $(TUNNEL_EXPORT_HE
 export-native-tunnel: $(BIN_DIR)/native-tunnel-export
 	$(BIN_DIR)/native-tunnel-export --root "$(CURDIR)" --out "$(TUNNEL_EXPORT_DIR)" \
 	 --source-head "$(shell git rev-parse HEAD)"
+
+# Finite native wiki propagation qualifier; no operator command registry leaf.
+$(eval $(call BUILD_NODE_TOOL,z23-wiki-runtime,tools/dev/wiki_runtime_main.c))
+
+# Cheap declaration/syntax screen only; registered tests and tool link remain mandatory.
+# Syntax-only does not exercise middle-end warnings (see the doctrine near line 1336).
+.PHONY: wiki-runtime-compile-check
+wiki-runtime-compile-check: $(VIEW_GEN_HEADERS) $(GUEST_KERNEL_GEN)
+	@$(CC) $(CFLAGS) -Wno-deprecated-declarations -fsyntax-only \
+	  tools/dev/wiki_runtime.c tools/dev/wiki_runtime_main.c
+	@$(CC) $(TEST_FAST_CFLAGS) -Wno-deprecated-declarations -fsyntax-only \
+	  tools/dev/wiki_runtime.c tests/harness/src/test_wiki_runtime.c
