@@ -1132,6 +1132,7 @@ int test_zcode_store(void)
     failures += t_store_pins();
     failures += t_store_possession_scheduler();
     failures += t_store_releases();
+    failures += t_store_release_quarantine();
     failures += t_store_blob();
     failures += t_store_work_output();
     failures += t_store_exact_cache_restore();

@@ -1046,16 +1046,17 @@ static int store_case_release_corrupt_history(
     ZS_CHECK("releases: remove conflicting fixture", unlink(fork_path) == 0);
 
     char backup[512];
-    snprintf(backup, sizeof(backup), "%s.saved", original_path);
+    zs_store_path(backup, sizeof(backup), dd, "recipes/release-original.saved");
     ZS_CHECK("releases: save original wire", rename(original_path, backup) == 0);
     f = fopen(original_path, "wb");
     wrote = f && fputc(0, f) != EOF;
     if (f && fclose(f) != 0) wrote = false;
     ZS_CHECK("releases: truncated history fixture writes", wrote);
     s = vcs_package_store_open(dd, 1000000u);
-    ZS_CHECK("releases: truncated history refuses open", s == NULL);
+    ZS_CHECK("releases: truncated history is quarantined, open succeeds",
+             s != NULL && vcs_package_store_quarantined_releases(s) == 1u &&
+             !zs_path_exists(original_path));
     if (s) vcs_package_store_close(s);
-    ZS_CHECK("releases: remove truncated fixture", unlink(original_path) == 0);
     ZS_CHECK("releases: restore original wire",
              rename(backup, original_path) == 0);
 

@@ -1398,6 +1398,8 @@ bool vcs_package_store_dump_state_json(struct json_value *out,
                      (int64_t)store->gc_orphans_total);
     json_push_kv_int(out, "quota_rejects_total",
                      (int64_t)store->quota_rejects_total);
+    json_push_kv_int(out, "releases_quarantined_total",
+                     (int64_t)store->releases_quarantined_total);
     /* Slice 3 publication state: persisted release envelopes on disk and
      * the last acceptance outcome this store produced. */
     json_push_kv_int(out, "releases_total",

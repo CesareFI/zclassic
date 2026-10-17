@@ -7,6 +7,7 @@
 #include "platform/positioned_file.h"
 #include "platform/directory_compat.h"
 #include <errno.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +16,8 @@
 #include <windows.h>
 #else
 #include <dirent.h>
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 
 #define STORE_LOG "vcs.store"
@@ -921,56 +924,180 @@ static int store_release_row_cmp(const void *left, const void *right)
     return memcmp(a->id, b->id, sizeof(a->id));
 }
 
-static bool store_release_row_add(const char *dir, const char *name,
-                                  struct store_release_row **rows,
-                                  size_t *count, size_t *capacity)
+struct store_replay {
+    const char *root;
+    const char *dir;
+    struct store_release_row *rows;
+    size_t count;
+    size_t capacity;
+    uint64_t quarantined;
+};
+
+enum store_release_read {
+    STORE_RELEASE_READ_OK,
+    STORE_RELEASE_READ_DAMAGED, /* proven not a release: size out of range */
+    STORE_RELEASE_READ_IO,      /* the read itself failed: not proof of damage */
+};
+
+static enum store_release_read store_release_read(const char *path,
+                                                  uint8_t **wire,
+                                                  size_t *wire_len)
+{
+    struct platform_positioned_file file;
+    platform_positioned_file_init(&file);
+    if (!platform_positioned_file_open(&file, path))
+        return STORE_RELEASE_READ_IO;
+    uint64_t size = 0;
+    if (!platform_positioned_file_size(&file, &size)) {
+        platform_positioned_file_close(&file);
+        return STORE_RELEASE_READ_IO;
+    }
+    if (size == 0 || size > VCS_PACKAGE_RELEASE_MAX_WIRE_BYTES) {
+        platform_positioned_file_close(&file);
+        return STORE_RELEASE_READ_DAMAGED;
+    }
+    uint8_t *buf = zcl_malloc((size_t)size, "store_release_read");
+    int64_t got = buf ? platform_positioned_file_read(&file, buf,
+                                                      (size_t)size, 0) : -1;
+    platform_positioned_file_close(&file);
+    if (got != (int64_t)size) {
+        free(buf);
+        return STORE_RELEASE_READ_IO;
+    }
+    *wire = buf;
+    *wire_len = (size_t)size;
+    return STORE_RELEASE_READ_OK;
+}
+
+/* NULL when the bytes are the release named by the file; else the reason
+ * they are provably not. */
+static const char *store_release_damage(const uint8_t *wire, size_t wire_len,
+                                        const char *name,
+                                        struct store_release_row *row)
+{
+    if (vcs_package_release_parse(wire, wire_len, &row->release) !=
+            VCS_PACKAGE_RELEASE_OK ||
+        vcs_package_release_id(&row->release, row->id) !=
+            VCS_PACKAGE_RELEASE_OK)
+        return "unparseable release";
+    char id_hex[65];
+    zcl_hex_encode(row->id, sizeof(row->id), id_hex);
+    return strcmp(id_hex, name) == 0 ? NULL
+                                     : "digest does not match file name";
+}
+
+static bool store_move_noreplace(const char *from, const char *to)
+{
+#if defined(_WIN32)
+    wchar_t wide_from[STORE_PATH_MAX];
+    wchar_t wide_to[STORE_PATH_MAX];
+    return store_release_wide_path(from, wide_from) &&
+        store_release_wide_path(to, wide_to) &&
+        MoveFileExW(wide_from, wide_to, MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    return rename(from, to) == 0;
+#endif
+}
+
+static bool store_sync_directory(const char *dir)
+{
+#if defined(_WIN32)
+    (void)dir;
+    return true;
+#else
+    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return false;
+    bool synced = fsync(fd) == 0;
+    close(fd);
+    return synced;
+#endif
+}
+
+/* First unused <name>.<unix_ts>[.<n>] under qdir. */
+static bool store_quarantine_target(const char *qdir, const char *name,
+                                    char *to, size_t to_size)
+{
+    long long stamp = (long long)time(NULL);
+    for (unsigned n = 0; n < 100u; n++) {
+        int len = n == 0
+            ? snprintf(to, to_size, "%s/%s.%lld", qdir, name, stamp)
+            : snprintf(to, to_size, "%s/%s.%lld.%u", qdir, name, stamp, n);
+        if (len <= 0 || (size_t)len >= to_size) return false;
+        if (!store_path_exists(to)) return true;
+    }
+    return false;
+}
+
+/* Rename, never delete: the damaged record stays inspectable in the store. */
+static bool store_release_quarantine(struct store_replay *rp,
+                                     const char *name, const char *reason)
+{
+    char qdir[STORE_PATH_MAX], from[STORE_PATH_MAX], to[STORE_PATH_MAX];
+    int a = snprintf(qdir, sizeof(qdir), "%s/quarantine/releases", rp->root);
+    int b = snprintf(from, sizeof(from), "%s/%s", rp->dir, name);
+    if (a <= 0 || (size_t)a >= sizeof(qdir) || b <= 0 ||
+        (size_t)b >= sizeof(from))
+        LOG_FAIL(STORE_LOG, "quarantine path too long for release %s", name);
+    if (!store_mkdir_p(qdir) ||
+        !store_quarantine_target(qdir, name, to, sizeof(to)) ||
+        !store_move_noreplace(from, to) ||
+        !store_sync_directory(qdir) || !store_sync_directory(rp->dir))
+        LOG_FAIL(STORE_LOG, "quarantine damaged release %s (%s): %s", from,
+                 reason, strerror(errno));
+    rp->quarantined++;
+    LOG_ERROR(STORE_LOG, "quarantined damaged release %s -> %s: %s", from, to,
+              reason);
+    return true;
+}
+
+static bool store_release_row_push(struct store_replay *rp,
+                                   const struct store_release_row *row)
+{
+    if (rp->count == rp->capacity) {
+        size_t maximum = STORE_RELEASE_REPLAY_BUDGET_BYTES / sizeof(*rp->rows);
+        if (rp->count >= maximum)
+            LOG_FAIL(STORE_LOG, "persisted release replay memory bound");
+        size_t next = rp->capacity ? rp->capacity * 2u : 64u;
+        if (next > maximum) next = maximum;
+        struct store_release_row *grown = zcl_realloc(
+            rp->rows, next * sizeof(*rp->rows), "store_release_replay");
+        if (!grown)
+            LOG_FAIL(STORE_LOG, "allocate persisted release replay");
+        rp->rows = grown;
+        rp->capacity = next;
+    }
+    rp->rows[rp->count++] = *row;
+    return true;
+}
+
+static bool store_release_row_add(struct store_replay *rp, const char *name)
 {
     if (!store_name_is_hex64(name))
         LOG_FAIL(STORE_LOG, "invalid persisted release filename %s", name);
     char path[STORE_PATH_MAX];
-    int n = snprintf(path, sizeof(path), "%s/%s", dir, name);
+    int n = snprintf(path, sizeof(path), "%s/%s", rp->dir, name);
     if (n <= 0 || (size_t)n >= sizeof(path))
         LOG_FAIL(STORE_LOG, "persisted release path too long");
+    uint8_t *wire = NULL;
     size_t wire_len = 0;
-    uint8_t *wire = store_read_file(path, &wire_len);
-    if (!wire)
-        LOG_FAIL(STORE_LOG, "unreadable persisted release %s", name);
+    enum store_release_read read = store_release_read(path, &wire, &wire_len);
+    if (read == STORE_RELEASE_READ_IO)
+        LOG_FAIL(STORE_LOG, "unreadable persisted release %s: %s", name,
+                 strerror(errno));
     struct store_release_row row = {0};
-    bool valid = wire_len <= VCS_PACKAGE_RELEASE_MAX_WIRE_BYTES &&
-        vcs_package_release_parse(wire, wire_len, &row.release) ==
-            VCS_PACKAGE_RELEASE_OK &&
-        vcs_package_release_id(&row.release, row.id) ==
-            VCS_PACKAGE_RELEASE_OK;
+    const char *damage = read == STORE_RELEASE_READ_DAMAGED
+        ? "zero length or oversize"
+        : store_release_damage(wire, wire_len, name, &row);
     free(wire);
-    char id_hex[65];
-    if (valid) {
-        zcl_hex_encode(row.id, sizeof(row.id), id_hex);
-        valid = strcmp(id_hex, name) == 0;
-    }
-    if (!valid)
-        LOG_FAIL(STORE_LOG, "invalid persisted release identity %s", name);
-    if (*count == *capacity) {
-        size_t maximum = STORE_RELEASE_REPLAY_BUDGET_BYTES / sizeof(**rows);
-        if (*count >= maximum)
-            LOG_FAIL(STORE_LOG, "persisted release replay memory bound");
-        size_t next = *capacity ? *capacity * 2u : 64u;
-        if (next > maximum) next = maximum;
-        struct store_release_row *grown = zcl_realloc(
-            *rows, next * sizeof(**rows), "store_release_replay");
-        if (!grown)
-            LOG_FAIL(STORE_LOG, "allocate persisted release replay");
-        *rows = grown;
-        *capacity = next;
-    }
-    (*rows)[(*count)++] = row;
-    return true;
+    if (damage)
+        return store_release_quarantine(rp, name, damage);
+    return store_release_row_push(rp, &row);
 }
 
 #if defined(_WIN32)
-static bool store_release_collect(const char *dir,
-                                  struct store_release_row **rows,
-                                  size_t *count, size_t *capacity)
+static bool store_release_collect(struct store_replay *rp)
 {
+    const char *dir = rp->dir;
     bool complete = true;
     wchar_t wide_dir[STORE_PATH_MAX];
     wchar_t pattern[STORE_PATH_MAX];
@@ -1003,8 +1130,7 @@ static bool store_release_collect(const char *dir,
                     WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
                                         entry.cFileName, -1, name, bytes,
                                         NULL, NULL) != bytes ||
-                    !store_release_row_add(dir, name, rows, count,
-                                           capacity)) {
+                    !store_release_row_add(rp, name)) {
                     complete = false;
                     break;
                 }
@@ -1017,10 +1143,9 @@ static bool store_release_collect(const char *dir,
     return complete;
 }
 #else
-static bool store_release_collect(const char *dir,
-                                  struct store_release_row **rows,
-                                  size_t *count, size_t *capacity)
+static bool store_release_collect(struct store_replay *rp)
 {
+    const char *dir = rp->dir;
     bool complete = true;
     DIR *d = opendir(dir);
     if (!d) {
@@ -1038,8 +1163,7 @@ static bool store_release_collect(const char *dir,
         if (strcmp(entry->d_name, ".") == 0 ||
             strcmp(entry->d_name, "..") == 0)
             continue;
-        if (!store_release_row_add(dir, entry->d_name,
-                                   rows, count, capacity)) {
+        if (!store_release_row_add(rp, entry->d_name)) {
             complete = false;
             break;
         }
@@ -1049,7 +1173,27 @@ static bool store_release_collect(const char *dir,
 }
 #endif
 
-struct vcs_package_accept *store_replay_releases(const char *root)
+static struct vcs_package_accept *store_replay_project(
+    struct store_replay *rp)
+{
+    struct vcs_package_accept *projection = vcs_package_accept_new();
+    if (!projection) return NULL;
+    if (rp->count > 1)
+        qsort(rp->rows, rp->count, sizeof(*rp->rows), store_release_row_cmp);
+    for (size_t i = 0; i < rp->count; i++) {
+        enum vcs_package_accept_result result =
+            vcs_package_accept(projection, &rp->rows[i].release);
+        if (result == VCS_PACKAGE_ACCEPT_OK) continue;
+        LOG_ERROR(STORE_LOG, "persisted release %zu refuses replay: %s", i,
+                  vcs_package_accept_result_string(result));
+        vcs_package_accept_free(projection);
+        return NULL;
+    }
+    return projection;
+}
+
+struct vcs_package_accept *store_replay_releases(const char *root,
+                                                 uint64_t *quarantined)
 {
     char dir[STORE_PATH_MAX];
     int n = snprintf(dir, sizeof(dir), "%s/releases", root);
@@ -1057,27 +1201,11 @@ struct vcs_package_accept *store_replay_releases(const char *root)
         LOG_ERROR(STORE_LOG, "persisted release directory path too long");
         return NULL;
     }
-    struct store_release_row *rows = NULL;
-    size_t count = 0, capacity = 0;
-    bool complete = store_release_collect(dir, &rows, &count, &capacity);
+    struct store_replay rp = { .root = root, .dir = dir };
     struct vcs_package_accept *projection =
-        complete ? vcs_package_accept_new() : NULL;
-    if (projection) {
-        if (count > 1)
-            qsort(rows, count, sizeof(*rows), store_release_row_cmp);
-        for (size_t i = 0; i < count; i++) {
-            enum vcs_package_accept_result result =
-                vcs_package_accept(projection, &rows[i].release);
-            if (result != VCS_PACKAGE_ACCEPT_OK) {
-                LOG_ERROR(STORE_LOG, "persisted release %zu refuses replay: %s",
-                          i, vcs_package_accept_result_string(result));
-                vcs_package_accept_free(projection);
-                projection = NULL;
-                break;
-            }
-        }
-    }
-    free(rows);
+        store_release_collect(&rp) ? store_replay_project(&rp) : NULL;
+    *quarantined = rp.quarantined;
+    free(rp.rows);
     if (!projection)
         LOG_ERROR(STORE_LOG, "persisted release history incomplete under %s",
                   dir);
@@ -1196,4 +1324,14 @@ bool vcs_package_store_cache_counts(struct vcs_package_store *store,
     out->trim_passes = store->hot_trim_passes;
     pthread_mutex_unlock(&store->lock);
     return true;
+}
+
+uint64_t vcs_package_store_quarantined_releases(
+    struct vcs_package_store *store)
+{
+    if (!store) return 0;
+    pthread_mutex_lock(&store->lock);
+    uint64_t total = store->releases_quarantined_total;
+    pthread_mutex_unlock(&store->lock);
+    return total;
 }

@@ -85,6 +85,9 @@ int t_store_pins(void);
 int t_store_possession_scheduler(void);
 int t_store_releases(void);
 
+/* test_zcode_store_quarantine.c — damaged persisted release records. */
+int t_store_release_quarantine(void);
+
 /* test_zcode_store_content.c — blob surface, zcode work output, and
  * exact-cache restore. */
 int t_store_blob(void);

@@ -1466,7 +1466,8 @@ bool store_open_recover(struct vcs_package_store *store)
     if (store->catalog_incomplete)
         LOG_FAIL(STORE_LOG, "committed manifest history incomplete under %s",
                  store->root);
-    struct vcs_package_accept *replayed = store_replay_releases(store->root);
+    struct vcs_package_accept *replayed = store_replay_releases(
+        store->root, &store->releases_quarantined_total);
     if (!replayed)
         LOG_FAIL(STORE_LOG, "release history recovery under %s", store->root);
     if (!store_gc_cas(store) || !store_commit_sweep(store)) {

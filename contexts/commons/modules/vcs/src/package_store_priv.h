@@ -77,6 +77,7 @@ struct vcs_package_store {
     uint64_t evictions_total;
     uint64_t gc_orphans_total;
     uint64_t quota_rejects_total;
+    uint64_t releases_quarantined_total; /* moved aside by the last open */
     pthread_mutex_t lock;
 };
 
@@ -136,8 +137,10 @@ enum vcs_package_store_result store_chunk_hash_checked(
 bool store_open_recover(struct vcs_package_store *store);
 /* Rebuild release acceptance from every present immutable envelope. The
  * caller owns the returned unpublished projection, or receives NULL on any
- * incomplete/corrupt history or resource failure. */
-struct vcs_package_accept *store_replay_releases(const char *root);
+ * incomplete/corrupt history or resource failure. *quarantined
+ * receives the count of provably invalid records moved aside. */
+struct vcs_package_accept *store_replay_releases(const char *root,
+                                                 uint64_t *quarantined);
 bool store_process_lock(struct vcs_package_store *store);
 void store_process_unlock(struct vcs_package_store *store);
 bool store_generation_check(struct vcs_package_store *store);
