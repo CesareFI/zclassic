@@ -7589,6 +7589,171 @@ static void fbr_p2p_init(struct fbr_p2p *x, struct node_db *db, int64_t id)
     x->node.addr.svc.addr.ip[15] = (uint8_t)id;
 }
 
+enum fb_review_ingress_object {
+    FB_REVIEW_TARGET, FB_REVIEW_ROOT, FB_REVIEW_LEFT, FB_REVIEW_RIGHT,
+    FB_REVIEW_OPPOSITE, FB_REVIEW_OBJECTS
+};
+
+static bool fb_review_ingress_sign(struct fleet_board_post *post, uint8_t who)
+{
+    uint8_t seed[32], pk[32];
+    fb_test_identity(who, seed, pk);
+    post->ttl = 3600;
+    return fleet_board_post_sign(post, seed, pk) == FLEET_BOARD_OK;
+}
+
+static bool fb_review_ingress_compose(struct fleet_board_post *p, uint64_t now)
+{
+    fb_test_compose(&p[FB_REVIEW_TARGET], FLEET_BOARD_KIND_WIKI, "author",
+                    "immutable ingress target", now - 4, 3600);
+    p[FB_REVIEW_TARGET].scope = FLEET_BOARD_SCOPE_PUBLIC;
+    (void)snprintf(p[FB_REVIEW_TARGET].room, sizeof(p[FB_REVIEW_TARGET].room),
+                   "%s", FLEET_BOARD_ROOM_DEFAULT);
+    (void)snprintf(p[FB_REVIEW_TARGET].slug, sizeof(p[FB_REVIEW_TARGET].slug),
+                   "peer-reviewed-page");
+    (void)snprintf(p[FB_REVIEW_TARGET].title, sizeof(p[FB_REVIEW_TARGET].title),
+                   "Reviewed ingress bytes");
+    if (!fb_review_ingress_sign(&p[FB_REVIEW_TARGET], 30)) return false;
+    return fb_review_compose(&p[FB_REVIEW_ROOT], 31, p[FB_REVIEW_TARGET].id,
+               NULL, "approve", "initial", now - 3) &&
+           fb_review_ingress_sign(&p[FB_REVIEW_ROOT], 31) &&
+           fb_review_compose(&p[FB_REVIEW_LEFT], 31, p[FB_REVIEW_TARGET].id,
+               p[FB_REVIEW_ROOT].id, "approve", "left branch", now - 1) &&
+           fb_review_ingress_sign(&p[FB_REVIEW_LEFT], 31) &&
+           fb_review_compose(&p[FB_REVIEW_RIGHT], 31, p[FB_REVIEW_TARGET].id,
+               p[FB_REVIEW_ROOT].id, "request-changes", "right branch", now - 2) &&
+           fb_review_ingress_sign(&p[FB_REVIEW_RIGHT], 31) &&
+           fb_review_compose(&p[FB_REVIEW_OPPOSITE], 32, p[FB_REVIEW_TARGET].id,
+               NULL, "request-changes", "independent reviewer", now) &&
+           fb_review_ingress_sign(&p[FB_REVIEW_OPPOSITE], 32);
+}
+
+static bool fb_review_ingress_stored(struct node_db *db,
+    const struct fleet_board_post *post, const uint8_t *frame, size_t frame_len,
+    int64_t expected_rows)
+{
+    struct db_fleet_board_post row;
+    uint8_t stored_frame[FLEET_BOARD_FRAME_MAX];
+    size_t stored_len = 0;
+    int64_t checked = 0;
+    return db_fleet_board_post_find(db, post->id, &row) &&
+           fleet_board_frame_encode_post(&row.post, stored_frame,
+               sizeof(stored_frame), &stored_len) == FLEET_BOARD_OK &&
+           stored_len == frame_len && !memcmp(stored_frame, frame, frame_len) &&
+           db_fleet_board_chain_verify(db, &checked) && checked == expected_rows;
+}
+
+/* This fixture crosses the production POST handler, not a direct DB import.
+ * Wire one receiver at a time because the board's service pointer is global. */
+static bool fb_review_ingress_post(struct fbr_p2p *peer,
+    const struct fleet_board_post *post, int64_t expected_rows)
+{
+    uint8_t frame[FLEET_BOARD_FRAME_MAX];
+    size_t frame_len = 0;
+    if (fleet_board_frame_encode_post(post, frame, sizeof(frame), &frame_len) !=
+        FLEET_BOARD_OK) return false;
+    int score = atomic_load(&peer->node.misbehavior);
+    boot_fleet_board_wire(&peer->svc);
+    bool ok = true;
+    for (unsigned replay = 0; replay < 2 && ok; replay++)
+        ok = boot_fleet_board_frame(&peer->mp, &peer->node, frame, frame_len,
+                                    NULL) &&
+             fb_review_ingress_stored(peer->svc.node_db, post, frame, frame_len,
+                                       expected_rows);
+    boot_fleet_board_shutdown();
+    return ok && atomic_load(&peer->node.misbehavior) == score &&
+           !peer->node.disconnect;
+}
+
+static bool fb_review_ingress_state(struct node_db *db,
+    const struct fleet_board_post *post,
+    const struct fleet_wiki_review_state *expected)
+{
+    struct fleet_wiki_review_state state;
+    return db_fleet_board_review_state(db, post, &state) &&
+           state.resolved == expected->resolved &&
+           state.lineage_valid == expected->lineage_valid &&
+           state.current == expected->current &&
+           state.complete == expected->complete && state.fork == expected->fork;
+}
+
+static bool fb_review_ingress_children(struct fbr_p2p *peer,
+    const struct fleet_board_post *posts, const unsigned order[3])
+{
+    for (size_t i = 0; i < 3; i++)
+        if (!fb_review_ingress_post(peer, &posts[order[i]], (int64_t)i + 1))
+            return false;
+    const struct fleet_wiki_review_state missing_target_and_parent = {0};
+    return fb_review_ingress_state(peer->svc.node_db, &posts[FB_REVIEW_LEFT],
+                                   &missing_target_and_parent);
+}
+
+static bool fb_review_ingress_equal(struct node_db *a, struct node_db *b,
+    const struct fleet_board_post *posts)
+{
+    for (size_t i = 0; i < FB_REVIEW_OBJECTS; i++) {
+        uint8_t frame[FLEET_BOARD_FRAME_MAX];
+        size_t frame_len = 0;
+        if (fleet_board_frame_encode_post(&posts[i], frame, sizeof(frame),
+                &frame_len) != FLEET_BOARD_OK ||
+            !fb_review_ingress_stored(a, &posts[i], frame, frame_len,
+                                       FB_REVIEW_OBJECTS) ||
+            !fb_review_ingress_stored(b, &posts[i], frame, frame_len,
+                                       FB_REVIEW_OBJECTS)) return false;
+    }
+    return true;
+}
+
+static int test_fleet_wiki_review_post_ingress_convergence(void)
+{
+    int failures = 0;
+    struct node_db a = {0}, b = {0};
+    static struct fbr_p2p peers[2];
+    struct fleet_board_post posts[FB_REVIEW_OBJECTS];
+    TEST("fleet wiki reviews: production POST ingress retains late targets, "
+         "parents, opposing opinions and forks exactly once") {
+        ASSERT(node_db_open(&a, ":memory:"));
+        ASSERT(node_db_open(&b, ":memory:"));
+        uint64_t now = (uint64_t)platform_time_wall_time_t();
+        ASSERT(now > 4);
+        ASSERT(fb_review_ingress_compose(posts, now));
+        fbr_p2p_init(&peers[0], &a, 61);
+        fbr_p2p_init(&peers[1], &b, 62);
+        const unsigned order_a[] = {
+            FB_REVIEW_LEFT, FB_REVIEW_OPPOSITE, FB_REVIEW_RIGHT};
+        const unsigned order_b[] = {
+            FB_REVIEW_RIGHT, FB_REVIEW_LEFT, FB_REVIEW_OPPOSITE};
+        ASSERT(fb_review_ingress_children(&peers[0], posts, order_a));
+        ASSERT(fb_review_ingress_children(&peers[1], posts, order_b));
+        ASSERT(fb_review_ingress_post(&peers[0], &posts[FB_REVIEW_TARGET], 4));
+        const struct fleet_wiki_review_state missing_parent = {
+            .resolved = true, .lineage_valid = false, .current = false,
+            .complete = false, .fork = false};
+        ASSERT(fb_review_ingress_state(&a, &posts[FB_REVIEW_LEFT],
+                                       &missing_parent));
+        ASSERT(fb_review_ingress_post(&peers[1], &posts[FB_REVIEW_ROOT], 4));
+        const struct fleet_wiki_review_state missing_target = {
+            .resolved = false, .lineage_valid = true, .current = true,
+            .complete = true, .fork = true};
+        ASSERT(fb_review_ingress_state(&b, &posts[FB_REVIEW_LEFT],
+                                       &missing_target));
+        ASSERT(fb_review_ingress_post(&peers[0], &posts[FB_REVIEW_ROOT], 5));
+        ASSERT(fb_review_ingress_post(&peers[1], &posts[FB_REVIEW_TARGET], 5));
+        ASSERT(fb_review_converged_views(&a, &posts[FB_REVIEW_ROOT],
+            &posts[FB_REVIEW_LEFT], &posts[FB_REVIEW_RIGHT],
+            &posts[FB_REVIEW_OPPOSITE]));
+        ASSERT(fb_review_converged_views(&b, &posts[FB_REVIEW_ROOT],
+            &posts[FB_REVIEW_LEFT], &posts[FB_REVIEW_RIGHT],
+            &posts[FB_REVIEW_OPPOSITE]));
+        ASSERT(fb_review_ingress_equal(&a, &b, posts));
+        PASS();
+    } _test_next:;
+    boot_fleet_board_shutdown();
+    if (a.open) node_db_close(&a);
+    if (b.open) node_db_close(&b);
+    return failures;
+}
+
 /* A raw P2P POST frame carrying a roster-shaped note from `who`. */
 static bool fbr_row_frame(struct fleet_board_post *p, uint8_t who,
                           const char *text, int64_t now, uint8_t *frame,
@@ -8150,6 +8315,7 @@ int test_fleet_board(void)
     failures += test_fleet_board_wiki();
     failures += test_fleet_board_two_nodes();
     failures += test_fleet_wiki_review_convergence();
+    failures += test_fleet_wiki_review_post_ingress_convergence();
     failures += test_fleet_wiki_review_budget();
     failures += test_fleet_board_waits_for_peer_handshake();
     failures += test_fleet_board_peer_churn_limits();
