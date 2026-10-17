@@ -6775,6 +6775,7 @@ struct fbr_ctx {
     bool remap;
     uint8_t remap_from[32];
     uint8_t remap_to[32];
+    struct zcl_fleet_head head; /* the test double's roster head */
 };
 static struct fbr_ctx g_fbr;
 
@@ -6800,16 +6801,25 @@ static bool fbr_root_cb(uint8_t root[32], bool *present, bool *manager,
 
 static bool fbr_verify_cb(const char *line, const uint8_t root[32],
                           enum zcl_fleet_root_state state, bool require,
-                          uint8_t signer[32], bool *sealed, const char **why,
+                          uint8_t signer[32], uint8_t box[32], bool *sealed,
+                          const char **why,
                           void *ctx)
 {
     (void)ctx;
     const struct zcl_fleet_roster_provider *real = zcl_fleet_roster_gate_provider();
-    bool ok = real->verify(line, root, state, require, signer, sealed, why,
+    bool ok = real->verify(line, root, state, require, signer, box, sealed, why,
                            real->ctx);
     if (ok && g_fbr.remap && memcmp(signer, g_fbr.remap_from, 32) == 0)
         memcpy(signer, g_fbr.remap_to, 32);
     return ok;
+}
+
+static void fbr_head_cb(const uint8_t root[32], struct zcl_fleet_head *out,
+                        void *ctx)
+{
+    (void)root;
+    (void)ctx;
+    *out = g_fbr.head;
 }
 
 static bool fbr_each_cb(void (*visit)(const char *line, void *user),
@@ -6825,7 +6835,7 @@ static void fbr_install(uint8_t root_id, bool manager)
 {
     uint8_t seed[32];
     static const struct zcl_fleet_roster_provider provider = {
-        .root = fbr_root_cb, .verify = fbr_verify_cb,
+        .root = fbr_root_cb, .verify = fbr_verify_cb, .head = fbr_head_cb,
         .each_line = fbr_each_cb, .ctx = NULL, .name = "fleet-board-test" };
     memset(&g_fbr, 0, sizeof g_fbr);
     g_fbr.present = true;
@@ -6988,6 +6998,67 @@ static int test_fleet_board_roster_membership(void)
         ASSERT(fbr_store_row(&db, FBR_STRANGER, "ZmFrZQ", now + 6, 3600));
         ASSERT_EQ(boot_fleet_roster_check(&db, stranger, now + 6),
                   BOOT_FLEET_ROSTER_NOT_MEMBER);
+        fbr_uninstall();
+        node_db_close(&db);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* The operator-signed roster head: a revoked BOX key is dropped from the
+ * roster the relay gate reads, a non-revoked box still is admitted, and a
+ * head that cannot be trusted admits nobody. The revoked set names BOX keys
+ * (the machine the operator admitted), while the roster holds each box's
+ * board SIGNING key; the line ties the two, so revocation has to be applied
+ * where the line is judged. */
+static int test_fleet_board_roster_revoked_box(void)
+{
+    int failures = 0;
+    TEST("fleet roster: a box the roster head revokes is not admitted, a "
+         "box it does not revoke still is, and an untrusted head admits "
+         "nobody") {
+        struct node_db db;
+        uint8_t revoked_signer[32], kept_signer[32], seed[32];
+        const int64_t now = 900000;
+        memset(&db, 0, sizeof db);
+        ASSERT(node_db_open(&db, ":memory:"));
+        fbr_install(FBR_ROOT, false);
+        fbr_key(FBR_MEMBER, revoked_signer);
+        fbr_key(FBR_PEER, kept_signer);
+        ASSERT(fbr_member_row(&db, FBR_ROOT, "m5", FBR_MEMBER, now));
+        ASSERT(fbr_member_row(&db, FBR_ROOT, "m9", FBR_PEER, now));
+        /* No head: nothing is revoked, both are members (the old
+         * behaviour), and the verified lines are now memoised. */
+        ASSERT(boot_fleet_roster_admits_peer(&db, revoked_signer, now));
+        ASSERT(boot_fleet_roster_admits_peer(&db, kept_signer, now));
+
+        /* The head revokes m5's BOX key (fbr_line derives it from the
+         * signer id). The memo must not carry m5 past it. */
+        g_fbr.head.state = ZCL_FLEET_HEAD_OK;
+        g_fbr.head.count = 1;
+        fbr_root_pub((uint8_t)(0x80 + FBR_MEMBER), seed,
+                     g_fbr.head.revoked[0]);
+        boot_fleet_roster_invalidate();
+        ASSERT_EQ(boot_fleet_roster_check(&db, revoked_signer, now),
+                  BOOT_FLEET_ROSTER_NOT_MEMBER);
+        ASSERT(!boot_fleet_roster_admits_peer(&db, revoked_signer, now));
+        ASSERT(boot_fleet_roster_admits_peer(&db, kept_signer, now));
+
+        /* A head that exists and cannot be trusted is not "nothing
+         * revoked": nobody is admitted. */
+        g_fbr.head.state = ZCL_FLEET_HEAD_FAILED;
+        g_fbr.head.count = 0;
+        boot_fleet_roster_invalidate();
+        ASSERT_EQ(boot_fleet_roster_check(&db, kept_signer, now),
+                  BOOT_FLEET_ROSTER_UNVERIFIABLE);
+        ASSERT(!boot_fleet_roster_admits_peer(&db, kept_signer, now));
+        ASSERT(!boot_fleet_roster_admits_peer(&db, revoked_signer, now));
+
+        /* Repaired or removed: both are members again. */
+        memset(&g_fbr.head, 0, sizeof g_fbr.head);
+        boot_fleet_roster_invalidate();
+        ASSERT(boot_fleet_roster_admits_peer(&db, revoked_signer, now));
+        ASSERT(boot_fleet_roster_admits_peer(&db, kept_signer, now));
         fbr_uninstall();
         node_db_close(&db);
         PASS();
@@ -8044,6 +8115,7 @@ int test_fleet_board(void)
     failures += test_fleet_board_fleet_wiki_full_is_final();
     failures += test_fleet_board_fleet_quota();
     failures += test_fleet_board_roster_membership();
+    failures += test_fleet_board_roster_revoked_box();
     failures += test_fleet_board_roster_root_standing();
     failures += test_fleet_board_roster_refused_root_no_notes();
     failures += test_fleet_board_roster_lifetime();

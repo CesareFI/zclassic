@@ -11,8 +11,10 @@
 #include "fleet_enrol.h"
 
 #include "base/cleanse.h"
+#include "base/safe_alloc.h"
 #include "util/fleet_roster_check.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 _Static_assert((int)ZCL_FLEET_ROOT_UNCHECKED == (int)FLEET_ANCHOR_UNCHECKED &&
@@ -56,7 +58,8 @@ static bool gate_root(uint8_t root[32], bool *present, bool *manager,
 
 static bool gate_verify(const char *line, const uint8_t root[32],
                         enum zcl_fleet_root_state state, bool require,
-                        uint8_t signer[32], bool *sealed, const char **why,
+                        uint8_t signer[32], uint8_t box[32], bool *sealed,
+                        const char **why,
                         void *ctx)
 {
     struct fleet_anchor_fact fact;
@@ -76,9 +79,40 @@ static bool gate_verify(const char *line, const uint8_t root[32],
                          strcmp(reason, FLEET_ENROL_WHY_ARGUMENTS));
     if (why)
         *why = reason;
-    if (ok)
+    if (ok) {
         memcpy(signer, machine.receipt.signer_pubkey, 32);
+        memcpy(box, machine.receipt.box_pubkey, 32);
+    }
     return ok;
+}
+
+_Static_assert(ZCL_FLEET_REVOKED_MAX == (unsigned)FLEET_ENROL_HEAD_REVOKED_MAX,
+               "the seam's revoked bound must match the head's");
+
+/* The roster head under `root`, copied into the seam's shape. ABSENT is
+ * "nothing revoked"; a head that exists and cannot be trusted is FAILED,
+ * which the engine turns into "admit nobody". */
+static void gate_head(const uint8_t root[32], struct zcl_fleet_head *out,
+                      void *ctx)
+{
+    struct fleet_head *head = zcl_malloc(sizeof *head, "fleet-gate-head");
+    enum fleet_head_state state;
+    (void)ctx;
+    memset(out, 0, sizeof *out);
+    if (!head) {
+        out->state = ZCL_FLEET_HEAD_FAILED;
+        return;
+    }
+    state = fleet_head_load(root, head, NULL);
+    if (state == FLEET_HEAD_OK) {
+        out->state = ZCL_FLEET_HEAD_OK;
+        out->count = head->n_revoked;
+        memcpy(out->revoked, head->revoked,
+               (size_t)head->n_revoked * FLEET_ENROL_PUBKEY_BYTES);
+    } else if (state == FLEET_HEAD_BAD) {
+        out->state = ZCL_FLEET_HEAD_FAILED;
+    }
+    free(head);
 }
 
 static bool gate_each_line(void (*visit)(const char *line, void *user),
@@ -92,6 +126,7 @@ static bool gate_each_line(void (*visit)(const char *line, void *user),
 static const struct zcl_fleet_roster_provider g_provider = {
     .root = gate_root,
     .verify = gate_verify,
+    .head = gate_head,
     .each_line = gate_each_line,
     .ctx = NULL,
     .name = "fleet_enrol_roster",

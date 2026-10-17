@@ -57,21 +57,36 @@ bool zcl_fleet_roster_root(uint8_t root[32], bool *present, bool *manager)
 
 bool zcl_fleet_roster_verify(const char *line, const uint8_t root[32],
                              enum zcl_fleet_root_state state, bool require,
-                             uint8_t signer[32], bool *sealed,
+                             uint8_t signer[32], uint8_t box[32], bool *sealed,
                              const char **why)
 {
+    uint8_t scratch[32];
     if (sealed)
         *sealed = false;
     if (why)
         *why = ROSTER_WHY_NO_PROVIDER;
     if (signer)
         memset(signer, 0, 32);
+    if (box)
+        memset(box, 0, 32);
     if (!line || !root || !signer ||
         !atomic_load_explicit(&g_ready, memory_order_acquire) ||
         !g_provider.verify)
         return false;
-    return g_provider.verify(line, root, state, require, signer, sealed, why,
+    return g_provider.verify(line, root, state, require, signer,
+                             box ? box : scratch, sealed, why,
                              g_provider.ctx);
+}
+
+void zcl_fleet_roster_head(const uint8_t root[32], struct zcl_fleet_head *out)
+{
+    if (!out)
+        return;
+    memset(out, 0, sizeof *out);
+    if (!root || !atomic_load_explicit(&g_ready, memory_order_acquire) ||
+        !g_provider.head)
+        return; /* no provider, or none that revokes: nothing is revoked */
+    g_provider.head(root, out, g_provider.ctx);
 }
 
 bool zcl_fleet_roster_each_line(void (*visit)(const char *line, void *user),

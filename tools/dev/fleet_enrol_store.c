@@ -33,6 +33,8 @@
 #define FLEET_DOMAIN "fleet-enrol"
 #define FLEET_ROSTER_LEAF "machines.roster"
 #define FLEET_NONCE_LEAF "invites.spent"
+#define FLEET_HEAD_LEAF "roster.head"
+#define FLEET_PIN_LEAF "operator.pin"
 
 /* Ceilings on the two files this module reads whole. The roster cannot
  * usefully exceed one line per assignable relay port, and the nonce list is
@@ -279,12 +281,309 @@ bool fleet_roster_append(const char *line, const char **why)
                           FLEET_ENROL_WHY_ROSTER_UNWRITABLE, why);
 }
 
-bool fleet_roster_import(const char *line,
-                         const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES],
-                         struct fleet_machine *out, bool *appended,
+/* ── strict state files: the roster head and the operator pin ─────────────
+ *
+ * fe_slurp treats every failure to open as "no file yet", which is right
+ * for a roster that does not exist and WRONG for a revocation list or a
+ * pin: an unreadable head must never read as "nothing revoked", and an
+ * unreadable pin must never read as "never pinned". These reads tell the
+ * two apart: only a path that is truly absent is absent. */
+
+enum fe_read { FE_READ_OK = 0, FE_READ_ABSENT, FE_READ_BAD };
+
+static enum fe_read fe_read_strict(const char *leaf, char *buf, size_t cap,
+                                   size_t *len)
+{
+    struct platform_positioned_file file;
+    char path[FLEET_ENROL_PATH_MAX];
+    uint64_t size = 0;
+    *len = 0;
+    buf[0] = '\0';
+    if (!fleet_enrol_state_path(leaf, path, sizeof(path)))
+        return FE_READ_BAD;
+    if (platform_private_path_absent(path))
+        return FE_READ_ABSENT;
+    platform_positioned_file_init(&file);
+    if (!platform_positioned_file_open(&file, path))
+        return FE_READ_BAD;
+    bool ok = platform_positioned_file_size(&file, &size) && size > 0 &&
+              size < cap &&
+              platform_positioned_file_read(&file, buf, (size_t)size, 0) ==
+                  (int64_t)size;
+    platform_positioned_file_close(&file);
+    if (!ok)
+        return FE_READ_BAD;
+    buf[size] = '\0';
+    *len = (size_t)size;
+    return FE_READ_OK;
+}
+
+/* Replace one leaf atomically: stage beside it, flush, rename over it. A
+ * reader sees the old file or the new one, never half of either. */
+static bool fe_replace_leaf(const char *leaf, const char *text, size_t len,
+                            const char *unwritable_why, const char **why)
+{
+    struct platform_private_file file;
+    char path[FLEET_ENROL_PATH_MAX];
+    char stage[FLEET_ENROL_PATH_MAX + 8];
+    fe_why(why, unwritable_why);
+    if (!fleet_enrol_state_path(leaf, path, sizeof(path))) {
+        fe_why(why, FLEET_ENROL_WHY_STATE_ROOT);
+        return false;
+    }
+    if (snprintf(stage, sizeof(stage), "%s.stage", path) >= (int)sizeof(stage))
+        LOG_FAIL(FLEET_DOMAIN, "fleet state path too long to stage: leaf=%s",
+                 leaf);
+    (void)platform_private_file_unlink_missing_ok(stage);
+    platform_private_file_init(&file);
+    bool ok = platform_private_file_create(stage, &file) &&
+              platform_private_file_write_at(&file, text, len, 0) &&
+              platform_private_file_truncate(&file, len) &&
+              platform_private_file_authority_flush(&file) &&
+              platform_private_file_replace(&file, stage, path);
+    if (!ok) {
+        platform_private_file_close(&file);
+        (void)platform_private_file_unlink_missing_ok(stage);
+        LOG_FAIL(FLEET_DOMAIN, "cannot replace one fleet state file: leaf=%s",
+                 leaf);
+    }
+    fe_why(why, NULL);
+    return true;
+}
+
+/* ── the operator pin ─────────────────────────────────────────────────────
+ *
+ * The first import records which operator key this box took a roster from.
+ * A later import under a different key is a changed fleet root and is
+ * refused by name unless the owner says so. It is a sibling of the key
+ * `fleet join` records, so the join path is untouched. */
+
+struct fe_pin {
+    bool present;
+    uint8_t key[FLEET_ENROL_PUBKEY_BYTES];
+};
+
+static bool fe_pin_read(struct fe_pin *pin, const char **why)
+{
+    char text[FLEET_ENROL_PUBKEY_HEX + 2];
+    size_t len = 0;
+    memset(pin, 0, sizeof(*pin));
+    enum fe_read r = fe_read_strict(FLEET_PIN_LEAF, text, sizeof(text), &len);
+    if (r == FE_READ_ABSENT)
+        return true;
+    if (r != FE_READ_OK || len != (size_t)(FLEET_ENROL_PUBKEY_HEX - 1) ||
+        !zcl_hex_decode_lower(text, pin->key, FLEET_ENROL_PUBKEY_BYTES)) {
+        memset(pin, 0, sizeof(*pin));
+        fe_why(why, FLEET_ENROL_WHY_PIN_UNREADABLE);
+        LOG_FAIL(FLEET_DOMAIN,
+                 "the recorded fleet operator pin is not 64 lowercase hex "
+                 "digits; refusing rather than pinning over it");
+    }
+    pin->present = true;
+    return true;
+}
+
+static bool fe_pin_write(const uint8_t key[FLEET_ENROL_PUBKEY_BYTES],
                          const char **why)
 {
+    char hex[FLEET_ENROL_PUBKEY_HEX];
+    zcl_hex_encode(key, FLEET_ENROL_PUBKEY_BYTES, hex);
+    return fe_replace_leaf(FLEET_PIN_LEAF, hex, FLEET_ENROL_PUBKEY_HEX - 1,
+                           FLEET_ENROL_WHY_ROSTER_UNWRITABLE, why);
+}
+
+/* May an import sealed by `fp` go ahead? `write` says the pin must be
+ * (re)written once the import has succeeded. */
+static bool fe_pin_gate(const uint8_t fp[FLEET_ENROL_PUBKEY_BYTES],
+                        bool confirm, bool *write, const char **why)
+{
+    struct fe_pin pin;
+    *write = false;
+    if (!fe_pin_read(&pin, why))
+        return false;
+    if (!pin.present) {
+        *write = true;
+        return true;
+    }
+    if (memcmp(pin.key, fp, FLEET_ENROL_PUBKEY_BYTES) == 0)
+        return true;
+    if (!confirm) {
+        fe_why(why, FLEET_ENROL_WHY_ROOT_CHANGED);
+        LOG_WARN(FLEET_DOMAIN,
+                 "fleet_root_changed: this import is sealed by an operator "
+                 "key other than the one this box pinned; pass "
+                 "confirm_operator_change=yes to re-pin");
+        return false;
+    }
+    *write = true;
+    return true;
+}
+
+/* ── the roster head ────────────────────────────────────────────────────── */
+
+enum fleet_head_state fleet_head_load(
+    const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES],
+    struct fleet_head *out, const char **why)
+{
+    char *text = zcl_malloc(FLEET_ENROL_HEAD_TEXT_MAX + 4u, "fleet-head");
+    enum fleet_head_state state = FLEET_HEAD_BAD;
+    size_t len = 0;
+    enum fe_read r;
+    fe_why(why, NULL);
+    memset(out, 0, sizeof(*out));
+    if (!text) {
+        fe_why(why, FLEET_ENROL_WHY_HEAD_UNREADABLE);
+        return FLEET_HEAD_BAD;
+    }
+    r = fe_read_strict(FLEET_HEAD_LEAF, text, FLEET_ENROL_HEAD_TEXT_MAX + 4u,
+                       &len);
+    if (r == FE_READ_ABSENT) {
+        free(text);
+        return FLEET_HEAD_ABSENT;
+    }
+    while (r == FE_READ_OK && len > 0 &&
+           (text[len - 1] == '\n' || text[len - 1] == '\r'))
+        text[--len] = '\0';
+    if (r == FE_READ_OK && fleet_head_parse(text, out, NULL) &&
+        memcmp(out->operator_pubkey, operator_pubkey,
+               FLEET_ENROL_PUBKEY_BYTES) == 0)
+        state = FLEET_HEAD_OK;
+    free(text);
+    if (state != FLEET_HEAD_OK) {
+        memset(out, 0, sizeof(*out));
+        fe_why(why, FLEET_ENROL_WHY_HEAD_UNREADABLE);
+        LOG_WARN(FLEET_DOMAIN,
+                 "fleet_head_unreadable: the roster head exists and is "
+                 "empty, unreadable, corrupt, or not sealed by this fleet's "
+                 "operator key; failing closed");
+    }
+    return state;
+}
+
+static bool fe_head_same(const struct fleet_head *a, const struct fleet_head *b)
+{
+    return a->seq == b->seq && a->issued_at == b->issued_at &&
+           a->n_revoked == b->n_revoked &&
+           memcmp(a->operator_pubkey, b->operator_pubkey,
+                  FLEET_ENROL_PUBKEY_BYTES) == 0 &&
+           memcmp(a->revoked, b->revoked,
+                  (size_t)a->n_revoked * FLEET_ENROL_PUBKEY_BYTES) == 0 &&
+           memcmp(a->signature, b->signature, FLEET_ENROL_SIG_BYTES) == 0;
+}
+
+/* The sequence rule against the head already held. `store` says the new
+ * head must be written. A held head that cannot be trusted has no sequence
+ * to protect, so it is replaced rather than leaving the box unrepairable. */
+static bool fe_head_rule(const struct fleet_head *fresh,
+                         const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES],
+                         bool *store, const char **why)
+{
+    struct fleet_head *held = zcl_malloc(sizeof(*held), "fleet-head-held");
+    enum fleet_head_state state;
+    *store = true;
+    if (!held) {
+        fe_why(why, FLEET_ENROL_WHY_HEAD_UNREADABLE);
+        return false;
+    }
+    state = fleet_head_load(operator_pubkey, held, NULL);
+    if (state == FLEET_HEAD_OK && fresh->seq < held->seq) {
+        fe_why(why, FLEET_ENROL_WHY_HEAD_STALE);
+        LOG_WARN(FLEET_DOMAIN, "fleet_head_stale: held seq=%llu, offered "
+                 "seq=%llu", (unsigned long long)held->seq,
+                 (unsigned long long)fresh->seq);
+        free(held);
+        return false;
+    }
+    if (state == FLEET_HEAD_OK && fresh->seq == held->seq) {
+        bool same = fe_head_same(fresh, held);
+        free(held);
+        *store = false;
+        if (same)
+            return true;
+        fe_why(why, FLEET_ENROL_WHY_HEAD_CONFLICT);
+        LOG_WARN(FLEET_DOMAIN, "fleet_head_conflict: two different heads "
+                 "carry the same sequence");
+        return false;
+    }
+    free(held);
+    return true;
+}
+
+bool fleet_head_import(const char *line,
+                       const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES],
+                       bool confirm_operator_change, struct fleet_head *out,
+                       bool *replaced, const char **why)
+{
+    bool store = false, pin = false;
+    fe_why(why, NULL);
+    *replaced = false;
+    if (!line || !operator_pubkey || !fleet_head_is_line(line) ||
+        strlen(line) >= (size_t)FLEET_ENROL_HEAD_TEXT_MAX) {
+        fe_why(why, FLEET_ENROL_WHY_ARGUMENTS);
+        return false;
+    }
+    if (!fleet_head_parse(line, out, NULL)) {
+        fe_why(why, FLEET_ENROL_WHY_ROSTER_LINE_UNSEALED);
+        return false;
+    }
+    /* Sealed by itself is not enough: it must be sealed by the key this box
+     * trusts. Another operator's head is a changed fleet root, whatever the
+     * pin says; this box is never told to trust it by a head it was given. */
+    if (memcmp(out->operator_pubkey, operator_pubkey,
+               FLEET_ENROL_PUBKEY_BYTES) != 0) {
+        fe_why(why, FLEET_ENROL_WHY_ROOT_CHANGED);
+        LOG_WARN(FLEET_DOMAIN, "fleet_root_changed: this head is sealed by "
+                 "an operator key other than the one this box trusts");
+        return false;
+    }
+    if (!fe_pin_gate(out->operator_pubkey, confirm_operator_change, &pin, why) ||
+        !fe_head_rule(out, operator_pubkey, &store, why))
+        return false;
+    if (store) {
+        if (!fe_replace_leaf(FLEET_HEAD_LEAF, line, strlen(line),
+                             FLEET_ENROL_WHY_ROSTER_UNWRITABLE, why))
+            return false;
+        *replaced = true;
+    }
+    return !pin || fe_pin_write(out->operator_pubkey, why);
+}
+
+/* A machine row must not be imported for a box the live head revokes, and
+ * must not be imported past a head this box cannot trust. */
+static bool fe_row_head_gate(
+    const struct fleet_machine *row,
+    const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES], const char **why)
+{
+    struct fleet_head *head = zcl_malloc(sizeof(*head), "fleet-head-gate");
+    enum fleet_head_state state;
+    bool revoked;
+    if (!head) {
+        fe_why(why, FLEET_ENROL_WHY_HEAD_UNREADABLE);
+        return false;
+    }
+    state = fleet_head_load(operator_pubkey, head, why);
+    revoked = state == FLEET_HEAD_OK &&
+              fleet_head_revokes(head, row->receipt.box_pubkey);
+    free(head);
+    if (state == FLEET_HEAD_BAD)
+        return false;
+    if (revoked) {
+        fe_why(why, FLEET_ENROL_WHY_BOX_REVOKED);
+        LOG_WARN(FLEET_DOMAIN, "fleet_box_revoked: the roster head revokes "
+                 "this box; its row is not imported");
+        return false;
+    }
+    return true;
+}
+
+bool fleet_roster_import_pinned(const char *line,
+                                const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES],
+                                bool confirm_operator_change,
+                                struct fleet_machine *out, bool *appended,
+                                const char **why)
+{
     struct fleet_roster_scan scan = {0};
+    bool pin = false;
     fe_why(why, NULL);
     *appended = false;
     if (!line || !operator_pubkey ||
@@ -299,19 +598,33 @@ bool fleet_roster_import(const char *line,
         fe_why(why, FLEET_ENROL_WHY_ROSTER_LINE_UNSEALED);
         return false;
     }
+    if (!fe_pin_gate(operator_pubkey, confirm_operator_change, &pin, why) ||
+        !fe_row_head_gate(out, operator_pubkey, why))
+        return false;
     if (!fleet_roster_scan(operator_pubkey, out->receipt.invite.name,
                            out->receipt.box_pubkey, &scan, why))
         return false;
-    if (scan.same_box)
-        return true; /* already held: importing twice adds nothing */
-    if (scan.name_taken) {
+    if (scan.name_taken && !scan.same_box) {
         fe_why(why, FLEET_ENROL_WHY_NAME_TAKEN);
         return false;
     }
-    if (!fleet_roster_append(line, why))
-        return false;
-    *appended = true;
-    return true;
+    if (!scan.same_box) {
+        if (!fleet_roster_append(line, why))
+            return false;
+        *appended = true;
+    }
+    /* already held: importing twice adds nothing, but it is still an import
+     * from this operator, so the pin is recorded all the same. */
+    return !pin || fe_pin_write(operator_pubkey, why);
+}
+
+bool fleet_roster_import(const char *line,
+                         const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES],
+                         struct fleet_machine *out, bool *appended,
+                         const char **why)
+{
+    return fleet_roster_import_pinned(line, operator_pubkey, false, out,
+                                      appended, why);
 }
 
 /* ── spent invite nonces ────────────────────────────────────────────────── */

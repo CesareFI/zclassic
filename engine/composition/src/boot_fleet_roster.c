@@ -182,12 +182,13 @@ bool boot_fleet_roster_log_due(enum boot_fleet_roster_log_kind kind,
 /* Every Ed25519 verify the roster runs goes through here, so the count the
  * tests read is the count the node paid. */
 static bool roster_verify(const char *line, const struct root_view *rv,
-                          uint8_t signer[32], bool *sealed)
+                          uint8_t signer[32], uint8_t box[32],
+                          bool *sealed)
 {
     const char *why = NULL;
     atomic_fetch_add_explicit(&g_verifies, 1, memory_order_relaxed);
     return zcl_fleet_roster_verify(line, rv->root, rv->state, rv->require,
-                                   signer, sealed, &why);
+                                   signer, box, sealed, &why);
 }
 
 /* ── the root, through the seam and the chain ────────────────────────── */
@@ -251,6 +252,8 @@ static enum snap_state roster_root_view(struct node_db *ndb,
 struct memo_entry {
     uint8_t digest[SHA256_OUTPUT_SIZE];
     uint8_t signer[32];
+    uint8_t box[32];        /* the key a roster head revokes, checked on
+                             * every use: the head can change under a memo */
 };
 
 struct line_memo {
@@ -270,23 +273,24 @@ static bool memo_matches(const struct line_memo *m, const struct root_view *rv)
            memcmp(m->root, rv->root, 32) == 0;
 }
 
-static const uint8_t *memo_find(const struct line_memo *m,
-                                const uint8_t digest[SHA256_OUTPUT_SIZE])
+static const struct memo_entry *memo_find(
+    const struct line_memo *m, const uint8_t digest[SHA256_OUTPUT_SIZE])
 {
     for (size_t i = 0; i < m->n; i++)
         if (memcmp(m->e[i].digest, digest, SHA256_OUTPUT_SIZE) == 0)
-            return m->e[i].signer;
+            return &m->e[i];
     return NULL;
 }
 
 static void memo_add(struct line_memo *m,
                      const uint8_t digest[SHA256_OUTPUT_SIZE],
-                     const uint8_t signer[32])
+                     const uint8_t signer[32], const uint8_t box[32])
 {
     if (m->n >= BOOT_FLEET_ROSTER_SCAN_ROWS)
         return;
     memcpy(m->e[m->n].digest, digest, SHA256_OUTPUT_SIZE);
     memcpy(m->e[m->n].signer, signer, 32);
+    memcpy(m->e[m->n].box, box, 32);
     m->n++;
 }
 
@@ -301,6 +305,8 @@ struct scan_acc {
     bool memo_ok;           /* g_memo was made under this root and state */
     size_t n_seen;
     uint8_t seen[BOOT_FLEET_ROSTER_SCAN_ROWS][SHA256_OUTPUT_SIZE];
+    unsigned revoked;       /* verified, but the head revokes the box */
+    struct zcl_fleet_head head; /* loaded once for this rebuild */
     struct line_memo next;  /* what this scan proved, kept for the next */
 };
 
@@ -344,32 +350,53 @@ static void scan_digest(const char *text, size_t len,
     sha256_finalize(&h, digest);
 }
 
+/* Is this box key in the head's revoked set? O(revoked), and the head was
+ * loaded once for this rebuild. */
+static bool head_revokes(const struct zcl_fleet_head *h, const uint8_t box[32])
+{
+    for (uint32_t i = 0; i < h->count; i++)
+        if (memcmp(h->revoked[i], box, 32) == 0)
+            return true;
+    return false;
+}
+
+/* One verified line becomes a member unless the head revokes its box. The
+ * memo keeps the line either way: the head can change under it. */
+static void scan_member(struct scan_acc *acc, const uint8_t digest[],
+                        const uint8_t signer[32], const uint8_t box[32])
+{
+    memo_add(&acc->next, digest, signer, box);
+    if (head_revokes(&acc->head, box)) {
+        acc->revoked++;
+        return;
+    }
+    snap_add_key(acc, signer);
+}
+
 /* Judge one distinct line: from the memo when the same line already
  * verified under this root and state, else by verifying it. */
 static void scan_judge(const struct fleet_board_post *p,
                        const uint8_t digest[SHA256_OUTPUT_SIZE],
                        struct scan_acc *acc)
 {
-    uint8_t signer[32];
+    uint8_t signer[32], box[32];
     bool sealed = false;
-    const uint8_t *known = acc->memo_ok ? memo_find(&g_memo, digest) : NULL;
+    const struct memo_entry *known =
+        acc->memo_ok ? memo_find(&g_memo, digest) : NULL;
     if (known) {
         acc->sealed++;
-        snap_add_key(acc, known);
-        memo_add(&acc->next, digest, known);
+        scan_member(acc, digest, known->signer, known->box);
         return;
     }
-    bool ok = roster_verify(p->text, acc->rv, signer, &sealed);
+    bool ok = roster_verify(p->text, acc->rv, signer, box, &sealed);
     if (sealed)
         acc->sealed++;
-    if (ok) {
-        snap_add_key(acc, signer);
-        memo_add(&acc->next, digest, signer);
-    } else if (sealed) {
+    if (ok)
+        scan_member(acc, digest, signer, box);
+    else if (sealed)
         acc->refused++;
-    } else {
+    else
         acc->bad++;
-    }
     memset(signer, 0, sizeof signer);
 }
 
@@ -403,6 +430,10 @@ static void scan_report(const struct scan_acc *acc, bool page_full)
     if (acc->dropped)
         LOG_WARN(ROSTER_LOG, "the roster holds more than %d members; %u "
                  "were left out", (int)BOOT_FLEET_ROSTER_MAX, acc->dropped);
+    if (acc->revoked)
+        LOG_WARN(ROSTER_LOG, "fleet_box_revoked: %u sealed roster row(s) "
+                 "name a box the roster head revokes and add nobody",
+                 acc->revoked);
     if (acc->refused)
         LOG_WARN(ROSTER_LOG, "the roster has %u sealed row(s) but the fleet "
                  "root's chain state refuses them: no fleet-scope relay",
@@ -466,6 +497,18 @@ static enum snap_state roster_scan(struct node_db *ndb, int64_t now,
         BOOT_FLEET_ROSTER_SCAN_ROWS, sizeof *rows, "fleet_roster_scan");
     struct scan_acc *acc = zcl_calloc(1, sizeof *acc, "fleet_roster_acc");
     if (!rows || !acc) {
+        free(rows);
+        free(acc);
+        return SNAP_UNVERIFIABLE;
+    }
+    /* The head is loaded ONCE here, not per peer. A head that exists and
+     * cannot be trusted is not "nothing revoked": it admits nobody, by name,
+     * until the owner repairs it. */
+    zcl_fleet_roster_head(rv->root, &acc->head);
+    if (acc->head.state == ZCL_FLEET_HEAD_FAILED) {
+        LOG_WARN(ROSTER_LOG, "fleet_head_unreadable: the roster head cannot "
+                 "be trusted (unreadable, corrupt, or not sealed by the "
+                 "fleet root): no fleet-scope relay until it is repaired");
         free(rows);
         free(acc);
         return SNAP_UNVERIFIABLE;
@@ -661,7 +704,7 @@ static enum fleet_board_result roster_row_screen(
     struct node_db *ndb, const struct fleet_board_post *post, int64_t now)
 {
     struct root_view rv;
-    uint8_t signer[32];
+    uint8_t signer[32], box[32];
     bool sealed = false;
     if (!ndb || !ndb->open)
         return FLEET_BOARD_ERR_ARGS;
@@ -682,8 +725,9 @@ static enum fleet_board_result roster_row_screen(
         atomic_fetch_add_explicit(&g_unverifiable, 1, memory_order_relaxed);
         return FLEET_BOARD_ERR_ROLE;
     }
-    bool ok = roster_verify(post->text, &rv, signer, &sealed);
+    bool ok = roster_verify(post->text, &rv, signer, box, &sealed);
     memset(signer, 0, sizeof signer);
+    memset(box, 0, sizeof box);
     memset(rv.root, 0, sizeof rv.root);
     (void)now;
     if (ok)
@@ -823,9 +867,9 @@ static int pub_held(struct node_db *ndb, int64_t now,
 static bool pub_line_ok(const char *line, const struct root_view *rv)
 {
     static const uint8_t none[32];
-    uint8_t signer[32];
+    uint8_t signer[32], box[32];
     bool sealed = false;
-    bool ok = roster_verify(line, rv, signer, &sealed) &&
+    bool ok = roster_verify(line, rv, signer, box, &sealed) &&
               memcmp(signer, none, 32) != 0;
     memset(signer, 0, sizeof signer);
     return ok;

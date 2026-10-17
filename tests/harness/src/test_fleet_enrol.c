@@ -2155,7 +2155,7 @@ static int test_fe_roster_gate_provider(void)
         char row[FLEET_ENROL_MACHINE_TEXT_MAX];
         char foreign[FLEET_ENROL_MACHINE_TEXT_MAX];
         char forged[FLEET_ENROL_MACHINE_TEXT_MAX];
-        uint8_t signer[32];
+        uint8_t signer[32], box[32], box_seed[32], box_pub[32];
         bool present = true, manager = true, sealed = false;
         const char *why = NULL;
         struct fe_lines lines = {0};
@@ -2181,33 +2181,37 @@ static int test_fe_roster_gate_provider(void)
 
         /* Sealed by the root, root active: verifies, and names the board
          * signing key the receipt carries. */
-        ASSERT(p->verify(row, op_pub, ZCL_FLEET_ROOT_ACTIVE, true, signer,
+        ASSERT(p->verify(row, op_pub, ZCL_FLEET_ROOT_ACTIVE, true, signer, box,
                          &sealed, &why, p->ctx));
         ASSERT(sealed && memcmp(signer, signer_pub, 32) == 0);
+        /* ...and the box key the operator admitted, which a roster head
+         * revokes. */
+        fe_key(0x62, box_seed, box_pub);
+        ASSERT(memcmp(box, box_pub, 32) == 0);
         /* Sealed by any other key, or edited by one byte: not a roster row,
          * whatever the chain says about the root. */
-        ASSERT(!p->verify(foreign, op_pub, ZCL_FLEET_ROOT_ACTIVE, true, signer,
+        ASSERT(!p->verify(foreign, op_pub, ZCL_FLEET_ROOT_ACTIVE, true, signer, box,
                           &sealed, &why, p->ctx));
         ASSERT(!sealed);
         ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_ROSTER_SIGNATURE);
-        ASSERT(!p->verify(forged, op_pub, ZCL_FLEET_ROOT_ACTIVE, true, signer,
+        ASSERT(!p->verify(forged, op_pub, ZCL_FLEET_ROOT_ACTIVE, true, signer, box,
                           &sealed, &why, p->ctx));
         ASSERT(!sealed);
         /* Genuine seal, root rotated or revoked, anchor required: refused by
          * the chain's name, and still known to be genuinely sealed. */
-        ASSERT(!p->verify(row, op_pub, ZCL_FLEET_ROOT_REVOKED, true, signer,
+        ASSERT(!p->verify(row, op_pub, ZCL_FLEET_ROOT_REVOKED, true, signer, box,
                           &sealed, &why, p->ctx));
         ASSERT(sealed);
         ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_ROOT_REVOKED);
-        ASSERT(!p->verify(row, op_pub, ZCL_FLEET_ROOT_ROTATED, true, signer,
+        ASSERT(!p->verify(row, op_pub, ZCL_FLEET_ROOT_ROTATED, true, signer, box,
                           &sealed, &why, p->ctx));
         ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_ROOT_ROTATED);
-        ASSERT(!p->verify(row, op_pub, ZCL_FLEET_ROOT_UNREADABLE, true, signer,
+        ASSERT(!p->verify(row, op_pub, ZCL_FLEET_ROOT_UNREADABLE, true, signer, box,
                           &sealed, &why, p->ctx));
         ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_ROOT_UNVERIFIABLE);
         /* Not required: a never-anchored root still verifies. */
         ASSERT(p->verify(row, op_pub, ZCL_FLEET_ROOT_NOT_ANCHORED, false,
-                         signer, &sealed, &why, p->ctx));
+                         signer, box, &sealed, &why, p->ctx));
 
         /* The provider reads this box's own roster file, line by line. */
         ASSERT(fleet_roster_append(row, &why));
@@ -2231,6 +2235,374 @@ static int test_fe_roster_gate_provider(void)
         ASSERT(p->root(got, &present, &manager, p->ctx));
         ASSERT(present && !manager);
         ASSERT(memcmp(got, signer_pub, 32) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* ── the roster head: revocation, sequence, operator pin ───────────────── */
+
+/* One sealed head under `op_byte`, revoking the boxes keyed by `box_bytes`. */
+static bool fe_head_line(uint8_t op_byte, uint64_t seq, const uint8_t *box_bytes,
+                         size_t n, char *out, size_t cap)
+{
+    uint8_t op_seed[32], op_pub[32], seed[32];
+    uint8_t keys[FLEET_ENROL_HEAD_REVOKED_MAX][32];
+    const char *why = NULL;
+    fe_key(op_byte, op_seed, op_pub);
+    for (size_t i = 0; i < n; ++i)
+        fe_key(box_bytes[i], seed, keys[i]);
+    return fleet_head_mint(seq, FE_NOW, &keys[0][0], n, op_seed, op_pub, out,
+                           cap, &why);
+}
+
+/* Write raw bytes over one state leaf, the way a disk fault or a hand edit
+ * would. */
+static bool fe_put_leaf(const char *leaf, const char *text)
+{
+    char path[PATH_MAX];
+    FILE *f;
+    if (!fleet_enrol_state_path(leaf, path, sizeof(path)))
+        return false;
+    f = fopen(path, "wb");
+    if (!f)
+        return false;
+    bool ok = fwrite(text, 1, strlen(text), f) == strlen(text);
+    return fclose(f) == 0 && ok;
+}
+
+static int test_fe_head_codec(void)
+{
+    int failures = 0;
+    TEST("fleet head: the sealed set is canonical (sorted, unique), a "
+         "256-key head round-trips, and a forged, truncated or non-head "
+         "line is refused") {
+        static char text[FLEET_ENROL_HEAD_TEXT_MAX];
+        static char forged[FLEET_ENROL_HEAD_TEXT_MAX];
+        static struct fleet_head head;
+        uint8_t op_seed[32], op_pub[32], seed[32], k1[32], k2[32], k3[32];
+        uint8_t keys[FLEET_ENROL_HEAD_REVOKED_MAX + 1][32];
+        const char *why = NULL;
+        fe_key(0x81, op_seed, op_pub);
+        fe_key(0x31, seed, k1);
+        fe_key(0x32, seed, k2);
+        fe_key(0x33, seed, k3);
+        uint8_t shuffled[4][32];
+        memcpy(shuffled[0], k3, 32);
+        memcpy(shuffled[1], k1, 32);
+        memcpy(shuffled[2], k3, 32); /* a duplicate */
+        memcpy(shuffled[3], k2, 32);
+        ASSERT(fleet_head_mint(7, FE_NOW, &shuffled[0][0], 4, op_seed, op_pub,
+                               text, sizeof(text), &why));
+        ASSERT(fleet_head_is_line(text));
+        ASSERT(fleet_head_parse(text, &head, &why));
+        ASSERT_EQ(head.seq, (uint64_t)7);
+        ASSERT_EQ(head.n_revoked, 3u);
+        ASSERT(memcmp(head.revoked[0], head.revoked[1], 32) < 0);
+        ASSERT(memcmp(head.revoked[1], head.revoked[2], 32) < 0);
+        ASSERT(fleet_head_revokes(&head, k1) && fleet_head_revokes(&head, k2) &&
+               fleet_head_revokes(&head, k3));
+        ASSERT(!fleet_head_revokes(&head, op_pub));
+
+        /* The size the format promises: 256 keys, and not 257. */
+        for (int i = 0; i < FLEET_ENROL_HEAD_REVOKED_MAX + 1; ++i) {
+            memset(keys[i], 0, 32);
+            keys[i][0] = (uint8_t)(i >> 8);
+            keys[i][1] = (uint8_t)i;
+            keys[i][31] = 1;
+        }
+        ASSERT(fleet_head_mint(1, FE_NOW, &keys[0][0],
+                               FLEET_ENROL_HEAD_REVOKED_MAX, op_seed, op_pub,
+                               text, sizeof(text), &why));
+        ASSERT(fleet_head_parse(text, &head, &why));
+        ASSERT_EQ(head.n_revoked, (uint32_t)FLEET_ENROL_HEAD_REVOKED_MAX);
+        ASSERT(!fleet_head_mint(1, FE_NOW, &keys[0][0],
+                                FLEET_ENROL_HEAD_REVOKED_MAX + 1, op_seed,
+                                op_pub, text, sizeof(text), &why));
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_HEAD_INVALID);
+        ASSERT(!fleet_head_mint(0, FE_NOW, NULL, 0, op_seed, op_pub, text,
+                                sizeof(text), &why));
+
+        /* A flipped bit is no longer sealed; a machine row is no head. */
+        ASSERT(fleet_head_mint(2, FE_NOW, &keys[0][0], 3, op_seed, op_pub,
+                               text, sizeof(text), &why));
+        (void)snprintf(forged, sizeof(forged), "%s", text);
+        forged[sizeof(FLEET_HEAD_PREFIX) + 10] ^= 1;
+        ASSERT(!fleet_head_parse(forged, &head, &why));
+        ASSERT(!fleet_head_parse("not a head", &head, &why));
+        ASSERT(!fleet_head_is_line("AAAA"));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_fe_head_sequence(void)
+{
+    int failures = 0;
+    TEST("fleet head import: a lower sequence is stale, the same bytes are "
+         "idempotent, the same sequence with other bytes conflicts, a higher "
+         "sequence replaces") {
+        static char h5[FLEET_ENROL_HEAD_TEXT_MAX], h4[FLEET_ENROL_HEAD_TEXT_MAX];
+        static char h5b[FLEET_ENROL_HEAD_TEXT_MAX], h6[FLEET_ENROL_HEAD_TEXT_MAX];
+        static struct fleet_head out, held;
+        uint8_t op_seed[32], op_pub[32];
+        const uint8_t one[1] = { 0x82 }, two[2] = { 0x82, 0x83 };
+        const char *why = NULL;
+        bool replaced = false;
+        fe_isolate("head-seq");
+        fe_key(0x81, op_seed, op_pub);
+        ASSERT(fe_head_line(0x81, 5, one, 1, h5, sizeof(h5)));
+        ASSERT(fe_head_line(0x81, 4, two, 2, h4, sizeof(h4)));
+        ASSERT(fe_head_line(0x81, 5, two, 2, h5b, sizeof(h5b)));
+        ASSERT(fe_head_line(0x81, 6, two, 2, h6, sizeof(h6)));
+
+        ASSERT_EQ(fleet_head_load(op_pub, &held, &why), FLEET_HEAD_ABSENT);
+        ASSERT(fleet_head_import(h5, op_pub, false, &out, &replaced, &why));
+        ASSERT(replaced);
+        ASSERT_EQ(fleet_head_load(op_pub, &held, &why), FLEET_HEAD_OK);
+        ASSERT_EQ(held.seq, (uint64_t)5);
+
+        ASSERT(!fleet_head_import(h4, op_pub, false, &out, &replaced, &why));
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_HEAD_STALE);
+        ASSERT(!replaced);
+        ASSERT(fleet_head_import(h5, op_pub, false, &out, &replaced, &why));
+        ASSERT(!replaced);
+        ASSERT(!fleet_head_import(h5b, op_pub, false, &out, &replaced, &why));
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_HEAD_CONFLICT);
+        ASSERT_EQ(fleet_head_load(op_pub, &held, &why), FLEET_HEAD_OK);
+        ASSERT_EQ(held.n_revoked, 1u);
+
+        ASSERT(fleet_head_import(h6, op_pub, false, &out, &replaced, &why));
+        ASSERT(replaced);
+        ASSERT_EQ(fleet_head_load(op_pub, &held, &why), FLEET_HEAD_OK);
+        ASSERT_EQ(held.seq, (uint64_t)6);
+        ASSERT_EQ(held.n_revoked, 2u);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_fe_head_revokes_import(void)
+{
+    int failures = 0;
+    TEST("fleet import: a machine row for a revoked box is refused, another "
+         "box still imports, and with no head file nothing is revoked") {
+        char revoked_row[FLEET_ENROL_MACHINE_TEXT_MAX];
+        char other_row[FLEET_ENROL_MACHINE_TEXT_MAX];
+        static char head[FLEET_ENROL_HEAD_TEXT_MAX];
+        static struct fleet_head out;
+        struct fleet_machine machine;
+        struct fleet_roster_scan scan = {0};
+        uint8_t op_seed[32], op_pub[32];
+        const uint8_t gone[1] = { 0x82 };
+        const char *why = NULL;
+        bool appended = false, replaced = false;
+        fe_isolate("head-revoked");
+        fe_key(0x81, op_seed, op_pub);
+        ASSERT(fe_row("studio", 0x81, 0x82, FLEET_ENROL_PORT_FIRST, "",
+                      revoked_row, sizeof(revoked_row)));
+        ASSERT(fe_row("depot", 0x81, 0x84, FLEET_ENROL_PORT_FIRST + 1, "",
+                      other_row, sizeof(other_row)));
+
+        /* No head file: the old behaviour, a row for any box imports. */
+        ASSERT(fleet_roster_import(other_row, op_pub, &machine, &appended,
+                                   &why));
+        ASSERT(appended);
+
+        ASSERT(fe_head_line(0x81, 1, gone, 1, head, sizeof(head)));
+        ASSERT(fleet_head_import(head, op_pub, false, &out, &replaced, &why));
+        ASSERT(!fleet_roster_import(revoked_row, op_pub, &machine, &appended,
+                                    &why));
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_BOX_REVOKED);
+        ASSERT(!appended);
+        ASSERT(fleet_roster_scan(op_pub, NULL, NULL, &scan, &why));
+        ASSERT_EQ(scan.rows, 1u);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_fe_head_fails_closed(void)
+{
+    int failures = 0;
+    TEST("fleet head: an empty, corrupt or foreign-sealed head file is "
+         "never read as nothing-revoked; import and the gate provider both "
+         "fail closed by name") {
+        char row[FLEET_ENROL_MACHINE_TEXT_MAX];
+        static char foreign[FLEET_ENROL_HEAD_TEXT_MAX];
+        static struct fleet_head out;
+        struct fleet_machine machine;
+        const struct zcl_fleet_roster_provider *p =
+            zcl_fleet_roster_gate_provider();
+        static struct zcl_fleet_head seam;
+        uint8_t op_seed[32], op_pub[32];
+        const uint8_t one[1] = { 0x82 };
+        const char *why = NULL;
+        bool appended = false;
+        fe_isolate("head-closed");
+        fe_key(0x81, op_seed, op_pub);
+        ASSERT(fe_row("studio", 0x81, 0x84, FLEET_ENROL_PORT_FIRST, "", row,
+                      sizeof(row)));
+        ASSERT(fe_head_line(0x91, 1, one, 1, foreign, sizeof(foreign)));
+        ASSERT(p && p->head);
+
+        /* Absent: nothing revoked, the seam says so. */
+        p->head(op_pub, &seam, p->ctx);
+        ASSERT_EQ(seam.state, ZCL_FLEET_HEAD_NONE);
+
+        const char *bad[] = { "\n", "garbage not a head\n", foreign };
+        for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); ++i) {
+            ASSERT(fe_put_leaf("roster.head", bad[i]));
+            why = NULL;
+            ASSERT_EQ(fleet_head_load(op_pub, &out, &why), FLEET_HEAD_BAD);
+            ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_HEAD_UNREADABLE);
+            ASSERT(!fleet_roster_import(row, op_pub, &machine, &appended,
+                                        &why));
+            ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_HEAD_UNREADABLE);
+            p->head(op_pub, &seam, p->ctx);
+            ASSERT_EQ(seam.state, ZCL_FLEET_HEAD_FAILED);
+            ASSERT_EQ(seam.count, 0u);
+        }
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_fe_operator_pin(void)
+{
+    int failures = 0;
+    TEST("fleet import: the first import pins the operator; a different "
+         "operator is fleet_root_changed until confirm_operator_change "
+         "re-pins; a head from an operator this box does not trust never "
+         "lands") {
+        char row_a[FLEET_ENROL_MACHINE_TEXT_MAX];
+        char row_b[FLEET_ENROL_MACHINE_TEXT_MAX];
+        static char head_b[FLEET_ENROL_HEAD_TEXT_MAX];
+        static struct fleet_head out;
+        struct fleet_machine machine;
+        uint8_t a_seed[32], a_pub[32], b_seed[32], b_pub[32];
+        const uint8_t none[1] = { 0x82 };
+        char pinned[128];
+        char path[PATH_MAX];
+        FILE *f;
+        const char *why = NULL;
+        bool appended = false, replaced = false;
+        fe_isolate("pin");
+        fe_key(0x81, a_seed, a_pub);
+        fe_key(0x91, b_seed, b_pub);
+        ASSERT(fe_row("studio", 0x81, 0x84, FLEET_ENROL_PORT_FIRST, "", row_a,
+                      sizeof(row_a)));
+        ASSERT(fe_row("depot", 0x91, 0x85, FLEET_ENROL_PORT_FIRST + 1, "",
+                      row_b, sizeof(row_b)));
+        ASSERT(fe_head_line(0x91, 1, none, 1, head_b, sizeof(head_b)));
+
+        /* First import pins A. */
+        ASSERT(fleet_roster_import(row_a, a_pub, &machine, &appended, &why));
+        ASSERT(fleet_enrol_state_path("operator.pin", path, sizeof(path)));
+        f = fopen(path, "rb");
+        ASSERT(f != NULL);
+        memset(pinned, 0, sizeof(pinned));
+        ASSERT(fread(pinned, 1, sizeof(pinned) - 1, f) == 64);
+        (void)fclose(f);
+        {
+            char hex[FLEET_ENROL_PUBKEY_HEX];
+            zcl_hex_encode(a_pub, 32, hex);
+            ASSERT_STR_EQ(pinned, hex);
+        }
+
+        /* A head sealed by B reaches a box that trusts A: refused, even when
+         * the owner confirms, because this box was never told to trust B. */
+        ASSERT(!fleet_head_import(head_b, a_pub, false, &out, &replaced, &why));
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_ROOT_CHANGED);
+        ASSERT(!fleet_head_import(head_b, a_pub, true, &out, &replaced, &why));
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_ROOT_CHANGED);
+        ASSERT_EQ(fleet_head_load(a_pub, &out, &why), FLEET_HEAD_ABSENT);
+
+        /* The box re-joins under B. Pinned A, trusting B: refused until the
+         * owner says yes, then B is the pin. */
+        ASSERT(fleet_enrol_operator_write(b_pub, &why));
+        ASSERT(!fleet_roster_import(row_b, b_pub, &machine, &appended, &why));
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_ROOT_CHANGED);
+        ASSERT(!fleet_head_import(head_b, b_pub, false, &out, &replaced, &why));
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_ROOT_CHANGED);
+        ASSERT(fleet_roster_import_pinned(row_b, b_pub, true, &machine,
+                                          &appended, &why));
+        ASSERT(appended);
+        ASSERT(fleet_head_import(head_b, b_pub, false, &out, &replaced, &why));
+        ASSERT(replaced);
+
+        /* An unreadable pin is a refusal, never a silent re-pin. */
+        ASSERT(fe_put_leaf("operator.pin", "not hex"));
+        ASSERT(!fleet_head_import(head_b, b_pub, true, &out, &replaced, &why));
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_PIN_UNREADABLE);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_fe_head_leaves(void)
+{
+    int failures = 0;
+    TEST("fleet roster head / fleet import through the shipped leaves: mint "
+         "a head, import it, then the revoked box's row is refused by "
+         "code") {
+        char row[FLEET_ENROL_MACHINE_TEXT_MAX];
+        char body[FLEET_ENROL_HEAD_TEXT_MAX + 256];
+        char revoke_hex[FLEET_ENROL_PUBKEY_HEX];
+        char head[FLEET_ENROL_HEAD_TEXT_MAX];
+        uint8_t seed[32], pub[32], box_seed[32], box_pub[32];
+        struct zcl_command_reply reply;
+        const char *line;
+        fe_isolate("head-leaves");
+        ASSERT(fe_manager_key(seed, pub));
+        fe_key(0x72, box_seed, box_pub);
+        zcl_hex_encode(box_pub, 32, revoke_hex);
+        ASSERT(fe_manager_row("studio", 0x72, seed, pub,
+                              FLEET_ENROL_PORT_FIRST, row, sizeof(row)));
+
+        /* A bad revoke entry refuses the whole list. */
+        (void)snprintf(body, sizeof(body),
+                       "{\"seq\":1,\"revoke\":\"%s,nothex\"}", revoke_hex);
+        ASSERT(fe_leaf_call("fleet.roster.head", "zcl.fleet.roster.head.v1",
+                            body, &reply));
+        ASSERT_STR_EQ(reply.error.evidence, FLEET_ENROL_WHY_HEAD_INVALID);
+        zcl_command_reply_free(&reply);
+
+        (void)snprintf(body, sizeof(body), "{\"seq\":3,\"revoke\":\"%s\"}",
+                       revoke_hex);
+        ASSERT(fe_leaf_call("fleet.roster.head", "zcl.fleet.roster.head.v1",
+                            body, &reply));
+        ASSERT_EQ(reply.exit_code, ZCL_COMMAND_EXIT_OK);
+        line = json_get_str(json_get(&reply.data, "head"));
+        ASSERT(line && fleet_head_is_line(line));
+        ASSERT_EQ(json_get_int(json_get(&reply.data, "revoked_count")), 1);
+        (void)snprintf(head, sizeof(head), "%s", line);
+        zcl_command_reply_free(&reply);
+
+        (void)snprintf(body, sizeof(body), "{\"line\":\"%s\"}", head);
+        ASSERT(fe_leaf_call("fleet.import", "zcl.fleet.import.v1", body,
+                            &reply));
+        ASSERT_EQ(reply.exit_code, ZCL_COMMAND_EXIT_OK);
+        ASSERT(json_get_bool(json_get(&reply.data, "replaced")));
+        zcl_command_reply_free(&reply);
+
+        (void)snprintf(body, sizeof(body), "{\"line\":\"%s\"}", row);
+        ASSERT(fe_leaf_call("fleet.import", "zcl.fleet.import.v1", body,
+                            &reply));
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_FAILED);
+        ASSERT_STR_EQ(reply.error.code, "FLEET_BOX_REVOKED");
+        zcl_command_reply_free(&reply);
+
+        /* The same head again is a no-op, and confirm_operator_change is an
+         * accepted input that only the word yes honours. */
+        (void)snprintf(body, sizeof(body),
+                       "{\"line\":\"%s\",\"confirm_operator_change\":\"true\"}",
+                       head);
+        ASSERT(fe_leaf_call("fleet.import", "zcl.fleet.import.v1", body,
+                            &reply));
+        ASSERT_EQ(reply.exit_code, ZCL_COMMAND_EXIT_OK);
+        ASSERT(!json_get_bool(json_get(&reply.data, "replaced")));
+        zcl_command_reply_free(&reply);
         PASS();
     } _test_next:;
     return failures;
@@ -2269,6 +2641,12 @@ int test_fleet_enrol(void)
     failures += test_fe_anchor_unreadable_fails_closed();
     failures += test_fe_anchor_rotation_and_invite();
     failures += test_fe_roster_gate_provider();
+    failures += test_fe_head_codec();
+    failures += test_fe_head_sequence();
+    failures += test_fe_head_revokes_import();
+    failures += test_fe_head_fails_closed();
+    failures += test_fe_operator_pin();
+    failures += test_fe_head_leaves();
     fe_restore();
     return failures;
 }

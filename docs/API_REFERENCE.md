@@ -82,9 +82,9 @@ z23 discover schema <path> --side=input|output
 | … `compat` (metadata only, names a fallback) | 63 |
 | … `planned` (fail-closed BLOCKED, exit 3) | 30 |
 | … dev-gated 🔧 (`ready` only in `z23-dev`) | 62 |
-| Leaves with `effect=mutate` | 287 |
+| Leaves with `effect=mutate` | 288 |
 | Leaves with `effect=destructive` | 6 |
-| Leaves requiring **owner** authority | 151 |
+| Leaves requiring **owner** authority | 152 |
 
 Per source file:
 
@@ -111,7 +111,7 @@ Per source file:
 | `engine/composition/commands/mind.def` | 4 | 1 | 3 |
 | `engine/composition/commands/fleet.def` | 42 | 9 | 33 |
 | `engine/composition/commands/fleet_agents.def` | 1 | 0 | 1 |
-| `engine/composition/commands/fleet_enrol.def` | 6 | 0 | 6 |
+| `engine/composition/commands/fleet_enrol.def` | 7 | 0 | 7 |
 | `engine/composition/commands/telemetry/root.def` | 6 | 2 | 4 |
 | `engine/composition/commands/telemetry/watch.def` | 1 | 0 | 1 |
 | `engine/composition/commands/telemetry/runtime.def` | 4 | 1 | 3 |
@@ -1878,7 +1878,8 @@ represented by its children's sections.
 | `fleet invite` | ready | mutate / app-write / **owner** · fast/low | **`name`**, `ttl_hours`, `relay`, `datadir` | `zcl.fleet.invite.v1` | `z23 fleet invite --name=studio --ttl-hours=24` | Mint one signed invite line that adds a computer to this fleet |
 | `fleet join` | ready | mutate / app-write / **owner** · fast/low | **`token`**, `onion` | `zcl.fleet.join.v1` | `z23 fleet join <token> [--onion=<v3>.onion]` | Join this computer to a fleet from one pasted invite |
 | `fleet admit` | ready | mutate / app-write / **owner** · fast/low | **`receipt`**, `bridge`, `datadir`, `require_anchor` | `zcl.fleet.admit.v1` | `z23 fleet admit <receipt>` | Admit one joined computer to this fleet's machine roster |
-| `fleet import` | ready | mutate / app-write / **owner** · fast/low | **`line`**, `datadir`, `require_anchor` | `zcl.fleet.import.v1` | `z23 fleet import <roster-line>` | Copy one manager-sealed roster line onto this box's machine roster |
+| `fleet roster head` | ready | mutate / app-write / **owner** · fast/low | `revoke`, **`seq`** | `zcl.fleet.roster.head.v1` | `z23 fleet roster head --seq=1 --revoke=<box_pubkey>` | Sign a roster head that revokes lost or retired computers |
+| `fleet import` | ready | mutate / app-write / **owner** · fast/low | **`line`**, `datadir`, `require_anchor`, `confirm_operator_change` | `zcl.fleet.import.v1` | `z23 fleet import <roster-line>` | Copy one manager-sealed roster line onto this box's machine roster |
 | `fleet machines` | ready | read / read / **owner** · fast/low | `offset`, `limit` | `zcl.fleet.machines.v1` | `z23 fleet machines --input='{"offset":0,"limit":64}'` | List the computers this owner has admitted to the fleet |
 | `fleet doctor` | ready | read / read / **owner** · foreground/low | `datadir` | `zcl.fleet_doctor.v1` | `z23 fleet doctor` | Where this node is in fleet setup, and what to run next |
 

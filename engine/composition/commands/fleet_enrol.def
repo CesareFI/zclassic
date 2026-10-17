@@ -1,6 +1,7 @@
 /* One-paste fleet enrolment: how an owner adds a computer to the fleet.
  *
- * WHAT THIS BRANCH IS. Five leaves and one ceremony. `fleet invite` on the
+ * WHAT THIS BRANCH IS. Five leaves and one ceremony, plus `fleet roster head`,
+ * which signs the revocation list `fleet import` also accepts. `fleet invite` on the
  * manager prints a single signed line. The owner pastes it into the AI agent
  * on the new computer, which clones, builds and runs `fleet join`. That
  * prints a second single line — the box's signed enrolment receipt — which
@@ -127,6 +128,34 @@ ZCL_COMMAND_READY_COMMAND(
     zcl_native_fleet_enrol_dispatch)
 
 ZCL_COMMAND_READY_COMMAND(
+    "fleet.roster.head", "fleet", "",
+    "Sign a roster head that revokes lost or retired computers",
+    "Signs one roster HEAD with this box's operator key and prints it as a "
+    "single line for pasting into `fleet import` on every box, this one "
+    "included. A head carries a sequence number (--seq, at least 1, and "
+    "higher than the last head you minted: boxes refuse a lower one) and "
+    "the set of box public keys (--revoke, comma-separated 64-hex "
+    "box_pubkey values from `fleet machines`; omit it to revoke nobody) "
+    "that this fleet no longer admits. The set is sorted and de-duplicated "
+    "before it is sealed, so two heads with the same content are the same "
+    "bytes. A revoked box's roster row is refused at import and its signing "
+    "key is dropped from the roster the relay gate reads. Writes nothing on "
+    "this box; importing the printed line is a separate act. Refuses by "
+    "name: fleet_head_invalid, fleet_head_too_large (a head longer than "
+    "`fleet import` accepts in one line), fleet_operator_unknown.", 0,
+    "fleet,roster,head,revoke,revocation,operator,sequence",
+    "zcl.fleet_roster_head_input.v1", "zcl.fleet.roster.head.v1",
+    "revoke,seq", "seq",
+    "z23 fleet roster head --seq=1 --revoke=<box_pubkey>",
+    ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_NONE,
+    zcl_native_fleet_enrol_dispatch)
+
+ZCL_COMMAND_READY_COMMAND(
     "fleet.import", "fleet", "",
     "Copy one manager-sealed roster line onto this box's machine roster",
     "How a box that is not the manager learns which machines its fleet "
@@ -143,10 +172,23 @@ ZCL_COMMAND_READY_COMMAND(
     "operator key sealed is refused unless that key is an active ZID anchor "
     "in the node.db read (fleet_root_not_anchored, fleet_root_rotated, "
     "fleet_root_revoked, fleet_root_anchor_unverifiable); a line it did not "
-    "seal is still roster_line_not_operator_sealed.", 0,
+    "seal is still roster_line_not_operator_sealed. The line may instead be "
+    "a roster HEAD minted by `fleet roster head`: an operator-sealed "
+    "sequence number and the box public keys the fleet has revoked. A head "
+    "with a lower sequence than the one held is refused (fleet_head_stale), "
+    "the same sequence and bytes is a no-op, the same sequence with "
+    "different bytes is refused (fleet_head_conflict), and a higher "
+    "sequence replaces it. A machine row for a revoked box is refused "
+    "(fleet_box_revoked), and a stored head this box cannot trust refuses "
+    "every row (fleet_head_unreadable) and admits no peer: it fails closed. "
+    "The first successful import pins the operator key it came from; a "
+    "later import under a different operator key is refused "
+    "(fleet_root_changed) unless the input carries "
+    "confirm_operator_change=yes, which re-pins. Only the exact word yes "
+    "counts.", 0,
     "fleet,import,roster,machine,enrol,operator,verify",
     "zcl.fleet_import_input.v1", "zcl.fleet.import.v1",
-    "line,datadir,require_anchor", "line",
+    "line,datadir,require_anchor,confirm_operator_change", "line",
     "z23 fleet import <roster-line>",
     ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_EFFECT_MUTATE,
     ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_LOCAL,

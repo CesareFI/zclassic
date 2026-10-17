@@ -22,12 +22,15 @@
 #include "net/acme_b64url.h"
 #include "platform/rng.h"
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define FE_VERSION 1u
 #define FE_DOMAIN_INVITE "z23-fleet-invite-v1"
 #define FE_DOMAIN_RECEIPT "z23-fleet-enrol-v1"
 #define FE_DOMAIN_MACHINE "z23-fleet-machine-v1"
+#define FE_DOMAIN_ROSTER_HEAD "z23-fleet-roster-head-v1"
 /* A receipt that also names the key the box will SIGN WITH. Version 1
  * receipts — every one minted before that field existed, including the ones
  * already sitting in rosters — still parse; only the newer shape carries
@@ -37,7 +40,7 @@
 
 /* One signing buffer: domain string, then body. Sized for the largest body
  * plus the longest domain. */
-#define FE_SIGN_MAX (FLEET_ENROL_MACHINE_WIRE_MAX + 32)
+#define FE_SIGN_MAX (FLEET_ENROL_HEAD_WIRE_MAX + 32)
 
 static void fe_why(const char **why, const char *token)
 {
@@ -699,4 +702,151 @@ bool fleet_machine_parse(const char *text,
      * costs one verify per row on a list that is bounded by the port
      * range. */
     return fleet_receipt_parse(receipt_text, &out->receipt, NULL, 0, NULL, why);
+}
+
+/* ── roster head ────────────────────────────────────────────────────────── */
+
+bool fleet_head_is_line(const char *line)
+{
+    return line && strncmp(line, FLEET_HEAD_PREFIX,
+                           sizeof(FLEET_HEAD_PREFIX) - 1u) == 0;
+}
+
+static int fe_key_cmp(const void *a, const void *b)
+{
+    return memcmp(a, b, FLEET_ENROL_PUBKEY_BYTES);
+}
+
+/* Sort `n` keys ascending and drop duplicates in place; returns the count
+ * kept. The sealed set is canonical so equal content is equal bytes. */
+static size_t fe_keys_canon(uint8_t (*keys)[FLEET_ENROL_PUBKEY_BYTES],
+                            size_t n)
+{
+    size_t kept = 0;
+    if (n == 0)
+        return 0;
+    qsort(keys, n, FLEET_ENROL_PUBKEY_BYTES, fe_key_cmp);
+    for (size_t i = 0; i < n; ++i) {
+        if (kept > 0 &&
+            memcmp(keys[kept - 1], keys[i], FLEET_ENROL_PUBKEY_BYTES) == 0)
+            continue;
+        if (kept != i)
+            memcpy(keys[kept], keys[i], FLEET_ENROL_PUBKEY_BYTES);
+        ++kept;
+    }
+    return kept;
+}
+
+bool fleet_head_mint(uint64_t seq, int64_t issued_at, const uint8_t *revoked,
+                     size_t count,
+                     const uint8_t seed[FLEET_ENROL_SEED_BYTES],
+                     const uint8_t pubkey[FLEET_ENROL_PUBKEY_BYTES],
+                     char *text, size_t text_cap, const char **why)
+{
+    uint8_t keys[FLEET_ENROL_HEAD_REVOKED_MAX][FLEET_ENROL_PUBKEY_BYTES];
+    uint8_t body[FLEET_ENROL_HEAD_WIRE_MAX];
+    uint8_t wire[FLEET_ENROL_HEAD_WIRE_MAX];
+    char b64[FLEET_ENROL_HEAD_TEXT_MAX];
+    struct fe_put p = { body, sizeof(body), 0, true };
+    size_t wire_len = 0, kept = 0;
+    int n;
+    fe_why(why, NULL);
+    if (seq < 1u || count > (size_t)FLEET_ENROL_HEAD_REVOKED_MAX ||
+        (count > 0 && !revoked) || !text) {
+        fe_why(why, FLEET_ENROL_WHY_HEAD_INVALID);
+        return false;
+    }
+    if (count)
+        memcpy(keys, revoked, count * FLEET_ENROL_PUBKEY_BYTES);
+    kept = fe_keys_canon(keys, count);
+    fe_put_u8(&p, FE_VERSION);
+    fe_put_raw(&p, pubkey, FLEET_ENROL_PUBKEY_BYTES);
+    fe_put_be(&p, seq, 8);
+    fe_put_be(&p, (uint64_t)issued_at, 8);
+    fe_put_be(&p, kept, 2);
+    for (size_t i = 0; i < kept; ++i)
+        fe_put_raw(&p, keys[i], FLEET_ENROL_PUBKEY_BYTES);
+    if (!p.ok) {
+        fe_why(why, FLEET_ENROL_WHY_HEAD_INVALID);
+        return false;
+    }
+    if (!fe_seal(FE_DOMAIN_ROSTER_HEAD, body, p.len, seed, pubkey, wire,
+                 sizeof(wire), &wire_len, b64, sizeof(b64), why))
+        return false;
+    n = snprintf(text, text_cap, "%s%s", FLEET_HEAD_PREFIX, b64);
+    if (n <= 0 || (size_t)n >= text_cap) {
+        fe_why(why, FLEET_ENROL_WHY_ARGUMENTS);
+        return false;
+    }
+    return true;
+}
+
+/* The body after the version byte: operator key, seq, issued_at, then the
+ * revoked set, which must be strictly ascending. */
+static bool fe_head_fields(struct fe_get *g, size_t body_len,
+                           struct fleet_head *out)
+{
+    fe_get_bytes(g, out->operator_pubkey, FLEET_ENROL_PUBKEY_BYTES);
+    out->seq = fe_get_be(g, 8);
+    out->issued_at = (int64_t)fe_get_be(g, 8);
+    out->n_revoked = (uint32_t)fe_get_be(g, 2);
+    if (!g->ok || out->seq < 1u ||
+        out->n_revoked > (uint32_t)FLEET_ENROL_HEAD_REVOKED_MAX)
+        return false;
+    for (uint32_t i = 0; i < out->n_revoked; ++i) {
+        fe_get_bytes(g, out->revoked[i], FLEET_ENROL_PUBKEY_BYTES);
+        if (g->ok && i > 0 &&
+            memcmp(out->revoked[i - 1], out->revoked[i],
+                   FLEET_ENROL_PUBKEY_BYTES) >= 0)
+            return false; /* not strictly ascending: not canonical */
+    }
+    return g->ok && g->pos == body_len;
+}
+
+bool fleet_head_parse(const char *text, struct fleet_head *out,
+                      const char **why)
+{
+    uint8_t local[FLEET_ENROL_HEAD_WIRE_MAX];
+    struct fe_get g = { local, 0, 0, true };
+    uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES];
+    size_t decoded = 0, body_len = 0;
+    fe_why(why, NULL);
+    memset(out, 0, sizeof(*out));
+    if (!fleet_head_is_line(text) ||
+        strlen(text) >= (size_t)FLEET_ENROL_HEAD_TEXT_MAX) {
+        fe_why(why, FLEET_ENROL_WHY_HEAD_UNREADABLE);
+        return false;
+    }
+    text += sizeof(FLEET_HEAD_PREFIX) - 1u;
+    /* The key that sealed it is named inside the body, which is not yet
+     * trusted: decode far enough to read it, then let fe_open check the
+     * seal under exactly that key. */
+    if (!acme_b64url_decode(text, local, sizeof(local), &decoded) ||
+        decoded < 1u + FLEET_ENROL_PUBKEY_BYTES + FLEET_ENROL_SIG_BYTES) {
+        fe_why(why, FLEET_ENROL_WHY_HEAD_UNREADABLE);
+        return false;
+    }
+    memcpy(operator_pubkey, local + 1, FLEET_ENROL_PUBKEY_BYTES);
+    if (!fe_open(text, FE_DOMAIN_ROSTER_HEAD, operator_pubkey, local,
+                 sizeof(local), &decoded, &body_len,
+                 FLEET_ENROL_WHY_HEAD_UNREADABLE,
+                 FLEET_ENROL_WHY_ROSTER_LINE_UNSEALED, why))
+        return false;
+    g.len = body_len;
+    if (fe_get_u8(&g) != FE_VERSION || !fe_head_fields(&g, body_len, out)) {
+        memset(out, 0, sizeof(*out));
+        fe_why(why, FLEET_ENROL_WHY_HEAD_UNREADABLE);
+        return false;
+    }
+    memcpy(out->signature, local + body_len, FLEET_ENROL_SIG_BYTES);
+    return true;
+}
+
+bool fleet_head_revokes(const struct fleet_head *head,
+                        const uint8_t box_pubkey[FLEET_ENROL_PUBKEY_BYTES])
+{
+    for (uint32_t i = 0; head && i < head->n_revoked; ++i)
+        if (memcmp(head->revoked[i], box_pubkey, FLEET_ENROL_PUBKEY_BYTES) == 0)
+            return true;
+    return false;
 }

@@ -160,6 +160,15 @@ enum {
 #define FLEET_ENROL_WHY_ARGUMENTS "fleet_arguments_invalid"
 #define FLEET_ENROL_WHY_ROSTER_LINE_UNSEALED "roster_line_not_operator_sealed"
 #define FLEET_ENROL_WHY_OPERATOR_UNKNOWN "fleet_operator_unknown"
+/* The operator-signed roster head (revocation), and the operator pin. */
+#define FLEET_ENROL_WHY_HEAD_STALE "fleet_head_stale"
+#define FLEET_ENROL_WHY_HEAD_CONFLICT "fleet_head_conflict"
+#define FLEET_ENROL_WHY_HEAD_UNREADABLE "fleet_head_unreadable"
+#define FLEET_ENROL_WHY_HEAD_INVALID "fleet_head_invalid"
+#define FLEET_ENROL_WHY_HEAD_TOO_LARGE "fleet_head_too_large"
+#define FLEET_ENROL_WHY_BOX_REVOKED "fleet_box_revoked"
+#define FLEET_ENROL_WHY_ROOT_CHANGED "fleet_root_changed"
+#define FLEET_ENROL_WHY_PIN_UNREADABLE "fleet_operator_pin_unreadable"
 
 /* ── the three records ──────────────────────────────────────────────────── */
 
@@ -233,6 +242,37 @@ struct fleet_machine {
     int64_t enrolled_at;
     uint16_t relay_port;
     uint8_t signature[FLEET_ENROL_SIG_BYTES];
+};
+
+/* The roster HEAD: one operator-sealed record naming the box public keys the
+ * fleet has revoked, under a monotonic sequence number. Text form is
+ * FLEET_HEAD_PREFIX then the same unpadded base64url body||signature a
+ * machine row uses, sealed under its own domain so a row can never be
+ * replayed as a head. The revoked set is canonical: strictly ascending, so
+ * two heads with the same content are the same bytes and "equal sequence,
+ * byte-identical" is a real test, not a guess. */
+enum {
+    FLEET_ENROL_HEAD_REVOKED_MAX = 256,
+    /* version + operator key + seq + issued_at + count + keys + signature */
+    FLEET_ENROL_HEAD_WIRE_MAX =
+        1 + 32 + 8 + 8 + 2 + 256 * 32 + 64,
+    FLEET_ENROL_HEAD_TEXT_MAX = (FLEET_ENROL_HEAD_WIRE_MAX * 4) / 3 + 24,
+};
+#define FLEET_HEAD_PREFIX "fleet-head1:"
+
+struct fleet_head {
+    uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES];
+    uint64_t seq;           /* >= 1 */
+    int64_t issued_at;
+    uint32_t n_revoked;
+    uint8_t revoked[FLEET_ENROL_HEAD_REVOKED_MAX][FLEET_ENROL_PUBKEY_BYTES];
+    uint8_t signature[FLEET_ENROL_SIG_BYTES];
+};
+
+enum fleet_head_state {
+    FLEET_HEAD_ABSENT = 0, /* no head file: nothing is revoked */
+    FLEET_HEAD_OK,
+    FLEET_HEAD_BAD,        /* a file exists and cannot be trusted: fail closed */
 };
 
 /* ── codec (tools/dev/fleet_enrol_codec.c) ──────────────────────────────── */
@@ -314,6 +354,31 @@ bool fleet_machine_parse(const char *text,
                          const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES],
                          struct fleet_machine *out, const char **why);
 
+/* Is this pasted line a roster head (as opposed to a machine row)? A prefix
+ * test only; the seal is checked by fleet_head_parse. */
+bool fleet_head_is_line(const char *line);
+
+/* Seal a head under the operator key. `revoked` is `count` box keys of 32
+ * bytes in any order; duplicates are collapsed and the set is sorted, so the
+ * sealed head is canonical. `seq` is at least 1 and count at most
+ * FLEET_ENROL_HEAD_REVOKED_MAX. Writes the text line. */
+bool fleet_head_mint(uint64_t seq, int64_t issued_at, const uint8_t *revoked,
+                     size_t count,
+                     const uint8_t seed[FLEET_ENROL_SEED_BYTES],
+                     const uint8_t pubkey[FLEET_ENROL_PUBKEY_BYTES],
+                     char *text, size_t text_cap, const char **why);
+
+/* Decode one head line and verify its seal under the operator key it
+ * carries, and that the revoked set is canonical. It proves the head is
+ * internally sealed, not that the operator is trusted: the caller compares
+ * `out->operator_pubkey` with the key it trusts. */
+bool fleet_head_parse(const char *text, struct fleet_head *out,
+                      const char **why);
+
+/* Is this box key revoked by the head? O(n_revoked). */
+bool fleet_head_revokes(const struct fleet_head *head,
+                        const uint8_t box_pubkey[FLEET_ENROL_PUBKEY_BYTES]);
+
 /* ── box identity (tools/dev/fleet_enrol_key.c) ─────────────────────────── */
 
 /* Absolute path of one leaf inside platform_state_root()/fleet/, creating
@@ -381,6 +446,43 @@ bool fleet_roster_import(const char *line,
                          const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES],
                          struct fleet_machine *out, bool *appended,
                          const char **why);
+
+/* fleet_roster_import with the operator pin made explicit. The pin
+ * (`operator.pin`, the operator key this box first imported from) is
+ * written on the first successful import; a later import under a different
+ * operator key is refused as fleet_root_changed unless
+ * `confirm_operator_change` is true, which re-pins. A machine row whose box
+ * key the live head revokes is refused as fleet_box_revoked, and a head file
+ * that cannot be trusted refuses every row as fleet_head_unreadable. */
+bool fleet_roster_import_pinned(const char *line,
+                                const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES],
+                                bool confirm_operator_change,
+                                struct fleet_machine *out, bool *appended,
+                                const char **why);
+
+/* Roster-head storage. The current head lives beside the roster as
+ * `roster.head`, replaced atomically (stage, flush, rename). A missing file
+ * is FLEET_HEAD_ABSENT, nothing revoked. A file that exists and is empty,
+ * unreadable, corrupt, or not sealed by `operator_pubkey` is FLEET_HEAD_BAD
+ * with `why` naming it: callers fail closed on BAD, they never treat it as
+ * empty. `out` is filled only for FLEET_HEAD_OK. */
+enum fleet_head_state fleet_head_load(
+    const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES],
+    struct fleet_head *out, const char **why);
+
+/* Import one head line sealed by `operator_pubkey`, the key this box trusts.
+ * Refusals, by name: roster_line_not_operator_sealed (not a valid seal),
+ * fleet_root_changed (sealed by a key this box does not trust, or the
+ * operator pin differs and `confirm_operator_change` is false),
+ * fleet_head_stale (lower sequence than the stored head),
+ * fleet_head_conflict (same sequence, different bytes). The same sequence
+ * and the same bytes succeeds with `replaced` false. A higher sequence
+ * replaces the stored head. The operator pin is written on the first
+ * success; `confirm_operator_change` re-pins. */
+bool fleet_head_import(const char *line,
+                       const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES],
+                       bool confirm_operator_change, struct fleet_head *out,
+                       bool *replaced, const char **why);
 
 /* Visit every line of this box's own machine roster file, verbatim and in
  * file order, without parsing it: the lines the manager publishes onto the

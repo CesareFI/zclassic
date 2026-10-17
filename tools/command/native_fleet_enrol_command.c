@@ -20,7 +20,9 @@
 
 #include "command/native_command.h"
 
+#include "base/cleanse.h"
 #include "base/hex.h"
+#include "base/safe_alloc.h"
 #include "fleet_enrol.h"
 #include "fleet_roles.h"
 #include "json/json.h"
@@ -32,6 +34,7 @@
 
 #include <sqlite3.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -683,6 +686,117 @@ static bool fe_import_gate(const struct zcl_command_request *request,
     return false;
 }
 
+/* confirm_operator_change is a STRING input like --require_anchor, but it
+ * fails the other way round: ONLY an exact "yes" re-pins, so a typo can
+ * never quietly accept a changed fleet root. */
+static bool fe_confirm_change(const struct zcl_command_request *request)
+{
+    const char *v = request ? json_get_str(json_get(request->input,
+                                                    "confirm_operator_change"))
+                            : NULL;
+    return v && strcmp(v, "yes") == 0;
+}
+
+/* Why an import was refused, as the code and the one sentence an owner or
+ * an agent acts on. An unlisted reason keeps the long-standing code. */
+static const struct {
+    const char *why;
+    const char *code;
+    const char *message;
+} fe_import_refusals[] = {
+    { FLEET_ENROL_WHY_HEAD_STALE, "FLEET_HEAD_STALE",
+      "this roster head has a lower sequence than the one this box already "
+      "holds. Importing it would un-revoke boxes; paste the newest head." },
+    { FLEET_ENROL_WHY_HEAD_CONFLICT, "FLEET_HEAD_CONFLICT",
+      "this box holds a different roster head with the same sequence. Two "
+      "heads at one sequence mean the operator signed twice; mint a higher "
+      "sequence." },
+    { FLEET_ENROL_WHY_ROOT_CHANGED, "FLEET_ROOT_CHANGED",
+      "this line is sealed by an operator key other than the one this box "
+      "pinned or trusts. Re-run with confirm_operator_change=yes only if "
+      "you meant to move this box to a new fleet root." },
+    { FLEET_ENROL_WHY_BOX_REVOKED, "FLEET_BOX_REVOKED",
+      "the roster head revokes this machine's box key, so its row is not "
+      "imported." },
+    { FLEET_ENROL_WHY_HEAD_UNREADABLE, "FLEET_HEAD_UNREADABLE",
+      "this box holds a roster head it cannot trust (unreadable, corrupt or "
+      "not sealed by its operator). It fails closed: import a good head, or "
+      "remove the file by hand if you know it is stale." },
+    { FLEET_ENROL_WHY_PIN_UNREADABLE, "FLEET_OPERATOR_PIN_UNREADABLE",
+      "the recorded operator pin cannot be read, so this box will not guess "
+      "which fleet root it pinned." },
+};
+
+static void fe_import_refuse(struct zcl_command_reply *reply, const char *why)
+{
+    for (size_t i = 0; why && i < sizeof(fe_import_refusals) /
+                                      sizeof(fe_import_refusals[0]); ++i) {
+        if (strcmp(why, fe_import_refusals[i].why) != 0)
+            continue;
+        fe_fail(reply, fe_import_refusals[i].code, "authorize",
+                fe_import_refusals[i].message, why);
+        return;
+    }
+    fe_fail(reply, "FLEET_IMPORT_REFUSED", "authorize",
+            "this roster line was not added. It must be one whole line "
+            "from the manager's roster, sealed by the operator key this "
+            "box trusts, for a machine whose name no other box here "
+            "already has.", why);
+}
+
+/* A head the operator key sealed is held to --require_anchor like a row; a
+ * head it did not seal falls through to fleet_head_import's own refusal. */
+static bool fe_import_head_gate(const struct zcl_command_request *request,
+                                struct zcl_command_reply *reply,
+                                const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES],
+                                const char *line, struct fleet_head *head,
+                                struct fleet_anchor_fact *anchor)
+{
+    if (!fleet_head_parse(line, head, NULL) ||
+        memcmp(head->operator_pubkey, operator_pubkey,
+               FLEET_ENROL_PUBKEY_BYTES) != 0)
+        return true;
+    return fe_anchor_gate(request, reply, operator_pubkey, anchor);
+}
+
+static void fe_import_head(const struct zcl_command_request *request,
+                           struct zcl_command_reply *reply,
+                           const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES],
+                           const char *line)
+{
+    struct fleet_head *head = zcl_malloc(sizeof(*head), "fleet-import-head");
+    struct fleet_anchor_fact anchor = {0};
+    const char *why = NULL;
+    bool replaced = false;
+    if (!head) {
+        fe_fail(reply, "FLEET_HEAD_UNREADABLE", "resolve",
+                "this box could not allocate room to read the head.",
+                FLEET_ENROL_WHY_HEAD_UNREADABLE);
+        return;
+    }
+    bool ok = fe_import_head_gate(request, reply, operator_pubkey, line, head,
+                                  &anchor);
+    if (ok && !fleet_head_import(line, operator_pubkey,
+                                 fe_confirm_change(request), head, &replaced,
+                                 &why)) {
+        fe_import_refuse(reply, why);
+        ok = false;
+    }
+    if (ok) {
+        (void)json_push_kv_str(&reply->data, "schema", "zcl.fleet.import.v1");
+        (void)json_push_kv_str(&reply->data, "kind", "head");
+        (void)json_push_kv_int(&reply->data, "seq", (int64_t)head->seq);
+        (void)json_push_kv_int(&reply->data, "issued_at", head->issued_at);
+        (void)json_push_kv_int(&reply->data, "revoked_count",
+                               (int64_t)head->n_revoked);
+        /* False when this exact head was already held: importing it twice
+         * is a no-op. */
+        (void)json_push_kv_bool(&reply->data, "replaced", replaced);
+        fe_anchor_render(reply, &anchor, fe_anchor_required(request));
+    }
+    free(head);
+}
+
 static void fe_import(const struct zcl_command_request *request,
                       struct zcl_command_reply *reply)
 {
@@ -696,15 +810,16 @@ static void fe_import(const struct zcl_command_request *request,
     struct fleet_anchor_fact anchor = {0};
     if (!fe_import_operator(reply, operator_pubkey))
         return;
+    if (fleet_head_is_line(line)) {
+        fe_import_head(request, reply, operator_pubkey, line);
+        return;
+    }
     if (!fe_import_gate(request, reply, operator_pubkey, line, &anchor))
         return;
-    if (!fleet_roster_import(line, operator_pubkey, &machine, &appended,
-                             &why)) {
-        fe_fail(reply, "FLEET_IMPORT_REFUSED", "authorize",
-                "this roster line was not added. It must be one whole line "
-                "from the manager's roster, sealed by the operator key this "
-                "box trusts, for a machine whose name no other box here "
-                "already has.", why);
+    if (!fleet_roster_import_pinned(line, operator_pubkey,
+                                    fe_confirm_change(request), &machine,
+                                    &appended, &why)) {
+        fe_import_refuse(reply, why);
         return;
     }
     zcl_hex_encode(machine.receipt.box_pubkey, FLEET_ENROL_PUBKEY_BYTES, hex);
@@ -719,6 +834,124 @@ static void fe_import(const struct zcl_command_request *request,
     fe_anchor_render(reply, &anchor, fe_anchor_required(request));
     (void)zcl_command_reply_add_next(reply, "fleet.machines", "{}",
                                      "see the roster this box now holds");
+}
+
+/* ── fleet roster head ──────────────────────────────────────────────────── */
+
+/* `fleet import` takes its line as an input string bounded at 4096
+ * characters; a head longer than that could be minted but never pasted, so
+ * it is refused here, by name, where the owner can still act on it. */
+#define FE_HEAD_PASTE_MAX 4096u
+
+struct fe_head_mint {
+    uint8_t keys[FLEET_ENROL_HEAD_REVOKED_MAX][FLEET_ENROL_PUBKEY_BYTES];
+    size_t count;
+    char text[FLEET_ENROL_HEAD_TEXT_MAX];
+};
+
+/* --revoke is a comma-separated list of 64-hex box public keys; absent means
+ * none (a head that revokes nobody still advances the sequence). One bad
+ * entry refuses the whole list rather than minting a partial revocation. */
+static bool fe_head_keys(struct zcl_command_reply *reply, const char *csv,
+                         struct fe_head_mint *m)
+{
+    char token[FLEET_ENROL_PUBKEY_HEX];
+    while (csv && *csv) {
+        const char *end = strchr(csv, ',');
+        size_t len = end ? (size_t)(end - csv) : strlen(csv);
+        if (len != FLEET_ENROL_PUBKEY_HEX - 1u ||
+            m->count >= (size_t)FLEET_ENROL_HEAD_REVOKED_MAX) {
+            fe_fail(reply, "FLEET_HEAD_INVALID", "normalize",
+                    "--revoke is a comma-separated list of at most 256 "
+                    "box public keys, each exactly 64 lowercase hex digits "
+                    "(the box_pubkey `fleet machines` prints).",
+                    FLEET_ENROL_WHY_HEAD_INVALID);
+            return false;
+        }
+        memcpy(token, csv, len);
+        token[len] = '\0';
+        if (!zcl_hex_decode_lower(token, m->keys[m->count++],
+                                  FLEET_ENROL_PUBKEY_BYTES)) {
+            fe_fail(reply, "FLEET_HEAD_INVALID", "normalize",
+                    "a --revoke entry is not 64 lowercase hex digits.",
+                    FLEET_ENROL_WHY_HEAD_INVALID);
+            return false;
+        }
+        csv = end ? end + 1 : NULL;
+    }
+    return true;
+}
+
+static bool fe_head_seq(const struct zcl_command_request *request,
+                        struct zcl_command_reply *reply, uint64_t *seq)
+{
+    const struct json_value *v = request ? json_get(request->input, "seq")
+                                         : NULL;
+    if (v && v->type == JSON_INT && json_get_int(v) >= 1) {
+        *seq = (uint64_t)json_get_int(v);
+        return true;
+    }
+    fe_fail(reply, "FLEET_HEAD_INVALID", "normalize",
+            "--seq is required and is a whole number of at least 1. Use a "
+            "number higher than the last head you minted; boxes refuse a "
+            "lower one.", FLEET_ENROL_WHY_HEAD_INVALID);
+    return false;
+}
+
+static void fe_roster_head(const struct zcl_command_request *request,
+                           struct zcl_command_reply *reply)
+{
+    uint8_t seed[FLEET_ENROL_SEED_BYTES], pubkey[FLEET_ENROL_PUBKEY_BYTES];
+    char hex[FLEET_ENROL_PUBKEY_HEX];
+    struct fe_head_mint *m = zcl_calloc(1, sizeof(*m), "fleet-head-mint");
+    const char *csv = request ? json_get_str(json_get(request->input,
+                                                      "revoke")) : NULL;
+    const char *why = NULL;
+    uint64_t seq = 0;
+    bool present = false, ok;
+    if (!m) {
+        fe_fail(reply, "FLEET_HEAD_INVALID", "execute",
+                "this box could not allocate room to mint a head.",
+                FLEET_ENROL_WHY_HEAD_INVALID);
+        return;
+    }
+    ok = fe_head_seq(request, reply, &seq) && fe_head_keys(reply, csv, m) &&
+         fe_key(reply, false, seed, pubkey, &present);
+    if (ok && !present) {
+        fe_fail(reply, "FLEET_OPERATOR_UNKNOWN", "resolve",
+                "this box has no fleet key, so it is not an operator. Run "
+                "`z23 fleet invite` on the manager first.",
+                FLEET_ENROL_WHY_OPERATOR_UNKNOWN);
+        ok = false;
+    }
+    if (ok && !fleet_head_mint(seq, fe_now(), &m->keys[0][0], m->count, seed,
+                               pubkey, m->text, sizeof(m->text), &why)) {
+        fe_fail(reply, "FLEET_HEAD_INVALID", "execute",
+                "this head was not minted.", why);
+        ok = false;
+    }
+    memory_cleanse(seed, sizeof(seed));
+    if (ok && strlen(m->text) > FE_HEAD_PASTE_MAX) {
+        fe_fail(reply, "FLEET_HEAD_TOO_LARGE", "execute",
+                "this head is longer than `fleet import` accepts in one "
+                "line. Revoke fewer boxes per head.",
+                FLEET_ENROL_WHY_HEAD_TOO_LARGE);
+        ok = false;
+    }
+    if (ok) {
+        zcl_hex_encode(pubkey, FLEET_ENROL_PUBKEY_BYTES, hex);
+        (void)json_push_kv_str(&reply->data, "schema",
+                               "zcl.fleet.roster.head.v1");
+        (void)json_push_kv_str(&reply->data, "operator_pubkey", hex);
+        (void)json_push_kv_int(&reply->data, "seq", (int64_t)seq);
+        (void)json_push_kv_int(&reply->data, "revoked_count",
+                               (int64_t)m->count);
+        (void)json_push_kv_str(&reply->data, "head", m->text);
+        (void)zcl_command_reply_add_next(
+            reply, "fleet.import", "{\"line\":\"<head>\"}",
+            "paste this head into fleet.import on every box, this one included");
+    }
+    free(m);
 }
 
 /* ── fleet machines ─────────────────────────────────────────────────────── */
@@ -920,18 +1153,25 @@ static void fe_machines(const struct zcl_command_request *request,
 void zcl_native_fleet_enrol_dispatch(
     const struct zcl_command_request *request, struct zcl_command_reply *reply)
 {
+    static const struct {
+        const char *path;
+        void (*run)(const struct zcl_command_request *,
+                    struct zcl_command_reply *);
+    } leaves[] = {
+        { "fleet.invite", fe_invite },
+        { "fleet.join", fe_join },
+        { "fleet.roster.head", fe_roster_head },
+        { "fleet.import", fe_import },
+        { "fleet.admit", fe_admit },
+        { "fleet.machines", fe_machines },
+    };
     const char *path = request && request->spec ? request->spec->path : NULL;
-    if (path && strcmp(path, "fleet.invite") == 0)
-        fe_invite(request, reply);
-    else if (path && strcmp(path, "fleet.join") == 0)
-        fe_join(request, reply);
-    else if (path && strcmp(path, "fleet.import") == 0)
-        fe_import(request, reply);
-    else if (path && strcmp(path, "fleet.admit") == 0)
-        fe_admit(request, reply);
-    else if (path && strcmp(path, "fleet.machines") == 0)
-        fe_machines(request, reply);
-    else
-        fe_fail(reply, "FLEET_COMMAND_INVALID", "dispatch",
-                "fleet enrolment dispatch requires an exact leaf path", "");
+    for (size_t i = 0; path && i < sizeof(leaves) / sizeof(leaves[0]); ++i) {
+        if (strcmp(path, leaves[i].path) == 0) {
+            leaves[i].run(request, reply);
+            return;
+        }
+    }
+    fe_fail(reply, "FLEET_COMMAND_INVALID", "dispatch",
+            "fleet enrolment dispatch requires an exact leaf path", "");
 }

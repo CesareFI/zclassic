@@ -45,6 +45,28 @@ enum zcl_fleet_root_state {
     ZCL_FLEET_ROOT_REVOKED,
 };
 
+/* The operator-signed roster HEAD, as the engine needs it: only the revoked
+ * box public keys. Loaded once per roster rebuild, never per peer.
+ *
+ * NONE: this box holds no head, so nothing is revoked (the old behaviour).
+ * OK: `revoked` holds `count` box keys, sorted ascending and unique.
+ * FAILED: a head file exists and cannot be trusted (unreadable, corrupt, or
+ * not sealed by the root). That is NEVER "nothing revoked": the gate admits
+ * nobody until the head is repaired. */
+#define ZCL_FLEET_REVOKED_MAX 256u
+
+enum zcl_fleet_head_state {
+    ZCL_FLEET_HEAD_NONE = 0,
+    ZCL_FLEET_HEAD_OK,
+    ZCL_FLEET_HEAD_FAILED,
+};
+
+struct zcl_fleet_head {
+    enum zcl_fleet_head_state state;
+    uint32_t count;
+    uint8_t revoked[ZCL_FLEET_REVOKED_MAX][32];
+};
+
 struct zcl_fleet_roster_provider {
     /* The operator root this node trusts. `present` false means this box
      * has no fleet root, which is a state and not an error; the function
@@ -58,11 +80,17 @@ struct zcl_fleet_roster_provider {
      * when the receipt named none). On false `why` is the typed token:
      * fleetboard.roster_signature_invalid for a bad seal, else one of the
      * fleet_root_* refusals, and `sealed` says whether the seal itself
-     * verified (so a revoked root is not confused with a forged row). */
+     * verified (so a revoked root is not confused with a forged row).
+     * `box` receives the line's box public key (the identity the operator
+     * admitted, which a roster head revokes), set on a verified seal. */
     bool (*verify)(const char *line, const uint8_t root[32],
                    enum zcl_fleet_root_state state, bool require,
-                   uint8_t signer[32], bool *sealed, const char **why,
-                   void *ctx);
+                   uint8_t signer[32], uint8_t box[32], bool *sealed,
+                   const char **why, void *ctx);
+    /* The roster head under `root`: the revoked box keys. Optional; a
+     * provider without it revokes nothing. */
+    void (*head)(const uint8_t root[32], struct zcl_fleet_head *out,
+                 void *ctx);
     /* Visit every line of this box's own machine roster, in file order.
      * The manager publishes these onto the board. False when unreadable. */
     bool (*each_line)(void (*visit)(const char *line, void *user),
@@ -82,8 +110,12 @@ bool zcl_fleet_roster_provider_installed(void);
 bool zcl_fleet_roster_root(uint8_t root[32], bool *present, bool *manager);
 bool zcl_fleet_roster_verify(const char *line, const uint8_t root[32],
                              enum zcl_fleet_root_state state, bool require,
-                             uint8_t signer[32], bool *sealed,
+                             uint8_t signer[32], uint8_t box[32], bool *sealed,
                              const char **why);
+/* The head under `root`. With no provider, or one without a head callback,
+ * the state is NONE: nothing revoked. */
+void zcl_fleet_roster_head(const uint8_t root[32],
+                           struct zcl_fleet_head *out);
 bool zcl_fleet_roster_each_line(void (*visit)(const char *line, void *user),
                                 void *user);
 
