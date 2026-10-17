@@ -193,4 +193,9 @@ enum hub_wait hub_rx_wait(struct hub_rx *rx, int fd, int timeout_ms,
     }
 }
 
+#else
+/* Linux-only unit: provide a declaration so the non-Linux translation unit
+ * is not empty (ISO C forbids an empty translation unit). */
+typedef int zcl_mesh_terminal_hub_io_unused;
+
 #endif /* __linux__ */

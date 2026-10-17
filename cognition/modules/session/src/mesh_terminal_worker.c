@@ -49,6 +49,8 @@
 #include <wchar.h>
 
 #include "util/safe_alloc.h" /* zcl_malloc: checked, logged OOM */
+#else
+#include <unistd.h> /* access (argv refusal) */
 #endif
 
 /* The default subtree process budget, enforced by the parent's
