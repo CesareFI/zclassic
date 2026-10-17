@@ -1,3 +1,5 @@
+// one-result-type-ok:pure-infallible-classifier — ap_pair_check maps two
+// identity snapshots to a verdict enum with no I/O, allocation or failure path.
 /* Copyright 2026 Rhett Creighton - Apache License 2.0
  *
  * authority_projection_pair — see services/authority_projection_pair.h.
