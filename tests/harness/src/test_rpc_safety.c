@@ -79,6 +79,84 @@ static void init_single_int_param(struct json_value *params, int64_t n)
     json_free(&v);
 }
 
+/* parse_amount overflow guards. Pre-fix the JSON_INT path multiplied
+ * unchecked (200000000000 ZCL wrapped to a positive 1553255926290448384
+ * sats, sailing through every downstream <=0 check), the whole-part loop
+ * accumulated unchecked, and the whole*1e8+frac multiply could overflow
+ * even for an in-loop in-range whole. Overflow now refuses with 0, the
+ * value callers already treat as invalid; in-range negatives (sendmany
+ * fee subtraction) and the exact INT64_MAX-sat boundary are unchanged. */
+static int t_parse_amount_bounds(void)
+{
+    int failures = 0;
+    struct json_value v;
+
+    printf("rpc_safety: parse_amount in-range semantics unchanged... ");
+    {
+        json_init(&v); json_set_int(&v, 5);
+        bool ok = parse_amount(&v) == 500000000;
+        json_free(&v);
+        json_init(&v); json_set_str(&v, "1.5");
+        ok = ok && parse_amount(&v) == 150000000;
+        json_free(&v);
+        json_init(&v); json_set_str(&v, "-1.25");
+        ok = ok && parse_amount(&v) == -125000000;
+        json_free(&v);
+        json_init(&v); json_set_str(&v, "0.00000001");
+        ok = ok && parse_amount(&v) == 1;
+        json_free(&v);
+        json_init(&v); json_set_str(&v, " 2");
+        ok = ok && parse_amount(&v) == 200000000;
+        json_free(&v);
+        if (ok) printf("OK\n");
+        else { printf("FAIL\n"); failures++; }
+    }
+
+    printf("rpc_safety: parse_amount exact money-range boundary... ");
+    {
+        /* w6 pinned the INT64_MAX magnitude boundary; w23's money-range
+         * guard (MAX_MONEY) intentionally refuses beyond supply, so the
+         * meaningful exact boundary is the money range itself. */
+        json_init(&v); json_set_str(&v, "21000000.00000000");
+        bool ok = parse_amount(&v) == MAX_MONEY;
+        json_free(&v);
+        json_init(&v); json_set_str(&v, "21000000.00000001");
+        ok = ok && parse_amount(&v) < 0;
+        json_free(&v);
+        json_init(&v); json_set_str(&v, "-21000000.00000000");
+        ok = ok && parse_amount(&v) == -MAX_MONEY;
+        json_free(&v);
+        json_init(&v); json_set_str(&v, "-21000000.00000001");
+        ok = ok && parse_amount(&v) < 0;
+        json_free(&v);
+        if (ok) printf("OK\n");
+        else { printf("FAIL\n"); failures++; }
+    }
+
+    printf("rpc_safety: parse_amount overflow refuses with 0... ");
+    {
+        json_init(&v); json_set_int(&v, 200000000000);
+        bool ok = parse_amount(&v) < 0;
+        json_free(&v);
+        json_init(&v); json_set_int(&v, -200000000000);
+        ok = ok && parse_amount(&v) < 0;
+        json_free(&v);
+        json_init(&v); json_set_str(&v, "99999999999999999999");
+        ok = ok && parse_amount(&v) < 0;
+        json_free(&v);
+        json_init(&v); json_set_str(&v, "92233720369.0");
+        ok = ok && parse_amount(&v) < 0;
+        json_free(&v);
+        json_init(&v); json_set_str(&v, "92233720368.54775808");
+        ok = ok && parse_amount(&v) < 0;
+        json_free(&v);
+        if (ok) printf("OK\n");
+        else { printf("FAIL\n"); failures++; }
+    }
+
+    return failures;
+}
+
 static bool result_is_chainstate_guard_error(const struct json_value *result,
                                              const char *method)
 {
@@ -306,9 +384,52 @@ static bool rpc_safety_save_projected_block(struct node_db *ndb,
     return db_block_save(ndb, &b);
 }
 
+/* parse_amount arithmetic guards (RED): a large whole-coin JSON int
+ * used to wrap (signed overflow, UB) into a small positive zat value,
+ * and both wallet send paths (z_sendmany, multisig sendmany) would
+ * build/sign/broadcast a tx paying something other than the requested
+ * amount — the wrapped value passes every downstream in-range check.
+ * Over-long digit strings and above-supply amounts must be refused
+ * too. Returns the failure count. */
+static int rs_check_parse_amount_guards(void)
+{
+    int failures = 0;
+    bool refused = true;
+    bool ok = true;
+    struct json_value v;
+
+    json_init(&v); json_set_int(&v, 184467440738LL);
+    refused = refused && parse_amount(&v) < 0;
+    json_free(&v);
+
+    json_init(&v); json_set_str(&v, "99999999999999999999.99999999");
+    refused = refused && parse_amount(&v) < 0;
+    json_free(&v);
+
+    json_init(&v); json_set_str(&v, "25000000.0");
+    refused = refused && parse_amount(&v) < 0;
+    json_free(&v);
+
+    json_init(&v); json_set_str(&v, "1.5");
+    ok = ok && parse_amount(&v) == 150000000;
+    json_free(&v);
+
+    json_init(&v); json_set_int(&v, 2);
+    ok = ok && parse_amount(&v) == 200000000;
+    json_free(&v);
+
+    printf("rpc_safety: parse_amount refuses overflow-scale amounts... ");
+    if (refused && ok) printf("OK\n");
+    else { printf("FAIL\n"); failures++; }
+    return failures;
+}
+
+int test_rpc_safety(void);
 int test_rpc_safety(void)
 {
     int failures = 0;
+
+    failures += t_parse_amount_bounds();
 
     printf("rpc_safety: wallet freshness follows authoritative H*... ");
     {
@@ -1581,6 +1702,9 @@ int test_rpc_safety(void)
         if (ok) printf("OK\n");
         else    { printf("FAIL\n"); failures++; }
     }
+
+    /* parse_amount arithmetic guards: see rs_check_parse_amount_guards. */
+    failures += rs_check_parse_amount_guards();
 
     return failures;
 }

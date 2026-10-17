@@ -10,6 +10,7 @@
 #include "wallet/wallet_sqlite.h"
 #include "chain/chainparams.h"
 #include "config/runtime.h"
+#include "core/amount.h"                /* MAX_MONEY */
 #include "json/json.h"
 #include "keys/key_io.h"
 #include "script/standard.h"
@@ -294,25 +295,13 @@ void format_amount(int64_t satoshis, char *out, size_t out_size)
     zcl_format_zcl(out, out_size, satoshis);
 }
 
-int64_t parse_amount(const struct json_value *v)
+/* Parse the decimal-string form: [ws] [-] digits [. digits], with the
+ * accumulation guard the vault-intent parser uses and the money-range
+ * bound no wallet operation can legitimately exceed (callers refuse
+ * non-positive amounts; the bound here keeps every downstream sum of
+ * these values un-overflowable). */
+static int64_t parse_amount_str(const char *str)
 {
-    if (!v) LOG_ERR("wallet", "parse_amount called with NULL json value");
-
-    if (v->type == JSON_INT) {
-        int64_t val = json_get_int(v);
-        return val * ZATOSHI_PER_ZCL;
-    }
-
-    const char *str = NULL;
-    char tmp[64];
-    if (v->type == JSON_STR) {
-        str = json_get_str(v);
-    } else if (v->type == JSON_REAL) {
-        snprintf(tmp, sizeof(tmp), "%.8f", json_get_real(v));
-        str = tmp;
-    }
-    if (!str) LOG_ERR("wallet", "parse_amount: unsupported json type %d", v->type);
-
     const char *p = str;
     while (*p == ' ') p++;
     bool neg = false;
@@ -320,7 +309,10 @@ int64_t parse_amount(const struct json_value *v)
 
     int64_t whole = 0;
     while (*p >= '0' && *p <= '9') {
-        whole = whole * 10 + (*p - '0');
+        int64_t digit = *p - '0';
+        if (whole > (INT64_MAX - digit) / 10)
+            LOG_ERR("wallet", "parse_amount: amount out of range");
+        whole = whole * 10 + digit;
         p++;
     }
 
@@ -339,8 +331,45 @@ int64_t parse_amount(const struct json_value *v)
         frac_digits++;
     }
 
+    /* Guard the final combine so whole*1e8 + frac can never wrap. */
+    if (whole > (INT64_MAX - frac) / ZATOSHI_PER_ZCL)
+        LOG_ERR("wallet", "parse_amount: amount out of range");
     int64_t satoshis = whole * ZATOSHI_PER_ZCL + frac;
-    return neg ? -satoshis : satoshis;
+    if (neg) satoshis = -satoshis;
+    if (satoshis > MAX_MONEY || satoshis < -MAX_MONEY)
+        LOG_ERR("wallet", "parse_amount: amount out of money range");
+    return satoshis;
+}
+
+int64_t parse_amount(const struct json_value *v)
+{
+    if (!v) LOG_ERR("wallet", "parse_amount called with NULL json value");
+
+    if (v->type == JSON_INT) {
+        int64_t val = json_get_int(v);
+        /* Guard BEFORE the multiply. A large-but-parseable whole-coin
+         * value used to wrap (signed overflow, UB) into a small
+         * positive amount — and the node would then build, sign, and
+         * broadcast a tx paying something other than what the caller
+         * requested, because the wrapped value passes every
+         * downstream in-range check. */
+        if (val > INT64_MAX / ZATOSHI_PER_ZCL ||
+            val < INT64_MIN / ZATOSHI_PER_ZCL)
+            LOG_ERR("wallet", "parse_amount: amount out of range");
+        return val * ZATOSHI_PER_ZCL;
+    }
+
+    const char *str = NULL;
+    char tmp[64];
+    if (v->type == JSON_STR) {
+        str = json_get_str(v);
+    } else if (v->type == JSON_REAL) {
+        snprintf(tmp, sizeof(tmp), "%.8f", json_get_real(v));
+        str = tmp;
+    }
+    if (!str) LOG_ERR("wallet", "parse_amount: unsupported json type %d", v->type);
+
+    return parse_amount_str(str);
 }
 
 bool wallet_ctx_db_ready(const struct wallet_rpc_context *ctx)

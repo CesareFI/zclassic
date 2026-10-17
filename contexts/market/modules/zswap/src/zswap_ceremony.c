@@ -395,6 +395,43 @@ static bool script_equals(const struct script *script,
 
 /* ── seller term verification ──────────────────────────────────────── */
 
+/* Re-derive the money terms from the accept data, with the overflow
+ * guards the assembly side applies. Returns false when any sum would
+ * wrap or a change term goes negative. */
+static bool zswap_ceremony_money_terms(
+    const struct zswap_quote_v1 *ad,
+    const struct zswap_buyer_accept *buyer,
+    const struct zswap_seller_accept *seller,
+    int64_t *buyer_change_out, int64_t *seller_change_out)
+{
+    int64_t buyer_total = 0;
+    for (size_t i = 0; i < buyer->num_inputs; i++) {
+        /* Without this guard two or more near-max inputs wrap the sum
+         * (UB) and the change terms are derived from arithmetic that
+         * does not match the real UTXO values. */
+        if (buyer->inputs[i].value_sats > INT64_MAX - buyer_total)
+            return false;
+        buyer_total += buyer->inputs[i].value_sats;
+    }
+    if (ad->zcl_amount > (uint64_t)INT64_MAX ||
+        buyer->fee_sats > (uint64_t)INT64_MAX)
+        return false;
+    int64_t zcl_amount = (int64_t)ad->zcl_amount;
+    int64_t fee = (int64_t)buyer->fee_sats;
+    /* Mirror of the assembly guard: keeps zcl_amount + fee and the
+     * change subtraction below from ever under/overflowing. */
+    if (zcl_amount > INT64_MAX - fee)
+        return false;
+    int64_t buyer_change = buyer_total - zcl_amount - fee;
+    int64_t seller_change =
+        seller->token_input.value_sats - ZSWAP_TOKEN_DUST_ZAT;
+    if (buyer_change < 0 || seller_change < 0)
+        return false;
+    *buyer_change_out = buyer_change;
+    *seller_change_out = seller_change;
+    return true;
+}
+
 enum zswap_ceremony_error zswap_ceremony_seller_verify_assembly(
     const struct zswap_quote_v1 *ad,
     const struct zswap_buyer_accept *buyer,
@@ -452,20 +489,12 @@ enum zswap_ceremony_error zswap_ceremony_seller_verify_assembly(
             return ZSWAP_CEREMONY_ERR_TERMS;
 
     /* Money math re-derived from the accept data. */
-    int64_t buyer_total = 0;
-    for (size_t i = 0; i < buyer->num_inputs; i++)
-        buyer_total += buyer->inputs[i].value_sats;
-    if (ad->zcl_amount > (uint64_t)INT64_MAX ||
-        buyer->fee_sats > (uint64_t)INT64_MAX)
+    int64_t buyer_change = 0, seller_change = 0;
+    if (!zswap_ceremony_money_terms(ad, buyer, seller,
+                                    &buyer_change, &seller_change))
         return ZSWAP_CEREMONY_ERR_TERMS;
     int64_t zcl_amount = (int64_t)ad->zcl_amount;
-    int64_t fee = (int64_t)buyer->fee_sats;
-    int64_t buyer_change = buyer_total - zcl_amount - fee;
-    int64_t seller_change =
-        seller->token_input.value_sats - ZSWAP_TOKEN_DUST_ZAT;
-    if (buyer_change < 0 || seller_change < 0)
-        return ZSWAP_CEREMONY_ERR_TERMS;
-    if (assembly->fee_sats != fee)
+    if (assembly->fee_sats != (int64_t)buyer->fee_sats)
         return ZSWAP_CEREMONY_ERR_TERMS;
     size_t expected_vout = 3 + (seller_change > 0 ? 1 : 0) +
                            (buyer_change > 0 ? 1 : 0);

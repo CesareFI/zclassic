@@ -972,7 +972,7 @@ contexts/market/modules/zswap/src/zswap_ceremony.c:zswap_accept_decode:24
 contexts/market/modules/zswap/src/zswap_ceremony.c:zswap_ceremony_buyer_verify_partial:24
 contexts/market/modules/zswap/src/zswap_ceremony.c:zswap_ceremony_error_string:24
 contexts/market/modules/zswap/src/zswap_ceremony.c:zswap_ceremony_seller_build_partial:18
-contexts/market/modules/zswap/src/zswap_ceremony.c:zswap_ceremony_seller_verify_assembly:65
+contexts/market/modules/zswap/src/zswap_ceremony.c:zswap_ceremony_seller_verify_assembly:61
 contexts/market/modules/zswap/src/zswap_ceremony.c:zswap_partial_decode:20
 contexts/market/modules/zswap/src/zswap_quote.c:zswap_quote_error_string:18
 contexts/market/modules/zswap/src/zswap_yardsale.c:zswap_yardsale_ingest_wire:16
@@ -1051,7 +1051,6 @@ contexts/wallet/controllers/src/wallet_diagnostic_keys.c:rpc_listwallettxdetail:
 contexts/wallet/controllers/src/wallet_diagnostic_ledger.c:rpc_walletledger:109
 contexts/wallet/controllers/src/wallet_diagnostic_repair.c:rpc_purgephantomutxos:18
 contexts/wallet/controllers/src/wallet_diagnostic_repair.c:rpc_reconcilewalletutxos:17
-contexts/wallet/controllers/src/wallet_helpers.c:parse_amount:16
 contexts/wallet/controllers/src/wallet_helpers.c:wallet_transparent_spendable_balance_diagnose:25
 contexts/wallet/controllers/src/wallet_native_backup_handlers.c:zcl_native_handle_wallet_backup_now:16
 contexts/wallet/controllers/src/wallet_native_handlers.c:wnh_amount_exact:20
