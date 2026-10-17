@@ -303,6 +303,7 @@ bool fleet_roster_append(const char *line, const char **why)
 int fleet_enrol_test_lock_wait_ms = FLEET_LOCK_WAIT_MS;
 void (*fleet_enrol_test_after_check)(void) = NULL;
 bool fleet_enrol_test_fail_pin_write = false;
+bool fleet_enrol_test_fail_dir_flush = false;
 #define FE_LOCK_WAIT_MS fleet_enrol_test_lock_wait_ms
 static void fe_test_after_check(void)
 {
@@ -409,6 +410,10 @@ static enum fe_read fe_read_strict(const char *leaf, char *buf, size_t cap,
  * before the next step of a multi-leaf transition. */
 static bool fe_dir_flush(const char *path)
 {
+#ifdef ZCL_TESTING
+    if (fleet_enrol_test_fail_dir_flush)
+        return false; /* the rename already happened */
+#endif
     struct platform_directory_transaction dir;
     char parent[FLEET_ENROL_PATH_MAX];
     char *slash;
@@ -434,7 +439,8 @@ static bool fe_dir_flush(const char *path)
 /* Replace one leaf atomically: stage beside it, flush, rename over it. A
  * reader sees the old file or the new one, never half of either. */
 static bool fe_replace_leaf(const char *leaf, const char *text, size_t len,
-                            const char *unwritable_why, const char **why)
+                            const char *unwritable_why, bool *changed,
+                            const char **why)
 {
     struct platform_private_file file;
     char path[FLEET_ENROL_PATH_MAX];
@@ -449,12 +455,15 @@ static bool fe_replace_leaf(const char *leaf, const char *text, size_t len,
                  leaf);
     (void)platform_private_file_unlink_missing_ok(stage);
     platform_private_file_init(&file);
+    bool renamed = false;
     bool ok = platform_private_file_create(stage, &file) &&
               platform_private_file_write_at(&file, text, len, 0) &&
               platform_private_file_truncate(&file, len) &&
               platform_private_file_authority_flush(&file) &&
-              platform_private_file_replace(&file, stage, path) &&
+              (renamed = platform_private_file_replace(&file, stage, path)) &&
               fe_dir_flush(path);
+    if (renamed && changed)
+        *changed = true; /* the leaf moved even if the flush then failed */
     if (!ok) {
         platform_private_file_close(&file);
         (void)platform_private_file_unlink_missing_ok(stage);
@@ -498,7 +507,7 @@ static bool fe_pin_read(struct fe_pin *pin, const char **why)
 }
 
 static bool fe_pin_write(const uint8_t key[FLEET_ENROL_PUBKEY_BYTES],
-                         const char **why)
+                         bool *changed, const char **why)
 {
     char hex[FLEET_ENROL_PUBKEY_HEX];
 #ifdef ZCL_TESTING
@@ -509,7 +518,7 @@ static bool fe_pin_write(const uint8_t key[FLEET_ENROL_PUBKEY_BYTES],
 #endif
     zcl_hex_encode(key, FLEET_ENROL_PUBKEY_BYTES, hex);
     return fe_replace_leaf(FLEET_PIN_LEAF, hex, FLEET_ENROL_PUBKEY_HEX - 1,
-                           FLEET_ENROL_WHY_ROSTER_UNWRITABLE, why);
+                           FLEET_ENROL_WHY_ROSTER_UNWRITABLE, changed, why);
 }
 
 /* May an import sealed by `fp` go ahead? `write` says the pin must be
@@ -616,7 +625,8 @@ static enum fe_hwm_state fe_hwm_read(struct fe_hwm *m)
     return FE_HWM_OK;
 }
 
-static bool fe_hwm_write(const struct fe_hwm *m, const char **why)
+static bool fe_hwm_write(const struct fe_hwm *m, bool *changed,
+                         const char **why)
 {
     char text[256];
     char op[FLEET_ENROL_PUBKEY_BYTES * 2 + 1];
@@ -630,7 +640,7 @@ static bool fe_hwm_write(const struct fe_hwm *m, const char **why)
         return false;
     }
     return fe_replace_leaf(FLEET_HWM_LEAF, text, (size_t)n,
-                           FLEET_ENROL_WHY_ROSTER_UNWRITABLE, why);
+                           FLEET_ENROL_WHY_ROSTER_UNWRITABLE, changed, why);
 }
 
 /* NULL when the head read as `r` is the one the record vouches for;
@@ -644,7 +654,7 @@ static const char *fe_head_vouched(
     if (hs != FE_HWM_OK)
         return FLEET_ENROL_WHY_HEAD_HWM;
     if (memcmp(m->op, operator_pubkey, FLEET_ENROL_PUBKEY_BYTES) != 0)
-        return FLEET_ENROL_WHY_HEAD_UNREADABLE;
+        return FLEET_ENROL_WHY_HEAD_HWM;
     if (r != FE_READ_OK)
         return FLEET_ENROL_WHY_HEAD_TORN;
     fe_head_digest(text, digest);
@@ -735,26 +745,95 @@ static bool fe_head_rule_held(const struct fleet_head *fresh,
     return false;
 }
 
-/* TORN: only the head the record vouches for (same digest) or a higher
- * sequence repairs it. */
+/* What the stored head says about the sequence floor. A head that parses
+ * and is sealed by the trusted operator is self-authenticating, so it floors
+ * the sequence even when the record has been lowered or damaged. NONE is a
+ * head that is absent or not such a head; UNASSESSABLE (allocation or read
+ * failure) must never be read as NONE. */
+enum fe_floor_state { FE_FLOOR_NONE = 0, FE_FLOOR_OK, FE_FLOOR_UNASSESSABLE };
+
+#ifdef ZCL_TESTING
+bool fleet_enrol_test_fail_floor = false;
+#endif
+
+static enum fe_floor_state fe_stored_head_floor(
+    const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES], uint64_t *floor)
+{
+    char *text = zcl_malloc(FLEET_ENROL_HEAD_TEXT_MAX + 4u, "fleet-head-floor");
+    struct fleet_head *head = zcl_malloc(sizeof(*head), "fleet-head-floor");
+    enum fe_floor_state state = FE_FLOOR_UNASSESSABLE;
+    enum fe_read r = FE_READ_BAD;
+    size_t len = 0;
+    *floor = 0;
+#ifdef ZCL_TESTING
+    if (fleet_enrol_test_fail_floor) {
+        free(text);
+        free(head);
+        return FE_FLOOR_UNASSESSABLE;
+    }
+#endif
+    if (text && head)
+        r = fe_read_strict(FLEET_HEAD_LEAF, text,
+                           FLEET_ENROL_HEAD_TEXT_MAX + 4u, &len);
+    if (text && head && r == FE_READ_ABSENT)
+        state = FE_FLOOR_NONE;
+    if (text && head && r == FE_READ_OK) {
+        while (len > 0 && (text[len - 1] == '\n' || text[len - 1] == '\r'))
+            text[--len] = '\0';
+        state = FE_FLOOR_NONE;
+        if (fleet_head_parse(text, head, NULL) &&
+            memcmp(head->operator_pubkey, operator_pubkey,
+                   FLEET_ENROL_PUBKEY_BYTES) == 0) {
+            *floor = head->seq;
+            state = FE_FLOOR_OK;
+        }
+    }
+    free(text);
+    free(head);
+    return state;
+}
+
+/* TORN: the floor is the higher of the record and any intact signed head on
+ * disk. Only the head the record vouches for (same digest, not below the
+ * floor) or a sequence ABOVE the floor repairs it. */
 static bool fe_head_rule_torn(const struct fleet_head *fresh,
                               const char *line, const struct fe_hwm *m,
-                              const char **why)
+                              uint64_t stored_floor, const char **why)
 {
     uint8_t digest[SHA256_OUTPUT_SIZE];
+    uint64_t floor = m->seq > stored_floor ? m->seq : stored_floor;
     fe_head_digest(line, digest);
-    if (fresh->seq > m->seq ||
-        (fresh->seq == m->seq && memcmp(digest, m->digest, sizeof(digest)) == 0))
+    if (fresh->seq > floor ||
+        (fresh->seq == floor && memcmp(digest, m->digest, sizeof(digest)) == 0))
         return true;
-    if (fresh->seq < m->seq)
-        return fe_head_stale(fresh, m->seq, why);
+    if (fresh->seq < floor)
+        return fe_head_stale(fresh, floor, why);
     fe_why(why, FLEET_ENROL_WHY_HEAD_CONFLICT);
     LOG_WARN(FLEET_DOMAIN, "fleet_head_conflict: the offered head is not the "
              "one the sequence record vouches for");
     return false;
 }
 
-/* The sequence rule. `store` says the new head must be written. */
+/* TORN, with the stored head's floor assessed first: a floor that cannot be
+ * assessed refuses the import rather than reading as "no stored head". */
+static bool fe_head_rule_torn_checked(
+    const struct fleet_head *fresh, const char *line, const struct fe_hwm *m,
+    const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES], const char **why)
+{
+    uint64_t floor = 0;
+    if (fe_stored_head_floor(operator_pubkey, &floor) ==
+        FE_FLOOR_UNASSESSABLE) {
+        fe_why(why, FLEET_ENROL_WHY_HEAD_UNREADABLE);
+        LOG_WARN(FLEET_DOMAIN, "fleet_head_unreadable: the stored head's "
+                 "sequence could not be assessed; refusing the import");
+        return false;
+    }
+    return fe_head_rule_torn(fresh, line, m, floor, why);
+}
+
+/* The sequence rule. `store` says the new head must be written. Only a box
+ * with neither file is fresh; a record naming another operator, or a head
+ * without a readable record, refuses every import (owner repair). */
 static bool fe_head_rule(const struct fleet_head *fresh, const char *line,
                          const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES],
                          bool *store, const char **why)
@@ -775,13 +854,11 @@ static bool fe_head_rule(const struct fleet_head *fresh, const char *line,
         ok = fe_head_rule_held(fresh, held, store, why);
     else if (state == FLEET_HEAD_BAD && lwhy &&
              strcmp(lwhy, FLEET_ENROL_WHY_HEAD_TORN) == 0)
-        ok = fe_head_rule_torn(fresh, line, &m, why);
-    else if (state == FLEET_HEAD_BAD && lwhy &&
-             strcmp(lwhy, FLEET_ENROL_WHY_HEAD_HWM) == 0)
-        fe_why(why, FLEET_ENROL_WHY_HEAD_HWM);
+        ok = fe_head_rule_torn_checked(fresh, line, &m, operator_pubkey, why);
+    else if (state == FLEET_HEAD_BAD)
+        fe_why(why, lwhy ? lwhy : FLEET_ENROL_WHY_HEAD_HWM);
     else
-        ok = true; /* fresh box, or the record is another operator's and the
-                    * pin gate already allowed this root */
+        ok = true; /* neither file: a fresh box */
     free(held);
     return ok;
 }
@@ -801,23 +878,19 @@ static bool fe_head_commit(const char *line, const struct fleet_head *head,
 {
     struct fe_hwm m;
     bool changed = false;
-    bool ok = true;
-    if (pin) {
-        ok = fe_pin_write(head->operator_pubkey, why);
-        changed = ok;
-    }
+    bool ok = !pin || fe_pin_write(head->operator_pubkey, &changed, why);
     if (ok && store) {
         memcpy(m.op, head->operator_pubkey, sizeof(m.op));
         m.seq = head->seq;
         fe_head_digest(line, m.digest);
-        ok = fe_hwm_write(&m, why);
-        changed = changed || ok;
+        ok = fe_hwm_write(&m, &changed, why);
         if (ok && fe_test_crash()) {
             fe_why(why, FLEET_ENROL_WHY_ROSTER_UNWRITABLE);
             ok = false;
         }
         ok = ok && fe_replace_leaf(FLEET_HEAD_LEAF, line, strlen(line),
-                                   FLEET_ENROL_WHY_ROSTER_UNWRITABLE, why);
+                                   FLEET_ENROL_WHY_ROSTER_UNWRITABLE, &changed,
+                                   why);
         *replaced = ok;
     }
     if (!ok && changed)
@@ -890,7 +963,8 @@ static bool fe_row_head_gate(
     }
     state = fleet_head_load(operator_pubkey, head, why);
     revoked = state == FLEET_HEAD_OK &&
-              fleet_head_revokes(head, row->receipt.box_pubkey);
+              (fleet_head_revokes(head, row->receipt.box_pubkey) ||
+               fleet_head_revokes(head, row->receipt.signer_pubkey));
     free(head);
     if (state == FLEET_HEAD_BAD)
         return false;
@@ -898,6 +972,21 @@ static bool fe_row_head_gate(
         fe_why(why, FLEET_ENROL_WHY_BOX_REVOKED);
         LOG_WARN(FLEET_DOMAIN, "fleet_box_revoked: the roster head revokes "
                  "this box; its row is not imported");
+        return false;
+    }
+    return true;
+}
+
+/* Record the pin after a row import; a failure after the row was appended or
+ * the pin leaf moved is the named partial state. */
+static bool fe_row_pin_finish(bool pin, bool appended,
+                              const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES],
+                              const char **why)
+{
+    bool pin_changed = false;
+    if (pin && !fe_pin_write(operator_pubkey, &pin_changed, why)) {
+        if (appended || pin_changed)
+            fe_why(why, FLEET_ENROL_WHY_IMPORT_PARTIAL);
         return false;
     }
     return true;
@@ -942,12 +1031,7 @@ static bool fe_row_import_locked(const char *line,
     }
     /* already held: importing twice adds nothing, but it is still an import
      * from this operator, so the pin is recorded all the same. */
-    if (pin && !fe_pin_write(operator_pubkey, why)) {
-        if (*appended)
-            fe_why(why, FLEET_ENROL_WHY_IMPORT_PARTIAL);
-        return false;
-    }
-    return true;
+    return fe_row_pin_finish(pin, *appended, operator_pubkey, why);
 }
 
 bool fleet_roster_import_pinned(const char *line,
@@ -974,6 +1058,65 @@ bool fleet_roster_import(const char *line,
 {
     return fleet_roster_import_pinned(line, operator_pubkey, false, out,
                                       appended, why);
+}
+
+/* ── the signers bound to a box ───────────────────────────────────────────
+ * The relay gate sees a peer's board SIGNING key, not its box key, so a head
+ * that revokes a box must also name every signer the operator's own roster
+ * rows have ever bound to that box (a rotation leaves more than one). */
+
+struct fe_signer_hunt {
+    const uint8_t *box;
+    uint8_t (*signers)[FLEET_ENROL_PUBKEY_BYTES];
+    size_t cap;
+    size_t n;
+    bool found;
+    bool overflow;
+};
+
+static void fe_signer_visit(const struct fleet_machine *machine, void *user)
+{
+    static const uint8_t none[FLEET_ENROL_PUBKEY_BYTES];
+    struct fe_signer_hunt *hunt = user;
+    if (memcmp(machine->receipt.box_pubkey, hunt->box,
+               FLEET_ENROL_PUBKEY_BYTES) != 0)
+        return;
+    hunt->found = true;
+    if (memcmp(machine->receipt.signer_pubkey, none, sizeof(none)) == 0)
+        return;
+    for (size_t i = 0; i < hunt->n; ++i)
+        if (memcmp(hunt->signers[i], machine->receipt.signer_pubkey,
+                   FLEET_ENROL_PUBKEY_BYTES) == 0)
+            return;
+    if (hunt->n >= hunt->cap) {
+        hunt->overflow = true;
+        return;
+    }
+    memcpy(hunt->signers[hunt->n++], machine->receipt.signer_pubkey,
+           FLEET_ENROL_PUBKEY_BYTES);
+}
+
+bool fleet_roster_signers_of_box(
+    const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES],
+    const uint8_t box_pubkey[FLEET_ENROL_PUBKEY_BYTES],
+    uint8_t (*signers)[FLEET_ENROL_PUBKEY_BYTES], size_t cap, size_t *count,
+    bool *found, const char **why)
+{
+    struct fe_signer_hunt hunt = { .box = box_pubkey, .signers = signers,
+                                   .cap = cap };
+    struct fleet_roster_scan scan = {0};
+    *found = false;
+    *count = 0;
+    if (!fleet_roster_each(operator_pubkey, fe_signer_visit, &hunt, &scan,
+                           why))
+        return false;
+    if (hunt.overflow) {
+        fe_why(why, FLEET_ENROL_WHY_HEAD_TOO_LARGE);
+        return false;
+    }
+    *found = hunt.found;
+    *count = hunt.n;
+    return true;
 }
 
 /* ── spent invite nonces ────────────────────────────────────────────────── */

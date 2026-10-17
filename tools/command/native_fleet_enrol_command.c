@@ -922,6 +922,50 @@ static bool fe_head_seq(const struct zcl_command_request *request,
     return false;
 }
 
+/* Every revoked box also revokes EVERY signer key this operator's roster
+ * rows have bound to it: the relay gate sees only the signer. A box whose
+ * row this operator does not hold cannot be revoked. */
+#define FE_SIGNERS_PER_BOX 16u
+
+static bool fe_head_add_signers(struct zcl_command_reply *reply,
+                                const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES],
+                                struct fe_head_mint *m)
+{
+    const size_t boxes = m->count;
+    for (size_t i = 0; i < boxes; ++i) {
+        uint8_t signers[FE_SIGNERS_PER_BOX][FLEET_ENROL_PUBKEY_BYTES];
+        const char *why = NULL;
+        size_t n = 0;
+        bool found = false;
+        if (!fleet_roster_signers_of_box(operator_pubkey, m->keys[i], signers,
+                                         FE_SIGNERS_PER_BOX, &n, &found,
+                                         &why)) {
+            fe_fail(reply, "FLEET_HEAD_INVALID", "resolve",
+                    "this box could not read its roster to find the signer "
+                    "keys of a box being revoked.", why);
+            return false;
+        }
+        if (!found) {
+            fe_fail(reply, "FLEET_REVOKE_BOX_UNKNOWN", "resolve",
+                    "a box named in --revoke has no row in this operator's "
+                    "roster, so its signer key cannot be revoked with it. "
+                    "Import or admit its row on this box first.",
+                    FLEET_ENROL_WHY_REVOKE_UNKNOWN);
+            return false;
+        }
+        if (m->count + n > (size_t)FLEET_ENROL_HEAD_REVOKED_MAX) {
+            fe_fail(reply, "FLEET_HEAD_INVALID", "normalize",
+                    "revoking these boxes and their signer keys needs more "
+                    "than 256 entries; revoke fewer boxes per head.",
+                    FLEET_ENROL_WHY_HEAD_INVALID);
+            return false;
+        }
+        for (size_t k = 0; k < n; ++k)
+            memcpy(m->keys[m->count++], signers[k], FLEET_ENROL_PUBKEY_BYTES);
+    }
+    return true;
+}
+
 static void fe_roster_head(const struct zcl_command_request *request,
                            struct zcl_command_reply *reply)
 {
@@ -948,6 +992,7 @@ static void fe_roster_head(const struct zcl_command_request *request,
                 FLEET_ENROL_WHY_OPERATOR_UNKNOWN);
         ok = false;
     }
+    ok = ok && fe_head_add_signers(reply, pubkey, m);
     if (ok && !fleet_head_mint(seq, fe_now(), &m->keys[0][0], m->count, seed,
                                pubkey, m->text, sizeof(m->text), &why)) {
         fe_fail(reply, "FLEET_HEAD_INVALID", "execute",

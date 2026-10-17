@@ -7248,7 +7248,7 @@ static int test_fleet_board_roster_revoked_after_lapse(void)
          "head revokes is still refused in the UNARMED fallback and any "
          "other key behaves as before") {
         struct node_db db;
-        uint8_t member[32], other[32];
+        uint8_t member[32], other[32], box[32], seed[32];
         char line[FLEET_ENROL_MACHINE_TEXT_MAX];
         const int64_t now = 1000000;
         const int64_t gone = now + (int64_t)FLEET_BOARD_TTL_MAX + 4000;
@@ -7259,15 +7259,37 @@ static int test_fleet_board_roster_revoked_after_lapse(void)
         fbr_key(FBR_PEER, other);
         ASSERT(fbr_line(FBR_ROOT, "m5", FBR_MEMBER, line, sizeof line));
         ASSERT(fbr_store_row(&db, 1, line, now, FLEET_BOARD_TTL_MAX));
+        /* What the real mint produces for a revoked box: the BOX key and the
+         * SIGNER key its roster row binds to it. Callers present the signer. */
+        fbr_root_pub((uint8_t)(0x80 + FBR_MEMBER), seed, box);
         g_fbr.head.state = ZCL_FLEET_HEAD_OK;
         g_fbr.head.count = 1;
-        memcpy(g_fbr.head.revoked[0], member, 32);
+        memcpy(g_fbr.head.revoked[0], member, 32); /* signer only, live row */
+        boot_fleet_roster_invalidate();
+        ASSERT_EQ(boot_fleet_roster_check(&db, member, now),
+                  BOOT_FLEET_ROSTER_NOT_MEMBER);
+        g_fbr.head.count = 2;
+        memcpy(g_fbr.head.revoked[1], box, 32);
         boot_fleet_roster_invalidate();
         ASSERT_EQ(boot_fleet_roster_check(&db, member, gone),
                   BOOT_FLEET_ROSTER_NOT_MEMBER);
         boot_fleet_roster_invalidate();
         ASSERT_EQ(boot_fleet_roster_check(&db, other, gone),
                   BOOT_FLEET_ROSTER_UNARMED);
+        /* A restart with every note lapsed rebuilds from stored state only;
+         * the head still refuses the signer. */
+        boot_fleet_roster_test_reset();
+        ASSERT_EQ(boot_fleet_roster_check(&db, member, gone),
+                  BOOT_FLEET_ROSTER_NOT_MEMBER);
+        ASSERT_EQ(boot_fleet_roster_check(&db, other, gone),
+                  BOOT_FLEET_ROSTER_UNARMED);
+        /* A head naming only the box (no signer counterpart) still refuses
+         * its live row, so the signer is not a member. */
+        g_fbr.head.count = 1;
+        memcpy(g_fbr.head.revoked[0], box, 32);
+        boot_fleet_roster_invalidate();
+        ASSERT_EQ(boot_fleet_roster_check(&db, member, now),
+                  BOOT_FLEET_ROSTER_NOT_MEMBER);
         fbr_uninstall();
         node_db_close(&db);
         PASS();

@@ -369,7 +369,7 @@ static void scan_member(struct scan_acc *acc, const uint8_t digest[],
                         const uint8_t signer[32], const uint8_t box[32])
 {
     memo_add(&acc->next, digest, signer, box);
-    if (head_revokes(&acc->head, box)) {
+    if (head_revokes(&acc->head, box) || head_revokes(&acc->head, signer)) {
         acc->revoked++;
         return;
     }

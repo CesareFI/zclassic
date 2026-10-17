@@ -1599,6 +1599,9 @@ static bool fe_manager_key(uint8_t seed[32], uint8_t pub[32])
 
 /* A receipt `box_byte`'s box signs against an invite the key (seed, pub)
  * minted at `now`: the join half of the ceremony. */
+/* When set, the next receipts name this board signing key. */
+static const struct fleet_signing_key *g_fe_signer;
+
 static bool fe_receipt_for(const char *name, uint8_t box_byte,
                            const uint8_t seed[32], const uint8_t pub[32],
                            int64_t now, char *receipt, size_t cap)
@@ -1615,7 +1618,7 @@ static bool fe_receipt_for(const char *name, uint8_t box_byte,
                              sizeof(token), &invite, &why) &&
            fleet_invite_parse(token, &invite, iw, sizeof(iw), &il, &why) &&
            fleet_receipt_mint(iw, il, FE_ONION, &facts, "", box_seed, box_pub,
-                              NULL, receipt, cap, &why);
+                              g_fe_signer, receipt, cap, &why);
 }
 
 /* One sealed roster line for the manager (seed, pub). */
@@ -2452,7 +2455,7 @@ static int test_fe_head_corrupt_no_rollback(void)
          "older valid head; a higher one repairs it; a missing or damaged "
          "sequence record fails closed") {
         static char h4[FLEET_ENROL_HEAD_TEXT_MAX], h6[FLEET_ENROL_HEAD_TEXT_MAX];
-        static char h9[FLEET_ENROL_HEAD_TEXT_MAX];
+        static char h9[FLEET_ENROL_HEAD_TEXT_MAX], h6b[FLEET_ENROL_HEAD_TEXT_MAX];
         static struct fleet_head out, held;
         char path[PATH_MAX];
         uint8_t op_seed[32], op_pub[32];
@@ -2465,6 +2468,12 @@ static int test_fe_head_corrupt_no_rollback(void)
         ASSERT(fe_head_line(0x81, 6, two, 2, h6, sizeof(h6)));
         ASSERT(fe_head_line(0x81, 9, two, 2, h9, sizeof(h9)));
         ASSERT(fleet_head_import(h6, op_pub, false, &out, &replaced, &why));
+        /* A DIFFERENT validly sealed head at the same sequence is not the
+         * one the record vouches for. */
+        ASSERT(fe_head_line(0x81, 6, two, 1, h6b, sizeof(h6b)));
+        ASSERT(fe_put_leaf("roster.head", h6b));
+        ASSERT_EQ(fleet_head_load(op_pub, &held, &why), FLEET_HEAD_BAD);
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_HEAD_TORN);
 
         /* Corrupt the held head: older is refused, a higher one repairs. */
         ASSERT(fe_put_leaf("roster.head", "garbage\n"));
@@ -2582,6 +2591,21 @@ static int test_fe_import_partial_is_honest(void)
         ASSERT(reply.error.mutated);
         zcl_command_reply_free(&reply);
 
+        /* The rename succeeded and the directory flush then failed: the
+         * leaf HAS changed, so the reply says mutated, by name. */
+        fe_isolate("import-flush");
+        ASSERT(fe_manager_key(seed, pub));
+        ASSERT(fleet_head_mint(1, FE_NOW, NULL, 0, seed, pub, h1, sizeof(h1),
+                               &why));
+        (void)snprintf(body, sizeof(body), "{\"line\":\"%s\",\"datadir\":\"%s\"}",
+                       h1, dd);
+        fleet_enrol_test_fail_dir_flush = true;
+        ASSERT(fe_leaf_call("fleet.import", "zcl.fleet.import.v1", body, &reply));
+        fleet_enrol_test_fail_dir_flush = false;
+        ASSERT_STR_EQ(reply.error.evidence, FLEET_ENROL_WHY_IMPORT_PARTIAL);
+        ASSERT(reply.error.mutated);
+        zcl_command_reply_free(&reply);
+
         /* A row appended and then the pin fails: partial too. */
         fe_isolate("import-partial-row");
         ASSERT(fe_manager_key(seed, pub));
@@ -2593,6 +2617,239 @@ static int test_fe_import_partial_is_honest(void)
         fleet_enrol_test_fail_pin_write = false;
         ASSERT(appended);
         ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_IMPORT_PARTIAL);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_fe_head_revokes_signer(void)
+{
+    int failures = 0;
+    TEST("fleet roster head: minting a revocation also names the box's "
+         "signer key from the operator's own row, refuses a box it holds no "
+         "row for, and the import refuses a row whose signer is revoked") {
+        char row[FLEET_ENROL_MACHINE_TEXT_MAX];
+        char row2[FLEET_ENROL_MACHINE_TEXT_MAX];
+        char body[FLEET_ENROL_HEAD_TEXT_MAX + 256];
+        char box_hex[FLEET_ENROL_PUBKEY_HEX];
+        char head_text[FLEET_ENROL_HEAD_TEXT_MAX];
+        static struct fleet_head head;
+        struct fleet_signing_key signer, signer2;
+        struct fleet_machine machine;
+        struct zcl_command_reply reply;
+        uint8_t seed[32], pub[32], box_seed[32], box_pub[32], ghost_pub[32];
+        uint8_t ghost_seed[32];
+        const char *why = NULL;
+        const char *line;
+        bool appended = false;
+        fe_isolate("head-signer");
+        ASSERT(fe_manager_key(seed, pub));
+        fe_key(0x72, box_seed, box_pub);
+        fe_key(0x74, ghost_seed, ghost_pub);
+        fe_key(0x73, signer.seed, signer.pubkey);
+        fe_key(0x75, signer2.seed, signer2.pubkey);
+        g_fe_signer = &signer;
+        ASSERT(fe_manager_row("studio", 0x72, seed, pub,
+                              FLEET_ENROL_PORT_FIRST, row, sizeof(row)));
+        g_fe_signer = &signer2;
+        ASSERT(fe_manager_row("depot", 0x76, seed, pub,
+                              FLEET_ENROL_PORT_FIRST + 1, row2, sizeof(row2)));
+        g_fe_signer = NULL;
+        ASSERT(fleet_roster_import(row, pub, &machine, &appended, &why));
+
+        /* Revoke the box only: the minted head carries box AND signer. */
+        zcl_hex_encode(box_pub, 32, box_hex);
+        (void)snprintf(body, sizeof(body), "{\"seq\":1,\"revoke\":\"%s\"}",
+                       box_hex);
+        ASSERT(fe_leaf_call("fleet.roster.head", "zcl.fleet.roster.head.v1",
+                            body, &reply));
+        ASSERT_EQ(reply.exit_code, ZCL_COMMAND_EXIT_OK);
+        line = json_get_str(json_get(&reply.data, "head"));
+        ASSERT(line && fleet_head_parse(line, &head, NULL));
+        ASSERT(fleet_head_revokes(&head, box_pub));
+        ASSERT(fleet_head_revokes(&head, signer.pubkey));
+        ASSERT_EQ(head.n_revoked, 2u);
+        zcl_command_reply_free(&reply);
+
+        /* A box with no local row cannot be revoked. */
+        zcl_hex_encode(ghost_pub, 32, box_hex);
+        (void)snprintf(body, sizeof(body), "{\"seq\":2,\"revoke\":\"%s\"}",
+                       box_hex);
+        ASSERT(fe_leaf_call("fleet.roster.head", "zcl.fleet.roster.head.v1",
+                            body, &reply));
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_FAILED);
+        ASSERT_STR_EQ(reply.error.evidence, FLEET_ENROL_WHY_REVOKE_UNKNOWN);
+        zcl_command_reply_free(&reply);
+
+        /* A head revoking only the SIGNER refuses that machine's row. */
+        ASSERT(fleet_head_mint(3, FE_NOW, signer2.pubkey, 1, seed, pub,
+                               head_text, sizeof(head_text), &why));
+        ASSERT(fleet_head_import(head_text, pub, false, &head,
+                                 &(bool){false}, &why));
+        ASSERT(!fleet_roster_import(row2, pub, &machine, &appended, &why));
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_BOX_REVOKED);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* Rewrite the sequence record: flip a hex digit of its operator, or set its
+ * sequence, keeping the rest. */
+static char g_fe_record_orig[300];
+
+static bool fe_restore_record(void)
+{
+    return fe_put_leaf("roster.head.seq", g_fe_record_orig);
+}
+
+static bool fe_tamper_record(bool flip_op, const char *seq_text)
+{
+    char path[PATH_MAX], text[256], out[300];
+    size_t len;
+    FILE *f;
+    if (!fleet_enrol_state_path("roster.head.seq", path, sizeof(path)))
+        return false;
+    f = fopen(path, "rb");
+    if (!f)
+        return false;
+    len = fread(text, 1, sizeof(text) - 1, f);
+    fclose(f);
+    while (len > 0 && text[len - 1] == '\n')
+        --len;
+    text[len] = '\0';
+    if (len < 64 + 3 + 64)
+        return false;
+    if (flip_op)
+        (void)snprintf(g_fe_record_orig, sizeof(g_fe_record_orig), "%s\n", text);
+    if (flip_op)
+        text[0] = text[0] == '0' ? '1' : '0';
+    if (seq_text)
+        (void)snprintf(out, sizeof(out), "%.64s %s %s\n", text, seq_text,
+                       text + len - 64);
+    else
+        (void)snprintf(out, sizeof(out), "%s\n", text);
+    return fe_put_leaf("roster.head.seq", out);
+}
+
+static int test_fe_head_floor_integrity(void)
+{
+    int failures = 0;
+    TEST("fleet head import: a sequence record naming another operator "
+         "refuses every import, and a lowered record cannot admit an older "
+         "head while an intact newer signed head is on disk") {
+        static char h5[FLEET_ENROL_HEAD_TEXT_MAX], h9[FLEET_ENROL_HEAD_TEXT_MAX];
+        static char h10[FLEET_ENROL_HEAD_TEXT_MAX];
+        static struct fleet_head out, held;
+        uint8_t op_seed[32], op_pub[32];
+        const uint8_t two[2] = { 0x82, 0x83 };
+        const char *why = NULL;
+        bool replaced = false;
+        fe_isolate("head-floor");
+        fe_key(0x81, op_seed, op_pub);
+        ASSERT(fe_head_line(0x81, 5, two, 1, h5, sizeof(h5)));
+        ASSERT(fe_head_line(0x81, 9, two, 2, h9, sizeof(h9)));
+        ASSERT(fe_head_line(0x81, 10, two, 2, h10, sizeof(h10)));
+        ASSERT(fleet_head_import(h9, op_pub, false, &out, &replaced, &why));
+
+        /* A record that names another operator refuses every import. */
+        ASSERT(fe_tamper_record(true, NULL));
+        ASSERT(!fleet_head_import(h10, op_pub, false, &out, &replaced, &why));
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_HEAD_HWM);
+        ASSERT_EQ(fleet_head_load(op_pub, &held, &why), FLEET_HEAD_BAD);
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_HEAD_HWM);
+
+        /* Repair the operator, then lower the record's sequence below the
+         * intact seq-9 head: the older head is still refused. */
+        ASSERT(fe_restore_record());
+        ASSERT(fe_tamper_record(false, "3"));
+        ASSERT_EQ(fleet_head_load(op_pub, &held, &why), FLEET_HEAD_BAD);
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_HEAD_TORN);
+        ASSERT(!fleet_head_import(h5, op_pub, false, &out, &replaced, &why));
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_HEAD_STALE);
+        /* The stored head's floor cannot be assessed: refuse, never read it
+         * as no stored head (which would let seq 5 in over the record's 3). */
+        fleet_enrol_test_fail_floor = true;
+        ASSERT(!fleet_head_import(h5, op_pub, false, &out, &replaced, &why));
+        fleet_enrol_test_fail_floor = false;
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_HEAD_UNREADABLE);
+        ASSERT(fleet_head_import(h10, op_pub, false, &out, &replaced, &why));
+        ASSERT_EQ(fleet_head_load(op_pub, &held, &why), FLEET_HEAD_OK);
+        ASSERT_EQ(held.seq, (uint64_t)10);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_fe_head_revokes_every_signer(void)
+{
+    int failures = 0;
+    TEST("fleet roster head: a revoked box that rotated signers has every "
+         "signer its rows bound revoked with it; a re-enrolment of that box "
+         "under a new signer is refused; a box-only head still refuses the "
+         "box") {
+        char row1[FLEET_ENROL_MACHINE_TEXT_MAX];
+        char row2[FLEET_ENROL_MACHINE_TEXT_MAX];
+        char row3[FLEET_ENROL_MACHINE_TEXT_MAX];
+        char body[FLEET_ENROL_HEAD_TEXT_MAX + 256];
+        char box_hex[FLEET_ENROL_PUBKEY_HEX];
+        char head_text[FLEET_ENROL_HEAD_TEXT_MAX];
+        static struct fleet_head head;
+        struct fleet_signing_key s1, s2, s3;
+        struct fleet_machine machine;
+        struct zcl_command_reply reply;
+        uint8_t seed[32], pub[32], box_seed[32], box_pub[32];
+        const char *why = NULL;
+        const char *line;
+        bool appended = false, replaced = false;
+        fe_isolate("head-signers");
+        ASSERT(fe_manager_key(seed, pub));
+        fe_key(0x72, box_seed, box_pub);
+        fe_key(0x73, s1.seed, s1.pubkey);
+        fe_key(0x75, s2.seed, s2.pubkey);
+        fe_key(0x77, s3.seed, s3.pubkey);
+        g_fe_signer = &s1;
+        ASSERT(fe_manager_row("studio", 0x72, seed, pub,
+                              FLEET_ENROL_PORT_FIRST, row1, sizeof(row1)));
+        g_fe_signer = &s2;   /* the same box, rotated to a second signer */
+        ASSERT(fe_manager_row("studio-2", 0x72, seed, pub,
+                              FLEET_ENROL_PORT_FIRST + 1, row2, sizeof(row2)));
+        g_fe_signer = &s3;   /* ...and re-enrolling later under a third */
+        ASSERT(fe_manager_row("studio-3", 0x72, seed, pub,
+                              FLEET_ENROL_PORT_FIRST + 2, row3, sizeof(row3)));
+        g_fe_signer = NULL;
+        ASSERT(fleet_roster_append(row1, &why));
+        ASSERT(fleet_roster_append(row2, &why));
+
+        zcl_hex_encode(box_pub, 32, box_hex);
+        (void)snprintf(body, sizeof(body), "{\"seq\":1,\"revoke\":\"%s\"}",
+                       box_hex);
+        ASSERT(fe_leaf_call("fleet.roster.head", "zcl.fleet.roster.head.v1",
+                            body, &reply));
+        ASSERT_EQ(reply.exit_code, ZCL_COMMAND_EXIT_OK);
+        line = json_get_str(json_get(&reply.data, "head"));
+        ASSERT(line && fleet_head_parse(line, &head, NULL));
+        ASSERT(fleet_head_revokes(&head, box_pub));
+        ASSERT(fleet_head_revokes(&head, s1.pubkey));
+        ASSERT(fleet_head_revokes(&head, s2.pubkey));
+        ASSERT_EQ(head.n_revoked, 3u);
+        (void)snprintf(head_text, sizeof(head_text), "%s", line);
+        zcl_command_reply_free(&reply);
+
+        /* Imported, the revoked box's re-enrolment under a new signer is
+         * refused (the box is revoked whatever signer it brings). */
+        ASSERT(fleet_head_import(head_text, pub, false, &head, &replaced,
+                                 &why));
+        ASSERT(!fleet_roster_import(row3, pub, &machine, &appended, &why));
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_BOX_REVOKED);
+
+        /* A head naming only the box (no signer counterpart) still refuses
+         * that box's row everywhere. */
+        ASSERT(fleet_head_mint(2, FE_NOW, box_pub, 1, seed, pub, head_text,
+                               sizeof(head_text), &why));
+        ASSERT(fleet_head_import(head_text, pub, false, &head, &replaced,
+                                 &why));
+        ASSERT(!fleet_roster_import(row3, pub, &machine, &appended, &why));
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_BOX_REVOKED);
         PASS();
     } _test_next:;
     return failures;
@@ -2779,6 +3036,13 @@ static int test_fe_head_leaves(void)
         zcl_hex_encode(box_pub, 32, revoke_hex);
         ASSERT(fe_manager_row("studio", 0x72, seed, pub,
                               FLEET_ENROL_PORT_FIRST, row, sizeof(row)));
+        {   /* the operator must hold the row to revoke the box */
+            struct fleet_machine held_row;
+            bool held_appended = false;
+            const char *held_why = NULL;
+            ASSERT(fleet_roster_import(row, pub, &held_row, &held_appended,
+                                       &held_why));
+        }
 
         /* A bad revoke entry refuses the whole list. */
         (void)snprintf(body, sizeof(body),
@@ -2867,6 +3131,9 @@ int test_fleet_enrol(void)
     failures += test_fe_head_corrupt_no_rollback();
     failures += test_fe_head_torn_crash();
     failures += test_fe_import_partial_is_honest();
+    failures += test_fe_head_revokes_signer();
+    failures += test_fe_head_floor_integrity();
+    failures += test_fe_head_revokes_every_signer();
     failures += test_fe_head_revokes_import();
     failures += test_fe_head_fails_closed();
     failures += test_fe_operator_pin();

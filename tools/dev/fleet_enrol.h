@@ -182,6 +182,9 @@ enum {
 /* An import changed some state files and then failed: the pin or the
  * sequence record moved but the head did not. */
 #define FLEET_ENROL_WHY_IMPORT_PARTIAL "fleet_import_partial"
+/* A head would revoke a box whose roster row this operator does not hold,
+ * so its signer key cannot be named: hold the row first. */
+#define FLEET_ENROL_WHY_REVOKE_UNKNOWN "fleet_revoke_box_unknown"
 
 /* ── the three records ──────────────────────────────────────────────────── */
 
@@ -505,6 +508,8 @@ extern int fleet_enrol_test_lock_wait_ms;
 extern void (*fleet_enrol_test_after_check)(void);
 extern bool fleet_enrol_test_crash_before_head;
 extern bool fleet_enrol_test_fail_pin_write;
+extern bool fleet_enrol_test_fail_floor;
+extern bool fleet_enrol_test_fail_dir_flush;
 #endif
 
 /* Visit every line of this box's own machine roster file, verbatim and in
@@ -532,6 +537,16 @@ bool fleet_roster_each(const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES],
                        void (*visit)(const struct fleet_machine *, void *),
                        void *user, struct fleet_roster_scan *out,
                        const char **why);
+
+/* Every signer key the operator's own roster rows bind to `box_pubkey` (at
+ * most `cap`; more refuses as fleet_head_too_large): `found` is false when no
+ * row for the box is held. A head that revokes a box must also revoke each of
+ * its signers, because the relay gate sees only the signer. */
+bool fleet_roster_signers_of_box(
+    const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES],
+    const uint8_t box_pubkey[FLEET_ENROL_PUBKEY_BYTES],
+    uint8_t (*signers)[FLEET_ENROL_PUBKEY_BYTES], size_t cap, size_t *count,
+    bool *found, const char **why);
 
 /* ── the ssh bridge (tools/dev/fleet_enrol_store.c) ─────────────────────── */
 
