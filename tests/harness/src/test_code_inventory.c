@@ -66,6 +66,29 @@ static bool ci_copy(const char *source_path, const char *destination_path)
     return ok;
 }
 
+static bool ci_test_room_fixture(void)
+{
+    if (system("mkdir -p " CI_FIX "/platform/modules/demo/tests "
+               CI_FIX "/engine/modules/demo/tests "
+               CI_FIX "/platform/modules/demo/tests_extra") != 0)
+        return false;
+    return ci_write(CI_FIX "/platform/modules/demo/tests/socket_windows_acceptance.c",
+        "#include \"demo/demo.h\"\n"
+        "int module_probe(void) { return demo_stub(1); }\n") &&
+        ci_write(CI_FIX "/engine/modules/demo/tests/acceptance.c",
+        "#include \"demo/demo.h\"\n"
+        "int authority_probe(void) { return demo_stub(2); }\n") &&
+        ci_write(CI_FIX "/platform/modules/demo/src/ordinary.c",
+        "#include \"demo/demo.h\"\n"
+        "int ordinary_probe(void) { return demo_stub(3); }\n") &&
+        ci_write(CI_FIX "/platform/modules/demo/src/latest_tests.c",
+        "#include \"demo/demo.h\"\n"
+        "int substring_probe(void) { return demo_stub(4); }\n") &&
+        ci_write(CI_FIX "/platform/modules/demo/tests_extra/probe.c",
+        "#include \"demo/demo.h\"\n"
+        "int segment_probe(void) { return demo_stub(5); }\n");
+}
+
 static bool ci_fixture(void)
 {
     if (system("rm -rf " CI_FIX " && mkdir -p "
@@ -872,10 +895,23 @@ static void ci_render_shift_invariance(void)
     free(restored);
 }
 
+static void ci_test_room_uses(const struct ci_inventory_report *report,
+                             const struct ci_inventory_capability *cap)
+{
+    const struct ci_inventory_symbol *stub = ci_symbol(report, cap, "demo_stub");
+    CI_ASSERT(stub != NULL);
+    if (!stub) return;
+    CI_ASSERT(stub->production_use_files == 3);
+    CI_ASSERT(stub->test_use_files == 2);
+    CI_ASSERT(stub->test_evidence == CI_INVENTORY_TEST_SOURCE_ONLY);
+    CI_ASSERT(stub->registered_test_group[0] == '\0');
+}
+
 int test_code_inventory(void)
 {
     ci_failures = 0;
     CI_ASSERT(ci_fixture());
+    CI_ASSERT(ci_test_room_fixture());
     struct ci_inventory_report *first = codeindex_inventory_analyze(CI_FIX);
     CI_ASSERT(first != NULL);
     if (!first) return 1;
@@ -905,6 +941,7 @@ int test_code_inventory(void)
     const struct ci_inventory_symbol *validate = ci_symbol(
         first, demo, "demo_validate");
     const struct ci_inventory_symbol *stub = ci_symbol(first, demo, "demo_stub");
+    ci_test_room_uses(first, demo);
     const struct ci_inventory_symbol *demo_local = ci_symbol(
         first, demo, "local_pick");
     const struct ci_inventory_symbol *other_local = ci_symbol(

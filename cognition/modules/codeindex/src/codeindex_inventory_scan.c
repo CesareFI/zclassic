@@ -75,11 +75,10 @@ static bool inv_has_segment(const char *path, const char *segment)
 bool inv_is_test_path(const char *path)
 {
     if (!path) return false;
-    if (strncmp(path, "tests/harness/", sizeof("tests/harness/") - 1) == 0)
-        return true;
+    if (inv_has_segment(path, "tests")) return true;
     if (strncmp(path, "contexts/commons/packages/",
                 sizeof("contexts/commons/packages/") - 1) == 0 &&
-        (inv_has_segment(path, "tests") || inv_has_segment(path, "test")))
+        inv_has_segment(path, "test"))
         return true;
     const char *base = strrchr(path, '/');
     base = base ? base + 1 : path;
