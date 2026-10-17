@@ -13,6 +13,7 @@
 
 #include "platform/time_compat.h"
 #include "models/file_service.h"
+#include "models/database_internal.h"
 #include "event/event.h"
 #include <string.h>
 #include <time.h>
@@ -75,9 +76,7 @@ bool db_file_service_save(struct node_db *ndb,
     /* Network-thread caller: serialize on the shared-connection statement
      * mutex like db_peer_save. A cached statement is never left stepped
      * after this returns (AR_STEP_DONE resets it on a failed step). */
-    bool locked_stmt = ndb->state_mutex_init;
-    if (locked_stmt)
-        zcl_mutex_lock(&ndb->state_mutex);
+    bool locked_stmt = node_db_lock_connection_and_state(ndb);
     AR_RESET(s);
     AR_BIND_BLOB(s, 1, fs->ip, 16);
     AR_BIND_INT(s, 2, fs->port);
@@ -86,8 +85,7 @@ bool db_file_service_save(struct node_db *ndb,
     AR_BIND_INT(s, 5, fs->is_zcl23 ? 1 : 0);
 
     bool ok = AR_STEP_DONE(s);
-    if (locked_stmt)
-        zcl_mutex_unlock(&ndb->state_mutex);
+    node_db_unlock_state_and_connection(ndb, locked_stmt);
     AR_FINISH_SAVE(cbs, fs, ok);
 }
 

@@ -11,6 +11,7 @@
 #include "platform/time_compat.h"
 #include "util/log_macros.h"
 #include "models/peer.h"
+#include "models/database_internal.h"
 #include "models/query_builder.h"
 #include "event/event.h"
 #include "net/port_policy.h"
@@ -113,12 +114,8 @@ static bool db_peer_save_with_attempts(struct node_db *ndb,
     AR_BEGIN_SAVE(cbs, "peer", p, db_peer_validate);
 
     sqlite3_stmt *s = ndb->stmt_peer_save;
-    bool locked_stmt = false;
     char err_msg[128] = {0};
-    if (ndb->state_mutex_init) {
-        zcl_mutex_lock(&ndb->state_mutex);
-        locked_stmt = true;
-    }
+    bool locked_stmt = node_db_lock_connection_and_state(ndb);
 
     int rc = SQLITE_OK;
     int attempts = 0;
@@ -155,8 +152,7 @@ static bool db_peer_save_with_attempts(struct node_db *ndb,
     AR_RESET(s);
     ndb->last_sqlite_rc = rc;
     snprintf(ndb->last_op, sizeof(ndb->last_op), "%s", "db_peer_save");
-    if (locked_stmt)
-        zcl_mutex_unlock(&ndb->state_mutex);
+    node_db_unlock_state_and_connection(ndb, locked_stmt);
 
     bool ok = rc == SQLITE_DONE;
     if (!ok) {

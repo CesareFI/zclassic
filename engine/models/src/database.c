@@ -70,6 +70,38 @@ static void node_db_state_destroy(struct node_db *ndb)
     ndb->state_mutex_init = false;
 }
 
+#ifdef ZCL_TESTING
+static node_db_locked_test_hook_fn g_locked_test_hook;
+static void *g_locked_test_hook_ctx;
+
+void node_db_set_locked_test_hook(node_db_locked_test_hook_fn fn, void *ctx)
+{
+    g_locked_test_hook_ctx = ctx;
+    g_locked_test_hook = fn;
+}
+#endif
+
+bool node_db_lock_connection_and_state(struct node_db *ndb)
+{
+    if (!ndb || !ndb->state_mutex_init)
+        return false;
+    sqlite3_mutex_enter(sqlite3_db_mutex(ndb->db));
+    zcl_mutex_lock(&ndb->state_mutex);
+#ifdef ZCL_TESTING
+    if (g_locked_test_hook)
+        g_locked_test_hook(g_locked_test_hook_ctx);
+#endif
+    return true;
+}
+
+void node_db_unlock_state_and_connection(struct node_db *ndb, bool locked)
+{
+    if (!locked)
+        return;
+    zcl_mutex_unlock(&ndb->state_mutex);
+    sqlite3_mutex_leave(sqlite3_db_mutex(ndb->db));
+}
+
 /* Execute `sql`, logging any error with `where` context.  Returns the
  * sqlite3 rc so callers can make tolerance decisions.  Wrapping
  * sqlite3_exec ensures the rc is never silently discarded — a dropped

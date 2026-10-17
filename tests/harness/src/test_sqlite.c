@@ -7,6 +7,8 @@
 #include "chain/chainparams.h"
 #include "storage/coins_db.h"
 #include "models/wallet_key.h"
+#include "models/block.h"
+#include "models/peer.h"
 #include "models/database_internal.h"
 #include "models/database_lifetime.h"
 #include "models/database_owner_lease.h"
@@ -34,6 +36,7 @@
 #include "primitives/transaction.h"
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <sys/stat.h>
 #if !defined(_WIN32)
 #include <sys/wait.h>
@@ -3691,6 +3694,142 @@ static int check_sqlite_54_tx_index_shutdown_abort(void)
     return 1;
 }
 
+#if !defined(_WIN32)
+/* ── Lock order: connection mutex before state_mutex ───────────────────
+ *
+ * The Mac node wedged with one thread inside db_block_save holding
+ * state_mutex and waiting for the sqlite connection mutex, while another
+ * held the connection mutex (the security posture read) and waited for
+ * state_mutex inside node_db_state_get. Each case runs in a forked child
+ * under alarm(5) so a deadlock is a counted failure, not a hung suite. */
+enum { LOCK_ORDER_BLOCK, LOCK_ORDER_PEER };
+
+struct lock_order_case {
+    struct node_db ndb;
+    int which;
+    atomic_int arrived;
+    atomic_int release;
+    atomic_int saved;
+};
+
+static void lock_order_sleep_ms(int ms)
+{
+    struct timespec ts = { 0, (long)ms * 1000000L };
+    nanosleep(&ts, NULL);
+}
+
+static bool lock_order_wait(atomic_int *flag, int limit_ms)
+{
+    for (int waited = 0; waited < limit_ms; waited++) {
+        if (atomic_load(flag))
+            return true;
+        lock_order_sleep_ms(1);
+    }
+    return atomic_load(flag) != 0;
+}
+
+static void lock_order_hook(void *ctx)
+{
+    struct lock_order_case *c = ctx;
+    atomic_store(&c->arrived, 1);
+    lock_order_wait(&c->release, 2000);
+}
+
+static bool lock_order_save(struct lock_order_case *c)
+{
+    static uint8_t solution[1];
+    if (c->which == LOCK_ORDER_PEER) {
+        struct db_peer p = {0};
+        memset(p.ip, 0x77, 16);
+        p.port = 8033;
+        p.services = 1;
+        p.last_seen = 1700000000;
+        return db_peer_save(&c->ndb, &p);
+    }
+    struct db_block b = {0};
+    memset(b.hash, 0xAA, 32);
+    memset(b.prev_hash, 0xBB, 32);
+    memset(b.merkle_root, 0xCC, 32);
+    b.height = 1;
+    b.time = 1700000000;
+    b.bits = 0x1d00ffff;
+    b.status = 3;
+    b.solution = solution;
+    b.solution_len = 1;
+    return db_block_save(&c->ndb, &b);
+}
+
+static void *lock_order_writer(void *arg)
+{
+    struct lock_order_case *c = arg;
+    atomic_store(&c->saved, lock_order_save(c) ? 1 : -1);
+    return NULL;
+}
+
+static int lock_order_child(int which)
+{
+    static struct lock_order_case c;
+    c.which = which;
+    if (!node_db_open(&c.ndb, ":memory:"))
+        return 1;
+    sqlite3_mutex *conn = sqlite3_db_mutex(c.ndb.db);
+    if (!conn)
+        return 2;
+    node_db_set_locked_test_hook(lock_order_hook, &c);
+
+    pthread_t writer;
+    sqlite3_mutex_enter(conn);
+    if (pthread_create(&writer, NULL, lock_order_writer, &c) != 0)
+        return 3;
+    /* Where the writer takes state_mutex first it reaches the hook now; where
+     * it takes the connection mutex first it queues behind this thread. */
+    lock_order_wait(&c.arrived, 500);
+    uint8_t buf[8];
+    size_t len = 0;
+    (void)node_db_state_get(&c.ndb, "lock_order_probe", buf, sizeof(buf), &len);
+    atomic_store(&c.release, 1);
+    sqlite3_mutex_leave(conn);
+    pthread_join(writer, NULL);
+    node_db_set_locked_test_hook(NULL, NULL);
+    node_db_close(&c.ndb);
+    return atomic_load(&c.saved) == 1 ? 0 : 4;
+}
+
+static bool lock_order_run(int which)
+{
+    pid_t child = fork();
+    if (child < 0)
+        return false;
+    if (child == 0) {
+        alarm(5);
+        _exit(lock_order_child(which));
+    }
+    int status = 0;
+    if (waitpid(child, &status, 0) != child)
+        return false;
+    if (WIFSIGNALED(status))
+        printf("deadlock: child killed by signal %d after 5 s... ",
+               WTERMSIG(status));
+    else if (WEXITSTATUS(status) != 0)
+        printf("child exit %d... ", WEXITSTATUS(status));
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static void check_sqlite_55_db_block_save_takes_connection_first(int *failures)
+{
+    printf("SQLite db_block_save takes the connection mutex before state_mutex... ");
+    if (lock_order_run(LOCK_ORDER_BLOCK)) printf("OK\n");
+    else { printf("FAIL\n"); (*failures)++; }
+}
+
+static void check_sqlite_56_db_peer_save_takes_connection_first(int *failures)
+{
+    printf("SQLite db_peer_save takes the connection mutex before state_mutex... ");
+    if (lock_order_run(LOCK_ORDER_PEER)) printf("OK\n");
+    else { printf("FAIL\n"); (*failures)++; }
+}
+#endif
+
 int test_sqlite(void) {
     int failures = 0;
 
@@ -3940,6 +4079,11 @@ int test_sqlite(void) {
     failures += check_sqlite_53_cached_readers_release_the_snap();
     failures += check_sqlite_projection_writer_reservation();
     failures += check_sqlite_54_tx_index_shutdown_abort();
+
+#if !defined(_WIN32)
+    check_sqlite_55_db_block_save_takes_connection_first(&failures);
+    check_sqlite_56_db_peer_save_takes_connection_first(&failures);
+#endif
 
     return failures;
 }

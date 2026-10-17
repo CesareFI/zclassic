@@ -266,4 +266,27 @@ void db_long_op_publish(const char *op, int64_t start_ms);
 void db_long_op_unpublish(void);
 void db_long_op_note_deadline(const char *op, int64_t elapsed_ms);
 
+/* ── Lock order ────────────────────────────────────────────────────────
+ *
+ * Two locks guard node.db access and they nest in one order only: the sqlite
+ * connection mutex (sqlite3_db_mutex(ndb->db), recursive, held inside every
+ * sqlite3_* call) comes BEFORE ndb->state_mutex. state_mutex alone never
+ * wraps a sqlite call. A site that steps a cached statement and stamps
+ * last_op/last_sqlite_rc under state_mutex takes both through the pair
+ * below; a leaf site that only reads or writes the state fields (and may
+ * itself be reached from inside a sqlite call, as node_db_note_activity is)
+ * takes state_mutex alone. Taking state_mutex first and then entering sqlite
+ * lets a thread that holds the connection mutex and wants state_mutex wedge
+ * against it. Returns true when the pair was taken; pass that value back to
+ * the unlock, which releases in reverse order. */
+bool node_db_lock_connection_and_state(struct node_db *ndb);
+void node_db_unlock_state_and_connection(struct node_db *ndb, bool locked);
+
+#ifdef ZCL_TESTING
+/* Test-only: fn runs inside the region node_db_lock_connection_and_state
+ * opens, after both locks are held. NULL removes it. */
+typedef void (*node_db_locked_test_hook_fn)(void *ctx);
+void node_db_set_locked_test_hook(node_db_locked_test_hook_fn fn, void *ctx);
+#endif
+
 #endif

@@ -16,6 +16,7 @@
  * after_save -> emit EV_MODEL_SAVED */
 
 #include "models/block.h"
+#include "models/database_internal.h"
 #include "util/log_macros.h"
 #include "encoding/utilstrencodings.h"
 #include "models/tx_index.h"
@@ -250,11 +251,7 @@ bool db_block_save(struct node_db *ndb, const struct db_block *b)
     AR_BEGIN_SAVE(cbs, "block", b, db_block_validate);
 
     sqlite3_stmt *s = ndb->stmt_block_insert;
-    bool locked_stmt = false;
-    if (ndb->state_mutex_init) {
-        zcl_mutex_lock(&ndb->state_mutex);
-        locked_stmt = true;
-    }
+    bool locked_stmt = node_db_lock_connection_and_state(ndb);
 
     int rc = SQLITE_OK;
     int attempts = 0;
@@ -274,8 +271,7 @@ bool db_block_save(struct node_db *ndb, const struct db_block *b)
     sqlite3_reset(s);
     ndb->last_sqlite_rc = rc;
     snprintf(ndb->last_op, sizeof(ndb->last_op), "%s", "db_block_save");
-    if (locked_stmt)
-        zcl_mutex_unlock(&ndb->state_mutex);
+    node_db_unlock_state_and_connection(ndb, locked_stmt);
 
     bool ok = rc == SQLITE_DONE;
     if (!ok) {
@@ -308,11 +304,7 @@ bool db_block_save_canonical(struct node_db *ndb, const struct db_block *b)
         return db_block_save(ndb, b);
 
     sqlite3_stmt *s = NULL;
-    bool locked_stmt = false;
-    if (ndb->state_mutex_init) {
-        zcl_mutex_lock(&ndb->state_mutex);
-        locked_stmt = true;
-    }
+    bool locked_stmt = node_db_lock_connection_and_state(ndb);
     db_block_reset_cached_readers(ndb);
 
     int prep_rc = sqlite3_prepare_v2(ndb->db,
@@ -325,8 +317,7 @@ bool db_block_save_canonical(struct node_db *ndb, const struct db_block *b)
         LOG_WARN("db_block_save_canonical", "db_block_save_canonical: prepare failed " "stmt=block_demote_same_height height=%d hash=%s " "prep_rc=%d prep_msg=%s db_rc=%d db_msg=%s", b->height, hash_hex, prep_rc, sqlite3_errstr(prep_rc), sqlite3_errcode(ndb->db), sqlite3_errmsg(ndb->db));
         if (s)
             sqlite3_finalize(s);
-        if (locked_stmt)
-            zcl_mutex_unlock(&ndb->state_mutex);
+        node_db_unlock_state_and_connection(ndb, locked_stmt);
         return false;
     }
 
@@ -343,8 +334,7 @@ bool db_block_save_canonical(struct node_db *ndb, const struct db_block *b)
     snprintf(ndb->last_op, sizeof(ndb->last_op), "%s",
              "db_block_save_canonical.demote");
     int changed = sqlite3_changes(ndb->db);
-    if (locked_stmt)
-        zcl_mutex_unlock(&ndb->state_mutex);
+    node_db_unlock_state_and_connection(ndb, locked_stmt);
     if (!demoted)
         return false;
 
