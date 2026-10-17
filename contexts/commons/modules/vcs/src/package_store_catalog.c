@@ -5,9 +5,9 @@
 #include "base/log_macros.h"
 #include "base/safe_alloc.h"
 #include "platform/positioned_file.h"
+#include "platform/clock.h"
 #include "platform/directory_compat.h"
 #include <errno.h>
-#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1017,7 +1017,7 @@ static bool store_sync_directory(const char *dir)
 static bool store_quarantine_target(const char *qdir, const char *name,
                                     char *to, size_t to_size)
 {
-    long long stamp = (long long)time(NULL);
+    long long stamp = (long long)(clock_now_wall_ms() / 1000);
     for (unsigned n = 0; n < 100u; n++) {
         int len = n == 0
             ? snprintf(to, to_size, "%s/%s.%lld", qdir, name, stamp)
