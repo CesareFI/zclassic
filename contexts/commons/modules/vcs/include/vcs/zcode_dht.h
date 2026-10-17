@@ -198,8 +198,8 @@ enum vcs_zcode_dht_error vcs_zcode_dht_contacts_serialize(
 enum vcs_zcode_dht_error vcs_zcode_dht_contacts_parse(
     const uint8_t *wire, size_t wire_len,
     const uint8_t expected_genesis[32], const uint8_t expected_self_id[32],
-    uint64_t now_unix, vcs_zcode_dht_chain_verify_fn chain_verify,
-    void *chain_ctx, struct vcs_zcode_dht_contact *contacts_out,
+    uint64_t now_unix, vcs_zcode_dht_chain_verify_fn transport_verify,
+    void *transport_ctx, struct vcs_zcode_dht_contact *contacts_out,
     uint32_t contact_capacity, uint32_t *count_out);
 
 #endif /* ZCL_VCS_ZCODE_DHT_H */

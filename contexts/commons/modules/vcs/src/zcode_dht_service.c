@@ -408,8 +408,10 @@ vcs_zcode_dht_service_create(const struct vcs_zcode_dht_service_params *p) {
   snprintf(s->datadir, sizeof(s->datadir), "%s", p->datadir);
   memcpy(s->genesis, p->network_genesis, 32);
   memcpy(s->local_noise_static, p->local_noise_static, 32);
-  s->chain_verify = p->chain_verify;
-  s->chain_ctx = p->chain_ctx;
+  s->transport_verify = p->transport_verify;
+  s->transport_ctx = p->transport_ctx;
+  s->authority_verify = p->authority_verify;
+  s->authority_ctx = p->authority_ctx;
   s->request_reachability = p->request_reachability;
   s->reachability_ctx = p->reachability_ctx;
   s->policy_decide = p->policy_decide;
@@ -482,7 +484,8 @@ vcs_zcode_dht_service_create(const struct vcs_zcode_dht_service_params *p) {
     }
     return s;
   }
-  if (s->chain_verify && !s->chain_verify(s->chain_ctx, &s->delegation)) {
+  if (s->authority_verify &&
+      !s->authority_verify(s->authority_ctx, &s->delegation)) {
     snprintf(s->disabled_reason, sizeof(s->disabled_reason),
              "DELEGATION_CHAIN_INVALID");
     vcs_zcode_dht_service_set_error(s,
@@ -500,8 +503,8 @@ vcs_zcode_dht_service_create(const struct vcs_zcode_dht_service_params *p) {
   (void)vcs_zcode_dht_service_persistence_load(s, p->now.wall_unix);
   struct vcs_zcode_dht_record_verify_context record_verify = {
       .now_unix = p->now.wall_unix,
-      .chain_verify = s->chain_verify,
-      .chain_ctx = s->chain_ctx,
+      .authority_verify = s->authority_verify,
+      .authority_ctx = s->authority_ctx,
   };
   memcpy(record_verify.network_genesis, s->genesis, 32);
   enum vcs_zcode_dht_record_store_result record_load =
@@ -555,8 +558,10 @@ bool vcs_zcode_dht_service_handle_frame(
                                                .session_generation =
                                                    p->session.generation,
                                                .now_unix = now.wall_unix,
-                                               .chain_verify = s->chain_verify,
-                                               .chain_ctx = s->chain_ctx};
+                                               .transport_verify = s->transport_verify,
+                                               .transport_ctx = s->transport_ctx,
+                                               .authority_verify = s->authority_verify,
+                                               .authority_ctx = s->authority_ctx};
   memcpy(v.noise_transcript_hash, p->session.transcript_hash, 32);
   memcpy(v.remote_noise_static, p->session.remote_static, 32);
   memcpy(v.network_genesis, s->genesis, 32);
@@ -769,7 +774,7 @@ static bool pending_candidate_valid(struct vcs_zcode_dht_service *s,
          vcs_zcode_dht_delegation_verify(&d, s->genesis, NULL, 0, NULL,
                                          wall_now) ==
              VCS_ZCODE_DHT_DELEGATION_OK &&
-         (!s->chain_verify || s->chain_verify(s->chain_ctx, &d));
+         (!s->transport_verify || s->transport_verify(s->transport_ctx, &d));
 }
 
 void vcs_zcode_dht_service_tick(struct vcs_zcode_dht_service *s,

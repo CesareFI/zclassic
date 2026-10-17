@@ -173,8 +173,10 @@ struct vcs_zcode_dht_service {
       datadir[VCS_ZCODE_DHT_SERVICE_DATADIR_CAP];
   uint8_t genesis[32], self_id[32], online_seed[32], local_noise_static[32];
   struct vcs_zcode_dht_delegation delegation;
-  vcs_zcode_dht_chain_verify_fn chain_verify;
-  void *chain_ctx;
+  vcs_zcode_dht_chain_verify_fn transport_verify;
+  void *transport_ctx;
+  vcs_zcode_dht_chain_verify_fn authority_verify;
+  void *authority_ctx;
   vcs_zcode_dht_reachability_fn request_reachability;
   void *reachability_ctx;
   vcs_zcode_sovereignty_decide_fn policy_decide;

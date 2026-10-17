@@ -34,6 +34,10 @@ struct chain_cache_state {
 static zcl_mutex_t g_chain_lock;
 static _Atomic int g_chain_lock_state;
 static struct chain_cache_state g_chain;
+/* Per-role invocation counters; kept outside g_chain so they are lock-free
+ * under the DHT mutex. */
+static _Atomic uint64_t g_transport_checks;
+static _Atomic uint64_t g_authority_checks;
 
 static void chain_lock(void) {
   if (atomic_load_explicit(&g_chain_lock_state, memory_order_acquire) != 2) {
@@ -108,6 +112,24 @@ bool boot_zcode_dht_chain_cached(
     g_chain.cache_misses++;
   zcl_mutex_unlock(&g_chain_lock);
   return found;
+}
+
+bool boot_zcode_dht_chain_transport_cached(
+    void *ctx, const struct vcs_zcode_dht_delegation *delegation) {
+  atomic_fetch_add_explicit(&g_transport_checks, 1, memory_order_relaxed);
+  return boot_zcode_dht_chain_cached(ctx, delegation);
+}
+
+bool boot_zcode_dht_chain_authority_cached(
+    void *ctx, const struct vcs_zcode_dht_delegation *delegation) {
+  atomic_fetch_add_explicit(&g_authority_checks, 1, memory_order_relaxed);
+  return boot_zcode_dht_chain_cached(ctx, delegation);
+}
+
+void boot_zcode_dht_chain_note_check(bool authority) {
+  atomic_fetch_add_explicit(authority ? &g_authority_checks
+                                      : &g_transport_checks,
+                            1, memory_order_relaxed);
 }
 
 bool boot_zcode_dht_chain_epoch_current(void) {
@@ -211,6 +233,12 @@ void boot_zcode_dht_chain_dump_json(struct json_value *out) {
   json_push_kv_int(out, "invalidations", (int64_t)g_chain.invalidations);
   json_push_kv_int(out, "ancestry_lookups",
                    (int64_t)g_chain.ancestry_lookups);
+  json_push_kv_int(out, "transport_checks",
+                   (int64_t)atomic_load_explicit(&g_transport_checks,
+                                                 memory_order_relaxed));
+  json_push_kv_int(out, "authority_checks",
+                   (int64_t)atomic_load_explicit(&g_authority_checks,
+                                                 memory_order_relaxed));
   json_push_kv_int(out, "ancestry_max_height_span",
                    (int64_t)g_chain.ancestry_max_height_span);
   zcl_mutex_unlock(&g_chain_lock);
@@ -219,5 +247,7 @@ void boot_zcode_dht_chain_dump_json(struct json_value *out) {
 void boot_zcode_dht_chain_reset(void) {
   chain_lock();
   memset(&g_chain, 0, sizeof(g_chain));
+  atomic_store_explicit(&g_transport_checks, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_authority_checks, 0, memory_order_relaxed);
   zcl_mutex_unlock(&g_chain_lock);
 }

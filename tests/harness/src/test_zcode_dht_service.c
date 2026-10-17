@@ -95,7 +95,7 @@ static struct vcs_zcode_dht_service *fixture_service_at(
       .datadir = dir,
       .transport_enabled = true,
       .now = {.wall_unix = now_unix, .monotonic_s = now_unix},
-      .chain_verify = chain_ok,
+      .transport_verify = chain_ok, .authority_verify = chain_ok,
       .policy_decide = policy_allow,
   };
   memcpy(p.network_genesis, genesis, 32);
@@ -476,7 +476,7 @@ static int test_record_board_filters_before_limit(void)
         .datadir = dir,
         .transport_enabled = true,
         .now = {.wall_unix = 1500, .monotonic_s = 1500},
-        .chain_verify = chain_ok,
+        .transport_verify = chain_ok, .authority_verify = chain_ok,
         .policy_decide = board_prefix_policy,
     };
     memcpy(params.network_genesis, genesis, 32);
@@ -591,7 +591,7 @@ static struct vcs_zcode_dht_service *multi_service(
       .datadir = net->dir[index],
       .transport_enabled = true,
       .now = net->now,
-      .chain_verify = chain_ok,
+      .transport_verify = chain_ok, .authority_verify = chain_ok,
       .request_reachability = multi_request_reachability,
       .reachability_ctx = &net->reach[index],
       .policy_decide = multi_policy,
@@ -5319,7 +5319,8 @@ static int test_signed_record_storage_denial(
     struct vcs_zcode_dht_service_params params = {
         .datadir = bdir, .transport_enabled = true,
         .now = {.wall_unix = 1000, .monotonic_s = 1000},
-        .chain_verify = chain_ok, .policy_decide = record_storage_policy,
+        .transport_verify = chain_ok, .authority_verify = chain_ok,
+        .policy_decide = record_storage_policy,
         .policy_ctx = &denied};
     memcpy(params.network_genesis, genesis, 32);
     memcpy(params.local_noise_static, bnoise, 32);

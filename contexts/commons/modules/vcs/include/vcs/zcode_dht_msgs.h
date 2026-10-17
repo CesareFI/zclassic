@@ -138,8 +138,10 @@ struct vcs_zcode_dht_msg_verify_context {
     uint8_t network_genesis[32];
     uint64_t session_generation;
     uint64_t now_unix;
-    vcs_zcode_dht_chain_verify_fn chain_verify;
-    void *chain_ctx;
+    vcs_zcode_dht_chain_verify_fn transport_verify;
+    void *transport_ctx;
+    vcs_zcode_dht_chain_verify_fn authority_verify;
+    void *authority_ctx;
 };
 
 enum vcs_zcode_dht_error vcs_zcode_dht_msg_serialize_find_node(

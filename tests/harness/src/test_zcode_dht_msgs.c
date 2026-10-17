@@ -48,8 +48,10 @@ static bool fixture_init(struct msg_fixture *f, int *chain_calls)
     memcpy(f->verify.network_genesis, genesis, 32);
     f->verify.session_generation = 9;
     f->verify.now_unix = 1500;
-    f->verify.chain_verify = chain_accept;
-    f->verify.chain_ctx = chain_calls;
+    f->verify.transport_verify = chain_accept;
+    f->verify.transport_ctx = chain_calls;
+    f->verify.authority_verify = chain_accept;
+    f->verify.authority_ctx = chain_calls;
     return true;
 }
 
@@ -294,6 +296,116 @@ static int test_record_frames(void)
     return failures;
 }
 
+struct role_counts {
+    int calls;
+    bool accept;
+};
+
+static bool role_stub(void *ctx, const struct vcs_zcode_dht_delegation *d)
+{
+    struct role_counts *c = ctx;
+    (void)d;
+    c->calls++;
+    return c->accept;
+}
+
+static int test_trust_roles_split(void)
+{
+    int failures = 0;
+    TEST("zcode dht msgs v2: transport trust authenticates a peer, authority trust gates records") {
+        struct msg_fixture f;
+        int unused = 0;
+        ASSERT(fixture_init(&f, &unused));
+        struct vcs_zcode_dht_msg_records records;
+        ASSERT(fixture_auth_record(&f, &records));
+        uint8_t rec_wire[VCS_ZCODE_DHT_MAX_FRAME_BYTES + 1];
+        size_t rec_len = 0;
+        ASSERT_EQ(vcs_zcode_dht_msg_serialize_records(
+                      &records, f.transcript, f.online_seed, rec_wire,
+                      sizeof(rec_wire), &rec_len),
+                  VCS_ZCODE_DHT_OK);
+        struct vcs_zcode_dht_msg_store_record store;
+        memset(&store, 0, sizeof(store));
+        store.session_generation = 9;
+        memcpy(store.sender_node_id, f.node_id, 32);
+        fill_query(store.query_id);
+        store.delegation = f.delegation;
+        store.record = records.records[0];
+        uint8_t store_wire[VCS_ZCODE_DHT_MAX_FRAME_BYTES + 1];
+        size_t store_len = 0;
+        ASSERT_EQ(vcs_zcode_dht_msg_serialize_store_record(
+                      &store, f.transcript, f.online_seed, store_wire,
+                      sizeof(store_wire), &store_len),
+                  VCS_ZCODE_DHT_OK);
+        struct vcs_zcode_dht_msg_find_node find;
+        memset(&find, 0, sizeof(find));
+        find.session_generation = 9;
+        memcpy(find.sender_node_id, f.node_id, 32);
+        fill_query(find.query_id);
+        find.delegation = f.delegation;
+        fill(find.target_node_id, 32, 0x99);
+        uint8_t find_wire[VCS_ZCODE_DHT_FIND_NODE_WIRE_BYTES + 1];
+        size_t find_len = 0;
+        ASSERT_EQ(vcs_zcode_dht_msg_serialize_find_node(
+                      &find, f.transcript, f.online_seed, find_wire,
+                      sizeof(find_wire), &find_len),
+                  VCS_ZCODE_DHT_OK);
+
+        /* Transport accepts, authority refuses: the peer authenticates but
+         * a record authored by that peer is not accepted. */
+        struct role_counts transport = {0, true};
+        struct role_counts authority = {0, false};
+        f.verify.transport_verify = role_stub;
+        f.verify.transport_ctx = &transport;
+        f.verify.authority_verify = role_stub;
+        f.verify.authority_ctx = &authority;
+        struct vcs_zcode_dht_msg parsed;
+        ASSERT_EQ(vcs_zcode_dht_msg_parse(find_wire, find_len, &f.verify,
+                                          &parsed), VCS_ZCODE_DHT_OK);
+        ASSERT_EQ(transport.calls, 1);
+        ASSERT_EQ(authority.calls, 0);
+        ASSERT(vcs_zcode_dht_msg_parse(store_wire, store_len, &f.verify,
+                                       &parsed) != VCS_ZCODE_DHT_OK);
+        ASSERT_EQ(transport.calls, 2);
+        ASSERT_EQ(authority.calls, 1);
+        ASSERT(vcs_zcode_dht_msg_parse(rec_wire, rec_len, &f.verify,
+                                       &parsed) != VCS_ZCODE_DHT_OK);
+        ASSERT_EQ(transport.calls, 3);
+        ASSERT_EQ(authority.calls, 2);
+
+        /* Reverse: transport refuses, so the session never authenticates
+         * and the authority role is not consulted at all. */
+        transport = (struct role_counts){0, false};
+        authority = (struct role_counts){0, true};
+        ASSERT_EQ(vcs_zcode_dht_msg_parse(find_wire, find_len, &f.verify,
+                                          &parsed),
+                  VCS_ZCODE_DHT_ERR_DELEGATION);
+        ASSERT_EQ(transport.calls, 1);
+        ASSERT_EQ(authority.calls, 0);
+        ASSERT(vcs_zcode_dht_msg_parse(store_wire, store_len, &f.verify,
+                                       &parsed) != VCS_ZCODE_DHT_OK);
+        ASSERT_EQ(authority.calls, 0);
+
+        /* Both accept: the same frames parse and each role ran once per
+         * path. */
+        transport = (struct role_counts){0, true};
+        authority = (struct role_counts){0, true};
+        ASSERT_EQ(vcs_zcode_dht_msg_parse(store_wire, store_len, &f.verify,
+                                          &parsed), VCS_ZCODE_DHT_OK);
+        ASSERT_EQ(transport.calls, 1);
+        ASSERT_EQ(authority.calls, 1);
+
+        /* A NULL role skips that role's check only. */
+        f.verify.authority_verify = NULL;
+        transport = (struct role_counts){0, true};
+        ASSERT_EQ(vcs_zcode_dht_msg_parse(store_wire, store_len, &f.verify,
+                                          &parsed), VCS_ZCODE_DHT_OK);
+        ASSERT_EQ(transport.calls, 1);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 int test_zcode_dht_msgs(void)
 {
     int failures = 0;
@@ -301,6 +413,7 @@ int test_zcode_dht_msgs(void)
     failures += test_nodes_hints();
     failures += test_rejections();
     failures += test_record_frames();
+    failures += test_trust_roles_split();
     printf("=== zcode_dht_msgs: %d failures ===\n", failures);
     return failures;
 }

@@ -73,8 +73,8 @@ static bool session_authenticate_cached_contact(
         return false;
       }
       if (verify_error != VCS_ZCODE_DHT_DELEGATION_OK ||
-          (service->chain_verify &&
-           !service->chain_verify(service->chain_ctx, &delegation)))
+          (service->transport_verify &&
+           !service->transport_verify(service->transport_ctx, &delegation)))
         return false;
       peer->authenticated = true;
       memcpy(peer->node_id, contact->node_id, 32);

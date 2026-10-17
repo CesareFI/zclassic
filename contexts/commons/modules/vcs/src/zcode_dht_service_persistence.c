@@ -243,8 +243,8 @@ bool vcs_zcode_dht_service_persistence_load(struct vcs_zcode_dht_service *s,
   enum vcs_zcode_dht_error e =
       stable
           ? vcs_zcode_dht_contacts_parse(
-                wire, len, s->genesis, s->self_id, now, s->chain_verify,
-                s->chain_ctx, contacts, VCS_ZCODE_DHT_MAX_CONTACTS, &count)
+                wire, len, s->genesis, s->self_id, now, s->transport_verify,
+                s->transport_ctx, contacts, VCS_ZCODE_DHT_MAX_CONTACTS, &count)
           : VCS_ZCODE_DHT_ERR_WIRE_SIZE;
   free(wire);
   bool ok = e == VCS_ZCODE_DHT_OK && vcs_zcode_dht_table_init(tmp, s->self_id);

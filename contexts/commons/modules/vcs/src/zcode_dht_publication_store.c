@@ -214,8 +214,8 @@ bool vcs_zcode_dht_publications_load(struct vcs_zcode_dht_service *service,
   }
   struct vcs_zcode_dht_record_verify_context verify = {
       .now_unix = now_unix,
-      .chain_verify = service->chain_verify,
-      .chain_ctx = service->chain_ctx,
+      .authority_verify = service->authority_verify,
+      .authority_ctx = service->authority_ctx,
   };
   memcpy(verify.network_genesis, service->genesis, 32);
   struct service_publication loaded[VCS_ZCODE_DHT_SERVICE_MAX_PUBLICATIONS];

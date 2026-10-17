@@ -166,8 +166,8 @@ static bool rf_init_values(struct record_fixture *f, int *chain_calls,
   rf_fill(beacon, 32, 0x44);
   rf_fill(master, 32, master_value);
   f->verify.now_unix = 1500;
-  f->verify.chain_verify = rf_chain_accept;
-  f->verify.chain_ctx = chain_calls;
+  f->verify.authority_verify = rf_chain_accept;
+  f->verify.authority_ctx = chain_calls;
   if (vcs_zcode_dht_delegation_sign(
           &f->delegation, f->verify.network_genesis, online_pub, noise, 120,
           beacon, 1000, 3000, 7, master) != VCS_ZCODE_DHT_DELEGATION_OK)

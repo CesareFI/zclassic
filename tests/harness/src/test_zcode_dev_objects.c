@@ -300,8 +300,8 @@ static bool zd_provider_record(
     memset(verify, 0, sizeof(*verify));
     zd_root(verify->network_genesis, 0x01);
     verify->now_unix = 1500;
-    verify->chain_verify = zd_provider_chain_accept;
-    verify->chain_ctx = chain_calls;
+    verify->authority_verify = zd_provider_chain_accept;
+    verify->authority_ctx = chain_calls;
     memset(record, 0, sizeof(*record));
     record->kind = VCS_ZCODE_DHT_RECORD_PROVIDER;
     (void)snprintf(record->namespace_name, sizeof(record->namespace_name),

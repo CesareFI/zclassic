@@ -374,7 +374,8 @@ static enum vcs_zcode_dht_error read_auth(
     if (vcs_zcode_dht_delegation_verify(
             delegation, v->network_genesis, v->remote_noise_static, 0, NULL,
             v->now_unix) != VCS_ZCODE_DHT_DELEGATION_OK ||
-        (v->chain_verify && !v->chain_verify(v->chain_ctx, delegation)))
+        (v->transport_verify &&
+         !v->transport_verify(v->transport_ctx, delegation)))
         return VCS_ZCODE_DHT_ERR_DELEGATION;
     uint8_t derived[32];
     if (!vcs_zcode_dht_delegation_node_id(derived, delegation) ||
@@ -574,8 +575,8 @@ enum vcs_zcode_dht_error vcs_zcode_dht_msg_parse(
             return VCS_ZCODE_DHT_ERR_WIRE_ORDER;
         struct vcs_zcode_dht_record_verify_context record_verify = {
             .now_unix = v->now_unix,
-            .chain_verify = v->chain_verify,
-            .chain_ctx = v->chain_ctx,
+            .authority_verify = v->authority_verify,
+            .authority_ctx = v->authority_ctx,
         };
         memcpy(record_verify.network_genesis, v->network_genesis, 32);
         for (uint32_t i = 0; i < count; i++) {
@@ -598,8 +599,8 @@ enum vcs_zcode_dht_error vcs_zcode_dht_msg_parse(
     } else if (kind == VCS_ZCODE_DHT_MSG_STORE_RECORD) {
         struct vcs_zcode_dht_record_verify_context record_verify = {
             .now_unix = v->now_unix,
-            .chain_verify = v->chain_verify,
-            .chain_ctx = v->chain_ctx,
+            .authority_verify = v->authority_verify,
+            .authority_ctx = v->authority_ctx,
         };
         memcpy(record_verify.network_genesis, v->network_genesis, 32);
         enum vcs_zcode_dht_record_error record_error =

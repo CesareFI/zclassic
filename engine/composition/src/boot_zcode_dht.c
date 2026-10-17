@@ -165,6 +165,16 @@ static bool dht_chain_verify_external(
     void *ctx, const struct vcs_zcode_dht_delegation *delegation) {
   return boot_zcode_dht_chain_authorize(ctx, delegation);
 }
+static bool dht_transport_verify_external(
+    void *ctx, const struct vcs_zcode_dht_delegation *delegation) {
+  boot_zcode_dht_chain_note_check(false);
+  return dht_chain_verify_external(ctx, delegation);
+}
+static bool dht_authority_verify_external(
+    void *ctx, const struct vcs_zcode_dht_delegation *delegation) {
+  boot_zcode_dht_chain_note_check(true);
+  return dht_chain_verify_external(ctx, delegation);
+}
 static struct vcs_zcode_dht_service *dht_create(
     struct msg_processor *mp, struct boot_svc_ctx *svc,
     struct vcs_zcode_dht_time now) {
@@ -174,8 +184,10 @@ static struct vcs_zcode_dht_service *dht_create(
       .datadir = svc->datadir,
       .transport_enabled = mp->net_mgr->noise_enabled,
       .now = now,
-      .chain_verify = dht_chain_verify_external,
-      .chain_ctx = svc,
+      .transport_verify = dht_transport_verify_external,
+      .transport_ctx = svc,
+      .authority_verify = dht_authority_verify_external,
+      .authority_ctx = svc,
       .request_reachability = boot_zcode_dht_reachability_request,
       .reachability_ctx = svc,
   };
@@ -185,8 +197,9 @@ static struct vcs_zcode_dht_service *dht_create(
   struct vcs_zcode_dht_service *created =
       vcs_zcode_dht_service_create(&params);
   if (created)
-    vcs_zcode_dht_service_set_chain_verify(
-        created, boot_zcode_dht_chain_cached, NULL);
+    vcs_zcode_dht_service_set_verify_roles(
+        created, boot_zcode_dht_chain_transport_cached, NULL,
+        boot_zcode_dht_chain_authority_cached, NULL);
   return created;
 }
 static void dht_ensure_periodic(struct msg_processor *mp,

@@ -93,8 +93,8 @@ struct vcs_zcode_dht_record {
 struct vcs_zcode_dht_record_verify_context {
   uint8_t network_genesis[32];
   uint64_t now_unix;
-  vcs_zcode_dht_chain_verify_fn chain_verify;
-  void *chain_ctx;
+  vcs_zcode_dht_chain_verify_fn authority_verify;
+  void *authority_ctx;
 };
 
 /* Derive the Kademlia routing target for one logical record stream. `root`

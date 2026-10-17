@@ -23,6 +23,12 @@ bool boot_zcode_dht_chain_authorize(
  * mutex: it performs atomic generation reads plus a sorted cache lookup only. */
 bool boot_zcode_dht_chain_cached(void *ctx,
     const struct vcs_zcode_dht_delegation *delegation);
+/* Role wrappers over the cached check: count one invocation, then delegate. */
+bool boot_zcode_dht_chain_transport_cached(void *ctx,
+    const struct vcs_zcode_dht_delegation *delegation);
+bool boot_zcode_dht_chain_authority_cached(void *ctx,
+    const struct vcs_zcode_dht_delegation *delegation);
+void boot_zcode_dht_chain_note_check(bool authority);
 bool boot_zcode_dht_chain_epoch_current(void);
 
 void boot_zcode_dht_chain_dump_json(struct json_value *out);

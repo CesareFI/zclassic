@@ -133,8 +133,10 @@ struct vcs_zcode_dht_service_params {
   uint8_t local_noise_static[32];
   bool transport_enabled;
   struct vcs_zcode_dht_time now;
-  vcs_zcode_dht_chain_verify_fn chain_verify;
-  void *chain_ctx;
+  vcs_zcode_dht_chain_verify_fn transport_verify;
+  void *transport_ctx;
+  vcs_zcode_dht_chain_verify_fn authority_verify;
+  void *authority_ctx;
   vcs_zcode_dht_reachability_fn request_reachability;
   void *reachability_ctx;
   vcs_zcode_sovereignty_decide_fn policy_decide;
@@ -536,9 +538,13 @@ size_t vcs_zcode_dht_service_delegations_for_noise(
     const struct vcs_zcode_dht_service *service,
     const uint8_t noise_static[32],
     struct vcs_zcode_dht_delegation *out, size_t max);
-void vcs_zcode_dht_service_set_chain_verify(
+/* Install both trust roles. transport_verify gates peer session and contact
+ * authentication; authority_verify gates record authorship and the local
+ * identity. A NULL role skips that role's chain check. */
+void vcs_zcode_dht_service_set_verify_roles(
     struct vcs_zcode_dht_service *service,
-    vcs_zcode_dht_chain_verify_fn chain_verify, void *chain_ctx);
+    vcs_zcode_dht_chain_verify_fn transport_verify, void *transport_ctx,
+    vcs_zcode_dht_chain_verify_fn authority_verify, void *authority_ctx);
 
 struct vcs_zcode_dht_persistence_snapshot;
 struct vcs_zcode_dht_persistence_snapshot *

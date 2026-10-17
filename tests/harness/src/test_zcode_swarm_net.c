@@ -972,7 +972,8 @@ static struct vcs_zcode_dht_service *zwn_dht_service(
         .datadir = datadir,
         .transport_enabled = true,
         .now = {.wall_unix = 1000, .monotonic_s = 1000},
-        .chain_verify = zwn_dht_chain_ok,
+        .transport_verify = zwn_dht_chain_ok,
+        .authority_verify = zwn_dht_chain_ok,
         .policy_decide = zwn_dht_policy_allow,
     };
     memcpy(params.network_genesis, genesis, 32);
@@ -2901,7 +2902,7 @@ static int zwn_t_sovereign_source_build(const struct chain_params *params)
         memset(provider_verify.network_genesis, 0x71,
                sizeof(provider_verify.network_genesis));
         provider_verify.now_unix = 1011;
-        provider_verify.chain_verify = zwn_dht_chain_ok;
+        provider_verify.authority_verify = zwn_dht_chain_ok;
         uint8_t provider_progress_root[32];
         bool provider_progress_reused = true;
         ASSERT(vcs_devloop_publication_advance_provider(

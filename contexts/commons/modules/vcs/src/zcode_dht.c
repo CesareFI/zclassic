@@ -551,7 +551,7 @@ enum vcs_zcode_dht_error vcs_zcode_dht_contacts_serialize(
 enum vcs_zcode_dht_error vcs_zcode_dht_contacts_parse(
     const uint8_t *wire, size_t len, const uint8_t genesis[32],
     const uint8_t self[32], uint64_t now,
-    vcs_zcode_dht_chain_verify_fn chain_verify, void *chain_ctx,
+    vcs_zcode_dht_chain_verify_fn transport_verify, void *transport_ctx,
     struct vcs_zcode_dht_contact *out, uint32_t out_cap, uint32_t *count_out)
 {
     if (!wire || !genesis || !self || !count_out || (out_cap && !out))
@@ -586,7 +586,7 @@ enum vcs_zcode_dht_error vcs_zcode_dht_contacts_parse(
         if (de != VCS_ZCODE_DHT_DELEGATION_OK || seen < 0 ||
             vcs_zcode_dht_delegation_verify(&d, genesis, NULL, 0, NULL, now) !=
                 VCS_ZCODE_DHT_DELEGATION_OK ||
-            (chain_verify && !chain_verify(chain_ctx, &d)) ||
+            (transport_verify && !transport_verify(transport_ctx, &d)) ||
             !vcs_zcode_dht_contact_from_delegation(&out[i], &d, seen, failures) ||
             memcmp(out[i].node_id, node_id, 32) != 0)
             return de != VCS_ZCODE_DHT_DELEGATION_OK

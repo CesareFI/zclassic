@@ -409,8 +409,8 @@ enum vcs_zcode_dht_record_error vcs_zcode_dht_record_parse(
     return VCS_ZCODE_DHT_RECORD_DELEGATION;
   if (!record_signature_valid(&parsed, wire, unsigned_len))
     return VCS_ZCODE_DHT_RECORD_SIGNATURE;
-  if (verify->chain_verify &&
-      !verify->chain_verify(verify->chain_ctx, &parsed.delegation))
+  if (verify->authority_verify &&
+      !verify->authority_verify(verify->authority_ctx, &parsed.delegation))
     return VCS_ZCODE_DHT_RECORD_CHAIN;
   *out = parsed;
   return VCS_ZCODE_DHT_RECORD_OK;
@@ -453,8 +453,8 @@ enum vcs_zcode_dht_record_error vcs_zcode_dht_record_parse_persisted(
     return VCS_ZCODE_DHT_RECORD_DELEGATION;
   if (!record_signature_valid(&parsed, wire, unsigned_len))
     return VCS_ZCODE_DHT_RECORD_SIGNATURE;
-  if (verify->chain_verify &&
-      !verify->chain_verify(verify->chain_ctx, &parsed.delegation))
+  if (verify->authority_verify &&
+      !verify->authority_verify(verify->authority_ctx, &parsed.delegation))
     return VCS_ZCODE_DHT_RECORD_CHAIN;
   *expired_out = verify->now_unix >= parsed.expiry;
   *out = parsed;

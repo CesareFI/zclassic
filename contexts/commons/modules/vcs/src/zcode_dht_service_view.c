@@ -214,13 +214,16 @@ size_t vcs_zcode_dht_service_delegations_for_noise(
   return count;
 }
 
-void vcs_zcode_dht_service_set_chain_verify(
+void vcs_zcode_dht_service_set_verify_roles(
     struct vcs_zcode_dht_service *s,
-    vcs_zcode_dht_chain_verify_fn chain_verify, void *chain_ctx) {
+    vcs_zcode_dht_chain_verify_fn transport_verify, void *transport_ctx,
+    vcs_zcode_dht_chain_verify_fn authority_verify, void *authority_ctx) {
   if (!s)
     return;
-  s->chain_verify = chain_verify;
-  s->chain_ctx = chain_ctx;
+  s->transport_verify = transport_verify;
+  s->transport_ctx = transport_ctx;
+  s->authority_verify = authority_verify;
+  s->authority_ctx = authority_ctx;
 }
 
 bool vcs_zcode_dht_service_revalidate(struct vcs_zcode_dht_service *s,
@@ -231,7 +234,8 @@ bool vcs_zcode_dht_service_revalidate(struct vcs_zcode_dht_service *s,
                                       s->local_noise_static, 0, NULL,
                                       now.wall_unix) !=
           VCS_ZCODE_DHT_DELEGATION_OK ||
-      (s->chain_verify && !s->chain_verify(s->chain_ctx, &s->delegation))) {
+      (s->authority_verify &&
+       !s->authority_verify(s->authority_ctx, &s->delegation))) {
     s->enabled = false;
     (void)snprintf(s->disabled_reason, sizeof(s->disabled_reason),
                    "LOCAL_IDENTITY_REVOKED_OR_STALE");
@@ -253,7 +257,8 @@ bool vcs_zcode_dht_service_revalidate(struct vcs_zcode_dht_service *s,
           vcs_zcode_dht_delegation_verify(&d, s->genesis, NULL, 0, NULL,
                                           now.wall_unix) !=
               VCS_ZCODE_DHT_DELEGATION_OK ||
-          (s->chain_verify && !s->chain_verify(s->chain_ctx, &d)))
+          (s->transport_verify &&
+           !s->transport_verify(s->transport_ctx, &d)))
         memcpy(remove[n++], c->node_id, 32);
     }
   for (size_t i = 0; i < n; i++)
