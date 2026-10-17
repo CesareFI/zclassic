@@ -16,6 +16,7 @@
  */
 
 #include "fleetledger/fleet_ledger.h"
+#include "fleet_ledger_replay.h"
 
 #include "util/fleet_role_check.h"
 #include "base/hex.h"
@@ -128,6 +129,7 @@ struct zcl_fleet_ledger {
     size_t latest_subjects;
     uint32_t newest_day;
     uint64_t overflow;
+    struct history_collect *history;
 };
 
 /* ── paths and stream ids ────────────────────────────────────────────── */
@@ -538,6 +540,7 @@ static enum zcl_fleet_status chain_load(struct zcl_fleet_ledger *l,
 
     enum zcl_fleet_status status = ZCL_FLEET_OK;
     uint64_t total = zcl_chainlog_count(log);
+    fleet_replay_history_begin(l->history, box->id);
     uint8_t expect[ZCL_FLEET_HASH_BYTES] = { 0 };
     uint8_t buf[ZCL_FLEET_ROW_MAX_BYTES];
     for (uint64_t seq = 1; seq <= total; seq++) {
@@ -549,23 +552,14 @@ static enum zcl_fleet_status chain_load(struct zcl_fleet_ledger *l,
             break;
         }
         struct zcl_fleet_row row;
-        status = zcl_fleet_row_decode(buf, len, &row, NULL);
-        if (status == ZCL_FLEET_OK && row.seq != seq)
-            status = ZCL_FLEET_SEQUENCE;
-        if (status == ZCL_FLEET_OK &&
-            memcmp(row.box_id, box->id, ZCL_FLEET_ID_BYTES) != 0)
-            status = ZCL_FLEET_NOT_OWNER;
-        if (status == ZCL_FLEET_OK &&
-            memcmp(row.prev_hash, expect, ZCL_FLEET_HASH_BYTES) != 0)
-            status = ZCL_FLEET_CHAIN_BROKEN;
-        if (status == ZCL_FLEET_OK)
-            status = zcl_fleet_row_verify(&row);
+        status = fleet_replay_verify_row(buf, len, seq, box->id, expect, &row);
         if (status != ZCL_FLEET_OK) {
             report->first_bad_seq = seq;
             memcpy(report->bad_box, box->id, ZCL_FLEET_ID_BYTES);
             break;
         }
         zcl_fleet_row_hash(buf, len, expect);
+        fleet_replay_history_row(l->history, &row, expect);
         bool cellular = false;
         index_row(l, box_index(l, box), &row, &cellular);
         index_experiment(l, &row);
@@ -669,7 +663,8 @@ static struct zcl_fleet_ledger *ledger_allocate(struct zcl_fleet_report *report)
 static struct zcl_fleet_ledger *ledger_open(
     const char *dir, const uint8_t self_box_id[ZCL_FLEET_ID_BYTES],
     const uint8_t self_signer[ZCL_FLEET_ID_BYTES],
-    struct zcl_fleet_report *report, bool read_only)
+    struct zcl_fleet_report *report, bool read_only,
+    struct history_collect *history)
 {
     if (!report) return NULL;
     memset(report, 0, sizeof(*report));
@@ -687,6 +682,7 @@ static struct zcl_fleet_ledger *ledger_open(
         return NULL;
     }
     l->read_only = read_only;
+    l->history = history;
     if (!ledger_directory(l->dir, read_only)) {
         report->status = ZCL_FLEET_IO;
         zcl_fleet_ledger_close(l);
@@ -725,14 +721,21 @@ struct zcl_fleet_ledger *zcl_fleet_ledger_open(
     const char *dir, const uint8_t self_box_id[ZCL_FLEET_ID_BYTES],
     const uint8_t self_signer[ZCL_FLEET_ID_BYTES], struct zcl_fleet_report *report)
 {
-    return ledger_open(dir, self_box_id, self_signer, report, false);
+    return ledger_open(dir, self_box_id, self_signer, report, false, NULL);
 }
 
 struct zcl_fleet_ledger *zcl_fleet_ledger_open_readonly(
     const char *dir, const uint8_t self_box_id[ZCL_FLEET_ID_BYTES],
     const uint8_t self_signer[ZCL_FLEET_ID_BYTES], struct zcl_fleet_report *report)
 {
-    return ledger_open(dir, self_box_id, self_signer, report, true);
+    return ledger_open(dir, self_box_id, self_signer, report, true, NULL);
+}
+
+struct zcl_fleet_ledger *fleet_replay_open_readonly(
+    const char *dir, const uint8_t *self_box, const uint8_t *self_signer,
+    struct zcl_fleet_report *report, struct history_collect *history)
+{
+    return ledger_open(dir, self_box, self_signer, report, true, history);
 }
 
 void zcl_fleet_ledger_close(struct zcl_fleet_ledger *ledger)

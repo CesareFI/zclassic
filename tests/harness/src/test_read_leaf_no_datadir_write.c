@@ -159,6 +159,8 @@ static const struct rlw_leaf g_rlw_leaves[] = {
 /* z23-toolgen:begin datadir-leaves - generated, do not edit */
     { "fleet.nodes.table",      zcl_native_handle_fleet_nodes_table,
       NULL, NULL,               NULL, NULL, NULL },
+    { "fleet.vitals.history",   zcl_native_handle_fleet_vitals_history,
+      NULL, NULL,               NULL, NULL, NULL },
 /* z23-toolgen:end datadir-leaves */
     /* app.store.products opens through
      * zcl_native_node_db_require_readonly(); core.sync.frontier.offline

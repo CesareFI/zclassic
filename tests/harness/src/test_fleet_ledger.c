@@ -395,6 +395,17 @@ static void fl_sample(struct json_value *input, struct zcl_command_reply *reply)
     zcl_native_handle_fleet_vitals_sample(&request, reply);
 }
 
+/* Page-state predicates are shared by readonly and corruption witnesses. */
+static bool fl_history_page_empty(const struct zcl_fleet_vitals_history *page)
+{
+    return !page->found && page->count == 0;
+}
+
+static bool fl_history_page_unpublished(const struct zcl_fleet_vitals_history *page)
+{
+    return fl_history_page_empty(page) && page->snapshot_head == 0;
+}
+
 #if !defined(_WIN32)
 static int64_t fl_export_monotonic_ns(void *self)
 {
@@ -694,6 +705,11 @@ static int test_fleet_ledger_observation(void)
     (void)snprintf(peer, sizeof(peer), "%s/peer", dir);
     (void)snprintf(self, sizeof(self), "%s/self.chainlog", dir);
     TEST("fleet ledger: readonly open preserves absence, modes and torn evidence") {
+        struct zcl_fleet_vitals_history page;
+        ASSERT_EQ(zcl_fleet_ledger_vitals_history_readonly(dir, id, signer,
+            id, -1, 0, 1, &page, &report), ZCL_FLEET_IO);
+        ASSERT(fl_history_page_empty(&page));
+        ASSERT(lstat(dir, &info) != 0);
         ledger = zcl_fleet_ledger_open_readonly(dir, id, signer, &report);
         ASSERT(!ledger);
         ASSERT(lstat(dir, &info) != 0);
@@ -739,6 +755,9 @@ static int test_fleet_ledger_observation(void)
         struct stat before = info;
         ledger = zcl_fleet_ledger_open_readonly(dir, id, signer, &report);
         ASSERT(!ledger && report.status == ZCL_FLEET_IO);
+        ASSERT_EQ(zcl_fleet_ledger_vitals_history_readonly(dir, id, signer,
+            id, -1, 0, 1, &page, &report), ZCL_FLEET_IO);
+        ASSERT(fl_history_page_empty(&page));
         ASSERT(stat(self, &info) == 0 && info.st_size == before.st_size &&
             info.st_mtime == before.st_mtime && info.st_mode == before.st_mode);
         ledger = zcl_fleet_ledger_open(dir, id, signer, &report);
@@ -750,6 +769,145 @@ static int test_fleet_ledger_observation(void)
     return failures;
 }
 #endif
+
+static bool fl_replay_routes(void)
+{
+    static const char *const paths[] = {
+        "engine/modules/fleetledger/src/fleet_ledger_replay.c",
+        "engine/modules/fleetledger/src/fleet_ledger_replay.h"
+    };
+    for (size_t p = 0; p < sizeof paths / sizeof paths[0]; p++) {
+        struct agent_impact_acc impact = {0};
+        if (!agent_impact_apply_shared_rules(paths[p], &impact) || impact.groups_lost)
+            return false;
+        bool ledger = false, lint = false;
+        for (size_t i = 0; i < impact.groups_len; i++) {
+            ledger |= strcmp(impact.groups[i], "fleet_ledger") == 0;
+            lint |= strcmp(impact.groups[i], "make_lint_gates") == 0;
+        }
+        if (!ledger || !lint) return false;
+    }
+    return true;
+}
+
+static int fl_history_cases(const char *root)
+{
+    int failures = 0;
+    struct fl_box b = {0};
+    TEST("fleet history pages scan gaps, distinguish absent/zero and retain head") {
+        ASSERT(fl_replay_routes());
+        ASSERT(fl_box_open(&b, root, "history", 0x73));
+        uint16_t subject = 0;
+        ASSERT(zcl_fleet_subject_from_name(ZCL_FLEET_KIND_VITALS,
+                                           "box.load1", &subject));
+        ASSERT_EQ(fl_add_vital(&b, "box.load1", 0), ZCL_FLEET_OK);
+        ASSERT_EQ(zcl_fleet_ledger_append(b.ledger, ZCL_FLEET_KIND_VITALS,
+            subject, NULL, 0, NULL, NULL, b.seed, NULL), ZCL_FLEET_OK);
+        for (size_t i = 0; i < 65; i++)
+            ASSERT_EQ(fl_add_vital(&b, "spend.tokens_in", 1), ZCL_FLEET_OK);
+#if !defined(_WIN32)
+        ASSERT_EQ(fl_latest_at(&b, 1700000000, 8), ZCL_FLEET_OK);
+#else
+        ASSERT_EQ(fl_add_vital(&b, "box.load1", 8), ZCL_FLEET_OK);
+#endif
+        struct zcl_fleet_report report;
+        struct zcl_fleet_vitals_history page;
+        ASSERT_EQ(zcl_fleet_ledger_vitals_history_readonly(b.dir, b.box_id,
+            b.signer, b.box_id, subject, 0, 1, &page, &report), ZCL_FLEET_OK);
+        ASSERT(page.found && page.more);
+        ASSERT_EQ(page.count, (size_t)1);
+        ASSERT_EQ(page.rows[0].pair[0].value, INT64_C(0));
+        ASSERT_EQ(page.next_seq, UINT64_C(1));
+        ASSERT_EQ(page.snapshot_head, UINT64_C(68));
+        uint8_t head[32];
+        memcpy(head, page.snapshot_hash, sizeof head);
+        ASSERT_EQ(zcl_fleet_ledger_vitals_history_readonly(b.dir, b.box_id,
+            b.signer, b.box_id, subject, 1, 64, &page, &report), ZCL_FLEET_OK);
+        ASSERT_EQ(page.count, (size_t)1);
+        ASSERT_EQ(page.rows[0].pair_count, 0);
+        ASSERT_EQ(page.next_seq, UINT64_C(65));
+        ASSERT(page.more);
+        ASSERT_EQ(zcl_fleet_ledger_vitals_history_readonly(b.dir, b.box_id,
+            b.signer, b.box_id, subject, 65, 64, &page, &report), ZCL_FLEET_OK);
+        ASSERT_EQ(page.count, (size_t)1);
+        ASSERT_EQ(page.rows[0].seq, UINT64_C(68));
+#if !defined(_WIN32)
+        ASSERT_EQ(page.rows[0].ts_unix, INT64_C(1700000000));
+#endif
+        ASSERT_EQ(page.next_seq, UINT64_C(68));
+        ASSERT(!page.more);
+        ASSERT(memcmp(head, page.snapshot_hash, sizeof head) == 0);
+        PASS();
+    }
+    TEST("fleet history refuses overflowing cursors and preserves missing box") {
+        struct zcl_fleet_report report;
+        struct zcl_fleet_vitals_history page;
+        uint8_t unknown[32] = {0x99};
+        ASSERT_EQ(zcl_fleet_ledger_vitals_history_readonly(b.dir, b.box_id,
+            b.signer, unknown, -1, 0, 64, &page, &report), ZCL_FLEET_OK);
+        ASSERT(!page.found && !page.more && page.count == 0);
+        ASSERT_EQ(zcl_fleet_ledger_vitals_history_readonly(b.dir, b.box_id,
+            b.signer, b.box_id, -1, 100, 64, &page, &report), ZCL_FLEET_OK);
+        ASSERT(page.found && !page.more && page.count == 0);
+        ASSERT_EQ(page.next_seq, UINT64_C(100));
+        ASSERT_EQ(page.snapshot_head, UINT64_C(68));
+        ASSERT_EQ(zcl_fleet_ledger_vitals_history_readonly(b.dir, b.box_id,
+            b.signer, b.box_id, -1, UINT64_MAX, 64, &page, &report),
+            ZCL_FLEET_ARGUMENT);
+        ASSERT(fl_history_page_empty(&page));
+        PASS();
+    }
+_test_next:
+    fl_box_close(&b);
+    return failures;
+}
+
+static int fl_history_late_failure(const char *root)
+{
+    int failures = 0;
+    struct fl_box b = {0};
+    struct zcl_chainlog *log = NULL;
+    TEST("fleet history publishes nothing when a later signed row refuses") {
+        ASSERT(fl_box_open(&b, root, "history-late", 0x74));
+        ASSERT_EQ(fl_add_vital(&b, "box.load1", 7), ZCL_FLEET_OK);
+        struct zcl_fleet_report report;
+        struct zcl_fleet_vitals_history page;
+        ASSERT_EQ(zcl_fleet_ledger_vitals_history_readonly(b.dir, b.box_id,
+            b.signer, b.box_id, -1, 0, 1, &page, &report), ZCL_FLEET_OK);
+        struct zcl_fleet_row row = page.rows[0];
+        row.seq = 2;
+        memcpy(row.prev_hash, page.snapshot_hash, sizeof row.prev_hash);
+        ASSERT_EQ(zcl_fleet_row_sign(&row, b.seed), ZCL_FLEET_OK);
+        row.sig[0] ^= 1;
+        uint8_t encoded[ZCL_FLEET_ROW_MAX_BYTES], stream[32];
+        size_t n = zcl_fleet_row_encode(&row, encoded, sizeof encoded);
+        ASSERT(n > 0);
+        struct sha3_256_ctx ctx;
+        sha3_256_init(&ctx);
+        sha3_256_write(&ctx, (const unsigned char *)"zcl.fleet_ledger.chain.v1",
+                       sizeof("zcl.fleet_ledger.chain.v1"));
+        sha3_256_write(&ctx, b.box_id, sizeof b.box_id);
+        sha3_256_finalize(&ctx, stream);
+        char path[400];
+        ASSERT((size_t)snprintf(path, sizeof path, "%s/self.chainlog", b.dir)
+               < sizeof path);
+        struct zcl_chainlog_report lower;
+        log = zcl_chainlog_open(path, stream, &lower);
+        ASSERT(log);
+        ASSERT_EQ(zcl_chainlog_append(log, 1, encoded, n, NULL, NULL),
+                  ZCL_CHAINLOG_OK);
+        zcl_chainlog_close(log); log = NULL;
+        ASSERT_EQ(zcl_fleet_ledger_vitals_history_readonly(b.dir, b.box_id,
+            b.signer, b.box_id, -1, 0, 1, &page, &report), ZCL_FLEET_SIG_INVALID);
+        ASSERT_EQ(report.first_bad_seq, UINT64_C(2));
+        ASSERT(fl_history_page_unpublished(&page));
+        PASS();
+    }
+_test_next:
+    zcl_chainlog_close(log);
+    fl_box_close(&b);
+    return failures;
+}
 
 static int fl_latest_cases(const char *root)
 {
@@ -973,6 +1131,8 @@ int test_fleet_ledger(void)
     }
 
     failures += fl_latest_cases(root);
+    failures += fl_history_cases(root);
+    failures += fl_history_late_failure(root);
 
     TEST("fleet ledger: refused appends clear the sequence output") {
         uint64_t seq = 77;
@@ -1619,6 +1779,10 @@ int test_fleet_ledger(void)
         /* Refused, named, and NOT repaired: an altered chain is evidence,
          * so it is neither skipped nor rewritten. */
         ASSERT(refused == NULL);
+        struct zcl_fleet_vitals_history page;
+        ASSERT(zcl_fleet_ledger_vitals_history_readonly(ta.dir, ta.box_id,
+            ta.signer, ta.box_id, -1, 0, 1, &page, &report) != ZCL_FLEET_OK);
+        ASSERT(fl_history_page_unpublished(&page));
         ASSERT(report.status == ZCL_FLEET_CHAIN_BROKEN ||
                report.status == ZCL_FLEET_SIG_INVALID ||
                report.status == ZCL_FLEET_MALFORMED);

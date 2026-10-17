@@ -1339,6 +1339,8 @@ REMOTE_COMMAND_CLASS("zcode.release.artifact.admit", REMOTE_CLASS_NEVER, "")
 /* z23-toolgen:begin remote-classes - generated, do not edit */
 /* fleet.nodes.table: readonly-local-v1 fixes this leaf to never remote. */
 REMOTE_COMMAND_CLASS("fleet.nodes.table", REMOTE_CLASS_NEVER, "")
+/* fleet.vitals.history: readonly-local-v1 fixes this leaf to never remote. */
+REMOTE_COMMAND_CLASS("fleet.vitals.history", REMOTE_CLASS_NEVER, "")
 /* fleet.vitals.read: readonly-local-v1 fixes this leaf to never remote. */
 REMOTE_COMMAND_CLASS("fleet.vitals.read", REMOTE_CLASS_NEVER, "")
 /* fleet.vitals.table: readonly-local-v1 fixes this leaf to never remote. */

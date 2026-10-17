@@ -835,6 +835,26 @@ ZCL_COMMAND_READY_READ(
     ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_nodes_table)
 
 ZCL_COMMAND_READY_READ(
+    "fleet.vitals.history", "fleet.vitals", "",
+    "Read a verified sequence page of recorded vitals",
+    "Reads one box's recorded VITALS in ascending sequence order, not "
+    "clock order. The page scans at most 64 sequence positions; verifying "
+    "the entire local ledger is not bounded by 64. No key, row, directory "
+    "or service is created. Signature and chain verification do not "
+    "establish delegated identity or current pairing authority. Missing "
+    "measurements are null, not zero.",
+    65536,
+    "fleet,vitals,history",
+    "zcl.fleet_vitals_history.input.v1", "zcl.fleet_vitals_history.v1",
+    "box,metric,after_seq,limit,datadir", "",
+    "z23 fleet vitals history --box=<64-lowercase-hex>",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FOREGROUND,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_vitals_history)
+
+ZCL_COMMAND_READY_READ(
     "fleet.vitals.read", "fleet.vitals", "",
     "Measure this box now: load, memory, disk and uptime",
     "Measures this machine once through the same platform seam that "

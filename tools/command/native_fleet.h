@@ -275,6 +275,11 @@ void zcl_native_handle_fleet_nodes_table(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);
 
+/* fleet.vitals.history (tools/command/native_fleet_vitals_history.c) */
+void zcl_native_handle_fleet_vitals_history(
+    const struct zcl_command_request *request,
+    struct zcl_command_reply *reply);
+
 /* fleet.vitals.read (tools/command/native_fleet_vitals_read.c) */
 void zcl_native_handle_fleet_vitals_read(
     const struct zcl_command_request *request,

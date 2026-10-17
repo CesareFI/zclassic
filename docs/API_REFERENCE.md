@@ -74,11 +74,11 @@ z23 discover schema <path> --side=input|output
 
 | Catalog fact | Count |
 |---|---|
-| Registry entries (branches + leaves) | 962 |
+| Registry entries (branches + leaves) | 963 |
 | Top-level roots | 15 |
 | Branches | 209 |
-| Leaves (dispatchable command paths) | 753 |
-| … `ready` (live handler in this build) | 660 |
+| Leaves (dispatchable command paths) | 754 |
+| … `ready` (live handler in this build) | 661 |
 | … `compat` (metadata only, names a fallback) | 63 |
 | … `planned` (fail-closed BLOCKED, exit 3) | 30 |
 | … dev-gated 🔧 (`ready` only in `z23-dev`) | 62 |
@@ -109,7 +109,7 @@ Per source file:
 | `engine/composition/commands/story.def` | 5 | 1 | 4 |
 | `engine/composition/commands/fleet_board.def` | 12 | 3 | 9 |
 | `engine/composition/commands/mind.def` | 4 | 1 | 3 |
-| `engine/composition/commands/fleet.def` | 41 | 9 | 32 |
+| `engine/composition/commands/fleet.def` | 42 | 9 | 33 |
 | `engine/composition/commands/fleet_agents.def` | 1 | 0 | 1 |
 | `engine/composition/commands/fleet_enrol.def` | 6 | 0 | 6 |
 | `engine/composition/commands/telemetry/root.def` | 6 | 2 | 4 |
@@ -1913,6 +1913,7 @@ represented by its children's sections.
 | Command | Avail | Policy | Input keys (**required**) | Output schema | Example | Summary |
 |---|---|---|---|---|---|---|
 | `fleet vitals sample` | ready | mutate / dev-mutation / operator · fast/low | `id` | `zcl.fleet_vitals_sample.v1` | `z23 fleet vitals sample` | Measure this box and append one signed vitals row per catalog metric |
+| `fleet vitals history` | ready | read / read / operator · foreground/low | `box`, `metric`, `after_seq`, `limit`, `datadir` | `zcl.fleet_vitals_history.v1` | `z23 fleet vitals history --box=<64-lowercase-hex>` | Read a verified sequence page of recorded vitals |
 | `fleet vitals read` | ready | read / read / operator · instant/tiny | none | `zcl.fleet_vitals_read.v1` | `z23 fleet vitals read` | Measure this box now: load, memory, disk and uptime |
 | `fleet vitals table` | ready | read / read / operator · foreground/low | `machines`, `deadline_ms` | `zcl.fleet_vitals_table.v1` | `z23 fleet vitals table` | One table of every named machine's load, memory and disk |
 

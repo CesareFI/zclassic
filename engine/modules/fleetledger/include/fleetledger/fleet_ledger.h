@@ -495,6 +495,33 @@ struct zcl_fleet_ledger *zcl_fleet_ledger_open_readonly(
 
 void zcl_fleet_ledger_close(struct zcl_fleet_ledger *ledger);
 
+/* A page is assembled during verified readonly replay, published only after
+ * ALL chains verify. The full replay IO is NOT bounded by the page's 64
+ * scanned sequence positions. Rows ascend by sequence, not wall clock.
+ * subject=-1 selects all VITALS; limit is 1..64. next_seq advances over
+ * filtered rows too; more refers to unscanned positions at snapshot_head.
+ * An absent box is found=false, distinct from an IO/corrupt-ledger refusal.
+ * Raw rows retain absent VALUE versus zero, signer and timestamp. Signature
+ * and chain verification do NOT evaluate delegation, pairing or freshness.
+ * Callers calculate staleness from their own clock and the metric cadence.
+ * self identity arguments have the same meaning as open_readonly; no seed
+ * is read. A cursor beyond the head returns an empty page, preserves that
+ * cursor and reports more=false (it does not certify a prior prefix).
+ * On any failure page is zeroed. UINT64_MAX cursors are refused. */
+struct zcl_fleet_vitals_history {
+    bool found;
+    bool more;
+    size_t count;
+    uint64_t next_seq;
+    uint64_t snapshot_head;
+    uint8_t snapshot_hash[ZCL_FLEET_HASH_BYTES];
+    struct zcl_fleet_row rows[ZCL_FLEET_BATCH_MAX];
+};
+enum zcl_fleet_status zcl_fleet_ledger_vitals_history_readonly(
+    const char *dir, const uint8_t *self_box, const uint8_t *self_signer,
+    const uint8_t *box, int subject, uint64_t after_seq, size_t limit,
+    struct zcl_fleet_vitals_history *page, struct zcl_fleet_report *report);
+
 /* Append one row to this box's own chain, signed with `seed`. Re-reads the
  * chain's tail under the chainlog's exclusive lock before composing the
  * row, so two processes appending at once produce two dense rows rather

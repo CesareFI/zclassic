@@ -1703,6 +1703,7 @@ ZCL_TEST_GROUP(mesh_guest_chan)
 ZCL_TEST_GROUP(fleet_nodes_table)
 ZCL_TEST_GROUP(fleet_vitals_read)
 ZCL_TEST_GROUP(fleet_vitals_table)
+ZCL_TEST_GROUP(fleet_vitals_history)
 /* z23-toolgen:end test-groups */
 ZCL_TEST_GROUP(toolgen)
 ZCL_TEST_GROUP(zssh)

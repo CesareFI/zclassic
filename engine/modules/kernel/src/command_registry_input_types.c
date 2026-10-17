@@ -586,12 +586,26 @@ static const struct cr_int_bound *cr_device_host_bound(const char *path,
 }
 /* A descriptor owns both discovery and validation for these leaf-scoped
  * integers. Unrelated leaves retain the ordinary string default. */
+static const struct cr_int_bound *cr_history_bound(const char *path,
+                                                   const char *key)
+{
+    if (strcmp(path, "fleet.vitals.history") != 0) return NULL;
+    static const struct cr_int_bound bounds[] = {
+        { "after_seq", 0, INT64_MAX }, { "limit", 1, 64 }
+    };
+    for (size_t i = 0; i < sizeof bounds / sizeof bounds[0]; i++)
+        if (strcmp(key, bounds[i].key) == 0) return &bounds[i];
+    return NULL;
+}
+
 static const struct cr_int_bound *cr_leaf_int_bound(const char *path,
                                                    const char *key)
 {
     static const struct cr_int_bound examples = { "example_limit", 0, 32 };
     if (strcmp(path, "core.consensus.utxo.compare.offline") == 0 &&
         strcmp(key, examples.key) == 0) return &examples;
+    const struct cr_int_bound *history = cr_history_bound(path, key);
+    if (history) return history;
     const struct cr_int_bound *bound = cr_device_host_bound(path, key);
     return bound ? bound : cr_device_package_bound(path, key);
 }
