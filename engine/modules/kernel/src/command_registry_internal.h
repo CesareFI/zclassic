@@ -107,6 +107,10 @@ size_t command_registry_serialize_reply(
     size_t budget_bytes, bool agent_session_presented,
     const struct agent_spend_policy_decision *policy, char *out,
     size_t out_size);
+bool command_registry_success_data_budget(
+    const struct zcl_command_spec *spec, bool invoked_by_alias,
+    size_t budget_bytes, bool agent_session_presented,
+    const struct agent_spend_policy_decision *policy, size_t *usable);
 
 /* ── command_registry_replace.c ────────────────────────────────────────
  * Pre-publish checks for zcl_command_registry_replace_batch(). */

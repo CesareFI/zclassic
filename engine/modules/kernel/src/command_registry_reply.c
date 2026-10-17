@@ -307,6 +307,62 @@ static bool serialize_body(struct json_value *root,
            command_registry_push_next_array(root, reply, registry, spec);
 }
 
+/* Same serializer owners as the final envelope, with empty data and no next.
+ * INT64_MAX reserves every possible elapsed integer width. Its true budget
+ * flag is one byte shorter than false, so retain one extra byte as well. */
+bool command_registry_success_data_budget(
+    const struct zcl_command_spec *spec, bool invoked_by_alias,
+    size_t budget_bytes, bool agent_session_presented,
+    const struct agent_spend_policy_decision *policy, size_t *usable)
+{
+    *usable = 0;
+    struct zcl_command_reply reply;
+    zcl_command_reply_init(&reply, spec->output_schema);
+    struct json_value root;
+    json_init(&root);
+    json_set_object(&root);
+    bool ok = serialize_envelope(&root, spec, &reply,
+        "local-ffffffffffffffff", INT64_MAX, true) &&
+        serialize_authority(&root, agent_session_presented, policy) &&
+        serialize_body(&root, NULL, spec, &reply, true, invoked_by_alias);
+    if (ok) {
+        size_t cap = spec->budget_bytes > 0
+            ? (size_t)spec->budget_bytes : ZCL_COMMAND_RESULT_BUDGET;
+        if (budget_bytes > 0 && budget_bytes < cap) cap = budget_bytes;
+        /* Empty data contributes two bytes; replace those with the caller's
+         * complete data value, keeping one byte for the boolean width. */
+        size_t overhead = json_write(&root, NULL, 0) - 2 + 1;
+        if (overhead < cap) *usable = cap - overhead;
+    }
+    json_free(&root);
+    zcl_command_reply_free(&reply);
+    return ok;
+}
+
+#ifdef ZCL_TESTING
+bool zcl_command_registry_test_success_budget(
+    const struct zcl_command_spec *spec, struct zcl_command_reply *reply,
+    const struct zcl_command_budget_fixture *fixture, size_t *usable,
+    char *wire, size_t wire_size, size_t *wire_bytes)
+{
+    struct agent_spend_policy_decision policy = {.allowed = true,
+        .debited_zat = fixture->debited_zat,
+        .window_remaining_zat = fixture->remaining_zat};
+    *wire_bytes = 0;
+    const char *evidence = fixture->authority_evidence ? fixture->authority_evidence : "";
+    int n = snprintf(policy.evidence, sizeof(policy.evidence), "%s", evidence);
+    if (n < 0 || (size_t)n >= sizeof(policy.evidence))
+        return false;
+    if (!command_registry_success_data_budget(spec, fixture->alias,
+            fixture->budget_bytes, fixture->presented, &policy, usable))
+        return false;
+    *wire_bytes = command_registry_serialize_reply(NULL, spec, reply,
+        fixture->alias, UINT64_MAX, fixture->elapsed_us, fixture->budget_bytes,
+        fixture->presented, &policy, wire, wire_size);
+    return true;
+}
+#endif
+
 size_t command_registry_serialize_reply(
     const struct zcl_command_registry *registry,
     const struct zcl_command_spec *spec, struct zcl_command_reply *reply,

@@ -693,30 +693,64 @@ static size_t fb_wiki_response_cap(const struct zcl_command_request *request)
 
 /* A truncated slug read names the exact chunk route that resumes it. The
  * registry refuses a self-referential next entry, so the hint is data. */
+static bool fb_wiki_read_hint(const char *id, int64_t offset,
+                              struct json_value *cont)
+{
+    struct json_value input;
+    json_init(cont);
+    json_init(&input);
+    json_set_object(cont);
+    json_set_object(&input);
+    bool ok = json_push_kv_str(&input, "id", id) &&
+        json_push_kv_int(&input, "offset", offset) &&
+        json_push_kv_int(&input, "bytes", 1024) &&
+        json_push_kv_str(cont, "command", "fleet.wiki.read") &&
+        json_push_kv(cont, "input", &input);
+    json_free(&input);
+    return ok;
+}
+
 static void fb_wiki_read_next(struct zcl_command_reply *reply)
 {
     const struct json_value *t = json_get(&reply->data, "truncated");
     if (!t || !json_get_bool(t))
         return;
-    struct json_value cont, input;
-    json_init(&cont);
-    json_init(&input);
-    json_set_object(&cont);
-    json_set_object(&input);
-    bool ok = json_push_kv_str(&input, "id",
-                  json_get_str(json_get(&reply->data, "id"))) &&
-        json_push_kv_int(&input, "offset",
-                  json_get_int(json_get(&reply->data, "next_offset"))) &&
-        json_push_kv_int(&input, "bytes", 1024) &&
-        json_push_kv_str(&cont, "command", "fleet.wiki.read") &&
-        json_push_kv(&cont, "input", &input) &&
+    struct json_value cont;
+    bool ok = fb_wiki_read_hint(json_get_str(json_get(&reply->data, "id")),
+        json_get_int(json_get(&reply->data, "next_offset")), &cont) &&
         json_push_kv(&reply->data, "continue", &cont);
-    json_free(&input);
     json_free(&cont);
     if (!ok)
         fb_fail(reply, ZCL_COMMAND_STATUS_FAILED, ZCL_COMMAND_EXIT_FAILED,
             "BOARD_PROJECTION_FAILED", "execute", false,
             "cannot faithfully build the continuation hint", "fleet.board");
+}
+
+/* Measure the actual continuation representation at the largest allowed
+ * byte offset. Full replies need none of this reservation. */
+static bool fb_wiki_read_allowance(const struct zcl_command_request *request,
+                                   struct json_value *out)
+{
+    /* Direct-handler callers have no registry envelope observation. Preserve
+     * their existing conservative RPC reservation rather than invent one. */
+    if (!request->success_data_budget_provided)
+        return true;
+    if (!request->success_data_budget)
+        return false;
+    static const char id[] =
+        "0000000000000000000000000000000000000000000000000000000000000000";
+    struct json_value cont, extra;
+    json_init(&extra); json_set_object(&extra);
+    bool ok = fb_wiki_read_hint(id, 16384, &cont) &&
+        json_push_kv(&extra, "continue", &cont);
+    /* Replacing the enclosing {} by a field in nonempty data adds a comma:
+     * subtract one byte, not two. Escaping is measured by json_write. */
+    if (ok) ok = json_push_kv_int(out, "data_budget",
+                     (int64_t)request->success_data_budget) &&
+        json_push_kv_int(out, "continuation_bytes", (int64_t)json_write(&extra, NULL, 0) - 1);
+    json_free(&cont);
+    json_free(&extra);
+    return ok;
 }
 
 static bool fb_wiki_chunk_request(const struct zcl_command_request *request,
@@ -769,7 +803,8 @@ void zcl_native_handle_fleet_wiki_read(
             return;
         }
         prepared = prepared && json_push_kv_str(&out, "slug", slug) &&
-            json_push_kv_int(&out, "response_budget", (int64_t)fb_wiki_response_cap(request));
+            json_push_kv_int(&out, "response_budget", (int64_t)fb_wiki_response_cap(request)) &&
+            fb_wiki_read_allowance(request, &out);
     }
     if (!prepared) {
         fb_fail(reply, ZCL_COMMAND_STATUS_FAILED, ZCL_COMMAND_EXIT_FAILED,

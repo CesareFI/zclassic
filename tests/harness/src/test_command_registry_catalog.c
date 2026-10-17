@@ -5618,6 +5618,167 @@ static int test_ops_statecatalog_page_bounds(void)
     return failures;
 }
 
+static bool data_budget_called, data_budget_seen;
+static size_t data_budget_value;
+
+static void data_budget_handler(const struct zcl_command_request *request,
+                                 struct zcl_command_reply *reply)
+{
+    data_budget_called = true;
+    data_budget_seen = request->success_data_budget_provided;
+    data_budget_value = request->success_data_budget;
+    /* {"fill":""} is eleven bytes, including its empty string. */
+    if (!data_budget_seen || data_budget_value < 11 || data_budget_value > 8192) {
+        zcl_command_reply_fail(reply, ZCL_COMMAND_STATUS_FAILED,
+            ZCL_COMMAND_EXIT_FAILED, "NO_DATA_ROOM", "prepare", false, false,
+            "no serialized data fits", "fixture.budget");
+        return;
+    }
+    char fill[8193];
+    memset(fill, 'x', data_budget_value - 11);
+    fill[data_budget_value - 11] = '\0';
+    if (!json_push_kv_str(&reply->data, "fill", fill))
+        zcl_command_reply_fail(reply, ZCL_COMMAND_STATUS_FAILED,
+            ZCL_COMMAND_EXIT_FAILED, "ALLOCATION_FAILED", "prepare", false, false,
+            "cannot construct the fixture data", "fixture.budget");
+}
+
+static bool data_budget_result(const struct json_value *envelope, size_t n,
+                                size_t cap, enum zcl_command_exit rc,
+                                bool fault)
+{
+    if (fault) {
+        const char *code = json_get_str(json_get(json_get(envelope, "error"), "code"));
+        return !data_budget_called && code && !strcmp(code, "RESPONSE_PROJECTION_FAILED");
+    }
+    if (cap == 256)
+        return data_budget_called && data_budget_seen && data_budget_value == 0 &&
+            n == 0 && rc == ZCL_COMMAND_EXIT_INTERNAL;
+    const struct json_value *data = json_get(envelope, "data");
+    return data_budget_called && data_budget_seen && rc == ZCL_COMMAND_EXIT_OK &&
+        json_write(data, NULL, 0) == data_budget_value && n > cap - 64;
+}
+
+static bool data_budget_case(const struct zcl_command_spec *base,
+                              size_t budget, bool alias, bool fault)
+{
+    struct zcl_command_spec spec = *base;
+    spec.path = "fixture.budget";
+    spec.output_schema = "zcl.fixture_\"budget.v1";
+    spec.input_schema = NULL;
+    spec.budget_bytes = 8192;
+    spec.handler = data_budget_handler;
+    struct zcl_command_registry registry = {.commands = &spec, .count = 1};
+    /* Error replies resolve their real discover.describe continuation. */
+    struct zcl_command_context context = {.registry = zcl_command_catalog(),
+        .granted_capabilities = ~(uint64_t)0, .authority_ceiling = ZCL_COMMAND_AUTH_OWNER};
+    struct json_value input, envelope;
+    json_init(&input); json_set_object(&input);
+    json_init(&envelope);
+    data_budget_called = data_budget_seen = false;
+    data_budget_value = 0;
+    size_t before = json_test_live_blocks();
+    if (fault) zcl_alloc_fault_fail_nth("json_set_str", 1);
+    char wire[8193];
+    enum zcl_command_exit rc;
+    size_t n = zcl_command_registry_execute_json(&registry, &spec, &context,
+        &input, alias, "budget-alias", "full", budget, 0, NULL, wire, sizeof(wire), &rc);
+    zcl_alloc_fault_clear();
+    bool ok = json_test_live_blocks() == before;
+    size_t cap = budget < 8192 ? budget : 8192;
+    ok = ok && n <= cap && (n == 0 || json_read(&envelope, wire, n));
+    ok = ok && data_budget_result(&envelope, n, cap, rc, fault);
+    if (!ok)
+        fprintf(stderr, "data budget case: cap=%zu alias=%d fault=%d bytes=%zu "
+            "exit=%d called=%d provided=%d usable=%zu live_before=%zu live_now=%zu\n",
+            cap, alias, fault, n, rc, data_budget_called, data_budget_seen,
+            data_budget_value, before, json_test_live_blocks());
+    json_free(&envelope);
+    json_free(&input);
+    return ok;
+}
+
+static bool data_budget_fill(struct zcl_command_reply *reply, size_t length)
+{
+    char fill[8193];
+    if (length >= sizeof(fill)) return false;
+    memset(fill, 'x', length); fill[length] = '\0';
+    json_free(&reply->data); json_init(&reply->data); json_set_object(&reply->data);
+    return json_push_kv_str(&reply->data, "fill", fill);
+}
+
+static bool data_budget_boundary(const struct zcl_command_spec *spec,
+    const struct zcl_command_budget_fixture *fixture, struct zcl_command_reply *reply,
+    size_t usable, size_t first_bytes)
+{
+    char wire[8193];
+    size_t cap = fixture->budget_bytes < 8192 ? fixture->budget_bytes : 8192;
+    size_t fill = usable - 11 + cap - first_bytes;
+    size_t observed = 0, allowance = 0;
+    bool ok = data_budget_fill(reply, fill) &&
+        zcl_command_registry_test_success_budget(spec, reply, fixture,
+            &allowance, wire, sizeof(wire), &observed) && observed == cap;
+    ok = ok && data_budget_fill(reply, fill + 1) &&
+        zcl_command_registry_test_success_budget(spec, reply, fixture,
+            &allowance, wire, sizeof(wire), &observed) && observed == 0;
+    return ok;
+}
+
+/* Synthetic policy evidence tests serialization, not policy authorization. */
+static bool data_budget_synthetic(const struct zcl_command_spec *base,
+                                   bool presented, bool alias, size_t cap)
+{
+    struct zcl_command_spec spec = *base;
+    spec.output_schema = "zcl.fixture_\"budget.v1";
+    spec.budget_bytes = 8192;
+    struct zcl_command_budget_fixture fixture = {.authority_evidence = "session:\"\\\n\303\251",
+        .debited_zat = INT64_MAX, .remaining_zat = INT64_MAX, .elapsed_us = INT64_MAX,
+        .budget_bytes = cap, .presented = presented, .alias = alias};
+    struct zcl_command_reply reply;
+    zcl_command_reply_init(&reply, spec.output_schema);
+    size_t usable = 0, n = 0;
+    char wire[8193];
+    bool ok = zcl_command_registry_test_success_budget(&spec, &reply, &fixture,
+        &usable, wire, sizeof(wire), &n) && usable > 11;
+    if (ok) ok = data_budget_fill(&reply, usable - 11) &&
+        zcl_command_registry_test_success_budget(&spec, &reply, &fixture,
+            &usable, wire, sizeof(wire), &n) && n > 0 && n <= cap;
+    struct json_value envelope;
+    json_init(&envelope);
+    if (ok) ok = json_read(&envelope, wire, n);
+    const char *session = json_get_str(json_get(json_get(&envelope, "authority"), "agent_session"));
+    const char *expected = presented ? fixture.authority_evidence : "none (local operator)";
+    ok = ok && session && !strcmp(session, expected) &&
+        json_get_int(json_get(&envelope, "elapsed_us")) == INT64_MAX &&
+        json_write(json_get(&envelope, "data"), NULL, 0) == usable;
+    if (ok) ok = data_budget_boundary(&spec, &fixture, &reply, usable, n);
+    json_free(&envelope);
+    zcl_command_reply_free(&reply);
+    return ok;
+}
+
+static int test_success_data_budget(void)
+{
+    int failures = 0;
+    TEST("registry: measured success-data allowance bounds aliases, escaped schema, "
+         "caller/spec caps, zero room and allocation refusal") {
+        const struct zcl_command_spec *base = find_spec(zcl_command_catalog(), "discover.help");
+        ASSERT(base);
+        const size_t caps[] = {8192, 4096, 256, 16384};
+        for (size_t i = 0; i < sizeof(caps) / sizeof(caps[0]); i++) {
+            ASSERT(data_budget_case(base, caps[i], false, false));
+            ASSERT(data_budget_case(base, caps[i], true, false));
+        }
+        ASSERT(data_budget_case(base, 8192, false, true));
+        ASSERT(data_budget_synthetic(base, false, false, 8192));
+        ASSERT(data_budget_synthetic(base, true, false, 8192));
+        ASSERT(data_budget_synthetic(base, true, true, 4096));
+        PASS();
+    } _test_next:;
+    zcl_alloc_fault_clear();
+    return failures;
+}
+
 int test_command_registry_catalog(void)
 {
     int failures = 0;
@@ -5712,6 +5873,7 @@ int test_command_registry_catalog(void)
     failures += test_blocker_basic_pages();
     failures += test_blocker_basic_refusals();
     failures += test_work_envelope_ceiling();
+    failures += test_success_data_budget();
     failures += test_typo_stays_branch();
     failures += test_ops_selftest_registry();
     failures += test_ops_dash_dashboards_ported();

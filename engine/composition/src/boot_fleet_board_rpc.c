@@ -719,8 +719,36 @@ static void fb_op_wiki_chunk(struct node_db *ndb, const struct json_value *in,
     fb_wiki_chunk_render(&row, start, (size_t)count, (size_t)cap, result);
 }
 
-/* Envelope allowance for the native bridge plus the continuation hint. */
+/* Legacy/direct callers cannot observe the native registry envelope. Keep
+ * their conservative allowance; registry callers supply measured limits. */
 #define FB_WIKI_READ_MARGIN 1536
+
+struct fb_wiki_read_limits { size_t full, partial; bool unbounded; };
+
+static bool fb_wiki_read_limits(const struct json_value *in,
+                                 struct fb_wiki_read_limits *out)
+{
+    int64_t cap = fb_int(in, "response_budget", 0);
+    const struct json_value *data = json_get(in, "data_budget");
+    if (!data) {
+        out->unbounded = cap <= 0;
+        out->full = cap > FB_WIKI_READ_MARGIN ? (size_t)cap - FB_WIKI_READ_MARGIN : 0;
+        out->partial = out->full;
+        return true;
+    }
+    const struct json_value *hint = json_get(in, "continuation_bytes");
+    if (data->type != JSON_INT || !hint || hint->type != JSON_INT)
+        return false;
+    int64_t room = json_get_int(data), extra = json_get_int(hint);
+    if (cap <= 0 || cap > 8192 || room < 0 || room > cap || extra < 0 || extra > room)
+        return false;
+    out->unbounded = false;
+    /* The RPC's ok field is retained in these sizing observations but omitted
+     * by the native bridge. This deliberately leaves small unused headroom. */
+    out->full = (size_t)room;
+    out->partial = (size_t)(room - extra);
+    return true;
+}
 
 /* Every temporary owns its copy; allocation failure is never a size result. */
 static bool fb_wiki_read_trial(const struct json_value *base, const char *text,
@@ -790,7 +818,8 @@ static bool fb_wiki_read_prefix(const struct db_fleet_board_post *row,
 /* Preserve the established full text plus parsed-entry representation when
  * it fits. Larger bodies use an explicitly partial raw-text projection. */
 static void fb_wiki_read_body(const struct db_fleet_board_post *row,
-                              int64_t cap, struct json_value *result)
+                              const struct fb_wiki_read_limits *limits,
+                              struct json_value *result)
 {
     struct json_value entry;
     json_init(&entry);
@@ -804,14 +833,12 @@ static void fb_wiki_read_body(const struct db_fleet_board_post *row,
     struct json_value trial;
     bool ok = fb_wiki_read_trial(result, row->post.text,
         parsed == FLEET_WIKI_PARSE_ENTRY ? &entry : NULL, false, 0, &trial);
-    size_t room = cap > FB_WIKI_READ_MARGIN
-        ? (size_t)cap - FB_WIKI_READ_MARGIN : 0;
-    if (ok && (cap <= 0 || json_write(&trial, NULL, 0) <= room)) {
+    if (ok && (limits->unbounded || json_write(&trial, NULL, 0) <= limits->full)) {
         json_free(result);
         *result = trial;
     } else {
         json_free(&trial);
-        if (ok) ok = fb_wiki_read_prefix(row, room, result);
+        if (ok) ok = fb_wiki_read_prefix(row, limits->partial, result);
     }
     json_free(&entry);
     if (!ok)
@@ -842,7 +869,12 @@ static void fb_op_wiki_read(struct node_db *ndb, const struct json_value *in,
         fb_error(result, "READ_PROJECTION_FAILED", "cannot faithfully construct page metadata");
         return;
     }
-    fb_wiki_read_body(&row, fb_int(in, "response_budget", 0), result);
+    struct fb_wiki_read_limits limits;
+    if (!fb_wiki_read_limits(in, &limits)) {
+        fb_error(result, "READ_BUDGET", "invalid response data or continuation allowance");
+        return;
+    }
+    fb_wiki_read_body(&row, &limits, result);
 }
 
 static void fb_op_wiki_list(struct node_db *ndb, struct json_value *result)

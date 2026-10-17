@@ -4532,8 +4532,36 @@ static bool fb_chunks_append(struct fb_rpc_env *e, const char *id,
     return true;
 }
 
-/* ok:true, id present, and either the full text or a truncated prefix whose
- * continuation hint resumes exactly where it stopped. */
+/* A partial slug body resumes exactly on its UTF-8 byte boundary. */
+static bool fb_slug_continuation(const struct json_value *d,
+                                  const char *text, const char *id)
+{
+    const char *got = json_get_str(json_get(d, "text"));
+    size_t n = strlen(got);
+    const struct json_value *hint = json_get(d, "continue");
+    const struct json_value *in = json_get(hint, "input");
+    const char *command = json_get_str(json_get(hint, "command"));
+    const char *hint_id = json_get_str(json_get(in, "id"));
+    return command && hint_id && n > 0 && n < strlen(text) && !memcmp(got, text, n) &&
+        ((uint8_t)text[n] & 0xC0) != 0x80 &&
+        json_get_int(json_get(d, "next_offset")) == (int64_t)n &&
+        !strcmp(command, "fleet.wiki.read") && !strcmp(hint_id, id) &&
+        json_get_int(json_get(in, "offset")) == (int64_t)n;
+}
+
+static bool fb_slug_reconstruct(struct fb_rpc_env *e, const struct json_value *d,
+                                 const char *text, const char *id)
+{
+    if (!fb_slug_continuation(d, text, id))
+        return false;
+    static char full[FLEET_BOARD_WIKI_TEXT_MAX + 1];
+    const char *got = json_get_str(json_get(d, "text"));
+    size_t n = strlen(got);
+    memcpy(full, got, n);
+    return fb_chunks_append(e, id, (int64_t)n, full, sizeof(full)) && !strcmp(full, text);
+}
+
+/* ok:true, exact revision identity and complete or reconstructible body. */
 static bool fb_slug_read_check(struct fb_rpc_env *e, const char *slug,
                                const char *text, const char *id, size_t budget)
 {
@@ -4543,32 +4571,14 @@ static bool fb_slug_read_check(struct fb_rpc_env *e, const char *slug,
         return false;
     }
     const struct json_value *d = json_get(&env, "data");
-    static char full[FLEET_BOARD_WIKI_TEXT_MAX + 1];
     const char *got = json_get_str(json_get(d, "text"));
     const char *got_id = json_get_str(json_get(d, "id"));
     bool ok = got && got_id && json_get_bool(json_get(&env, "ok")) &&
         !strcmp(got_id, id) &&
         json_get_int(json_get(d, "text_len")) == (int64_t)strlen(text);
-    if (ok && json_get_bool(json_get(d, "truncated"))) {
-        size_t n = strlen(got);
-        const struct json_value *hint = json_get(d, "continue");
-        const struct json_value *in = json_get(hint, "input");
-        const char *command = json_get_str(json_get(hint, "command"));
-        const char *hint_id = json_get_str(json_get(in, "id"));
-        ok = command && hint_id && n > 0 && n < strlen(text) && !memcmp(got, text, n) &&
-            ((uint8_t)text[n] & 0xC0) != 0x80 &&
-            json_get_int(json_get(d, "next_offset")) == (int64_t)n &&
-            !strcmp(command, "fleet.wiki.read") &&
-            !strcmp(hint_id, id) &&
-            json_get_int(json_get(in, "offset")) == (int64_t)n;
-        if (ok) {
-            memcpy(full, got, n);
-            ok = fb_chunks_append(e, id, (int64_t)n, full, sizeof(full)) &&
-                !strcmp(full, text);
-        }
-    } else if (ok) {
-        ok = !strcmp(got, text);
-    }
+    if (ok)
+        ok = json_get_bool(json_get(d, "truncated"))
+            ? fb_slug_reconstruct(e, d, text, id) : !strcmp(got, text);
     json_free(&env);
     return ok;
 }
@@ -4589,28 +4599,61 @@ static bool fb_slug_read_sizes(struct fb_rpc_env *e, int64_t now)
             return false;
         char id[65]; fleet_board_id_to_hex(row.post.id, id);
         if (!fb_slug_read_check(e, slug, text, id, 8192) ||
-            !fb_slug_read_check(e, slug, text, id, 4096))
+            !fb_slug_read_check(e, slug, text, id, 4096) ||
+            !fb_slug_read_check(e, slug, text, id, 2048))
             return false;
     }
     return true;
 }
 
 /* Full structured reads retain both established representations. */
-static bool fb_slug_structured_compat(struct fb_rpc_env *e, int64_t now)
+static bool fb_slug_full_fit_text(char *text, size_t cap)
 {
-    char text[512];
-    fb_entry_json(text, sizeof(text), "budget compatibility", FB_ONE_LESSON,
-                   "\"kernel\"");
-    if (!fb_test_ingest_page(&e->db, "budget-structured", text, 9, now))
+    /* The complete structured response fits 8192 bytes, although its RPC
+     * body exceeds 8192 - 1536. Preserve both representations at that edge. */
+    char rule[201], why[401], evidence[401], lesson[1100], lessons[3400];
+    memset(rule, 'r', sizeof(rule) - 1); rule[sizeof(rule) - 1] = '\0';
+    memset(why, 'w', sizeof(why) - 1); why[sizeof(why) - 1] = '\0';
+    memset(evidence, 'e', sizeof(evidence) - 1);
+    evidence[sizeof(evidence) - 1] = '\0';
+    int n = snprintf(lesson, sizeof(lesson),
+        "{\"rule\":\"%s\",\"why\":\"%s\",\"evidence\":\"%s\"}",
+        rule, why, evidence);
+    if (n < 0 || (size_t)n >= sizeof(lesson))
         return false;
+    n = snprintf(lessons, sizeof(lessons), "%s,%s,%s", lesson, lesson, lesson);
+    if (n < 0 || (size_t)n >= sizeof(lessons))
+        return false;
+    fb_entry_json(text, cap, "budget compatibility", lessons, "\"kernel\"");
+    return strlen(text) == 3255;
+}
+
+static bool fb_slug_structured_full(struct fb_rpc_env *e, const char *slug,
+                                    const char *text)
+{
     struct json_value env;
-    bool ok = fb_slug_envelope(e, "budget-structured", 8192, &env);
+    bool ok = fb_slug_envelope(e, slug, 8192, &env);
     const struct json_value *data = json_get(&env, "data");
     const char *raw = json_get_str(json_get(data, "text"));
     const struct json_value *entry = json_get(data, "entry");
-    ok = ok && raw && strcmp(raw, text) == 0 && entry && entry->type == JSON_OBJ;
+    ok = ok && raw && !strcmp(raw, text) && entry && entry->type == JSON_OBJ &&
+        !json_get_bool(json_get(data, "truncated")) && json_write(&env, NULL, 0) <= 8192;
     json_free(&env);
     return ok;
+}
+
+static bool fb_slug_structured_compat(struct fb_rpc_env *e, int64_t now)
+{
+    char text[4096];
+    fb_entry_json(text, sizeof(text), "budget compatibility", FB_ONE_LESSON,
+                   "\"kernel\"");
+    if (!fb_test_ingest_page(&e->db, "budget-structured", text, 9, now) ||
+        !fb_slug_structured_full(e, "budget-structured", text))
+        return false;
+    if (!fb_slug_full_fit_text(text, sizeof(text)) ||
+        !fb_test_ingest_page(&e->db, "budget-structured-full-fit", text, 10, now))
+        return false;
+    return fb_slug_structured_full(e, "budget-structured-full-fit", text);
 }
 
 /* Faults are armed at the RPC boundary, after request construction. */
@@ -4639,12 +4682,14 @@ static bool fb_slug_projection_fault(struct fb_rpc_env *e, const char *slug,
     return ok;
 }
 
-static bool fb_slug_prepare_fault(struct fb_rpc_env *e, const char *label, unsigned nth)
+static bool fb_slug_prepare_fault(struct fb_rpc_env *e, const char *label,
+                                   unsigned nth, bool allowance)
 {
     struct json_value input;
     json_init(&input); json_set_object(&input);
     (void)json_push_kv_str(&input, "slug", "big-page-6000");
-    struct zcl_command_request request = {.input = &input, .budget_bytes = 4096};
+    struct zcl_command_request request = {.input = &input, .budget_bytes = 4096,
+        .success_data_budget_provided = allowance, .success_data_budget = 3000};
     struct zcl_command_reply reply;
     zcl_command_reply_init(&reply, "zcl.fleet_wiki_read.v1");
     size_t before = json_test_live_blocks();
@@ -4666,8 +4711,9 @@ static bool fb_slug_prepare_fault(struct fb_rpc_env *e, const char *label, unsig
 
 static bool fb_slug_projection_checks(struct fb_rpc_env *e)
 {
-    if (!fb_slug_prepare_fault(e, "json_set_str", 2) ||
-        !fb_slug_prepare_fault(e, "json_push_kv_key", 3) ||
+    if (!fb_slug_prepare_fault(e, "json_set_str", 2, false) ||
+        !fb_slug_prepare_fault(e, "json_push_kv_key", 3, false) ||
+        !fb_slug_prepare_fault(e, "json_copy_children", 1, true) ||
         !fb_slug_projection_fault(e, "budget-structured", "json_string", 1)) return false;
     const char *labels[] = {"fleet_board.rpc.wiki_prefix", "json_copy_children",
         "json_copy_keys", "json_copy_key", "json_copy_str", "json_set_str"};
@@ -4684,6 +4730,60 @@ static bool fb_slug_projection_checks(struct fb_rpc_env *e)
     return true;
 }
 
+/* Older/direct callers have no measured registry envelope allowance. */
+static bool fb_slug_direct_fallback(struct fb_rpc_env *e, const char *slug,
+                                     bool partial)
+{
+    struct json_value input;
+    json_init(&input); json_set_object(&input);
+    bool ok = json_push_kv_str(&input, "slug", slug);
+    struct zcl_command_request request = {.input = &input, .budget_bytes = 4096};
+    struct zcl_command_reply reply;
+    zcl_command_reply_init(&reply, "zcl.fleet_wiki_read.v1");
+    fb_native_test_table = &e->table;
+    node_rpc_client_set_test_hook(fb_native_rpc);
+    if (ok) zcl_native_handle_fleet_wiki_read(&request, &reply);
+    node_rpc_client_set_test_hook(NULL); fb_native_test_table = NULL;
+    const char *text = json_get_str(json_get(&reply.data, "text"));
+    ok = ok && reply.status == ZCL_COMMAND_STATUS_PASSED && text && text[0] &&
+        json_get_bool(json_get(&reply.data, "truncated")) == partial &&
+        json_write(&reply.data, NULL, 0) <= 4096;
+    if (ok && !partial) {
+        const struct json_value *entry = json_get(&reply.data, "entry");
+        ok = entry && entry->type == JSON_OBJ;
+    }
+    zcl_command_reply_free(&reply); json_free(&input);
+    return ok;
+}
+
+static bool fb_slug_rpc_limits(struct fb_rpc_env *e)
+{
+    static const char *const cases[] = {
+        "\"data_budget\":\"bad\",\"continuation_bytes\":0",
+        "\"data_budget\":1000,\"continuation_bytes\":\"bad\"",
+        "\"data_budget\":-1,\"continuation_bytes\":0",
+        "\"data_budget\":8193,\"continuation_bytes\":0",
+        "\"data_budget\":1000,\"continuation_bytes\":-1",
+        "\"data_budget\":1000,\"continuation_bytes\":1001",
+        "\"data_budget\":1000",
+        "\"data_budget\":0,\"continuation_bytes\":0"
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char text[256];
+        (void)snprintf(text, sizeof(text),
+            "{\"op\":\"wiki_read\",\"slug\":\"budget-structured\",\"response_budget\":8192,%s}", cases[i]);
+        struct json_value input, result;
+        json_init(&input); json_init(&result);
+        bool ok = json_read(&input, text, strlen(text)) && fb_test_rpc(&e->table, &input, &result);
+        const char *code = json_get_str(json_get(&result, "code"));
+        ok = ok && !json_get_bool(json_get(&result, "ok")) && code &&
+            !strcmp(code, "READ_BUDGET");
+        json_free(&input); json_free(&result);
+        if (!ok) return false;
+    }
+    return true;
+}
+
 static int test_fleet_wiki_slug_budget(void)
 {
     int failures = 0;
@@ -4695,14 +4795,9 @@ static int test_fleet_wiki_slug_budget(void)
         ASSERT(fb_slug_read_sizes(&e, (int64_t)platform_time_wall_time_t()));
         ASSERT(fb_slug_structured_compat(&e, (int64_t)platform_time_wall_time_t()));
         ASSERT(fb_slug_projection_checks(&e));
-        struct json_value refusal;
-        bool parsed = fb_slug_envelope_as(&e, "big-page-6000", 2048, false, &refusal);
-        const char *code = parsed
-            ? json_get_str(json_get(json_get(&refusal, "error"), "code")) : NULL;
-        bool budget_refused = parsed && !json_get_bool(json_get(&refusal, "ok")) &&
-            code && strcmp(code, "READ_BUDGET") == 0;
-        json_free(&refusal);
-        ASSERT(budget_refused);
+        ASSERT(fb_slug_rpc_limits(&e));
+        ASSERT(fb_slug_direct_fallback(&e, "budget-structured", false));
+        ASSERT(fb_slug_direct_fallback(&e, "big-page-6000", true));
         PASS();
     } _test_next:;
     node_rpc_client_set_test_hook(NULL);

@@ -188,7 +188,16 @@ static void execute_handler(const struct zcl_command_spec *spec,
         .invoked_name = invoked_name,
         .agent_policy_settled = true,
     };
-    handler(&request, reply);
+    bool presented = context && context->agent_session && context->agent_session[0];
+    if (command_registry_success_data_budget(spec, invoked_by_alias,
+            budget_bytes, presented, policy, &request.success_data_budget)) {
+        request.success_data_budget_provided = true;
+        handler(&request, reply);
+    } else {
+        zcl_command_reply_fail(reply, ZCL_COMMAND_STATUS_FAILED,
+            ZCL_COMMAND_EXIT_INTERNAL, "RESPONSE_PROJECTION_FAILED", "prepare",
+            false, false, "cannot measure the bounded response envelope", spec->path);
+    }
     if ((policy->debited_zat > 0 || policy->intent_debit_managed) &&
         !reply->error.mutated) {
         agent_spend_policy_release(context ? context->agent_session : NULL,

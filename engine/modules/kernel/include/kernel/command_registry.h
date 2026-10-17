@@ -288,6 +288,14 @@ struct zcl_command_request {
     const struct json_value *input;
     const char *view;         /* "summary" | "normal" | "full" (default) */
     size_t budget_bytes;      /* 0 = contract default (never raises the cap) */
+    /* Conservative serialized-data allowance for a PASSED reply retaining
+     * spec->output_schema and no next entries. The registry measures its own
+     * envelope with this invocation's authority/alias and maximum timing
+     * widths. A changed schema/status/next invalidates the allowance; final
+     * serialization always enforces the cap. False means an older/direct
+     * caller supplied no allowance; true with zero means no data fits. */
+    bool success_data_budget_provided;
+    size_t success_data_budget;
     size_t max_items;         /* 0 = unbounded; bounds a --view=full page */
     const char *cursor;       /* opaque page cursor for --view=full, or NULL */
     bool invoked_by_alias;
@@ -378,6 +386,22 @@ struct zcl_command_registry {
     const struct zcl_command_spec *commands;
     size_t count;
 };
+
+#ifdef ZCL_TESTING
+/* Synthetic serialization evidence only; this does not authorize a session
+ * or exercise policy evaluation/debit. It uses the real sizing/serialization
+ * owners so tests can force timing widths and escaped authority strings. */
+struct zcl_command_budget_fixture {
+    const char *authority_evidence;
+    int64_t debited_zat, remaining_zat, elapsed_us;
+    size_t budget_bytes;
+    bool presented, alias;
+};
+bool zcl_command_registry_test_success_budget(
+    const struct zcl_command_spec *spec, struct zcl_command_reply *reply,
+    const struct zcl_command_budget_fixture *fixture, size_t *usable,
+    char *wire, size_t wire_size, size_t *wire_bytes);
+#endif
 
 void zcl_command_reply_init(struct zcl_command_reply *reply,
                             const char *data_schema);
