@@ -4885,7 +4885,7 @@ endif
 # Make already captured this exact record before dispatching lint. Pass it to
 # the read-only CFLAGS query so that query does not walk the source tree again.
 check-capability-closure lint lint-preflight: export ZCL_CAP_CLOSURE_SOURCE_RECORD := $(BUILD_SOURCE_RECORD)
-check-capability-closure: $(LINTC_TOOL)
+check-capability-closure: $(BIN_DIR)/z23-lint
 	@./build/bin/z23-lint capability-closure-data --selftest
 	@./tools/lint/check_capability_closure.sh --selftest
 	@./tools/lint/check_capability_closure.sh
