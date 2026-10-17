@@ -8,6 +8,7 @@
 #include "models/fleet_board_post_internal.h"
 #include "models/db_txn.h"
 #include "models/query_builder.h"
+#include "session/fleet_wiki_entry.h"
 #include "util/log_macros.h"
 
 #include <string.h>
@@ -69,6 +70,74 @@ static enum fleet_board_wiki_write_status wiki_write_replay(
     return FLEET_WIKI_WRITE_REPLAY;
 }
 
+static enum fleet_board_wiki_write_status wiki_write_plain_head(
+    struct node_db *ndb, struct qb *q, struct db_fleet_board_post *out, bool *found)
+{
+    *found = false;
+    qb_limit(q, FLEET_BOARD_LIST_MAX + 1);
+    sqlite3_stmt *s = NULL;
+    if (!QB_PREPARE(ndb, q, s)) return FLEET_WIKI_WRITE_STORAGE;
+    enum fleet_board_wiki_write_status status = FLEET_WIKI_WRITE_OK;
+    unsigned scanned = 0;
+    while (AR_STEP_ROW(s)) {
+        if (++scanned > FLEET_BOARD_LIST_MAX) { status = FLEET_WIKI_WRITE_STORAGE; break; }
+        if (!fleet_board_row_read(s, out)) { status = FLEET_WIKI_WRITE_CORRUPT; break; }
+        struct json_value review;
+        enum fleet_wiki_review_status kind = fleet_wiki_review_parse(
+            out->post.text, out->post.text_len, &review, NULL);
+        json_free(&review);
+        if (kind == FLEET_WIKI_REVIEW_ALLOC_FAILED) { status = FLEET_WIKI_WRITE_STORAGE; break; }
+        if (kind != FLEET_WIKI_NOT_REVIEW) continue;
+        *found = true; break;
+    }
+    if (sqlite3_reset(s) != SQLITE_OK) status = FLEET_WIKI_WRITE_STORAGE;
+    sqlite3_finalize(s);
+    return status;
+}
+
+
+static enum fleet_board_wiki_write_status wiki_write_review_head(
+    struct node_db *ndb, const struct fleet_board_post *post, const uint8_t *expected)
+{
+    struct qb q;
+    fleet_board_select_row(&q);
+    qb_where_int(&q, QB_C_fleet_board_posts_kind, QB_EQ, FLEET_BOARD_KIND_WIKI);
+    qb_where_blob(&q, QB_C_fleet_board_posts_ref, QB_EQ, post->ref, 32);
+    qb_where_blob(&q, QB_C_fleet_board_posts_host_pubkey, QB_EQ, post->host_pubkey, 32);
+    qb_where_int(&q, QB_C_fleet_board_posts_scope, QB_EQ, post->scope);
+    qb_where_text(&q, QB_C_fleet_board_posts_room, QB_EQ, post->room);
+    if (expected) qb_where_blob(&q, QB_C_fleet_board_posts_supersedes, QB_EQ, expected, 32);
+    qb_limit(&q, FLEET_BOARD_LIST_MAX + 1);
+    sqlite3_stmt *s = NULL;
+    if (!QB_PREPARE(ndb, &q, s)) return FLEET_WIKI_WRITE_STORAGE;
+    enum fleet_board_wiki_write_status status = FLEET_WIKI_WRITE_OK;
+    unsigned scanned = 0;
+    while (AR_STEP_ROW(s)) {
+        struct db_fleet_board_post row;
+        if (++scanned > FLEET_BOARD_LIST_MAX) { status = FLEET_WIKI_WRITE_STORAGE; break; }
+        if (!fleet_board_row_read(s, &row)) { status = FLEET_WIKI_WRITE_CORRUPT; break; }
+        struct json_value review;
+        enum fleet_wiki_review_status kind = fleet_wiki_review_parse(
+            row.post.text, row.post.text_len, &review, NULL);
+        json_free(&review);
+        if (kind == FLEET_WIKI_REVIEW_ALLOC_FAILED) { status = FLEET_WIKI_WRITE_STORAGE; break; }
+        if (kind == FLEET_WIKI_NOT_REVIEW) continue;
+        if (kind != FLEET_WIKI_REVIEW_VALID || !fleet_board_review_shape(&row.post)) {
+            status = FLEET_WIKI_WRITE_CORRUPT; break;
+        }
+        /* Absent means no prior opinion; an expected id names one explicit
+         * graph leaf. An earlier-dated child still supersedes that leaf. */
+        status = FLEET_WIKI_WRITE_CONFLICT; break;
+    }
+    if (sqlite3_reset(s) != SQLITE_OK) status = FLEET_WIKI_WRITE_STORAGE;
+    sqlite3_finalize(s);
+    if (status != FLEET_WIKI_WRITE_OK || !expected) return status;
+    struct db_fleet_board_post parent;
+    if (!db_fleet_board_post_find(ndb, expected, &parent)) return FLEET_WIKI_WRITE_CORRUPT;
+    return post->created_at > parent.post.created_at ? FLEET_WIKI_WRITE_OK : FLEET_WIKI_WRITE_CLOCK;
+}
+
+
 static enum fleet_board_wiki_write_status wiki_write_head(
     struct node_db *ndb, const struct fleet_board_post *post,
     const uint8_t *expected)
@@ -76,13 +145,18 @@ static enum fleet_board_wiki_write_status wiki_write_head(
     struct qb q;
     fleet_board_select_row(&q);
     qb_where_int(&q, QB_C_fleet_board_posts_kind, QB_EQ, FLEET_BOARD_KIND_WIKI);
+    struct json_value review;
+    enum fleet_wiki_review_status kind = fleet_wiki_review_parse(post->text, post->text_len, &review, NULL);
+    json_free(&review);
+    if (kind == FLEET_WIKI_REVIEW_ALLOC_FAILED || kind == FLEET_WIKI_REVIEW_INVALID)
+        return FLEET_WIKI_WRITE_STORAGE;
+    if (kind == FLEET_WIKI_REVIEW_VALID) return wiki_write_review_head(ndb, post, expected);
     qb_where_text(&q, QB_C_fleet_board_posts_slug, QB_EQ, post->slug);
     qb_order_by(&q, QB_C_fleet_board_posts_created_at, QB_DESC);
     qb_order_by(&q, QB_C_fleet_board_posts_id, QB_DESC);
-    qb_limit(&q, 1);
     struct db_fleet_board_post head;
     bool found;
-    enum fleet_board_wiki_write_status status = wiki_write_row(ndb, &q, &head, false, &found);
+    enum fleet_board_wiki_write_status status = wiki_write_plain_head(ndb, &q, &head, &found);
     if (status != FLEET_WIKI_WRITE_OK) return status;
     if (found != (expected != NULL) || (found && memcmp(head.post.id, expected, 32))) {
         LOG_WARN("fleet.board", "wiki mutation receiver-local head differs from expected");
@@ -124,6 +198,8 @@ static enum fleet_board_wiki_write_status wiki_write_transaction(
     if (status == FLEET_WIKI_WRITE_REPLAY)
         return db_txn_commit(txn) ? status : FLEET_WIKI_WRITE_STORAGE;
     if (status != FLEET_WIKI_WRITE_OK) return status;
+    *refusal = db_fleet_board_review_local_check(ndb, post);
+    if (*refusal != FLEET_BOARD_OK) return FLEET_WIKI_WRITE_REFUSED;
     status = wiki_write_head(ndb, post, expected);
     if (status != FLEET_WIKI_WRITE_OK) return status;
     bool evicted = false;

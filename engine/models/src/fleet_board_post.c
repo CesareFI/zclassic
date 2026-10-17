@@ -11,6 +11,7 @@
 
 #include "models/fleet_board_post.h"
 #include "models/fleet_board_post_internal.h"
+#include "session/fleet_wiki_entry.h"
 
 #include "util/fleet_role_check.h"
 #include "base/safe_alloc.h"
@@ -618,6 +619,7 @@ enum fleet_board_result fleet_board_ingest_prepare(
     struct node_db *ndb, const struct fleet_board_post *post, int64_t now,
     size_t *body_len_out, bool *known_out)
 {
+    if (!fleet_board_review_shape(post)) return FLEET_BOARD_ERR_TEXT;
     enum fleet_board_result r =
         board_ingest_admissible(ndb, post, now, known_out);
     if (r != FLEET_BOARD_OK || *known_out)
@@ -1203,36 +1205,6 @@ int db_fleet_board_list_checked(struct node_db *ndb,
     return count;
 }
 
-bool db_fleet_board_wiki_read(struct node_db *ndb, const char *slug,
-                              struct db_fleet_board_post *out)
-{
-    /* raw-return-ok:absent-page-is-not-an-error — an illegal or unknown slug
-     * has no page, and saying so in the log on every miss would drown the
-     * one line that matters. */
-    if (!ndb || !ndb->open || !out || !fleet_board_slug_valid(slug))
-        return false; // raw-return-ok:absent-page-is-not-an-error
-    struct qb q;
-    qb_select(&q, QB_T_fleet_board_posts);
-    qb_select_columns(&q, k_board_cols, BOARD_NCOLS);
-    qb_where_int(&q, QB_C_fleet_board_posts_kind, QB_EQ,
-                 FLEET_BOARD_KIND_WIKI);
-    qb_where_text(&q, QB_C_fleet_board_posts_slug, QB_EQ, slug);
-    /* Newest created_at wins; the larger id breaks a tie, so two nodes
-     * holding the same revisions always resolve the same page. */
-    qb_order_by(&q, QB_C_fleet_board_posts_created_at, QB_DESC);
-    qb_order_by(&q, QB_C_fleet_board_posts_id, QB_DESC);
-    sqlite3_stmt *s = NULL;
-    if (!QB_PREPARE(ndb, &q, s)) {
-        LOG_WARN("fleet.board", "wiki latest prepare failed slug=%s: %s",
-                 slug, qb_error(&q));
-        return false;
-    }
-    bool found = false;
-    while (!found && AR_STEP_ROW(s))
-        found = fleet_board_row_read(s, out);
-    sqlite3_finalize(s);
-    return found;
-}
 
 int db_fleet_board_wiki_history(struct node_db *ndb, const char *slug,
                                 struct db_fleet_board_post *out, size_t max)

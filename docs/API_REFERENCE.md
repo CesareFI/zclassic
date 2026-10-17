@@ -1899,7 +1899,7 @@ represented by its children's sections.
 | `fleet wiki read` | ready | read / read / operator · fast/low | **`slug`**, `id`, `offset`, `bytes` | `zcl.fleet_wiki_read.v1` | `z23 fleet wiki read push-gate` | Read the latest revision of one page |
 | `fleet wiki list` | ready | read / read / operator · fast/low | none | `zcl.fleet_board_list.v1` | `z23 fleet wiki list` | Every page this node holds |
 | `fleet wiki find` | ready | read / read / operator · foreground/low | `q`, `topic`, `applies_to`, `after_slug` | `zcl.fleet_wiki_find.v1` | `z23 fleet wiki find push-gate` | Find structured knowledge entries |
-| `fleet wiki history` | ready | read / read / operator · fast/low | **`slug`** | `zcl.fleet_board_list.v1` | `z23 fleet wiki history push-gate` | Every revision of one page, newest first |
+| `fleet wiki history` | ready | read / read / operator · fast/low | `slug`, `target`, `after_id` | `zcl.fleet_board_list.v1` | `z23 fleet wiki history push-gate` | Every revision of one page, newest first |
 
 #### `fleet.ledger` — Write and inspect the ledger
 

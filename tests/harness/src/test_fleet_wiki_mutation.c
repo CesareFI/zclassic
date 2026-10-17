@@ -1,10 +1,19 @@
 /* Copyright 2026 Rhett Creighton - Apache License 2.0
  * Receiver-local wiki mutation: exact CAS, retained replay, and rollback. */
 #include "test/test_core.h"
+#include "config/boot_fleet_board.h"
+#include "config/boot_internal.h"
+#include "config/runtime.h"
+#include "rpc/server.h"
+#include "base/safe_alloc.h"
+#include "command/native_command.h"
+#include "controllers/rpc_client.h"
 #include "models/fleet_board_post.h"
 #include "models/fleet_board_post_internal.h"
 #include "crypto/ed25519.h"
 #include "util/thread_registry.h"
+#include "util/fleet_role_check.h"
+#include "session/fleet_wiki_entry.h"
 #include "platform/time_compat.h"
 
 #include <stdatomic.h>
@@ -363,8 +372,460 @@ static int fwm_head_step_case(void)
     return failures;
 }
 
+static bool fwm_review(struct fleet_board_post *post, unsigned author,
+    const char *marker, const struct fleet_board_post *target, int64_t now,
+    const uint8_t *parent)
+{
+    char hex[65], body[512];
+    fleet_board_id_to_hex(target->id, hex);
+    (void)snprintf(body, sizeof(body),
+        "{\"schema\":\"zcl.fleet_wiki_review.v1\",\"target\":\"%s\","
+        "\"verdict\":\"approve\",\"rating\":5,\"rationale\":\"Reviewed exact bytes\"}", hex);
+    if (!fwm_post(post, author, marker, body, now, parent)) return false;
+    memcpy(post->ref, target->id, 32);
+    uint8_t seed[32] = {0}, sk[32], pk[32];
+    seed[0] = (uint8_t)author; seed[31] = 71;
+    ed25519_keypair(pk, sk, seed);
+    return fleet_board_post_sign(post, sk, pk) == FLEET_BOARD_OK;
+}
+
+static int fwm_review_admission(void)
+{
+    int failures = 0;
+    struct node_db db = {0};
+    TEST("wiki review: exact targets, independent signers and guarded updates") {
+        ASSERT(node_db_open(&db, ":memory:"));
+        struct fleet_board_post target, other, review, second, update, retry;
+        struct db_fleet_board_post out;
+        ASSERT(fwm_post(&target, 18, "review-target", "exact target", FWM_NOW, NULL));
+        ASSERT_EQ(fwm_write(&db, &target, NULL, &out), FLEET_WIKI_WRITE_OK);
+        ASSERT(fwm_review(&review, 19, "review-first", &target, FWM_NOW + 1, NULL));
+        ASSERT_EQ(fwm_write(&db, &review, NULL, &out), FLEET_WIKI_WRITE_OK);
+        ASSERT(fwm_review(&second, 20, "review-second", &target, FWM_NOW + 2, NULL));
+        ASSERT_EQ(fwm_write(&db, &second, NULL, &out), FLEET_WIKI_WRITE_OK);
+        ASSERT(db_fleet_board_wiki_read(&db, target.slug, &out));
+        ASSERT(memcmp(out.post.id, target.id, 32) == 0);
+        ASSERT(fwm_review(&update, 19, "review-update", &target, FWM_NOW + 3, review.id));
+        ASSERT_EQ(fwm_write(&db, &update, review.id, &out), FLEET_WIKI_WRITE_OK);
+        ASSERT(fwm_review(&retry, 19, "review-stale", &target, FWM_NOW + 4, review.id));
+        ASSERT_EQ(fwm_write(&db, &retry, review.id, &out), FLEET_WIKI_WRITE_CONFLICT);
+        ASSERT(fwm_review(&retry, 19, "review-update", &target, FWM_NOW + 5, review.id));
+        ASSERT_EQ(fwm_write(&db, &retry, review.id, &out), FLEET_WIKI_WRITE_REPLAY);
+        ASSERT(memcmp(out.post.id, update.id, 32) == 0);
+        ASSERT(fwm_post(&other, 18, "review-target-other", "another target", FWM_NOW + 6, target.id));
+        /* Generic page behavior stays unchanged; use a distinct slug because
+         * the review fixtures deliberately share the target slug. */
+        (void)snprintf(other.slug, sizeof(other.slug), "other-target");
+        uint8_t seed[32] = {0}, sk[32], pk[32];
+        seed[0] = 18; seed[31] = 71;
+        ed25519_keypair(pk, sk, seed);
+        memset(other.supersedes, 0, 32);
+        ASSERT_EQ(fleet_board_post_sign(&other, sk, pk), FLEET_BOARD_OK);
+        ASSERT_EQ(fwm_write(&db, &other, NULL, &out), FLEET_WIKI_WRITE_OK);
+        ASSERT(fwm_review(&retry, 19, "review-retarget", &other, FWM_NOW + 7, update.id));
+        ASSERT_EQ(fwm_write(&db, &retry, update.id, &out), FLEET_WIKI_WRITE_REFUSED);
+        ASSERT(fwm_review(&retry, 19, "review-room", &target, FWM_NOW + 8, update.id));
+        (void)snprintf(retry.room, sizeof(retry.room), "other-room");
+        seed[0] = 19; ed25519_keypair(pk, sk, seed);
+        ASSERT_EQ(fleet_board_post_sign(&retry, sk, pk), FLEET_BOARD_OK);
+        ASSERT_EQ(fwm_write(&db, &retry, update.id, &out), FLEET_WIKI_WRITE_REFUSED);
+        review.text[review.text_len - 2] ^= 1;
+        ASSERT_EQ(fwm_write(&db, &review, NULL, &out), FLEET_WIKI_WRITE_REFUSED);
+        PASS();
+    } _test_next:;
+    if (db.open) node_db_close(&db);
+    return failures;
+}
+
+static int fwm_review_peer_order(void)
+{
+    int failures = 0;
+    struct node_db db = {0};
+    TEST("wiki review: peer-before-target retention, duplicate import and corrupt target refusal") {
+        ASSERT(node_db_open(&db, ":memory:"));
+        struct fleet_board_post target, review, retry;
+        struct db_fleet_board_post out;
+        ASSERT(fwm_post(&target, 18, "peer-target", "target bytes", FWM_NOW, NULL));
+        ASSERT(fwm_review(&review, 19, "peer-review", &target, FWM_NOW + 1, NULL));
+        bool stored = false;
+        ASSERT_EQ(db_fleet_board_post_ingest(&db, &review, FWM_NOW + 1, &stored), FLEET_BOARD_OK);
+        ASSERT(stored);
+        ASSERT(db_fleet_board_post_find(&db, review.id, &out));
+        stored = true;
+        ASSERT_EQ(db_fleet_board_post_ingest(&db, &review, FWM_NOW + 1, &stored), FLEET_BOARD_OK);
+        ASSERT(!stored);
+        ASSERT_EQ(db_fleet_board_post_ingest(&db, &target, FWM_NOW + 1, &stored), FLEET_BOARD_OK);
+        ASSERT(stored);
+        ASSERT(db_fleet_board_post_find(&db, target.id, &out));
+        ASSERT(node_db_exec(&db, "UPDATE fleet_board_posts SET text='corrupt target' WHERE receipt='peer-target'"));
+        ASSERT(fwm_review(&retry, 19, "corrupt-review", &target, FWM_NOW + 2, review.id));
+        ASSERT_EQ(fwm_write(&db, &retry, review.id, &out), FLEET_WIKI_WRITE_REFUSED);
+        ASSERT(fwm_review(&retry, 19, "peer-review", &target, FWM_NOW + 3, NULL));
+        ASSERT_EQ(fwm_write(&db, &retry, NULL, &out), FLEET_WIKI_WRITE_REPLAY);
+        ASSERT(memcmp(out.post.id, review.id, 32) == 0);
+        PASS();
+    } _test_next:;
+    if (db.open) node_db_close(&db);
+    return failures;
+}
+
+
+static bool fwm_review_resign(struct fleet_board_post *post, unsigned author)
+{
+    uint8_t seed[32] = {0}, sk[32], pk[32];
+    seed[0] = (uint8_t)author; seed[31] = 71;
+    ed25519_keypair(pk, sk, seed);
+    return fleet_board_post_sign(post, sk, pk) == FLEET_BOARD_OK;
+}
+
+static int fwm_review_boundaries(void)
+{
+    int failures = 0;
+    zcl_fleet_role_checker_install_permissive_for_testing();
+    struct node_db db = {0};
+    TEST("wiki review: signed ref, rating, private scope and reviewer lineage are bound") {
+        ASSERT(node_db_open(&db, ":memory:"));
+        struct fleet_board_post target, private_target, review, bad;
+        struct db_fleet_board_post out;
+        ASSERT(fwm_post(&target, 18, "boundary-target", "target", FWM_NOW, NULL));
+        ASSERT_EQ(fwm_write(&db, &target, NULL, &out), FLEET_WIKI_WRITE_OK);
+        ASSERT(fwm_review(&review, 19, "boundary-review", &target, FWM_NOW + 1, NULL));
+        ASSERT_EQ(fwm_write(&db, &review, NULL, &out), FLEET_WIKI_WRITE_OK);
+        ASSERT(fwm_review(&bad, 20, "forged-parent", &target, FWM_NOW + 2, review.id));
+        ASSERT_EQ(fwm_write(&db, &bad, review.id, &out), FLEET_WIKI_WRITE_REFUSED);
+        ASSERT(fwm_review(&bad, 19, "forged-ref", &target, FWM_NOW + 3, review.id));
+        bad.ref[0] ^= 1;
+        ASSERT(fwm_review_resign(&bad, 19));
+        ASSERT_EQ(fwm_write(&db, &bad, review.id, &out), FLEET_WIKI_WRITE_REFUSED);
+        bool stored = false;
+        ASSERT_EQ(db_fleet_board_post_ingest(&db, &bad, FWM_NOW + 3, &stored), FLEET_BOARD_ERR_TEXT);
+        ASSERT(!stored);
+        ASSERT(fwm_review(&bad, 19, "bad-rating", &target, FWM_NOW + 4, review.id));
+        char *rating = strstr(bad.text, "\"rating\":5");
+        ASSERT(rating != NULL); rating[9] = '6';
+        ASSERT(fwm_review_resign(&bad, 19));
+        ASSERT_EQ(fwm_write(&db, &bad, review.id, &out), FLEET_WIKI_WRITE_REFUSED);
+        ASSERT(fwm_post(&private_target, 18, "private-target", "private target", FWM_NOW + 5, NULL));
+        private_target.scope = FLEET_BOARD_SCOPE_FLEET;
+        private_target.room[0] = '\0';
+        (void)snprintf(private_target.slug, sizeof(private_target.slug), "private-target");
+        ASSERT(fwm_review_resign(&private_target, 18));
+        ASSERT_EQ(fwm_write(&db, &private_target, NULL, &out), FLEET_WIKI_WRITE_OK);
+        ASSERT(fwm_review(&bad, 19, "private-leak", &private_target, FWM_NOW + 6, NULL));
+        ASSERT_EQ(fwm_write(&db, &bad, NULL, &out), FLEET_WIKI_WRITE_REFUSED);
+        PASS();
+    } _test_next:;
+    if (db.open) node_db_close(&db);
+    return failures;
+}
+
+
+static int fwm_review_queries(void)
+{
+    int failures = 0;
+    struct node_db db = {0};
+    TEST("wiki review: unresolved arrival resolves, graph forks paginate and explicit leaves survive clock reversal") {
+        ASSERT(node_db_open(&db, ":memory:"));
+        struct fleet_board_post target, root, left, right, next, plain, orphan, child;
+        struct db_fleet_board_post out;
+        struct fleet_wiki_review_state state;
+        bool stored = false;
+        ASSERT(fwm_post(&target, 18, "query-target", "target", FWM_NOW, NULL));
+        ASSERT(fwm_review(&root, 19, "query-root", &target, FWM_NOW + 1, NULL));
+        ASSERT_EQ(db_fleet_board_post_ingest(&db, &root, FWM_NOW + 1, &stored), FLEET_BOARD_OK);
+        ASSERT(db_fleet_board_review_state(&db, &root, &state));
+        ASSERT(!state.resolved);
+        ASSERT_EQ(db_fleet_board_post_ingest(&db, &target, FWM_NOW + 1, &stored), FLEET_BOARD_OK);
+        ASSERT(db_fleet_board_review_state(&db, &root, &state));
+        ASSERT(state.resolved && state.lineage_valid && state.complete && state.current && !state.fork);
+        struct fleet_board_post private_review;
+        ASSERT(fwm_review(&private_review, 22, "query-private", &target, FWM_NOW + 1, NULL));
+        private_review.scope = FLEET_BOARD_SCOPE_FLEET; private_review.room[0] = 0;
+        ASSERT(fwm_review_resign(&private_review, 22));
+        zcl_fleet_role_checker_install_permissive_for_testing();
+        ASSERT_EQ(db_fleet_board_post_ingest(&db, &private_review, FWM_NOW + 1, &stored), FLEET_BOARD_OK);
+        private_review.scope = FLEET_BOARD_SCOPE_PUBLIC;
+        (void)snprintf(private_review.room, sizeof(private_review.room), "other-room");
+        ASSERT(fwm_review_resign(&private_review, 22));
+        ASSERT_EQ(db_fleet_board_post_ingest(&db, &private_review, FWM_NOW + 1, &stored), FLEET_BOARD_OK);
+        ASSERT(fwm_review(&left, 19, "query-left", &target, FWM_NOW + 10, root.id));
+        ASSERT(fwm_review(&right, 19, "query-right", &target, FWM_NOW + 2, root.id));
+        ASSERT_EQ(db_fleet_board_post_ingest(&db, &left, FWM_NOW + 10, &stored), FLEET_BOARD_OK);
+        ASSERT_EQ(db_fleet_board_post_ingest(&db, &right, FWM_NOW + 10, &stored), FLEET_BOARD_OK);
+        ASSERT(db_fleet_board_review_state(&db, &right, &state));
+        ASSERT(state.current && state.fork && state.complete);
+        uint8_t cursor[32] = {0}, next_cursor[32];
+        size_t seen = 0, count = 0;
+        bool more = true;
+        while (more && seen < 8) {
+            struct db_fleet_board_post page[1];
+            ASSERT(db_fleet_board_wiki_reviews(&db, target.id, cursor, page, 1, &count, next_cursor, &more));
+            ASSERT_EQ(count, 1);
+            ASSERT_EQ(page[0].post.scope, FLEET_BOARD_SCOPE_PUBLIC);
+            ASSERT(strcmp(page[0].post.room, FLEET_BOARD_ROOM_DEFAULT) == 0);
+            ASSERT(memcmp(next_cursor, page[0].post.id, 32) == 0);
+            ASSERT(memcmp(page[0].post.id, cursor, 32) > 0);
+            memcpy(cursor, next_cursor, 32);
+            seen += count;
+        }
+        ASSERT_EQ(seen, 3); ASSERT(!more);
+        ASSERT(fwm_post(&plain, 19, "query-plain-ref", "ordinary referenced page", FWM_NOW + 100, NULL));
+        memcpy(plain.ref, target.id, 32);
+        ASSERT(fwm_review_resign(&plain, 19));
+        ASSERT_EQ(db_fleet_board_post_ingest(&db, &plain, FWM_NOW + 100, &stored), FLEET_BOARD_OK);
+        ASSERT(fwm_review(&next, 19, "query-next", &target, FWM_NOW + 11, right.id));
+        ASSERT_EQ(fwm_write(&db, &next, right.id, &out), FLEET_WIKI_WRITE_OK);
+        ASSERT(fwm_review(&next, 19, "query-old-leaf", &target, FWM_NOW + 12, root.id));
+        ASSERT_EQ(fwm_write(&db, &next, root.id, &out), FLEET_WIKI_WRITE_CONFLICT);
+        uint8_t absent[32]; memset(absent, 0x77, 32);
+        ASSERT(fwm_review(&orphan, 21, "query-orphan", &target, FWM_NOW + 3, absent));
+        ASSERT(fwm_review(&child, 21, "query-child", &target, FWM_NOW + 4, orphan.id));
+        ASSERT_EQ(db_fleet_board_post_ingest(&db, &orphan, FWM_NOW + 4, &stored), FLEET_BOARD_OK);
+        ASSERT_EQ(db_fleet_board_post_ingest(&db, &child, FWM_NOW + 4, &stored), FLEET_BOARD_OK);
+        ASSERT(db_fleet_board_review_state(&db, &child, &state));
+        ASSERT(state.resolved && !state.lineage_valid && !state.complete && !state.current);
+        PASS();
+    } _test_next:;
+    if (db.open) node_db_close(&db);
+    return failures;
+}
+
+static int fwm_review_parser(void)
+{
+    int failures = 0;
+    TEST("wiki review: parser bounds, whitespace, literal escapes and decoded NUL") {
+        struct fleet_board_post target, review;
+        memset(&target, 0, sizeof(target)); memset(target.id, 0x11, 32);
+        ASSERT(fwm_review(&review, 19, "parser", &target, FWM_NOW, NULL));
+        struct json_value parsed;
+        char raw[1024];
+        raw[0] = ' '; raw[1] = '\n';
+        memcpy(raw + 2, review.text, review.text_len);
+        size_t len = review.text_len + 2;
+        raw[len] = 'X'; /* Input is deliberately not NUL-terminated at len. */
+        ASSERT_EQ(fleet_wiki_review_parse(raw, len, &parsed, NULL), FLEET_WIKI_REVIEW_VALID);
+        json_free(&parsed);
+        char hex[65]; fleet_board_id_to_hex(target.id, hex);
+        (void)snprintf(raw, sizeof(raw),
+            "{\"schema\":\"zcl.fleet_wiki_review.v1\",\"target\":\"%s\","
+            "\"verdict\":\"comment\",\"rationale\":\"literal \\\\u0000\"}", hex);
+        ASSERT_EQ(fleet_wiki_review_parse(raw, strlen(raw), &parsed, NULL), FLEET_WIKI_REVIEW_VALID);
+        json_free(&parsed);
+        (void)snprintf(raw, sizeof(raw),
+            "{\"schema\":\"zcl.fleet_wiki_review.v1\",\"target\":\"%s\","
+            "\"verdict\":\"comment\",\"rationale\":\"hidden \\u0000suffix\"}", hex);
+        ASSERT_EQ(fleet_wiki_review_parse(raw, strlen(raw), &parsed, NULL), FLEET_WIKI_NOT_REVIEW);
+        ASSERT(!json_valid(raw, strlen(raw)));
+        json_free(&parsed);
+        (void)snprintf(raw, sizeof(raw), "{\"note\":\"ordinary %cu0000suffix\"}", 0x5c);
+        ASSERT_EQ(fleet_wiki_review_parse(raw, strlen(raw), &parsed, NULL), FLEET_WIKI_NOT_REVIEW);
+        json_free(&parsed);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int fwm_review_quota(void)
+{
+    int failures = 0;
+    struct node_db db = {0};
+    db_fleet_board_test_set_wiki_limits(100, 2);
+    db_fleet_board_test_reset_wiki_evictions();
+    TEST("wiki review: quota cannot confuse a review fork with superseded page history") {
+        ASSERT(node_db_open(&db, ":memory:"));
+        struct fleet_board_post target, first, fork, update;
+        struct db_fleet_board_post out;
+        ASSERT(fwm_post(&target, 18, "quota-target", "target", FWM_NOW, NULL));
+        ASSERT_EQ(fwm_write(&db, &target, NULL, &out), FLEET_WIKI_WRITE_OK);
+        ASSERT(fwm_review(&first, 18, "quota-review", &target, FWM_NOW + 1, NULL));
+        ASSERT_EQ(fwm_write(&db, &first, NULL, &out), FLEET_WIKI_WRITE_OK);
+        ASSERT(fwm_review(&fork, 18, "quota-fork", &target, FWM_NOW + 2, NULL));
+        bool stored = false;
+        ASSERT_EQ(db_fleet_board_post_ingest(&db, &fork, FWM_NOW + 2, &stored), FLEET_BOARD_ERR_WIKI_FULL);
+        ASSERT(!stored);
+        ASSERT(db_fleet_board_post_find(&db, target.id, &out));
+        ASSERT(fwm_review(&update, 18, "quota-update", &target, FWM_NOW + 3, first.id));
+        ASSERT_EQ(fwm_write(&db, &update, first.id, &out), FLEET_WIKI_WRITE_REFUSED);
+        ASSERT(db_fleet_board_post_find(&db, target.id, &out));
+        ASSERT(db_fleet_board_post_find(&db, first.id, &out));
+        struct fleet_wiki_review_state state;
+        ASSERT(db_fleet_board_review_state(&db, &first, &state));
+        ASSERT(state.resolved && state.complete && state.lineage_valid && state.current);
+        db_fleet_board_test_set_wiki_limits(100, 3);
+        ASSERT_EQ(fwm_write(&db, &update, first.id, &out), FLEET_WIKI_WRITE_OK);
+        ASSERT(db_fleet_board_review_state(&db, &update, &state));
+        ASSERT(state.resolved && state.complete && state.lineage_valid && state.current);
+        PASS();
+    } _test_next:;
+    if (db.open) node_db_close(&db);
+    db_fleet_board_test_set_wiki_limits(0, 0);
+    db_fleet_board_test_reset_wiki_evictions();
+    return failures;
+}
+
+
+static bool fwm_rpc_call(struct rpc_table *table, const struct json_value *input,
+    struct json_value *result)
+{
+    struct json_value params;
+    json_init(&params); json_set_array(&params);
+    bool ok = json_push_back(&params, input) &&
+        rpc_table_execute(table, "fleet_board", &params, result);
+    json_free(&params);
+    return ok;
+}
+
+static int fwm_review_rpc(void)
+{
+    int failures = 0;
+    struct node_db db = {0};
+    char dir[256] = {0}, warmup[256];
+    bool was_warming = rpc_is_in_warmup(warmup, sizeof(warmup));
+    TEST("wiki review: existing RPC publishes and retrieves signed exact-target statements") {
+        ASSERT(node_db_open(&db, ":memory:"));
+        test_make_tmpdir(dir, sizeof(dir), "fleetboard", "review");
+        struct db_service service = {.node_db = &db, .started = true};
+        struct app_runtime_context runtime = {.db_service = &service};
+        struct boot_svc_ctx svc = {.node_db = &db, .datadir = dir};
+        boot_fleet_board_shutdown(); boot_fleet_board_wire(&svc);
+        app_runtime_set_current(&runtime);
+        struct rpc_table table;
+        rpc_table_init(&table); boot_fleet_board_register_rpc(&table);
+        set_rpc_warmup_finished();
+        struct fleet_board_post target, peer;
+        ASSERT(fwm_post(&target, 18, "rpc-target", "target", FWM_NOW, NULL));
+        ASSERT(fwm_review(&peer, 19, "rpc-peer-review", &target, FWM_NOW + 1, NULL));
+        bool stored;
+        ASSERT_EQ(db_fleet_board_post_ingest(&db, &peer, FWM_NOW + 1, &stored), FLEET_BOARD_OK);
+        char hex[65]; fleet_board_id_to_hex(target.id, hex);
+        struct json_value in, result;
+        json_init(&in); json_set_object(&in); json_init(&result);
+        ASSERT(json_push_kv_str(&in, "op", "wiki_history"));
+        ASSERT(json_push_kv_str(&in, "target", hex));
+        ASSERT(fwm_rpc_call(&table, &in, &result));
+        ASSERT(json_get_bool(json_get(&result, "ok")));
+        ASSERT_EQ(json_size(json_get(&result, "posts")), 1);
+        const struct json_value *item = json_at(json_get(&result, "posts"), 0);
+        ASSERT(!json_get_bool(json_get(item, "target_resolved")));
+        json_free(&result); json_init(&result);
+        ASSERT_EQ(db_fleet_board_post_ingest(&db, &target, FWM_NOW + 1, &stored), FLEET_BOARD_OK);
+        ASSERT(fwm_rpc_call(&table, &in, &result));
+        item = json_at(json_get(&result, "posts"), 0);
+        ASSERT(json_get_bool(json_get(item, "target_resolved")));
+        ASSERT(strcmp(json_get_str(json_get(item, "reviewer")),
+            json_get_str(json_get(item, "host"))) == 0);
+        json_free(&in); json_free(&result);
+        json_init(&in); json_set_object(&in); json_init(&result);
+        ASSERT(json_push_kv_str(&in, "op", "post"));
+        ASSERT(json_push_kv_str(&in, "kind", "wiki"));
+        ASSERT(json_push_kv_str(&in, "slug", "rpc-review"));
+        ASSERT(json_push_kv_str(&in, "title", "Exact revision review"));
+        ASSERT(json_push_kv_str(&in, "text", peer.text));
+        ASSERT(json_push_kv_str(&in, "format", "review"));
+        ASSERT(fwm_rpc_call(&table, &in, &result));
+        ASSERT(json_get_bool(json_get(&result, "ok")));
+        uint8_t published[32];
+        ASSERT(fleet_board_id_from_hex(json_get_str(json_get(&result, "id")), published));
+        struct db_fleet_board_post retained;
+        ASSERT(db_fleet_board_post_find(&db, published, &retained));
+        ASSERT_EQ(fleet_board_post_verify(&retained.post), FLEET_BOARD_OK);
+        ASSERT(memcmp(retained.post.ref, target.id, 32) == 0);
+        json_free(&in); json_free(&result);
+        json_init(&in); json_set_object(&in); json_init(&result);
+        char malformed[512];
+        (void)snprintf(malformed, sizeof(malformed),
+            "{\"schema\":\"zcl.fleet_wiki_review.v1\",\"target\":\"%s\","
+            "\"verdict\":\"comment\",\"rationale\":\"bad %cu0000suffix\"}", hex, 0x5c);
+        ASSERT(json_push_kv_str(&in, "op", "post"));
+        ASSERT(json_push_kv_str(&in, "kind", "wiki"));
+        ASSERT(json_push_kv_str(&in, "slug", "malformed-review"));
+        ASSERT(json_push_kv_str(&in, "title", "Malformed review"));
+        ASSERT(json_push_kv_str(&in, "text", malformed));
+        ASSERT(json_push_kv_str(&in, "format", "review"));
+        ASSERT(fwm_rpc_call(&table, &in, &result));
+        ASSERT(!json_get_bool(json_get(&result, "ok")));
+        ASSERT(strcmp(json_get_str(json_get(&result, "code")), "BAD_REVIEW") == 0);
+        json_free(&in); json_free(&result);
+        PASS();
+    } _test_next:;
+    app_runtime_set_current(NULL);
+    if (was_warming) set_rpc_warmup_started(warmup);
+    boot_fleet_board_shutdown();
+    if (db.open) node_db_close(&db);
+    if (dir[0]) test_rm_rf(dir);
+    return failures;
+}
+
+
+static unsigned fwm_native_calls;
+static char *fwm_native_unexpected_rpc(const char *method, const char *params)
+{
+    (void)method; (void)params;
+    fwm_native_calls++;
+    return NULL;
+}
+
+static int fwm_review_native_faults(void)
+{
+    int failures = 0;
+    TEST("wiki review: native request construction fails without losing target or continuation") {
+        struct json_value input;
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "target",
+            "1111111111111111111111111111111111111111111111111111111111111111"));
+        ASSERT(json_push_kv_str(&input, "after_id",
+            "2222222222222222222222222222222222222222222222222222222222222222"));
+        bool ok = true;
+        node_rpc_client_set_test_hook(fwm_native_unexpected_rpc);
+        const char *labels[] = {"json_set_str", "json_push_kv_key"};
+        for (unsigned label = 0; label < 2; label++) for (unsigned nth = 1; nth <= (label ? 5u : 3u); nth++) {
+            struct zcl_command_request request = {.input = &input, .budget_bytes = 8192,
+                .success_data_budget_provided = true, .success_data_budget = 7000};
+            struct zcl_command_reply reply;
+            zcl_command_reply_init(&reply, "zcl.fleet_board_list.v1");
+            size_t before = json_test_live_blocks();
+            fwm_native_calls = 0;
+            zcl_alloc_fault_fail_nth(labels[label], nth);
+            zcl_native_handle_fleet_wiki_history(&request, &reply);
+            bool hit = zcl_alloc_fault_armed_label() == NULL;
+            zcl_alloc_fault_clear();
+            ok = ok && hit && !fwm_native_calls &&
+                reply.status != ZCL_COMMAND_STATUS_PASSED &&
+                !strcmp(reply.error.code, "REVIEW_REQUEST_FAILED");
+            zcl_command_reply_free(&reply);
+            ok = ok && json_test_live_blocks() == before;
+        }
+        node_rpc_client_set_test_hook(NULL);
+        json_free(&input);
+        ASSERT(ok);
+        PASS();
+    } _test_next:;
+    zcl_alloc_fault_clear();
+    node_rpc_client_set_test_hook(NULL);
+    return failures;
+}
+
+
+static int fwm_review_missing(void)
+{
+    int failures = 0;
+    struct node_db db = {0};
+    TEST("wiki review: local publication refuses a missing exact target") {
+        ASSERT(node_db_open(&db, ":memory:"));
+        struct fleet_board_post review;
+        struct db_fleet_board_post out;
+        struct fleet_board_post absent = {0};
+        memset(absent.id, 0x11, 32);
+        ASSERT(fwm_review(&review, 19, "review-missing", &absent, FWM_NOW, NULL));
+        ASSERT_EQ(fwm_write(&db, &review, NULL, &out), FLEET_WIKI_WRITE_REFUSED);
+        PASS();
+    } _test_next:;
+    if (db.open) node_db_close(&db);
+    return failures;
+}
+
 int test_fleet_wiki_mutation(void)
 {
-    return fwm_replay_cas() + fwm_race_case() + fwm_storage_cases() +
+    return fwm_review_native_faults() + fwm_review_rpc() + fwm_review_parser() + fwm_review_queries() + fwm_review_quota() + fwm_review_boundaries() + fwm_review_peer_order() + fwm_review_admission() + fwm_review_missing() + fwm_replay_cas() + fwm_race_case() + fwm_storage_cases() +
         fwm_sequence_overflow() + fwm_eviction_case() + fwm_head_step_case();
 }

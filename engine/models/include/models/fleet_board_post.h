@@ -380,4 +380,20 @@ void db_fleet_board_test_reset_wiki_evictions(void);
 void db_fleet_board_test_clear_quarantine(void);
 #endif
 
+/* Review admission and reads use the existing signed WIKI ledger. Local check
+ * runs inside the caller's write transaction; peer ingest permits unresolved
+ * targets but never inconsistent signed body/ref bindings. */
+bool fleet_board_review_shape(const struct fleet_board_post *);
+enum fleet_board_result db_fleet_board_review_local_check(
+    struct node_db *, const struct fleet_board_post *);
+bool db_fleet_board_wiki_reviews(struct node_db *, const uint8_t target[32],
+    const uint8_t after[32], struct db_fleet_board_post *, size_t,
+    size_t *, uint8_t next[32], bool *);
+struct fleet_wiki_review_state {
+    unsigned graph_verified;
+    bool resolved, lineage_valid, current, fork, complete;
+};
+bool db_fleet_board_review_state(struct node_db *,
+    const struct fleet_board_post *, struct fleet_wiki_review_state *);
+
 #endif /* ZCL_DB_MODEL_FLEET_BOARD_POST_H */

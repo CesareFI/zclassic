@@ -940,6 +940,157 @@ static int test_fleet_board_two_nodes(void)
     return failures;
 }
 
+static bool fb_review_compose(struct fleet_board_post *post, uint8_t who,
+    const uint8_t target[32], const uint8_t *parent, const char *verdict,
+    const char *rationale, uint64_t now)
+{
+    char id[65], body[4096];
+    fleet_board_id_to_hex(target, id);
+    int written = snprintf(body, sizeof(body),
+        "{\"schema\":\"zcl.fleet_wiki_review.v1\",\"target\":\"%s\","
+        "\"verdict\":\"%s\",\"rating\":%u,\"rationale\":\"%s\"}",
+        id, verdict, !strcmp(verdict, "approve") ? 5u : 1u, rationale);
+    if (written < 0 || (size_t)written >= sizeof(body)) return false;
+    fb_test_compose(post, FLEET_BOARD_KIND_WIKI, "descriptive-agent", body, now, 60);
+    post->scope = FLEET_BOARD_SCOPE_PUBLIC;
+    (void)snprintf(post->room, sizeof(post->room), "%s", FLEET_BOARD_ROOM_DEFAULT);
+    (void)snprintf(post->slug, sizeof(post->slug), "peer-reviewed-page");
+    (void)snprintf(post->title, sizeof(post->title), "Exact revision review");
+    memcpy(post->ref, target, 32);
+    if (parent) memcpy(post->supersedes, parent, 32);
+    uint8_t seed[32], pk[32];
+    fb_test_identity(who, seed, pk);
+    return fleet_board_post_sign(post, seed, pk) == FLEET_BOARD_OK;
+}
+
+/* The receiver decodes INV, sends GET, then verifies decoded POST bytes.
+ * Replay the same POST once more to qualify duplicate import idempotence. */
+static bool fb_review_exchange_id(const uint8_t id[32], uint8_t heard[1][32])
+{
+    uint8_t ids[1][32], frame[FLEET_BOARD_FRAME_MAX], type;
+    size_t len = 0, count = 0;
+    memcpy(ids[0], id, 32);
+    if (fleet_board_frame_encode_ids(FLEET_BOARD_FRAME_INV, ids, 1, frame,
+            sizeof(frame), &len) != FLEET_BOARD_OK ||
+        fleet_board_frame_decode_ids(frame, len, &type, heard, 1, &count) != FLEET_BOARD_OK ||
+        type != FLEET_BOARD_FRAME_INV || count != 1 ||
+        fleet_board_frame_encode_ids(FLEET_BOARD_FRAME_GET, heard, count, frame,
+            sizeof(frame), &len) != FLEET_BOARD_OK ||
+        fleet_board_frame_decode_ids(frame, len, &type, heard, 1, &count) != FLEET_BOARD_OK ||
+        type != FLEET_BOARD_FRAME_GET || count != 1) return false;
+    return true;
+}
+
+static bool fb_review_converged_views(struct node_db *db,
+    const struct fleet_board_post *root, const struct fleet_board_post *left,
+    const struct fleet_board_post *right, const struct fleet_board_post *opposite)
+{
+    struct fleet_wiki_review_state state;
+    if (!db_fleet_board_review_state(db, root, &state)) return false;
+    bool ok = state.resolved;
+    ok &= state.complete;
+    ok &= !state.current;
+    ok &= state.fork;
+    const struct fleet_board_post *leaves[] = {left, right, opposite};
+    for (size_t i = 0; i < 3; i++) {
+        if (!db_fleet_board_review_state(db, leaves[i], &state)) return false;
+        ok &= state.resolved;
+        ok &= state.lineage_valid;
+        ok &= state.complete;
+        ok &= state.current;
+        ok &= state.fork == (i < 2);
+    }
+    return ok;
+}
+
+
+static bool fb_review_transfer(struct node_db *from, struct node_db *to,
+    const uint8_t id[32], int64_t now)
+{
+    uint8_t heard[1][32], frame[FLEET_BOARD_FRAME_MAX];
+    size_t len = 0;
+    if (!fb_review_exchange_id(id, heard)) return false;
+    struct db_fleet_board_post row;
+    if (!db_fleet_board_post_find(from, heard[0], &row) ||
+        fleet_board_frame_encode_post(&row.post, frame, sizeof(frame), &len) != FLEET_BOARD_OK)
+        return false;
+    bool already = db_fleet_board_have(to, id);
+    for (unsigned replay = 0; replay < 2; replay++) {
+        struct fleet_board_post decoded;
+        bool stored = false;
+        if (fleet_board_frame_decode_post(frame, len, &decoded) != FLEET_BOARD_OK ||
+            memcmp(decoded.id, id, 32) ||
+            db_fleet_board_post_ingest(to, &decoded, now, &stored) != FLEET_BOARD_OK ||
+            stored != (!already && replay == 0)) return false;
+    }
+    return true;
+}
+
+static int test_fleet_wiki_review_convergence(void)
+{
+    int failures = 0;
+    struct node_db a = {0}, b = {0};
+    TEST("fleet wiki reviews: reordered signed peer objects converge without hiding opposing opinions or forks") {
+        ASSERT(node_db_open(&a, ":memory:")); ASSERT(node_db_open(&b, ":memory:"));
+        const int64_t now = 900000;
+        uint8_t seed[32], pk[32]; fb_test_identity(30, seed, pk);
+        struct fleet_board_post target, root, left, right, opposite;
+        fb_test_compose(&target, FLEET_BOARD_KIND_WIKI, "author", "immutable target", now, 60);
+        target.scope = FLEET_BOARD_SCOPE_PUBLIC;
+        (void)snprintf(target.room, sizeof(target.room), "%s", FLEET_BOARD_ROOM_DEFAULT);
+        (void)snprintf(target.slug, sizeof(target.slug), "peer-reviewed-page");
+        (void)snprintf(target.title, sizeof(target.title), "Reviewed page");
+        ASSERT_EQ(fleet_board_post_sign(&target, seed, pk), FLEET_BOARD_OK);
+        ASSERT(fb_review_compose(&root, 31, target.id, NULL, "approve", "initial", now + 1));
+        ASSERT(fb_review_compose(&left, 31, target.id, root.id, "approve", "left branch", now + 3));
+        ASSERT(fb_review_compose(&right, 31, target.id, root.id, "request-changes", "right branch", now + 2));
+        ASSERT(fb_review_compose(&opposite, 32, target.id, NULL, "request-changes", "independent reviewer", now + 4));
+        ASSERT_EQ(db_fleet_board_post_ingest(&a, &target, now + 4, NULL), FLEET_BOARD_OK);
+        ASSERT_EQ(db_fleet_board_post_ingest(&a, &root, now + 4, NULL), FLEET_BOARD_OK);
+        ASSERT_EQ(db_fleet_board_post_ingest(&a, &left, now + 4, NULL), FLEET_BOARD_OK);
+        ASSERT_EQ(db_fleet_board_post_ingest(&b, &right, now + 4, NULL), FLEET_BOARD_OK);
+        ASSERT_EQ(db_fleet_board_post_ingest(&b, &opposite, now + 4, NULL), FLEET_BOARD_OK);
+        struct fleet_wiki_review_state state;
+        ASSERT(db_fleet_board_review_state(&b, &right, &state));
+        ASSERT(!state.resolved && !state.lineage_valid && !state.current);
+        ASSERT(fb_review_transfer(&b, &a, right.id, now + 4));
+        ASSERT(fb_review_transfer(&a, &b, left.id, now + 4));
+        ASSERT(fb_review_transfer(&b, &a, opposite.id, now + 4));
+        ASSERT(fb_review_transfer(&a, &b, target.id, now + 4));
+        ASSERT(db_fleet_board_review_state(&b, &right, &state));
+        ASSERT(state.resolved && !state.lineage_valid && !state.current);
+        ASSERT(fb_review_transfer(&a, &b, root.id, now + 4));
+        struct fleet_board_post *objects[] = {&target, &root, &left, &right, &opposite};
+        for (size_t i = 0; i < 5; i++) {
+            struct db_fleet_board_post on_a, on_b;
+            ASSERT(db_fleet_board_post_find(&a, objects[i]->id, &on_a));
+            ASSERT(db_fleet_board_post_find(&b, objects[i]->id, &on_b));
+            uint8_t wire_a[FLEET_BOARD_FRAME_MAX], wire_b[FLEET_BOARD_FRAME_MAX];
+            size_t len_a = 0, len_b = 0;
+            ASSERT_EQ(fleet_board_frame_encode_post(&on_a.post, wire_a, sizeof(wire_a), &len_a), FLEET_BOARD_OK);
+            ASSERT_EQ(fleet_board_frame_encode_post(&on_b.post, wire_b, sizeof(wire_b), &len_b), FLEET_BOARD_OK);
+            ASSERT_EQ(len_a, len_b); ASSERT(memcmp(wire_a, wire_b, len_a) == 0);
+        }
+        struct node_db *nodes[] = {&a, &b};
+        for (size_t i = 0; i < 2; i++) {
+            ASSERT(fb_review_converged_views(nodes[i], &root, &left, &right, &opposite));
+            int64_t checked = 0;
+            ASSERT(db_fleet_board_chain_verify(nodes[i], &checked)); ASSERT_EQ(checked, 5);
+        }
+        uint8_t after[32] = {0}, cursor[32]; size_t count_a, count_b; bool more_a, more_b;
+        struct db_fleet_board_post rows_a[4], rows_b[4];
+        ASSERT(db_fleet_board_wiki_reviews(&a, target.id, after, rows_a, 4, &count_a, cursor, &more_a));
+        ASSERT(db_fleet_board_wiki_reviews(&b, target.id, after, rows_b, 4, &count_b, cursor, &more_b));
+        ASSERT_EQ(count_a, 4); ASSERT_EQ(count_b, 4); ASSERT(!more_a && !more_b);
+        for (size_t i = 0; i < count_a; i++) ASSERT(memcmp(rows_a[i].post.id, rows_b[i].post.id, 32) == 0);
+        PASS();
+    } _test_next:;
+    if (a.open) node_db_close(&a);
+    if (b.open) node_db_close(&b);
+    return failures;
+}
+
+
 static bool fb_test_busy_frame(struct node_db *db, struct msg_processor *mp,
     struct p2p_node *node, const uint8_t *frame, size_t frame_len,
     const uint8_t post_id[32])
@@ -4656,6 +4807,96 @@ static bool fb_slug_structured_compat(struct fb_rpc_env *e, int64_t now)
     return fb_slug_structured_full(e, "budget-structured-full-fit", text);
 }
 
+static bool fb_review_envelope(struct fb_rpc_env *e, const char *target,
+    size_t budget, bool expect_ok, struct json_value *envelope)
+{
+    struct json_value input;
+    json_init(&input); json_set_object(&input);
+    bool prepared = json_push_kv_str(&input, "target", target);
+    const struct zcl_command_registry *reg = zcl_command_catalog();
+    const struct zcl_command_spec *spec = zcl_command_registry_find(reg,
+        "fleet.wiki.history", NULL);
+    struct zcl_command_context ctx = {.registry = reg,
+        .granted_capabilities = ~(uint64_t)0,
+        .authority_ceiling = ZCL_COMMAND_AUTH_OWNER};
+    fb_native_test_table = &e->table;
+    node_rpc_client_set_test_hook(fb_native_rpc);
+    char wire[8193];
+    enum zcl_command_exit rc = ZCL_COMMAND_EXIT_FAILED;
+    size_t n = prepared ? zcl_command_registry_execute_json(reg, spec, &ctx, &input,
+        false, "fleet.wiki.history", "full", budget, 0, NULL,
+        wire, sizeof(wire), &rc) : 0;
+    node_rpc_client_set_test_hook(NULL); fb_native_test_table = NULL;
+    json_free(&input); json_init(envelope);
+    return prepared && n > 0 && n <= budget &&
+        (rc == ZCL_COMMAND_EXIT_OK) == expect_ok &&
+        json_read(envelope, wire, strlen(wire));
+}
+
+static int test_fleet_wiki_review_budget(void)
+{
+    int failures = 0;
+    struct fb_rpc_env e;
+    bool opened = false;
+    TEST("fleet wiki reviews: complete registry envelopes honor escaped-body budgets without cursor advancement") {
+        ASSERT(fb_rpc_env_open(&e)); opened = true;
+        const int64_t now = (int64_t)platform_time_wall_time_t();
+        struct fleet_board_post target, review;
+        uint8_t seed[32], pk[32]; fb_test_identity(40, seed, pk);
+        fb_test_compose(&target, FLEET_BOARD_KIND_WIKI, "author", "budget target", (uint64_t)now, 60);
+        target.scope = FLEET_BOARD_SCOPE_PUBLIC;
+        (void)snprintf(target.room, sizeof(target.room), "%s", FLEET_BOARD_ROOM_DEFAULT);
+        (void)snprintf(target.slug, sizeof(target.slug), "review-budget-target");
+        (void)snprintf(target.title, sizeof(target.title), "Budget target");
+        ASSERT_EQ(fleet_board_post_sign(&target, seed, pk), FLEET_BOARD_OK);
+        ASSERT_EQ(db_fleet_board_post_ingest(&e.db, &target, now, NULL), FLEET_BOARD_OK);
+        char escaped[2001];
+        for (size_t i = 0; i < 1000; i++) { escaped[2 * i] = 0x5c; escaped[2 * i + 1] = '"'; }
+        escaped[2000] = 0;
+        ASSERT(fb_review_compose(&review, 41, target.id, NULL, "approve", escaped, (uint64_t)now));
+        ASSERT_EQ(db_fleet_board_post_ingest(&e.db, &review, now, NULL), FLEET_BOARD_OK);
+        char id[65]; fleet_board_id_to_hex(target.id, id);
+        struct json_value env;
+        ASSERT(fb_review_envelope(&e, id, 8192, true, &env));
+        ASSERT(json_get_bool(json_get(&env, "ok")));
+        ASSERT(json_write(&env, NULL, 0) <= 8192);
+        const struct json_value *data = json_get(&env, "data");
+        ASSERT_EQ(json_size(json_get(data, "posts")), 1);
+        const struct json_value *item = json_at(json_get(data, "posts"), 0);
+        ASSERT(strcmp(json_get_str(json_get(item, "text")), review.text) == 0);
+        ASSERT(strlen(json_get_str(json_get(json_get(item, "review"), "rationale"))) == 1000);
+        json_free(&env);
+        ASSERT(fb_review_envelope(&e, id, 4096, false, &env));
+        ASSERT(!json_get_bool(json_get(&env, "ok")));
+        ASSERT(json_write(&env, NULL, 0) <= 4096);
+        ASSERT(strcmp(json_get_str(json_get(json_get(&env, "error"), "code")), "REVIEW_BUDGET") == 0);
+        ASSERT(!json_get(json_get(&env, "data"), "posts"));
+        ASSERT(!json_get(json_get(&env, "data"), "after_id"));
+        json_free(&env);
+        /* Exercise the actual registry boundary, including policy/status/schema
+         * overhead. One byte below its smallest complete envelope must refuse. */
+        size_t low = 4097, high = 8192;
+        while (low < high) {
+            size_t mid = low + (high - low) / 2;
+            /* Probe either outcome, then inspect the returned envelope. */
+            bool success = fb_review_envelope(&e, id, mid, true, &env);
+            if (!success) {
+                json_free(&env);
+                ASSERT(fb_review_envelope(&e, id, mid, false, &env));
+            }
+            bool accepted = json_get_bool(json_get(&env, "ok"));
+            json_free(&env);
+            if (accepted) high = mid; else low = mid + 1;
+        }
+        ASSERT(fb_review_envelope(&e, id, low, true, &env)); json_free(&env);
+        ASSERT(fb_review_envelope(&e, id, low - 1, false, &env)); json_free(&env);
+        PASS();
+    } _test_next:;
+    if (opened) fb_rpc_env_close(&e);
+    return failures;
+}
+
+
 /* Faults are armed at the RPC boundary, after request construction. */
 static bool fb_slug_projection_fault(struct fb_rpc_env *e, const char *slug,
     const char *label, unsigned nth)
@@ -7778,6 +8019,8 @@ int test_fleet_board(void)
     failures += test_fleet_board_inventory_pages();
     failures += test_fleet_board_wiki();
     failures += test_fleet_board_two_nodes();
+    failures += test_fleet_wiki_review_convergence();
+    failures += test_fleet_wiki_review_budget();
     failures += test_fleet_board_waits_for_peer_handshake();
     failures += test_fleet_board_peer_churn_limits();
     failures += test_fleet_board_rpc_verification();

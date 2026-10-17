@@ -879,6 +879,27 @@ void zcl_native_handle_fleet_wiki_history(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply)
 {
+    if (json_get(request->input, "target")) {
+        struct json_value out, body;
+        json_init(&out); json_set_object(&out); json_init(&body);
+        const char *target = json_get_str(json_get(request->input, "target"));
+        const struct json_value *cursor = json_get(request->input, "after_id");
+        bool prepared = json_push_kv_str(&out, "op", "wiki_history") &&
+            target && json_push_kv_str(&out, "target", target);
+        if (prepared && cursor)
+            prepared = cursor->type == JSON_STR && json_push_kv_str(&out, "after_id", cursor->val.s);
+        size_t cap = fb_wiki_response_cap(request);
+        prepared = prepared && json_push_kv_int(&out, "response_budget", (int64_t)cap);
+        if (prepared && request->success_data_budget_provided)
+            prepared = json_push_kv_int(&out, "data_budget", (int64_t)request->success_data_budget);
+        if (!prepared)
+            fb_fail(reply, ZCL_COMMAND_STATUS_FAILED, ZCL_COMMAND_EXIT_FAILED,
+                "REVIEW_REQUEST_FAILED", "prepare", false,
+                "cannot faithfully construct target and continuation request", "fleet.wiki.history");
+        else if (fb_call(reply, &out, &body, 0)) fb_project_object(reply, &body);
+        json_free(&body); json_free(&out);
+        return;
+    }
     const char *slug = json_get_str(json_get(request->input, "slug"));
     if (!slug || !slug[0]) {
         fb_fail(reply, ZCL_COMMAND_STATUS_FAILED, ZCL_COMMAND_EXIT_INVALID,

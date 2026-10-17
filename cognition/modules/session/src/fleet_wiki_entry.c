@@ -230,3 +230,73 @@ bool fleet_wiki_entry_query_matches(const struct json_value *entry,
         (fleet_wiki_entry_matches(entry, query->q) ||
          (query->slug && query->slug[0] && contains_folded(query->slug, query->q)));
 }
+
+static const char *review_violation(const struct json_value *root)
+{
+    static const char *const keys[] = {
+        "schema", "target", "verdict", "rating", "rationale"
+    };
+    if (!entry_keys_in(root, keys, 5))
+        return "review contains unknown or duplicate keys";
+    const struct json_value *target = json_get(root, "target");
+    uint8_t id[32];
+    char canonical[65];
+    if (!entry_text_ok(target, 64, 64) ||
+        !fleet_board_id_from_hex(target->val.s, id))
+        return "review target must be an exact 64-character revision id";
+    fleet_board_id_to_hex(id, canonical);
+    static const uint8_t zero[32];
+    if (memcmp(id, zero, 32) == 0 || strcmp(canonical, target->val.s))
+        return "review target must be a nonzero canonical lowercase id";
+    const struct json_value *verdict = json_get(root, "verdict");
+    if (!entry_text_ok(verdict, 1, 15) ||
+        (strcmp(verdict->val.s, "approve") &&
+         strcmp(verdict->val.s, "request-changes") &&
+         strcmp(verdict->val.s, "comment")))
+        return "review verdict must be approve, request-changes or comment";
+    const struct json_value *rating = json_get(root, "rating");
+    if (rating && (rating->type != JSON_INT || rating->val.i < 1 || rating->val.i > 5))
+        return "review rating must be an integer from 1 through 5";
+    if (!entry_text_ok(json_get(root, "rationale"), 1, 1000))
+        return "review rationale must be 1..1000 printable UTF-8 bytes";
+    return NULL;
+}
+
+
+/* Materialization is separate from recognizing the reserved review schema.
+ * Invalid JSON, including escaped NUL, remains an inert non-review body. */
+static bool review_materialize(const char *text, size_t len,
+    struct json_value *out, enum fleet_wiki_review_status *status, const char **why)
+{
+    size_t start = 0;
+    while (text && start < len && (text[start] == ' ' || text[start] == 9 ||
+        text[start] == 10 || text[start] == 13)) start++;
+    if (!text || start == len || text[start] != '{' || !json_valid(text, len))
+        return false;
+    if (json_read(out, text, len)) return true;
+    json_free(out); json_init(out);
+    if (why) *why = "review allocation failed";
+    *status = FLEET_WIKI_REVIEW_ALLOC_FAILED;
+    return false;
+}
+
+enum fleet_wiki_review_status fleet_wiki_review_parse(
+    const char *text, size_t len, struct json_value *out, const char **why)
+{
+    if (why) *why = NULL;
+    if (!out) return FLEET_WIKI_REVIEW_INVALID;
+    json_init(out);
+    enum fleet_wiki_review_status status = FLEET_WIKI_NOT_REVIEW;
+    if (!review_materialize(text, len, out, &status, why)) return status;
+    const struct json_value *schema = json_get(out, "schema");
+    if (out->type != JSON_OBJ || !schema || schema->type != JSON_STR ||
+        strcmp(schema->val.s, FLEET_WIKI_REVIEW_SCHEMA)) {
+        json_free(out); json_init(out);
+        return FLEET_WIKI_NOT_REVIEW;
+    }
+    const char *violation = review_violation(out);
+    if (!violation) return FLEET_WIKI_REVIEW_VALID;
+    if (why) *why = violation;
+    json_free(out); json_init(out);
+    return FLEET_WIKI_REVIEW_INVALID;
+}

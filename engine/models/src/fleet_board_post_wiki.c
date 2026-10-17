@@ -16,9 +16,12 @@
 #include "models/def/fleet_board_post_fields.def"
 #include "models/activerecord.h"
 #include "models/query_builder.h"
+#include "session/fleet_wiki_entry.h"
+#include "base/safe_alloc.h"
 #include "util/log_macros.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef ZCL_TESTING
@@ -53,17 +56,13 @@ static int64_t board_wiki_stored_max(void)
 
 /* One stored wiki revision of one key, as much as the eviction rule reads. */
 struct board_wiki_row {
+    bool review;
     uint8_t id[32];
     char slug[FLEET_BOARD_SLUG_MAX + 1];
     int64_t created_at;
 };
 enum { BOARD_WIKI_SCAN_MAX = FLEET_BOARD_PUBLIC_QUOTA_STORED_MAX };
 
-static const enum qb_column k_board_wiki_cols[] = {
-    QB_C_fleet_board_posts_id,
-    QB_C_fleet_board_posts_slug,
-    QB_C_fleet_board_posts_created_at,
-};
 
 /* This key's wiki rows in this scope, oldest first. Returns the count, or -1
  * when the scan failed or the key holds more rows than the buffer, in which
@@ -73,33 +72,41 @@ static int board_wiki_rows(struct node_db *ndb,
                            struct board_wiki_row *rows)
 {
     struct qb q;
-    qb_select(&q, QB_T_fleet_board_posts);
-    qb_select_columns(&q, k_board_wiki_cols, 3);
+    fleet_board_select_row(&q);
     qb_where_blob(&q, QB_C_fleet_board_posts_host_pubkey, QB_EQ,
                   post->host_pubkey, 32);
     qb_where_int(&q, QB_C_fleet_board_posts_scope, QB_EQ, post->scope);
-    qb_where_int(&q, QB_C_fleet_board_posts_kind, QB_EQ,
-                 FLEET_BOARD_KIND_WIKI);
+    qb_where_int(&q, QB_C_fleet_board_posts_kind, QB_EQ, FLEET_BOARD_KIND_WIKI);
     qb_order_by(&q, QB_C_fleet_board_posts_created_at, QB_ASC);
     qb_order_by(&q, QB_C_fleet_board_posts_id, QB_ASC);
     sqlite3_stmt *s = NULL;
-    if (!QB_PREPARE(ndb, &q, s))
-        return -1;
+    if (!QB_PREPARE(ndb, &q, s)) return -1;
     int n = 0;
+    bool healthy = true;
     while (AR_STEP_ROW(s)) {
-        if (n >= BOARD_WIKI_SCAN_MAX || sqlite3_column_bytes(s, 0) != 32) {
-            sqlite3_finalize(s);
-            return -1;
+        struct db_fleet_board_post row;
+        if (n >= BOARD_WIKI_SCAN_MAX || !fleet_board_row_read(s, &row)) {
+            healthy = false; break;
         }
-        memcpy(rows[n].id, sqlite3_column_blob(s, 0), 32);
-        (void)snprintf(rows[n].slug, sizeof(rows[n].slug), "%s",
-                       (const char *)sqlite3_column_text(s, 1));
-        rows[n].created_at = sqlite3_column_int64(s, 2);
+        struct json_value review;
+        enum fleet_wiki_review_status kind = fleet_wiki_review_parse(
+            row.post.text, row.post.text_len, &review, NULL);
+        json_free(&review);
+        if (kind != FLEET_WIKI_NOT_REVIEW &&
+            (kind != FLEET_WIKI_REVIEW_VALID || !fleet_board_review_shape(&row.post))) {
+            healthy = false; break;
+        }
+        memcpy(rows[n].id, row.post.id, 32);
+        (void)snprintf(rows[n].slug, sizeof(rows[n].slug), "%s", row.post.slug);
+        rows[n].created_at = (int64_t)row.post.created_at;
+        rows[n].review = kind == FLEET_WIKI_REVIEW_VALID;
         n++;
     }
+    healthy = sqlite3_reset(s) == SQLITE_OK && healthy;
     sqlite3_finalize(s);
-    return n;
+    return healthy ? n : -1;
 }
+
 
 /* True when `other` is a later revision than (created_at, id): the same
  * order db_fleet_board_wiki_read resolves a page by. */
@@ -111,38 +118,38 @@ static bool board_wiki_later(const struct board_wiki_row *other,
             memcmp(other->id, id, 32) > 0);
 }
 
-/* Row i is superseded when the incoming revision shares its slug (the
- * caller has already proven the incoming one is the newest of that slug) or
- * a later stored revision of the same slug exists. */
-static bool board_wiki_superseded(const struct board_wiki_row *rows, int n,
-                                  int i, const char *incoming_slug)
+static bool board_wiki_plain_superseded(const struct board_wiki_row *rows,
+    int n, int i, const struct fleet_board_post *post, bool incoming_review)
 {
-    if (strcmp(rows[i].slug, incoming_slug) == 0)
-        return true;
+    if (!incoming_review && !strcmp(rows[i].slug, post->slug)) return true;
     for (int j = 0; j < n; j++)
-        if (j != i && strcmp(rows[j].slug, rows[i].slug) == 0 &&
-            board_wiki_later(&rows[j], rows[i].created_at, rows[i].id))
-            return true;
+        if (!rows[j].review && !strcmp(rows[j].slug, rows[i].slug) &&
+            board_wiki_later(&rows[j], rows[i].created_at, rows[i].id)) return true;
     return false;
 }
 
-/* The oldest superseded revision of this key, or false when every stored
- * revision is the newest of its slug, or when the incoming revision is
- * itself older than a stored revision of its slug (accepting it would only
- * churn the store). The newest revision of a slug is never named. */
+
 static bool board_wiki_pick_victim(const struct board_wiki_row *rows, int n,
                                    const struct fleet_board_post *post,
                                    uint8_t victim[32])
 {
-    for (int i = 0; i < n; i++)
-        if (strcmp(rows[i].slug, post->slug) == 0 &&
-            board_wiki_later(&rows[i], (int64_t)post->created_at, post->id))
-            return false;
+    struct json_value review;
+    enum fleet_wiki_review_status kind = fleet_wiki_review_parse(
+        post->text, post->text_len, &review, NULL);
+    json_free(&review);
+    if (kind != FLEET_WIKI_NOT_REVIEW && kind != FLEET_WIKI_REVIEW_VALID)
+        return false;
+    bool incoming_review = kind == FLEET_WIKI_REVIEW_VALID;
+    if (!incoming_review)
+        for (int i = 0; i < n; i++)
+            if (!rows[i].review && strcmp(rows[i].slug, post->slug) == 0 &&
+                board_wiki_later(&rows[i], (int64_t)post->created_at, post->id))
+                return false;
     for (int i = 0; i < n; i++) {
-        if (board_wiki_superseded(rows, n, i, post->slug)) {
-            memcpy(victim, rows[i].id, 32);
-            return true;
-        }
+        /* Review ancestors are needed to establish complete lineage. Quota
+         * pressure may refuse an append, never silently sever that evidence. */
+        if (rows[i].review) continue;
+        if (board_wiki_plain_superseded(rows, n, i, post, incoming_review)) { memcpy(victim, rows[i].id, 32); return true; }
     }
     return false;
 }
@@ -302,6 +309,11 @@ static enum fleet_wiki_query_status board_wiki_query_latest(
         }
         (*verified)++;
         if (fleet_board_row_read(s, out)) {
+            struct json_value review;
+            enum fleet_wiki_review_status kind = fleet_wiki_review_parse(out->post.text, out->post.text_len, &review, NULL);
+            json_free(&review);
+            if (kind == FLEET_WIKI_REVIEW_ALLOC_FAILED) { status = FLEET_WIKI_QUERY_VISITOR_FAILED; break; }
+            if (kind != FLEET_WIKI_NOT_REVIEW) continue;
             *found = true;
             break;
         }
@@ -375,4 +387,283 @@ bool db_fleet_board_wiki_read_checked(struct node_db *ndb, const char *slug,
     /* Every attempt before the winner was a newer revision that failed. */
     *newer_unverified = verified > 1;
     return true;
+}
+
+/* The signed review type is a payload format, not a second storage authority. */
+bool fleet_board_review_shape(const struct fleet_board_post *post)
+{
+    if (!post || post->kind != FLEET_BOARD_KIND_WIKI) return post != NULL;
+    struct json_value review;
+    enum fleet_wiki_review_status kind = fleet_wiki_review_parse(
+        post->text, post->text_len, &review, NULL);
+    bool valid = kind == FLEET_WIKI_NOT_REVIEW;
+    if (kind == FLEET_WIKI_REVIEW_VALID) {
+        uint8_t target[32];
+        valid = fleet_board_id_from_hex(json_get_str(json_get(&review, "target")), target) &&
+            !memcmp(target, post->ref, 32);
+    }
+    json_free(&review);
+    if (!valid) LOG_WARN("fleet.board", "signed wiki review shape or target binding refused");
+    return valid;
+}
+
+static bool review_same_lineage(const struct fleet_board_post *a,
+    const struct fleet_board_post *b)
+{
+    return a->kind == FLEET_BOARD_KIND_WIKI && b->kind == FLEET_BOARD_KIND_WIKI &&
+        a->scope == b->scope && !strcmp(a->room, b->room) &&
+        !memcmp(a->host_pubkey, b->host_pubkey, 32) && !memcmp(a->ref, b->ref, 32);
+}
+
+static bool review_is_typed(const struct fleet_board_post *post)
+{
+    struct json_value review;
+    enum fleet_wiki_review_status kind = fleet_wiki_review_parse(
+        post->text, post->text_len, &review, NULL);
+    json_free(&review);
+    return kind == FLEET_WIKI_REVIEW_VALID && fleet_board_review_shape(post);
+}
+
+static bool review_ancestry(struct node_db *, const struct fleet_board_post *);
+
+enum fleet_board_result db_fleet_board_review_local_check(
+    struct node_db *ndb, const struct fleet_board_post *post)
+{
+    struct json_value review;
+    enum fleet_wiki_review_status kind = fleet_wiki_review_parse(post->text, post->text_len, &review, NULL);
+    json_free(&review);
+    if (kind == FLEET_WIKI_NOT_REVIEW) return FLEET_BOARD_OK;
+    if (kind != FLEET_WIKI_REVIEW_VALID || !fleet_board_review_shape(post)) return FLEET_BOARD_ERR_TEXT;
+    struct db_fleet_board_post target;
+    if (!db_fleet_board_post_find(ndb, post->ref, &target) ||
+        target.post.kind != FLEET_BOARD_KIND_WIKI ||
+        target.post.scope != post->scope || strcmp(target.post.room, post->room)) {
+        LOG_WARN("fleet.board", "local review requires a retained verified target in the same visibility scope and room");
+        return FLEET_BOARD_ERR_SCOPE;
+    }
+    static const uint8_t zero[32];
+    if (memcmp(post->supersedes, zero, 32)) {
+        struct db_fleet_board_post parent;
+        if (!db_fleet_board_post_find(ndb, post->supersedes, &parent) ||
+            !review_is_typed(&parent.post) || !review_same_lineage(post, &parent.post) ||
+            !review_ancestry(ndb, &parent.post)) {
+            LOG_WARN("fleet.board", "local review predecessor is unavailable or belongs to another reviewer or target");
+            return FLEET_BOARD_ERR_TEXT;
+        }
+    }
+    return FLEET_BOARD_OK;
+}
+
+/* Stable id pagination is independent of mutable newest-by-slug selection.
+ * Corrupt rows fail the entire page; no false exhaustion is reported. */
+static bool review_row_classify(const struct fleet_board_post *post, bool *typed)
+{
+    struct json_value review;
+    enum fleet_wiki_review_status kind =
+        fleet_wiki_review_parse(post->text, post->text_len, &review, NULL);
+    json_free(&review);
+    *typed = kind == FLEET_WIKI_REVIEW_VALID;
+    if (kind == FLEET_WIKI_NOT_REVIEW) return true;
+    return kind == FLEET_WIKI_REVIEW_VALID && fleet_board_review_shape(post);
+}
+
+static bool review_page_arguments(struct node_db *ndb, const uint8_t *target,
+    const uint8_t *after, struct db_fleet_board_post *out, size_t max,
+    size_t *count, uint8_t *next, bool *more)
+{
+    if (!ndb || !ndb->open || !target || !after || !out || !count ||
+        !next || !more || !max || max > FLEET_BOARD_LIST_MAX) {
+        LOG_WARN("fleet.board", "review page requires open storage, ids and bounded output arguments");
+        return false;
+    }
+    return true;
+}
+
+
+bool db_fleet_board_wiki_reviews(struct node_db *ndb, const uint8_t target[32],
+    const uint8_t after[32], struct db_fleet_board_post *out, size_t max,
+    size_t *count, uint8_t next[32], bool *more)
+{
+    if (!review_page_arguments(ndb, target, after, out, max, count, next, more)) return false;
+    *count = 0; *more = false;
+    memcpy(next, after, 32);
+    struct qb q;
+    fleet_board_select_row(&q);
+    qb_where_int(&q, QB_C_fleet_board_posts_kind, QB_EQ, FLEET_BOARD_KIND_WIKI);
+    qb_where_blob(&q, QB_C_fleet_board_posts_ref, QB_EQ, target, 32);
+    qb_where_int(&q, QB_C_fleet_board_posts_scope, QB_EQ, FLEET_BOARD_SCOPE_PUBLIC);
+    qb_where_text(&q, QB_C_fleet_board_posts_room, QB_EQ, FLEET_BOARD_ROOM_DEFAULT);
+    qb_where_blob(&q, QB_C_fleet_board_posts_id, QB_GT, after, 32);
+    qb_order_by(&q, QB_C_fleet_board_posts_id, QB_ASC);
+    qb_limit(&q, FLEET_BOARD_LIST_MAX + 1);
+    sqlite3_stmt *s = NULL;
+    if (!QB_PREPARE(ndb, &q, s)) {
+        LOG_WARN("fleet.board", "review page query prepare failed: %s", qb_error(&q));
+        return false;
+    }
+    unsigned scanned = 0;
+    bool healthy = true;
+    while (AR_STEP_ROW(s)) {
+        if (scanned++ == FLEET_BOARD_LIST_MAX || *count == max) { *more = true; break; }
+        struct db_fleet_board_post row;
+        if (!fleet_board_row_read(s, &row)) { healthy = false; break; }
+        bool typed;
+        if (!review_row_classify(&row.post, &typed)) { healthy = false; break; }
+        memcpy(next, row.post.id, 32);
+        if (typed) out[(*count)++] = row;
+    }
+    healthy = sqlite3_reset(s) == SQLITE_OK && healthy;
+    sqlite3_finalize(s);
+    if (!healthy) LOG_WARN("fleet.board", "review page could not verify every selected row");
+    return healthy;
+}
+
+static bool review_ancestry(struct node_db *ndb, const struct fleet_board_post *post)
+{
+    static const uint8_t zero[32];
+    struct fleet_board_post current = *post;
+    for (unsigned i = 0; i < FLEET_BOARD_LIST_MAX; i++) {
+        if (!memcmp(current.supersedes, zero, 32)) return true;
+        struct db_fleet_board_post parent;
+        if (!db_fleet_board_post_find(ndb, current.supersedes, &parent) ||
+            !review_is_typed(&parent.post) || !review_same_lineage(post, &parent.post))
+            return false;
+        current = parent.post;
+    }
+    return false;
+}
+
+
+static bool review_graph_path(const int *parents, size_t n, size_t start)
+{
+    size_t at = start;
+    for (size_t depth = 0; depth < n; depth++) {
+        if (parents[at] == -1) return true;
+        if (parents[at] < 0) return false;
+        at = (size_t)parents[at];
+    }
+    return false; /* A cycle or traversal beyond this retained graph. */
+}
+
+static bool review_graph_load(struct node_db *ndb, const struct fleet_board_post *post,
+    struct db_fleet_board_post *rows, size_t *count, unsigned *verified)
+{
+    struct qb q;
+    fleet_board_select_row(&q);
+    qb_where_int(&q, QB_C_fleet_board_posts_kind, QB_EQ, FLEET_BOARD_KIND_WIKI);
+    qb_where_blob(&q, QB_C_fleet_board_posts_ref, QB_EQ, post->ref, 32);
+    qb_where_blob(&q, QB_C_fleet_board_posts_host_pubkey, QB_EQ, post->host_pubkey, 32);
+    qb_where_int(&q, QB_C_fleet_board_posts_scope, QB_EQ, post->scope);
+    qb_where_text(&q, QB_C_fleet_board_posts_room, QB_EQ, post->room);
+    qb_limit(&q, FLEET_BOARD_LIST_MAX + 1);
+    sqlite3_stmt *s = NULL;
+    *count = 0;
+    if (!QB_PREPARE(ndb, &q, s)) return false;
+    unsigned scanned = 0;
+    bool healthy = true;
+    while (AR_STEP_ROW(s)) {
+        if (scanned++ == FLEET_BOARD_LIST_MAX) { healthy = false; break; }
+        (*verified)++;
+        if (!fleet_board_row_read(s, &rows[*count])) { healthy = false; break; }
+        bool typed;
+        if (!review_row_classify(&rows[*count].post, &typed)) { healthy = false; break; }
+        if (typed) (*count)++;
+    }
+    healthy = sqlite3_reset(s) == SQLITE_OK && healthy;
+    sqlite3_finalize(s);
+    return healthy;
+}
+
+static size_t review_graph_bind(const struct db_fleet_board_post *rows, size_t n,
+    const uint8_t id[32], int *parents)
+{
+    static const uint8_t zero[32];
+    size_t own = n;
+    for (size_t i = 0; i < n; i++) {
+        parents[i] = !memcmp(rows[i].post.supersedes, zero, 32) ? -1 : -2;
+        for (size_t j = 0; j < n; j++)
+            if (!memcmp(rows[i].post.supersedes, rows[j].post.id, 32))
+                parents[i] = (int)j;
+        if (!memcmp(rows[i].post.id, id, 32)) own = i;
+    }
+    return own;
+}
+
+static void review_graph_assess(const struct db_fleet_board_post *rows, size_t n,
+    const uint8_t id[32], bool healthy, struct fleet_wiki_review_state *state)
+{
+    int parents[FLEET_BOARD_LIST_MAX];
+    size_t own = review_graph_bind(rows, n, id, parents);
+    state->lineage_valid = healthy && own < n && review_graph_path(parents, n, own);
+    if (healthy) for (size_t i = 0; i < n; i++)
+        if (!review_graph_path(parents, n, i)) healthy = false;
+    state->complete = healthy;
+    if (!healthy) return;
+    unsigned leaves = 0;
+    for (size_t i = 0; i < n; i++) {
+        bool child = false;
+        for (size_t j = 0; j < n; j++) if (parents[j] == (int)i) child = true;
+        if (child) continue;
+        leaves++;
+        if (i == own) state->current = true;
+    }
+    state->fork = leaves > 1;
+}
+
+/* At most LIST_MAX graph signatures plus one target signature. Ancestry is
+ * then walked in already verified memory, never re-verified per descendant. */
+bool db_fleet_board_review_state(struct node_db *ndb,
+    const struct fleet_board_post *post, struct fleet_wiki_review_state *state)
+{
+    if (!state || !post || !review_is_typed(post)) return false;
+    memset(state, 0, sizeof(*state));
+    struct db_fleet_board_post target;
+    state->resolved = db_fleet_board_post_find(ndb, post->ref, &target) &&
+        target.post.kind == FLEET_BOARD_KIND_WIKI &&
+        target.post.scope == post->scope && !strcmp(target.post.room, post->room);
+    struct db_fleet_board_post *rows = zcl_calloc(FLEET_BOARD_LIST_MAX,
+        sizeof(*rows), "fleet.board.review_graph");
+    if (!rows) return false;
+    size_t count;
+    bool healthy = review_graph_load(ndb, post, rows, &count, &state->graph_verified);
+    review_graph_assess(rows, count, post->id, healthy, state);
+    free(rows);
+    return true;
+}
+
+
+bool db_fleet_board_wiki_read(struct node_db *ndb, const char *slug,
+                              struct db_fleet_board_post *out)
+{
+    /* raw-return-ok:absent-page-is-not-an-error — an illegal or unknown slug
+     * has no page, and saying so in the log on every miss would drown the
+     * one line that matters. */
+    if (!ndb || !ndb->open || !out || !fleet_board_slug_valid(slug))
+        return false; // raw-return-ok:absent-page-is-not-an-error
+    struct qb q;
+    fleet_board_select_row(&q);
+    qb_where_int(&q, QB_C_fleet_board_posts_kind, QB_EQ,
+                 FLEET_BOARD_KIND_WIKI);
+    qb_where_text(&q, QB_C_fleet_board_posts_slug, QB_EQ, slug);
+    /* Newest created_at wins; the larger id breaks a tie, so two nodes
+     * holding the same revisions always resolve the same page. */
+    qb_order_by(&q, QB_C_fleet_board_posts_created_at, QB_DESC);
+    qb_order_by(&q, QB_C_fleet_board_posts_id, QB_DESC);
+    sqlite3_stmt *s = NULL;
+    if (!QB_PREPARE(ndb, &q, s)) {
+        LOG_WARN("fleet.board", "wiki latest prepare failed slug=%s: %s",
+                 slug, qb_error(&q));
+        return false;
+    }
+    bool found = false;
+    while (!found && AR_STEP_ROW(s)) {
+        if (!fleet_board_row_read(s, out)) continue;
+        struct json_value review;
+        enum fleet_wiki_review_status kind = fleet_wiki_review_parse(out->post.text, out->post.text_len, &review, NULL);
+        json_free(&review);
+        if (kind == FLEET_WIKI_REVIEW_ALLOC_FAILED) break;
+        found = kind == FLEET_WIKI_NOT_REVIEW;
+    }
+    sqlite3_finalize(s);
+    return found;
 }

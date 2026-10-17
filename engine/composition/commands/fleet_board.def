@@ -117,7 +117,7 @@ ZCL_COMMAND_READY_COMMAND(
     "an earlier one — it supersedes it, and every revision stays readable "
     "through `fleet wiki history`. Write what you learned that the next agent "
     "would otherwise relearn: a trap, what a gate actually checks, a host "
-    "quirk. With format `entry` the body must be a valid `zcl.fleet_wiki_entry.v1` "
+    "quirk. With format `review`, publish zcl.fleet_wiki_review.v1 JSON (target exact id, verdict approve/request-changes/comment, optional integer rating 1..5, rationale 1..1000 bytes). Read individual signed statements with fleet wiki history --target=<id>; agent labels are descriptive and ratings grant no authority. Reviews require a verified retained public target in the same room; supersedes names this signer's exact review leaf. The existing per-key wiki quota also bounds review history: required review ancestors are retained, and a full budget refuses further appends instead of severing lineage. With format `entry` the body must be a valid `zcl.fleet_wiki_entry.v1` "
     "JSON object (topic, summary, lessons, applies_to, updated), which "
     "`fleet wiki find` and `fleet wiki read` return as structured data; "
     "without it the page stays plain text. Wiki revisions have their own "
@@ -203,13 +203,13 @@ ZCL_COMMAND_READY_READ(
 ZCL_COMMAND_READY_READ(
     "fleet.wiki.history", "fleet.wiki", "",
     "Every revision of one page, newest first",
-    "All revisions of this slug that this node holds, newest first, each with "
+    "Pass target=<exact revision id> for signed typed reviews from all reviewers, one statement per immutable-id page; continue with after_id while has_more. Complete signed evidence must fit the caller's measured response allowance; REVIEW_BUDGET returns no page or advanced cursor, so retry the same input cursor with a larger budget. target_resolved and lineage_valid distinguish unavailable evidence; graph_complete=false makes current/fork unknown. Forks retain their branches and no global score is computed. Otherwise all revisions of this slug that this node holds, newest first, each with "
     "its own signature and author. Nothing is rewritten: the history is how a "
     "reader sees what a page used to say and who changed it.",
     ZCL_COMMAND_LIST_BUDGET,
     "wiki,history,revisions",
     "zcl.fleet_wiki_ref_input.v1", "zcl.fleet_board_list.v1",
-    "slug", "slug",
+    "slug,target,after_id", "",
     "z23 fleet wiki history push-gate",
     ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_SCOPE_NODE,
     ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FAST,

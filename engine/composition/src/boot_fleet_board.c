@@ -2,6 +2,7 @@
  * The only net-to-fleet-board adapter; see config/boot_fleet_board.h. */
 
 #include "config/boot_fleet_board.h"
+#include "session/fleet_wiki_entry.h"
 
 #include "config/boot_fleet_roster.h"
 #include "config/boot_internal.h"
@@ -653,6 +654,45 @@ static enum fleet_board_result fleet_board_sign_local(struct fleet_board_post *p
     return r;
 }
 
+static enum fleet_board_result fleet_board_review_prepare(
+    struct fleet_board_post *post, bool *typed)
+{
+    *typed = false;
+    if (post->kind != FLEET_BOARD_KIND_WIKI) return FLEET_BOARD_OK;
+    struct json_value review;
+    enum fleet_wiki_review_status kind = fleet_wiki_review_parse(
+        post->text, post->text_len, &review, NULL);
+    if (kind == FLEET_WIKI_REVIEW_VALID)
+        (void)fleet_board_id_from_hex(json_get_str(json_get(&review, "target")), post->ref);
+    json_free(&review);
+    if (kind == FLEET_WIKI_REVIEW_INVALID || kind == FLEET_WIKI_REVIEW_ALLOC_FAILED)
+        return FLEET_BOARD_ERR_TEXT;
+    *typed = kind == FLEET_WIKI_REVIEW_VALID;
+    return FLEET_BOARD_OK;
+}
+
+static enum fleet_board_result fleet_board_review_publish(
+    struct node_db *ndb, struct fleet_board_post *post, int64_t now)
+{
+    char marker[65];
+    fleet_board_id_to_hex(post->id, marker);
+    (void)snprintf(post->receipt, sizeof(post->receipt), "review-v1:%s", marker);
+    enum fleet_board_result r = fleet_board_sign_local(post);
+    if (r != FLEET_BOARD_OK) return r;
+    static const uint8_t zero[32];
+    const uint8_t *expected = memcmp(post->supersedes, zero, 32) ? post->supersedes : NULL;
+    struct db_fleet_board_post out;
+    enum fleet_board_result refusal;
+    enum fleet_board_wiki_write_status written =
+        db_fleet_board_wiki_write(ndb, post, expected, now, &out, &refusal);
+    if (written != FLEET_WIKI_WRITE_OK && written != FLEET_WIKI_WRITE_REPLAY)
+        return refusal != FLEET_BOARD_OK ? refusal : FLEET_BOARD_ERR_STORAGE;
+    if (written == FLEET_WIKI_WRITE_OK && post->scope != FLEET_BOARD_SCOPE_FLEET)
+        boot_fleet_board_announce(out.post.id);
+    return FLEET_BOARD_OK;
+}
+
+
 enum fleet_board_result boot_fleet_board_publish(
     struct fleet_board_post *post, int64_t now)
 {
@@ -661,7 +701,10 @@ enum fleet_board_result boot_fleet_board_publish(
     struct node_db *ndb = fleet_board_db();
     if (!ndb)
         return FLEET_BOARD_ERR_ARGS;
-    enum fleet_board_result r = fleet_board_sign_local(post);
+    bool typed;
+    enum fleet_board_result r = fleet_board_review_prepare(post, &typed);
+    if (r != FLEET_BOARD_OK) return r;
+    r = fleet_board_sign_local(post);
     if (r != FLEET_BOARD_OK)
         return r;
     /* A roster row is stored here only if its seal verifies, exactly as it
@@ -672,6 +715,7 @@ enum fleet_board_result boot_fleet_board_publish(
             return r;
     }
 
+    if (typed) return fleet_board_review_publish(ndb, post, now);
     bool stored = false;
     r = db_fleet_board_post_ingest(ndb, post, now, &stored);
     if (r != FLEET_BOARD_OK)
@@ -696,6 +740,9 @@ enum fleet_board_wiki_write_status boot_fleet_board_wiki_write(
         LOG_WARN("fleet.board", "wiki mutation signing context unavailable");
         return FLEET_WIKI_WRITE_ARGS;
     }
+    bool typed;
+    *refusal = fleet_board_review_prepare(post, &typed);
+    if (*refusal != FLEET_BOARD_OK) return FLEET_WIKI_WRITE_REFUSED;
     *refusal = fleet_board_sign_local(post);
     if (*refusal != FLEET_BOARD_OK) return FLEET_WIKI_WRITE_REFUSED;
     enum fleet_board_wiki_write_status status =

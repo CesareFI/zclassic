@@ -65,4 +65,18 @@ bool fleet_wiki_entry_query_matches(const struct json_value *,
     const struct fleet_wiki_entry_query *);
 
 
+/* Signed review bodies remain ordinary WIKI ledger objects. The host signing
+ * key is the reviewer; an agent label is descriptive, with no Sybil resistance,
+ * reputation, permission or execution authority. Targets never follow a slug. */
+#define FLEET_WIKI_REVIEW_SCHEMA "zcl.fleet_wiki_review.v1"
+enum fleet_wiki_review_status {
+    FLEET_WIKI_NOT_REVIEW, FLEET_WIKI_REVIEW_VALID,
+    FLEET_WIKI_REVIEW_INVALID, FLEET_WIKI_REVIEW_ALLOC_FAILED
+};
+/* Valid output owns a JSON object; all other outputs are JSON_NULL.
+ * verdict: approve/request-changes/comment; optional integer rating: 1..5;
+ * rationale: 1..1000 printable UTF-8 bytes; target: canonical exact id. */
+enum fleet_wiki_review_status fleet_wiki_review_parse(
+    const char *, size_t, struct json_value *, const char **);
+
 #endif

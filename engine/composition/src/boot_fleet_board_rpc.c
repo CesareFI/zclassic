@@ -222,8 +222,17 @@ static bool fb_check_entry_format(const struct json_value *in,
     const char *format = fb_str(in, "format", NULL);
     if (!format)
         return true;
+    if (!strcmp(format, "review")) {
+        struct json_value review;
+        const char *why = NULL;
+        enum fleet_wiki_review_status status = fleet_wiki_review_parse(post->text, post->text_len, &review, &why);
+        json_free(&review);
+        if (status == FLEET_WIKI_REVIEW_VALID) return true;
+        fb_error(result, "BAD_REVIEW", why ? why : "format review requires zcl.fleet_wiki_review.v1");
+        return false;
+    }
     if (strcmp(format, "entry") != 0) {
-        fb_error(result, "BAD_FORMAT", "format must be entry when given");
+        fb_error(result, "BAD_FORMAT", "format must be entry or review when given");
         return false;
     }
     struct json_value entry;
@@ -891,10 +900,136 @@ static void fb_op_wiki_list(struct node_db *ndb, struct json_value *result)
     free(rows);
 }
 
+/* Exact-target retrieval includes every signer and preserves forks. Private
+ * or cross-room peer statements are not projected by this public wiki view. */
+static bool fb_review_allowance(const struct json_value *in, size_t *allowance)
+{
+    const struct json_value *cap_value = json_get(in, "response_budget");
+    const struct json_value *data = json_get(in, "data_budget");
+    int64_t cap = fb_int(in, "response_budget", 8192);
+    if ((cap_value && cap_value->type != JSON_INT) || cap < 2048 || cap > 8192)
+        return false;
+    if (data) {
+        if (data->type != JSON_INT || data->val.i < 0 || data->val.i > cap)
+            return false;
+        *allowance = (size_t)data->val.i;
+    } else {
+        /* Direct RPC/handler calls lack a measured registry envelope. */
+        *allowance = (size_t)cap - FB_WIKI_READ_MARGIN;
+    }
+    return true;
+}
+
+
+static const char *fb_review_resolution(const struct fleet_wiki_review_state *state)
+{
+    if (!state->resolved) return "unresolved-target";
+    if (!state->lineage_valid) return "unresolved-lineage";
+    if (!state->complete) return "graph-unavailable";
+    if (state->fork) return "fork";
+    return state->current ? "current-held-opinion" : "superseded";
+}
+
+static bool fb_review_render_row(struct node_db *ndb,
+    const struct db_fleet_board_post *row, struct json_value *item)
+{
+    const struct fleet_board_post *post = &row->post;
+    struct fleet_wiki_review_state state;
+    struct json_value review;
+    enum fleet_wiki_review_status kind =
+        fleet_wiki_review_parse(post->text, post->text_len, &review, NULL);
+    if (kind != FLEET_WIKI_REVIEW_VALID ||
+        !db_fleet_board_review_state(ndb, post, &state)) {
+        json_free(&review);
+        return false;
+    }
+    bool ok = fb_render_post_fields(item, row, true);
+    ok &= json_push_kv(item, "review", &review);
+    ok &= json_push_kv_bool(item, "target_resolved", state.resolved);
+    ok &= json_push_kv_bool(item, "lineage_valid", state.lineage_valid);
+    ok &= json_push_kv_bool(item, "graph_complete", state.complete);
+    ok &= json_push_kv_int(item, "graph_verified", state.graph_verified);
+    ok &= json_push_kv_int(item, "graph_verify_limit", FLEET_BOARD_LIST_MAX);
+    ok &= json_push_kv_bool(item, "current", state.current);
+    ok &= json_push_kv_bool(item, "fork", state.fork);
+    ok &= json_push_kv_str(item, "resolution", fb_review_resolution(&state));
+    ok &= json_push_kv_str(item, "reviewer", json_get_str(json_get(item, "host")));
+    json_free(&review);
+    return ok;
+}
+
+static bool fb_review_result(struct json_value *result, const struct json_value *posts,
+    const char *target, const uint8_t next[32], bool more)
+{
+    json_set_object(result);
+    char hex[65]; fleet_board_id_to_hex(next, hex);
+    bool ok = json_push_kv_bool(result, "ok", true);
+    ok &= json_push_kv(result, "posts", posts);
+    ok &= json_push_kv_str(result, "target", target);
+    ok &= json_push_kv_str(result, "after_id", hex);
+    ok &= json_push_kv_bool(result, "has_more", more);
+    ok &= json_push_kv_str(result, "selection",
+        "receiver-held individual statements; no global score or reviewer privilege");
+    return ok;
+}
+
+static void fb_op_wiki_reviews(struct node_db *ndb, const struct json_value *in,
+    struct json_value *result)
+{
+    size_t allowance;
+    if (!fb_review_allowance(in, &allowance)) {
+        fb_error(result, "REVIEW_BUDGET",
+            "response_budget must be 2048..8192 and measured data_budget must fit it");
+        return;
+    }
+    uint8_t target[32], after[32] = {0}, next[32];
+    const char *text = fb_str(in, "target", "");
+    const char *cursor = fb_str(in, "after_id", "");
+    if (!fleet_board_id_from_hex(text, target) ||
+        (cursor[0] && !fleet_board_id_from_hex(cursor, after))) {
+        fb_error(result, "BAD_REVIEW_QUERY", "target and after_id must be exact revision ids");
+        return;
+    }
+    struct db_fleet_board_post rows[1];
+    size_t count;
+    bool more;
+    if (!db_fleet_board_wiki_reviews(ndb, target, after, rows, 1, &count, next, &more)) {
+        fb_error(result, "REVIEW_QUERY_FAILED", "review page unavailable; no exhaustion is claimed");
+        return;
+    }
+    struct json_value posts;
+    json_init(&posts); json_set_array(&posts);
+    bool ok = true;
+    for (size_t i = 0; i < count; i++) {
+        const struct fleet_board_post *post = &rows[i].post;
+        if (post->scope != FLEET_BOARD_SCOPE_PUBLIC ||
+            strcmp(post->room, FLEET_BOARD_ROOM_DEFAULT)) continue;
+        struct json_value item;
+        json_init(&item); json_set_object(&item);
+        ok = fb_review_render_row(ndb, &rows[i], &item);
+        if (ok) ok = json_push_back(&posts, &item);
+        json_free(&item);
+        if (!ok) break;
+    }
+    if (ok) ok = fb_review_result(result, &posts, text, next, more);
+    json_free(&posts);
+    if (!ok) {
+        fb_error(result, "REVIEW_PROJECTION_FAILED", "cannot faithfully project review evidence");
+        return;
+    }
+    size_t encoded = json_write(result, NULL, 0);
+    if (!encoded) fb_error(result, "REVIEW_PROJECTION_FAILED", "cannot measure complete review evidence");
+    else if (encoded > allowance)
+        fb_error(result, "REVIEW_BUDGET",
+            "complete signed review page does not fit; retry the same target and input cursor with a larger budget");
+}
+
+
 static void fb_op_wiki_history(struct node_db *ndb,
                                const struct json_value *in,
                                struct json_value *result)
 {
+    if (json_get(in, "target")) { fb_op_wiki_reviews(ndb, in, result); return; }
     const char *slug = fb_str(in, "slug", NULL);
     if (!slug || !slug[0]) {
         fb_error(result, "MISSING_SLUG", "slug is required");
