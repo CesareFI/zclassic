@@ -152,7 +152,10 @@ static bool acc_mode_cpu(const struct wkr_job *job, struct wkr_result *res)
 {
     volatile unsigned long long spin = 0;
     ULONGLONG until = GetTickCount64() + 30000u;
-    (void)job;
+    char started[4200];
+    int count = snprintf(started, sizeof(started), "%s/cpu-started.txt", job->rundir);
+    if (count < 0 || (size_t)count >= sizeof(started) || !acc_try_write(started))
+        return false;
     while (GetTickCount64() < until)
         spin++;
     (void)spin;
@@ -400,10 +403,16 @@ static bool acc_case_cpu(void)
     struct wkr_outcome oc;
     struct wkr_job *job = acc_job("cpu", "mode=cpu\n");
     bool ok;
+    char started[4200];
     if (!job)
         return acc_fail("cpu", "cannot make the run dir");
     oc = acc_run(job, 25, 1, &out);
-    ok = out.status == 1 && oc.rc == 130 && out.wall_ms < 20000;
+    int count = snprintf(started, sizeof(started), "%s/cpu-started.txt", job->rundir);
+    DWORD attributes = count >= 0 && (size_t)count < sizeof(started)
+        ? GetFileAttributesA(started) : INVALID_FILE_ATTRIBUTES;
+    ok = out.status == 1 && oc.rc == 130 && out.wall_ms < 20000 &&
+         out.cpu_limit_hit && attributes != INVALID_FILE_ATTRIBUTES &&
+         !(attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT));
     if (!ok)
         acc_fail("cpu", "the CPU cap did not end in the crashed verdict");
     free(job);

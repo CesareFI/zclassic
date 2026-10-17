@@ -326,6 +326,7 @@ static bool fxg_match(const char *p, const char *s)
     return fxg_class(p + 1 + neg, e, *s) != neg && fxg_match(e + 1, s + 1);
 }
 
+#if !defined(_WIN32)
 static void fxg_found_add(struct fxg_found *f, const char *path)
 {
     size_t n = strlen(path);
@@ -339,6 +340,7 @@ static void fxg_found_add(struct fxg_found *f, const char *path)
     f->n += n;
     f->count++;
 }
+#endif /* !defined(_WIN32) */
 
 static void fxg_walk(const char *root, char *path, size_t len,
                      const char *rest, struct fxg_found *f);

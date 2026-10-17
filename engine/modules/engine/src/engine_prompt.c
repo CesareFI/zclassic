@@ -6,6 +6,7 @@
 
 #include "engine/engine_prompt.h"
 
+#include "base/format_attribute.h"
 #include "base/log_macros.h"
 #include "base/safe_alloc.h"
 #include "base/serialize_le.h"
@@ -639,7 +640,7 @@ enum {
 };
 
 static void contract_refuse(char *reason, size_t cap, const char *fmt, ...)
-    __attribute__((format(printf, 3, 4)));
+    ZCL_PRINTF_LIKE(3, 4);
 
 static void contract_refuse(char *reason, size_t cap, const char *fmt, ...)
 {

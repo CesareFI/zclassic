@@ -291,11 +291,46 @@ do_ready() {
 }
 
 [ "$#" -le 2 ] || usage
+# Pure argv regressions, also runnable without building Tor or provenance tools.
+tor_configure_args_selftest() {
+    local recorded label marker literal
+    recorded="--disable-asciidoc 'LIBS=-liphlpapi -lbcrypt -lws2_32' '--with-openssl-dir=/path with spaces'"
+    zcl_tor_configure_args_match "$recorded" --disable-asciidoc \
+        'LIBS=-liphlpapi -lbcrypt -lws2_32' '--with-openssl-dir=/path with spaces' || return 1
+    zcl_tor_configure_args_match '--disable-asciidoc --disable-asciidoc' \
+        --disable-asciidoc || return 1
+    for label in missing changed malformed embedded conflicting multiline feature package; do
+        case "$label" in
+            missing) recorded='--other'; literal=--disable-asciidoc ;;
+            changed) recorded="'LIBS=-lwrong'"; literal=LIBS=-lright ;;
+            malformed) recorded="'unterminated"; literal=--disable-asciidoc ;;
+            embedded) recorded="'OTHER= --disable-asciidoc '"; literal=--disable-asciidoc ;;
+            conflicting) recorded='LIBS=-lright LIBS=-lwrong'; literal=LIBS=-lright ;;
+            multiline) recorded=$'\047VALUE=line one\nline two\047'; literal=$'VALUE=line one\nline two' ;;
+            feature) recorded='--disable-asciidoc --enable-asciidoc'; literal=--disable-asciidoc ;;
+            package) recorded='--with-openssl-dir=/vendor --without-openssl-dir'; literal=--with-openssl-dir=/vendor ;;
+        esac
+        if zcl_tor_configure_args_match "$recorded" "$literal"; then
+            echo "tor_archives_ready: configure argv selftest FAILED — $label admitted" >&2
+            return 1
+        fi
+    done
+    marker="$(mktemp "${TMPDIR:-/tmp}/z23-tor-args-marker.XXXXXX")" || return 1
+    rm -f -- "$marker" || return 1
+    literal='VALUE=$(touch '"$marker"');`touch '"$marker"'`;*?'
+    if ! zcl_tor_configure_args_match "'$literal'" "$literal" || [ -e "$marker" ]; then
+        rm -f -- "$marker"
+        return 1
+    fi
+    echo 'tor_archives_ready: configure argv selftest PASS'
+}
+
 case "${1:-ready}" in
     ready) do_ready ready "${2:-}" ;;
     link-only) do_ready link-only "${2:-}" ;;
     check) do_check ;;
     --selftest)
+        tor_configure_args_selftest || exit 1
         # The banner must name the knob, the stamp, and the way out. A future
         # edit that drops any of the three makes the refusal unactionable.
         for needle in 'ZCL_TOR=stub' 'tor=stub' 'make tor-full' 'refuses -tor'; do

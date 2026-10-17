@@ -8,6 +8,11 @@
 
 set -euo pipefail
 
+# These fixtures require real links; MSYS otherwise may copy their targets.
+case "$(uname -s 2>/dev/null || printf unknown)" in
+    MSYS*|MINGW*|CYGWIN*) export MSYS="${MSYS:+$MSYS }winsymlinks:sys" ;;
+esac
+
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SELF_DIR/../.." && pwd)"
 if ! cd "$ROOT"; then
@@ -388,6 +393,8 @@ phase compiler-id-cross-tree-scope
 mkdir -p "$WORK/scope-link"
 ln -sfn -- "$ROOT" "$WORK/scope-link/tree"
 ln -sfn -- "$WORK" "$WORK/scope-link/aliased"
+[ -L "$WORK/scope-link/tree" ] && [ -L "$WORK/scope-link/aliased" ] ||
+    fail 'scope aliases must be real symbolic links'
 TREE_DIRECT_ID="$("$KEY_TOOL" compiler-id "$CC_COMMAND" "$CXX_COMMAND" "$ROOT")"
 TREE_ALIAS_ID="$("$KEY_TOOL" compiler-id "$CC_COMMAND" "$CXX_COMMAND" "$WORK/scope-link/tree")"
 [ "$TREE_DIRECT_ID" = "$TREE_ALIAS_ID" ] ||
@@ -1018,10 +1025,24 @@ cmp -s "$QUARANTINE_SESSION" "$SESSION_MAIN" ||
     fail 'dead unverified epoch did not receive a fresh live lease'
 [ -d "$QUARANTINE_CANDIDATE_DIR" ] ||
     fail 'dead unverified epoch candidate generation was not recreated'
-[ -f "$QUARANTINE_ROOT/.epoch-admission/$EPOCH_MAIN.lock" ] &&
+[ -d "$QUARANTINE_ROOT/.epoch-admission" ] &&
+[ ! -L "$QUARANTINE_ROOT/.epoch-admission" ] &&
 [ ! -e "$QUARANTINE_EPOCH_DIR/.admission.lock" ] &&
 [ ! -e "$QUARANTINE_EPOCH_DIR/.admission.lock.d" ] ||
-    fail 'epoch admission lock was not retained outside quarantine scope'
+    fail 'epoch admission lock root was not retained outside quarantine scope'
+case "$(uname -s 2>/dev/null || printf unknown)" in
+    MINGW*|MSYS*)
+        # The mkdir backend removes its transient lock when recovery releases it.
+        [ ! -e "$QUARANTINE_ROOT/.epoch-admission/$EPOCH_MAIN.lock.d" ] &&
+        [ ! -L "$QUARANTINE_ROOT/.epoch-admission/$EPOCH_MAIN.lock.d" ] ||
+            fail 'epoch admission directory lock was not released after recovery'
+        ;;
+    *)
+        [ -f "$QUARANTINE_ROOT/.epoch-admission/$EPOCH_MAIN.lock" ] &&
+        [ ! -L "$QUARANTINE_ROOT/.epoch-admission/$EPOCH_MAIN.lock" ] ||
+            fail 'epoch admission file lock was not retained outside quarantine scope'
+        ;;
+esac
 [ -z "$(find "$QUARANTINE_ROOT/.failed-epochs" -mindepth 1 -print -quit)" ] ||
     fail 'dead unverified epoch quarantine was not removed after recovery'
 
@@ -1081,7 +1102,18 @@ mkdir -p "$MAKE_RECOVERY_EPOCH_DIR/.leases" \
     "$MAKE_RECOVERY/bin/test-fast/epochs/$EPOCH_MAIN"
 printf 'int main(void) { return 0; }\n' > "$MAKE_RECOVERY_SOURCE"
 printf 'stale object that must never reach the linker\n' > "$MAKE_RECOVERY_OBJECT"
-printf '%s\n' "$MAKE_RECOVERY_OBJECT" > "$MAKE_RECOVERY_RSP"
+# Native Windows linkers read response-file bytes without MSYS argv conversion.
+# Change only the path spelling; the exact epoch object remains the authority.
+MAKE_RECOVERY_RSP_OBJECT="$MAKE_RECOVERY_OBJECT"
+case "$(uname -s 2>/dev/null || printf unknown)" in
+    MINGW*|MSYS*)
+        MAKE_RECOVERY_RSP_OBJECT="$(cygpath -am -- "$MAKE_RECOVERY_OBJECT")" ||
+            fail 'could not convert recovery response-file object path'
+        ;;
+esac
+MAKE_RECOVERY_RSP_OBJECT="${MAKE_RECOVERY_RSP_OBJECT//\\/\\\\}"
+MAKE_RECOVERY_RSP_OBJECT="${MAKE_RECOVERY_RSP_OBJECT//\"/\\\"}"
+printf '"%s"\n' "$MAKE_RECOVERY_RSP_OBJECT" > "$MAKE_RECOVERY_RSP"
 printf '%s\n' '# fixture view inputs are already ready' \
     > "$MAKE_RECOVERY_VIEW_READY"
 
@@ -1493,9 +1525,11 @@ if [ "$verbose" = 1 ] && [ "$preprocess" = 1 ]; then
     fi
     printf 'Using built-in specs.\n' >&2
     if [ -z "${SHIMCC_NO_SEARCH:-}" ]; then
-        printf '#include <...> search starts here:\n' >&2
-        printf ' %s/include\n' "$SHIMCC_ROOT" >&2
-        printf 'End of search list.\n' >&2
+        eol='\n'
+        [ -z "${SHIMCC_CRLF:-}" ] || eol='\r\n'
+        printf '#include <...> search starts here:%b' "$eol" >&2
+        printf ' %s/include%b' "$SHIMCC_ROOT" "$eol" >&2
+        printf 'End of search list.%b' "$eol" >&2
     fi
     exit 0
 fi
@@ -1575,6 +1609,17 @@ SHIM_ID="$(shim_compiler_id)" ||
 [[ "$SHIM_ID" =~ ^[0-9a-f]{64}$ ]] || fail 'fixture compiler fingerprint is malformed'
 [ "$SHIM_ID" = "$(shim_compiler_id)" ] ||
     fail 'back-to-back compiler fingerprints of one unchanged driver disagreed'
+
+# Native Windows compiler diagnostics use CRLF; those roots must still be
+# inventoried, and edits to their headers must still change the fingerprint.
+SHIM_CRLF_ID="$(shim_compiler_id SHIMCC_CRLF=1)" ||
+    fail 'CRLF include-search diagnostics were refused'
+printf '/* CRLF root authority probe */\n' > "$SHIM_ROOT/include/crlf-probe.h"
+SHIM_CRLF_CHANGED_ID="$(shim_compiler_id SHIMCC_CRLF=1)" ||
+    fail 'CRLF include-search fingerprint failed after a header change'
+[ "$SHIM_CRLF_ID" != "$SHIM_CRLF_CHANGED_ID" ] ||
+    fail 'CRLF include-search roots omitted header changes'
+rm -- "$SHIM_ROOT/include/crlf-probe.h"
 
 # A5: only `ld` and `ld.<name>` are linkers a driver can select. Tools that
 # merely start with "ld" (ldd, ldconfig, ldattach live in /usr/sbin and

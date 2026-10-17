@@ -121,5 +121,38 @@ size_t platform_directory_names_test_take_sort_calls(void);
  * directory flush reports OUTCOME_UNKNOWN rather than ordinary failure. */
 void platform_directory_child_move_test_fail_durability_once(void);
 #endif
-
+#if defined(_WIN32)
+/* Narrow namespace capability: retained named no-reparse directory with
+ * DELETE and enumeration rights. Ordinary open_child retains traverse only. */
+enum platform_directory_result platform_directory_transaction_open_child_namespace(
+    struct platform_directory_transaction *parent, const char *leaf,
+    bool create, struct platform_directory_transaction *child);
+bool platform_directory_transaction_parent(const char *path,
+    struct platform_directory_transaction *parent,
+    char leaf[PLATFORM_DIRECTORY_CHILD_LEAF_MAX + 1u]);
+int platform_directory_result_errno(enum platform_directory_result result);
+int platform_directory_child_duplicate_fd(uintptr_t native, int flags);
+int platform_directory_transaction_read_fd(const char *path, bool private_owner_only);
+bool platform_directory_transaction_write_atomic(const char *path, const void *data, size_t size);
+bool platform_directory_transaction_remove_tree(const char *path);
+/* Remove only beneath this exact namespace-capable private directory, then
+ * remove that directory by retained handle. Refuse every reparse point and
+ * bound recursion/enumeration. The caller retains and closes its capability. */
+bool platform_directory_transaction_remove_retained(
+    struct platform_directory_transaction *directory, unsigned depth);
+/* Move the exact namespace-capable source directory to an absent leaf. Both
+ * parent capabilities must be ordinary traverse-only transactions. Windows
+ * may refuse a DELETE-bearing destination capability because its internal
+ * relative rename open has incompatible sharing. OUTCOME_UNKNOWN means the
+ * move completed but post-move identity/durability proof failed: preserve all
+ * involved names and reconcile by a fresh exact observation before cleanup. */
+enum platform_directory_result platform_directory_transaction_move_directory(
+    struct platform_directory_transaction *source_parent, const char *source_leaf,
+    struct platform_directory_transaction *source,
+    struct platform_directory_transaction *destination_parent, const char *destination_leaf);
+bool platform_directory_transaction_replace_path(const char *staging, const char *destination);
+#endif
+#if defined(_WIN32) && defined(ZCL_TESTING)
+void platform_directory_transaction_move_directory_test_fail_durability_once(void);
+#endif
 #endif

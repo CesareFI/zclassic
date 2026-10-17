@@ -13,6 +13,55 @@
 #include <unistd.h>
 #include "platform/clock.h"
 
+#if defined(__MSYS__)
+#include "private_acl_internal.h"
+#include <io.h>
+#include <stdint.h>
+#include <sys/cygwin.h>
+
+static_assert(sizeof(long) >= sizeof(intptr_t), "MSYS HANDLE bridge must retain pointer width");
+
+static bool native_acl_valid(int fd)
+{
+    long raw = _get_osfhandle(fd);
+    return raw != -1 && platform_private_acl_validate_handle(
+        (HANDLE)(intptr_t)raw, false);
+}
+
+/* CREATE_NEW installs private authority atomically. Existing files are never
+ * repaired here; identity() validates their retained handle's actual ACL. */
+static int native_create_private(const char *path)
+{
+    wchar_t wide[32768];
+    if (cygwin_conv_path(CCP_POSIX_TO_WIN_W, path, wide, sizeof(wide)))
+        return -1;
+    struct platform_private_acl acl;
+    if (!platform_private_acl_create(&acl)) {
+        errno = EACCES;
+        return -1;
+    }
+    SECURITY_ATTRIBUTES attributes = {
+        .nLength = sizeof(attributes),
+        .lpSecurityDescriptor = platform_private_acl_descriptor(&acl),
+        .bInheritHandle = FALSE};
+    HANDLE created = CreateFileW(wide, GENERIC_READ | GENERIC_WRITE | READ_CONTROL,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, &attributes,
+        CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    DWORD error = GetLastError();
+    bool valid = created != INVALID_HANDLE_VALUE &&
+        platform_private_acl_validate_handle(created, false);
+    bool closed = created == INVALID_HANDLE_VALUE || CloseHandle(created);
+    platform_private_acl_destroy(&acl);
+    if (created == INVALID_HANDLE_VALUE &&
+        (error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS)) return 0;
+    if (!valid || !closed) {
+        errno = EACCES;
+        return -1;
+    }
+    return 0;
+}
+#endif
+
 #ifndef VENDOR_LOCK_BUILD_KEY
 #define VENDOR_LOCK_BUILD_KEY "unqualified"
 #endif
@@ -36,6 +85,12 @@ static int identity(int fd, const char *path)
         errno = EPERM;
         return refuse("vendor_lock_identity_refused", path);
     }
+#if defined(__MSYS__)
+    if (!native_acl_valid(fd)) {
+        errno = EACCES;
+        return refuse("vendor_lock_native_acl_refused", path);
+    }
+#endif
     return 0;
 }
 
@@ -75,7 +130,13 @@ static int run_command(char **argv)
         errno = EISDIR;
         return refuse("vendor_lock_legacy_directory_refused", argv[1]);
     }
+#if defined(__MSYS__)
+    if (native_create_private(argv[1]))
+        return refuse("vendor_lock_private_create_refused", argv[1]);
+    int fd = open(argv[1], O_RDWR | O_NOFOLLOW);
+#else
     int fd = open(argv[1], O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
+#endif
     if (fd < 0) return refuse("vendor_lock_open_refused", argv[1]);
     if (identity(fd, argv[1]) || acquire(fd, argv[1], timeout)) {
         close(fd);

@@ -3,7 +3,10 @@
  * installed only when its manifest is strictly formed, its detached Ed25519
  * signature verifies against a locally trusted key, and the executable
  * matches the manifest SHA3-512. Generations are content addressed;
- * "current" and "last-good" are symbolic links replaced atomically.
+ * "current" and "last-good" are replaced atomically: POSIX symbolic links,
+ * or Windows validated private files containing exactly "generations/",
+ * 128 lowercase hex characters and LF (141 bytes, no NUL or trailing bytes).
+ * This storage contract grants no execution or confinement authority.
  * docs/PLUGINS.md is the operator-facing description. */
 #ifndef ZCL_PLUGIN_STORE_H
 #define ZCL_PLUGIN_STORE_H
@@ -82,7 +85,7 @@ enum plugin_status plugin_hash_file(const char *path,
 /* Install the plugin described by manifest_path (NAME.plugin.json). The
  * signature is NAME.plugin.sig and the executable is NAME, both in the same
  * directory. root is the plugin store, normally ~/.z23/plugins. Installing
- * does not change the current link. A generation is named by the signed
+ * does not change the current pointer. A generation is named by the signed
  * manifest digest (out->generation), so the same executable under different
  * capabilities is a distinct generation. already_present is set when that
  * exact manifest and executable were stored earlier. */
@@ -105,9 +108,9 @@ enum plugin_status plugin_store_rollback(const char *root, const char *name,
  * same as unreadable: only PLUGIN_SLOT_MISSING means the part is not there.
  * PLUGIN_SLOT_UNREADABLE is a permission or I/O failure, so the part may
  * exist and nothing may be inferred from its empty value. PLUGIN_SLOT_CORRUPT
- * is present but not what the store writes (a link that is not a
- * generations/<128 hex> link, or a generations entry that is not a
- * directory). */
+ * is present but not what the store writes (an invalid POSIX symbolic link,
+ * a malformed Windows generation pointer file, or a generations entry that
+ * is not a directory). */
 enum plugin_slot_state {
     PLUGIN_SLOT_OK = 0,
     PLUGIN_SLOT_MISSING,

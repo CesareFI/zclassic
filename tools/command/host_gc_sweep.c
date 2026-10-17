@@ -268,6 +268,7 @@ static void hg_parse_worktrees(struct hg_scan *scan, size_t cls,
 
 /* ------------------------------------------------------- occupancy pass */
 
+#if !defined(_WIN32)
 static void hg_mark_target(struct hg_scan *scan, const char *target)
 {
     if (!target || target[0] != '/')
@@ -276,6 +277,7 @@ static void hg_mark_target(struct hg_scan *scan, const char *target)
         if (!scan->cands[i].occupied && hg_under(scan->cands[i].path, target))
             scan->cands[i].occupied = true;
 }
+#endif /* !defined(_WIN32) */
 
 static void hg_mark_link(struct hg_scan *scan, const char *link)
 {

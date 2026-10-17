@@ -726,6 +726,7 @@ static bool resident_spawn_linux(struct resident_launch *launch,
 
 /* Refuse a confined spawn the host cannot enforce. Never degrades: an
  * unavailable Landlock or seccomp is a named refusal, not an unconfined run. */
+#if !defined(_WIN32)
 static bool resident_confine_supported(const struct os_sandbox_profile *profile,
                                        char *error, size_t error_size)
 {
@@ -761,6 +762,7 @@ static bool resident_confine_supported(const struct os_sandbox_profile *profile,
     return false;
 #endif
 }
+#endif /* !defined(_WIN32) */
 
 static bool resident_spawn_common(struct resident_launch *launch,
                                   char *const argv[], char *const envp[],

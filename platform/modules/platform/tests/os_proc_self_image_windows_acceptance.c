@@ -19,9 +19,11 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <string.h>
 
 #if defined(_WIN32)
 
+#include <windows.h>
 #define SELF_IMAGE_CYCLES 256
 /* Handle counts on Windows are process-wide and other machinery in the CRT
  * may legitimately move them by a handful across the loop. A LEAK moves them
@@ -47,8 +49,54 @@ static bool read_running_image_header(void)
     return got == sizeof(header) && header[0] == 'M' && header[1] == 'Z';
 }
 
-int main(void)
+static bool command_line_tokens_round_trip(void)
 {
+    wchar_t image[32768], line[33000];
+    DWORD length = GetModuleFileNameW(NULL, image, 32768);
+    if (!length || length >= 32768 ||
+        swprintf(line, 33000, L"\"%ls\" --cmdline-token-probe \"two words\" "
+                 L"\"embedded\\\"quote\" token-boundary", image) <= 0)
+        return false;
+    STARTUPINFOW startup = {.cb = sizeof(startup)};
+    PROCESS_INFORMATION child = {0};
+    if (!CreateProcessW(image, line, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                        NULL, NULL, &startup, &child))
+        return false;
+    DWORD waited = WaitForSingleObject(child.hProcess, 10000);
+    if (waited != WAIT_OBJECT_0) {
+        (void)TerminateProcess(child.hProcess, 1);
+        (void)WaitForSingleObject(child.hProcess, 5000);
+    }
+    DWORD code = 1;
+    bool ok = waited == WAIT_OBJECT_0 && GetExitCodeProcess(child.hProcess, &code) && code == 0;
+    CloseHandle(child.hThread);
+    CloseHandle(child.hProcess);
+    return ok;
+}
+static bool command_line_token_probe(void)
+{
+    return os_proc_cmdline_has_token("two words") &&
+           os_proc_cmdline_has_token("embedded\"quote") &&
+           os_proc_cmdline_has_token("token-boundary") &&
+           !os_proc_cmdline_has_token("two") &&
+           !os_proc_cmdline_has_token("words") &&
+           !os_proc_cmdline_has_token("embedded") &&
+           !os_proc_cmdline_has_token("token") &&
+           !os_proc_cmdline_has_token(NULL) &&
+           !os_proc_cmdline_has_token("");
+}
+
+int main(int argc, char **argv)
+{
+    if (argc > 1) {
+        if (argc != 5 || strcmp(argv[1], "--cmdline-token-probe") != 0)
+            return 1;
+        return command_line_token_probe() ? 0 : 1;
+    }
+    if (!command_line_tokens_round_trip()) {
+        fputs("os_proc_self_image_acceptance: command-line tokens failed\n", stderr);
+        return 1;
+    }
     /* The rung must be the honest one. RESOLVED_PATH and not RUNNING_IMAGE:
      * GetModuleFileNameW returns a PEB-cached STRING, so the reopen is by
      * name and a rename-then-install deploy -- the standard Windows update

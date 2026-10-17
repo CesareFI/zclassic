@@ -560,6 +560,7 @@ bool zcl_verify_attest_test_override_compiled(void)
 
 /* One spelling per path: absolute, no empty, "." or ".." component, no
  * trailing slash. Every component is then lstat'ed exactly once. */
+#if !defined(_WIN32)
 static const char *va_path_shape(const char *path)
 {
     size_t n = strlen(path);
@@ -573,6 +574,7 @@ static const char *va_path_shape(const char *path)
         return ZCL_VERIFY_ATTEST_WHY_KEY_PATH_NOT_CANONICAL;
     return NULL;
 }
+#endif /* !defined(_WIN32) */
 
 #if !defined(_WIN32)
 static void va_entry_from_stat(const struct stat *st,

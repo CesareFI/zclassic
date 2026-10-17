@@ -15,30 +15,52 @@ commands read and write files only.
   trusted_keys                      one public key per line
   NAME/
     generations/<SHA3-512 hex>/
-      NAME                          executable, mode 0555
-      NAME.plugin.json              manifest, mode 0444
-      NAME.plugin.sig               signature, mode 0444
-    current    -> generations/<id>  symbolic link
-    last-good  -> generations/<id>  symbolic link
+      NAME                          executable, mode 0555 on POSIX
+      NAME.plugin.json              manifest, mode 0444 on POSIX
+      NAME.plugin.sig               signature, mode 0444 on POSIX
+    current    -> generations/<id>  symbolic link on POSIX
+    last-good  -> generations/<id>  symbolic link on POSIX
 ```
 
 The generation id is the SHA3-512 of the signed manifest (domain-tagged, as
 signed) as 128 lowercase hex characters. It covers the capabilities and the
 executable hash, so the same executable under new capabilities is a new
 generation. Generations stored under the executable hash still work. Installing stores a generation and leaves `current` alone.
-`switch` and `rollback` replace the links by creating a temporary symbolic link
-beside them and renaming it over the old one, so a reader sees the old or the
-new target and never a missing link. An interrupted swap leaves `current`
-unchanged; the next swap removes the leftover temporary link.
+On POSIX, `switch` and `rollback` replace the links by creating a temporary
+symbolic link beside them and renaming it over the old one, so a reader sees
+the old or the new target and never a missing link. An interrupted swap leaves
+`current` unchanged; the next swap removes the leftover temporary link.
+
+On Windows, `current` and `last-good` are ordinary private files, opened and
+validated through the retained directory capability. Each contains exactly
+141 bytes: `generations/`, 128 lowercase hex characters, then one LF byte,
+with no NUL or extra bytes. A flushed temporary file is atomically published
+over the old pointer. Reparse points and malformed pointer files are refused.
+If a namespace move completes but its final identity or durability proof
+fails, the operation reports `PLUGIN_IO` and preserves the involved files
+for reconciliation; an error alone does not prove that the move did not occur.
 
 ## Permissions
 
-`trusted_keys` must be a regular file owned by you and not writable by group or
-others. `~/.z23/plugins`, each `NAME` directory and each `generations`
-directory must be real directories with the same ownership and mode rule.
-Nothing inside the store may be a symbolic link except `current` and
-`last-good`, whose targets must have the form `generations/<128 hex>`. A
-violation is refused with `PLUGIN_TRUST_INSECURE`.
+On POSIX, `trusted_keys` must be a regular file owned by you and not writable
+by group or others. `~/.z23/plugins`, each `NAME` directory and each
+`generations` directory must be real directories with the same ownership and
+mode rule. Nothing inside the store may be a symbolic link except `current`
+and `last-good`, whose targets must have the form `generations/<128 hex>`.
+A violation is refused with `PLUGIN_TRUST_INSECURE`.
+
+On Windows, the store directories, `trusted_keys`, signing keys and generation
+pointer files use protected ACLs owned by the current account, granting full
+access only to that account and SYSTEM, with no inherited or additional ACEs.
+Signing keys and `trusted_keys` also require an existing owner-private parent
+directory with this ACL. An existing pack output directory must be private;
+a new output directory is created private. Reparse points are refused.
+Insecure signing keys or key parents report `PLUGIN_KEY_INSECURE`; insecure
+trust files or store directories report `PLUGIN_TRUST_INSECURE`.
+
+Windows storage operations do not enable plugin execution or establish a
+confinement guarantee. `plugin run` remains Linux-only and refuses other hosts
+with `PLUGIN_RUN_PLATFORM`.
 
 ## Manifest
 
@@ -119,8 +141,12 @@ z23 plugin install ./dist/hello.plugin.json
 ```
 
 - **Key file.** Exactly the 32-byte Ed25519 seed (RFC 8032), the same form as
-  the onion vanity seed. `keygen` creates it with `O_EXCL`, mode 0600, from the
-  host CSPRNG and refuses an existing path with `PLUGIN_KEY_EXISTS`. `pack`
+  the onion vanity seed. `keygen` creates it exclusively from the host CSPRNG,
+  with mode 0600 on POSIX or the protected Windows ACL above, and refuses an
+  existing path with `PLUGIN_KEY_EXISTS`. Windows requires the owner-private
+  key parent for both creation and loading. A failed durability observation
+  can leave an exclusively created private key for owner reconciliation;
+  `keygen` still refuses to overwrite it. `pack`
   refuses a key file that is not a regular file you own, that group or others
   can access, that is a symbolic link (`PLUGIN_KEY_INSECURE`), or whose size is
   not 32 bytes (`PLUGIN_KEY_MALFORMED`).
@@ -135,8 +161,9 @@ z23 plugin install ./dist/hello.plugin.json
   are overwritten. Each of the three files is replaced atomically through a
   temporary sibling and a rename, but not as a set: a failure part way can
   leave a manifest, signature and executable that do not match, which
-  `install` refuses. `--dir` follows a symbolic link and creates only the last
-  missing path level, with mode 0700.
+  `install` refuses. On POSIX, `--dir` follows a symbolic link and creates only
+  the last missing path level, with mode 0700. Windows requires a real private
+  output directory and refuses reparse points.
 - **Signature.** The signature covers the manifest bytes exactly as written,
   ending with one newline, as described under Signature.
 
@@ -312,7 +339,7 @@ Every refusal carries `error.code` and `error.next_action`.
 | `PLUGIN_NO_LAST_GOOD` | No `switch` has recorded a last-good generation. |
 | `PLUGIN_TRUST_INSECURE` | `trusted_keys` or the store has a wrong owner, is group or world writable, or contains a symbolic link or non-regular file. |
 | `PLUGIN_KEY_MISSING` | `pack` was given a key file that does not exist. |
-| `PLUGIN_KEY_INSECURE` | The key file is not a regular file owned by you, is accessible to group or others, or is a symbolic link. |
+| `PLUGIN_KEY_INSECURE` | The key file is not a regular private file owned by you, is a link/reparse point, or its required Windows parent/ACL is not private. |
 | `PLUGIN_KEY_MALFORMED` | The key file is not exactly 32 bytes. |
 | `PLUGIN_KEY_EXISTS` | `keygen` never overwrites an existing path. |
 | `PLUGIN_IO` | A file operation failed; check permissions and free space. |

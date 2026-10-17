@@ -76,7 +76,11 @@ static const struct {
     [PLUGIN_ERR_KEY_MISSING] = { "PLUGIN_KEY_MISSING",
         "create the signing key first: z23 plugin keygen <key file>" },
     [PLUGIN_ERR_KEY_INSECURE] = { "PLUGIN_KEY_INSECURE",
+#if defined(_WIN32)
+        "use a regular signing key in an owner-private directory; its protected ACL and the directory ACL must grant full access only to your account and SYSTEM, with no reparse points" },
+#else
         "make the key file a regular file owned by you with mode 0600 (chmod 600 <key file>), not a symbolic link" },
+#endif
     [PLUGIN_ERR_KEY_MALFORMED] = { "PLUGIN_KEY_MALFORMED",
         "use a key file of exactly 32 bytes, as written by: z23 plugin keygen <key file>" },
     [PLUGIN_ERR_KEY_EXISTS] = { "PLUGIN_KEY_EXISTS",

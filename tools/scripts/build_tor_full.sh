@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Copyright 2026 Rhett Creighton - Apache License 2.0
-# Build the pinned embedded-Tor submodule explicitly. The default node build
-# remains offline-friendly and links the stub until an operator asks for this.
+# Build the pinned embedded-Tor submodule, used by default node bootstrap.
 #
 # HOST SEAM (macOS). Upstream Tor is macOS-capable on its own: configure.ac
 # carries darwin* arms and the vendored fork adds no Linux-only syscall. What a
@@ -57,7 +56,7 @@ zcl_tor_prepare_environment tor-full || exit $?
 
 cd "$ROOT"
 if [ ! -e "$TOR_DIR/.git" ]; then
-    git submodule update --init vendor/tor
+    git -c core.autocrlf=false submodule update --init vendor/tor
 fi
 
 expected="$(git ls-files -s -- vendor/tor | awk 'NR == 1 { print $2 }')"
@@ -91,11 +90,29 @@ if [ -n "$VENDOR_TARGET" ]; then
     fi
 fi
 
-# Tor does not track its generated ./configure (vendor/tor/.gitignore names
-# /configure), so a fresh checkout must run autogen.sh. That needs the autotools
-# on every host, macOS included; say so by name instead of letting autoreconf
-# fail with a message that does not identify what is missing.
-if [ ! -x "$TOR_SRC_DIR/configure" ]; then
+# Git for Windows can materialize clean pinned text as CRLF. Autoconf treats
+# backslash-CR as an argument instead of a continuation. Never rewrite an
+# existing checkout here: it may contain local Tor work that must be preserved.
+for autotools_input in configure.ac Makefile.am autogen.sh; do
+    if LC_ALL=C grep -q $'\r$' "$TOR_SRC_DIR/$autotools_input"; then
+        echo "tor-full: tor_autotools_crlf_refused: $TOR_SRC_DIR/$autotools_input" >&2
+        echo "tor-full: preserve local Tor work, configure the submodule with core.autocrlf=false," >&2
+        echo "tor-full: then restore LF source bytes from its exact pinned commit and rerun." >&2
+        exit 4
+    fi
+done
+
+# Autoreconf can leave configure behind before automake installs its required
+# auxiliary files. Qualify the complete generated input set so an interrupted
+# bootstrap is repaired by the same autogen.sh (-i -f) route as a fresh checkout.
+tor_autotools_ready() {
+    [ -x "$TOR_SRC_DIR/configure" ] || return 1
+    local generated
+    for generated in Makefile.in orconfig.h.in ar-lib config.guess config.sub compile missing install-sh; do
+        [ -s "$TOR_SRC_DIR/$generated" ] || return 1
+    done
+}
+if ! tor_autotools_ready; then
     missing=""
     for tool in autoconf automake aclocal autoheader; do
         command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
@@ -107,12 +124,16 @@ if [ ! -x "$TOR_SRC_DIR/configure" ]; then
         missing="$missing libtoolize(glibtoolize)"
     fi
     if [ -n "$missing" ]; then
-        echo "tor-full: ${TOR_SRC_DIR#"$ROOT"/} ships no generated ./configure, so autogen.sh must run," >&2
+        echo "tor-full: ${TOR_SRC_DIR#"$ROOT"/} has incomplete generated autotools inputs, so autogen.sh must run," >&2
         echo "tor-full: but these autotools are absent:$missing" >&2
         echo "tor-full: install autoconf, automake and libtool for this host, then rerun." >&2
         exit 4
     fi
     (cd "$TOR_SRC_DIR" && ./autogen.sh)
+    if ! tor_autotools_ready; then
+        echo "tor-full: autogen.sh left required generated autotools inputs incomplete" >&2
+        exit 4
+    fi
 fi
 
 # Compile Tor against the SAME OpenSSL the node links, not the host's.
@@ -267,13 +288,10 @@ configure_args=""
 if [ -x "$TOR_BUILD_DIR/config.status" ]; then
     configure_args="$($TOR_BUILD_DIR/config.status --config 2>/dev/null || true)"
 fi
-configured=true
-for option in "${configure_opts[@]}"; do
-    case " $configure_args " in
-        *" $option "*) ;;
-        *) configured=false ;;
-    esac
-done
+configured=false
+if zcl_tor_configure_args_match "$configure_args" "${configure_opts[@]}"; then
+    configured=true
+fi
 
 if [ "$configured" != true ]; then
     (cd "$TOR_BUILD_DIR" && \

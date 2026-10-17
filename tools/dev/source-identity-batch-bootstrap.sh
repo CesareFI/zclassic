@@ -70,10 +70,18 @@ if [ "$fresh" = 1 ] &&
     exit 0
 fi
 
-BOOTSTRAP_CC="${ZCL_BOOTSTRAP_CC:-cc}"
+# Source capture runs in the POSIX build shell. Select its host compiler on
+# MSYS2, where PATH's cc normally targets the native UCRT product instead.
+HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"
+case "$HOST_SYSTEM" in
+    MSYS*|MINGW*|CYGWIN*)
+        BOOTSTRAP_CC="${ZCL_BOOTSTRAP_CC:-/usr/bin/cc}"
+        ;;
+    *) BOOTSTRAP_CC="${ZCL_BOOTSTRAP_CC:-cc}" ;;
+esac
 FLAGS=(-std=c23 -O2 -Wall -Wextra -Werror -pedantic
        -D_POSIX_C_SOURCE=200809L)
-if [ "$(uname -s 2>/dev/null)" = Darwin ]; then
+if [ "$HOST_SYSTEM" = Darwin ]; then
     FLAGS+=(-D_DARWIN_C_SOURCE -Dst_mtim=st_mtimespec
             -Dst_ctim=st_ctimespec)
 fi

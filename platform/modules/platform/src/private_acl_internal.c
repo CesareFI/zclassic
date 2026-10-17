@@ -7,13 +7,14 @@
 #include "private_acl_internal.h"
 #include "base/safe_alloc.h"
 
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__MSYS__)
 #include "base/safe_alloc.h"
 
 #include <aclapi.h>
 #include <sddl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <wchar.h>
 
 void platform_private_acl_init_empty(struct platform_private_acl *acl)
 {

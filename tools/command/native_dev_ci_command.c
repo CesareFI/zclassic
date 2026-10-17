@@ -67,6 +67,7 @@
  */
 
 #include "command/native_command.h"
+#include "base/format_attribute.h"
 #include "command/native_dev_proof_command.h"
 
 #include "config/command_catalog.h"
@@ -152,7 +153,7 @@ struct dci_screen {
 };
 
 static void dci_say(struct dci_screen *s, const char *format, ...)
-    __attribute__((format(printf, 2, 3)));
+    ZCL_PRINTF_LIKE(2, 3);
 
 static void dci_say(struct dci_screen *s, const char *format, ...)
 {

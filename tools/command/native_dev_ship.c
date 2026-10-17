@@ -35,6 +35,7 @@
 
 #include "command/native_command.h"
 
+#include "base/format_attribute.h"
 #include "base/safe_alloc.h"
 #include "json/json.h"
 #include "kernel/command_registry.h"
@@ -120,7 +121,7 @@ static bool ship_is_hex(const char *s, size_t len)
     return true;
 }
 
-__attribute__((format(printf, 3, 4)))
+ZCL_PRINTF_LIKE(3, 4)
 static void ship_refuse(struct ship_plan *p, const char *cls,
                         const char *fmt, ...)
 {

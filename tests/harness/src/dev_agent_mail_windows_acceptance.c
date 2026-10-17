@@ -173,8 +173,10 @@ static const char *dvx_busy_outbox_refuses(
     struct zcl_command_reply reply;
     uint64_t after = 0;
     if (!call(fx->post, &reply)) return "contended post input";
+    /* Native byte-range contention refuses the sequence read before append. */
     bool refused = reply.exit_code != 0 &&
-        strcmp(reply.error.code, "MAIL_WRITE_FAILED") == 0;
+        strcmp(reply.error.code, "MAIL_READ_FAILED") == 0 &&
+        strcmp(reply.error.message, "cannot read the private outbox") == 0;
     json_free(&reply.data);
     if (!refused || !platform_private_file_size(file, &after) || after != size)
         return "busy outbox refuses without changing bytes";
@@ -246,10 +248,60 @@ static const char *dvx_blocked_cursor_directory(struct dvx_fixture *fx)
     return NULL;
 }
 
+/* Stream names travel unchanged in resume tokens: qualify both sides of the
+ * 128-byte boundary through the real enumeration and pull handler. */
+static const char *dvx_stream_name_boundary(struct dvx_fixture *fx)
+{
+    struct platform_directory_transaction mail;
+    platform_directory_transaction_init(&mail);
+    if (!platform_directory_transaction_open(&mail, fx->mail))
+        return "stream-name fixture directory";
+    const char *error = NULL;
+    for (size_t length = 128; length <= 129; length++) {
+        char name[130];
+        memset(name, 'a', length);
+        memcpy(name + length - 6u, ".jsonl", 7u);
+        struct platform_directory_child file;
+        platform_directory_child_init(&file);
+        if (!platform_directory_child_create(&mail, name, &file)) {
+            error = "stream-name fixture creation";
+            break;
+        }
+        platform_directory_child_close(&file);
+        struct zcl_command_reply reply;
+        if (!call("{\"action\":\"pull\",\"since\":0}", &reply)) {
+            error = "stream-name pull input";
+            break;
+        }
+        const char *token = json_get_str(json_get(&reply.data, "next_since"));
+        bool ok = length == 128
+            ? reply.exit_code == 0 && token && strstr(token, name) != NULL
+            : reply.exit_code != 0 &&
+              strcmp(reply.error.code, "MAIL_STREAM_NAME_INVALID") == 0;
+        json_free(&reply.data);
+        struct platform_directory_child_info info;
+        bool unchanged = platform_directory_child_open(&mail, name, &file) &&
+            platform_directory_child_info(&file, &info) && info.size == 0;
+        platform_directory_child_close(&file);
+        bool removed = platform_directory_child_unlink(&mail, name, false);
+        if (!ok || !unchanged || !removed) {
+            error = length == 128 ? "128-byte stream name round trip"
+                                  : "129-byte stream name refusal without mutation";
+            break;
+        }
+    }
+    platform_directory_transaction_close(&mail);
+    return error;
+}
 static const char *dvx_final_post_and_cleanup(struct dvx_fixture *fx)
 {
     if (!succeeds(fx->post)) return "post succeeds after releasing lock";
-    if (!platform_private_file_unlink_missing_ok(fx->outbox) ||
+    char post_lock[4200];
+    if (snprintf(post_lock, sizeof(post_lock), "%s/post.lock", fx->mail) >=
+            (int)sizeof(post_lock))
+        return "post-lock fixture path";
+    if (!platform_private_file_unlink_missing_ok(post_lock) ||
+        !platform_private_file_unlink_missing_ok(fx->outbox) ||
         !platform_private_file_unlink_missing_ok(fx->cursor) ||
         !platform_private_directory_remove_empty(fx->mail) ||
         !platform_private_directory_remove_empty(fx->state))
@@ -274,6 +326,8 @@ int main(void)
     if ((err = dvx_setup_state_root(&fx))) return fail(err);
     if ((err = dvx_build_paths(&fx))) return fail(err);
     if ((err = dvx_post_pull_round_trip(&fx))) return fail(err);
+    if ((err = dvx_stream_name_boundary(&fx))) return fail(err);
+    puts("PASS stream names: exact 128-byte resume token; 129-byte refusal without mutation");
     if ((err = dvx_outbox_private_and_content(&fx, &file, &outbox_size)))
         return fail(err);
     if ((err = dvx_busy_outbox_refuses(&fx, &file, outbox_size)))

@@ -4,6 +4,7 @@
 
 set -euo pipefail
 export LC_ALL=C
+OBJECT_HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SELF_DIR/build-epoch-open-file-identity.sh"
 source "$SELF_DIR/build-epoch-lock-wait.sh"
@@ -170,7 +171,7 @@ session_unchanged()
 {
     [ -f "$SESSION" ] && [ ! -L "$SESSION" ] &&
         z23_build_epoch_open_fd_matches_path "$SESSION" 8 \
-            "$(uname -s 2>/dev/null || printf unknown)" || return 1
+            "$OBJECT_HOST_SYSTEM" || return 1
     if IFS= read -r -d '' session_binary_prefix < "$SESSION"; then
         return 1
     fi
@@ -235,7 +236,7 @@ compile_one()
 {
     local staging staging_base object dep note_record note_tmp marker_tmp
     local compiler_rc
-    local host_system empty_deadline pid start actual owner_start now
+    local empty_deadline pid start actual owner_start now
     local stale_pid= stale_start= stale_deadline=0
     # Long source filenames can make the staging directory path breach Windows
     # MAX_PATH. Use a short deterministic prefix derived from OUTPUT_BASE; the
@@ -269,8 +270,7 @@ compile_one()
         note_tmp="$staging/${OUTPUT_BASE%.o}.gcno-path"
         printf '%s\n' "$staging/${OUTPUT_BASE%.o}.gcno" > "$note_tmp"
     fi
-    host_system="$(uname -s 2>/dev/null || printf unknown)"
-    case "$host_system" in
+    case "$OBJECT_HOST_SYSTEM" in
         MINGW*|MSYS*)
             empty_deadline=0
             while ! mkdir "$ADMISSION_LOCK_DIR" 2>/dev/null; do
@@ -332,7 +332,7 @@ compile_one()
             [ -f "$ADMISSION_LOCK_FILE" ] &&
                 z23_build_epoch_open_fd_matches_path \
                     "$ADMISSION_LOCK_FILE" 6 \
-                    "$(uname -s 2>/dev/null || printf unknown)" ||
+                    "$OBJECT_HOST_SYSTEM" ||
                 fail 'epoch admission lock is not the opened regular file'
             z23_build_epoch_flock_bounded 'compile-epoch-object' 6 \
                 "$ADMISSION_LOCK_FILE" 'epoch admission' || {
@@ -343,7 +343,7 @@ compile_one()
                 [ ! -L "$ADMISSION_LOCK_FILE" ] &&
                 z23_build_epoch_open_fd_matches_path \
                     "$ADMISSION_LOCK_FILE" 6 \
-                    "$(uname -s 2>/dev/null || printf unknown)" ||
+                    "$OBJECT_HOST_SYSTEM" ||
                 fail 'epoch admission lock changed while waiting'
             ;;
     esac

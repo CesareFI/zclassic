@@ -2500,7 +2500,7 @@ windows-acceptance-compile: $(ZCL_WINDOWS_ACCEPTANCE_BINS)
 windows-acceptance: windows-acceptance-compile
 
 ifeq ($(ZCL_HOST_WINDOWS),1)
-windows-acceptance: windows-headless-run-selftest
+windows-acceptance: windows-headless-run-selftest process-group-exec
 
 	@$(MAKE) --no-print-directory z23
 	@root="$$(cygpath -aw .)"; \

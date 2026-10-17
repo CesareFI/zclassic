@@ -39,7 +39,9 @@ enum psk_write { PSK_WRITTEN, PSK_EXISTS, PSK_IO, PSK_UNCERTAIN, PSK_UNSUPPORTED
 
 /* Test-only failure injection after the file exists: bit 0 fails the write,
  * bit 1 fails the cleanup unlink. */
+#if !defined(_WIN32) || defined(ZCL_TESTING)
 static unsigned psk_fault_for_test;
+#endif
 #if defined(ZCL_TESTING)
 void zcl_native_device_psk_fault_for_test(unsigned mask) { psk_fault_for_test = mask; }
 #endif

@@ -2344,7 +2344,6 @@ platform/modules/platform/src/os_binary_slots.c:os_binary_slots_prepare_launch#2
 platform/modules/platform/src/os_binary_slots.c:read_streak_at:21
 platform/modules/platform/src/os_binary_slots.c:store_streak_at:18
 platform/modules/platform/src/os_proc.c:os_proc_close_inherited_fds:16
-platform/modules/platform/src/os_proc.c:os_proc_cmdline_has_token:18
 platform/modules/platform/src/os_proc.c:os_proc_pid_exe_path:19
 platform/modules/platform/src/os_proc.c:os_proc_pid_start_token:23
 platform/modules/platform/src/os_proc.c:os_proc_uptime_seconds:18

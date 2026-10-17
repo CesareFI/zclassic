@@ -47,6 +47,7 @@ ZCL_WINDOWS_ACCEPTANCE_TESTS := \
 	package_lifecycle_store_refusal \
 	package_prepare \
 	path_replace \
+	plugin_store \
 	os_binary_slots_refusal \
 	os_proc_pid_image \
 	os_proc_self_image \
@@ -713,3 +714,33 @@ ZCL_WINDOWS_ACCEPTANCE_zcode_benchmark_executor_refusal_SOURCES := \
 	tests/harness/src/zcode_benchmark_executor_windows_refusal_acceptance.c \
 	contexts/commons/services/src/zcode_benchmark_executor_windows.c \
 	platform/modules/base/src/result.c
+
+ZCL_WINDOWS_ACCEPTANCE_plugin_store_SOURCES := \
+	tests/harness/src/plugin_store_windows_acceptance.c \
+	contexts/commons/modules/plugin/src/plugin_key.c \
+	contexts/commons/modules/plugin/src/plugin_pack.c \
+	contexts/commons/modules/plugin/src/plugin_fs.c \
+	contexts/commons/modules/plugin/src/plugin_store.c \
+	contexts/commons/modules/plugin/src/plugin_manifest.c \
+	platform/modules/platform/src/directory_transaction.c \
+	platform/modules/platform/src/directory_transaction_paths.c \
+	platform/modules/platform/src/private_file.c \
+	platform/modules/platform/src/private_destination.c \
+	platform/modules/platform/src/private_directory.c \
+	platform/modules/platform/src/private_acl_internal.c \
+	platform/modules/platform/src/directory_compat.c \
+	platform/modules/platform/src/rng.c \
+	platform/modules/base/src/safe_alloc.c \
+	platform/modules/base/src/cleanse.c \
+	platform/modules/base/src/log_level.c \
+	platform/modules/json/src/json.c \
+	platform/modules/sha3/src/sha3.c \
+	core/modules/crypto/src/ed25519.c \
+	core/modules/crypto/src/random_secret.c \
+	core/modules/core/src/random.c \
+	core/modules/crypto/src/sha512.c
+ZCL_WINDOWS_ACCEPTANCE_plugin_store_FLAGS := \
+	-DZCL_TESTING -Icontexts/commons/modules/plugin/src \
+	-ffunction-sections -fdata-sections
+ZCL_WINDOWS_ACCEPTANCE_plugin_store_LIBS := \
+	-Wl,--gc-sections -ladvapi32 -lbcrypt

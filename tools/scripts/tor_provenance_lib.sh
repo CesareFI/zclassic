@@ -106,3 +106,54 @@ zcl_tor_provenance_ensure_bin() {
     fi
     return 0
 }
+
+# Decode config.status's quoted argv as data, never shell source. Unknown or
+# conflicting observations force configure to run again with the original argv.
+zcl_tor_configure_args_match() {
+    local recorded="$1" arguments_file option argument key argument_key matched
+    shift
+    local -a recorded_argv=()
+    # xargs cannot decode multiline shell words; do not reuse that representation.
+    [[ "$recorded" != *$'\n'* ]] || return 1
+    arguments_file="$(mktemp "${TMPDIR:-/tmp}/z23-tor-config-args.XXXXXX")" || return 1
+    if ! printf '%s\n' "$recorded" |
+        xargs printf '%s\0' >"$arguments_file" 2>/dev/null; then
+        rm -f -- "$arguments_file"
+        return 1
+    fi
+    # read -d is available in Bash 3.2, unlike mapfile. Check redirection even
+    # when this function is called in an if condition (which disables errexit).
+    if ! {
+        while IFS= read -r -d '' argument; do
+            recorded_argv+=("$argument")
+        done
+        :
+    } <"$arguments_file"; then
+        rm -f -- "$arguments_file"
+        return 1
+    fi
+    rm -f -- "$arguments_file" || return 1
+    for option in "$@"; do
+        key="${option%%=*}"
+        case "$key" in
+            --enable-*) key="feature:${key#--enable-}" ;;
+            --disable-*) key="feature:${key#--disable-}" ;;
+            --with-*) key="package:${key#--with-}" ;;
+            --without-*) key="package:${key#--without-}" ;;
+        esac
+        matched=false
+        for argument in ${recorded_argv[@]+"${recorded_argv[@]}"}; do
+            argument_key="${argument%%=*}"
+            case "$argument_key" in
+                --enable-*) argument_key="feature:${argument_key#--enable-}" ;;
+                --disable-*) argument_key="feature:${argument_key#--disable-}" ;;
+                --with-*) argument_key="package:${argument_key#--with-}" ;;
+                --without-*) argument_key="package:${argument_key#--without-}" ;;
+            esac
+            [ "$argument_key" = "$key" ] || continue
+            [ "$argument" = "$option" ] || return 1
+            matched=true
+        done
+        "$matched" || return 1
+    done
+}

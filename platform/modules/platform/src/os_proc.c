@@ -639,6 +639,43 @@ enum os_proc_image_identity os_proc_self_exe_identity(void)
 #endif
 }
 
+#if defined(_WIN32)
+static bool os_proc_windows_cmdline_has_token(const wchar_t *wide_token)
+{
+    int argc = 0;
+    /* Loading Shell32 eagerly prevents a low-integrity, UI-restricted worker
+     * from reaching main. Load its parser only when needed, from System32. */
+    HMODULE shell = LoadLibraryExW(L"shell32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    typedef LPWSTR *(WINAPI *parse_fn)(LPCWSTR, int *);
+    parse_fn parse = NULL;
+    FARPROC symbol = shell ? GetProcAddress(shell, "CommandLineToArgvW") : NULL;
+    static_assert(sizeof(parse) == sizeof(symbol), "Windows parser symbol width");
+    memcpy(&parse, &symbol, sizeof(parse));
+    if (!parse) {
+        DWORD error = GetLastError();
+        if (shell) FreeLibrary(shell);
+        fprintf(stderr, "os_proc: command-line parser unavailable win32=%lu\n",
+                (unsigned long)error);
+        return false;
+    }
+    wchar_t **argv = parse(GetCommandLineW(), &argc);
+    if (!argv)
+        fprintf(stderr, "os_proc: command-line parsing failed win32=%lu\n",
+                (unsigned long)GetLastError());
+    bool found = false;
+    for (int i = 0; argv && i < argc; i++) {
+        if (wcscmp(argv[i], wide_token) == 0) {
+            found = true;
+            break;
+        }
+    }
+    if (argv)
+        LocalFree(argv);
+    FreeLibrary(shell);
+    return found;
+}
+#endif
+
 bool os_proc_cmdline_has_token(const char *token)
 {
     if (!token || !*token)
@@ -651,18 +688,7 @@ bool os_proc_cmdline_has_token(const char *token)
         (int)(sizeof(wide_token) / sizeof(wide_token[0])));
     if (wide_token_len <= 0)
         return false;
-    int argc = 0;
-    wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    bool found = false;
-    for (int i = 0; argv && i < argc; i++) {
-        if (wcscmp(argv[i], wide_token) == 0) {
-            found = true;
-            break;
-        }
-    }
-    if (argv)
-        LocalFree(argv);
-    return found;
+    return os_proc_windows_cmdline_has_token(wide_token);
 #elif defined(__APPLE__)
     int argc = *_NSGetArgc();
     char **argv = *_NSGetArgv();

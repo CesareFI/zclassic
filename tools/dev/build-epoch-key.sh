@@ -652,6 +652,8 @@ compiler-id)
         [ "$probe_rc" -eq 0 ] ||
             fail "compiler include-search probe failed rc=$probe_rc: $output"
         while IFS= read -r line; do
+            # Native Windows drivers emit CRLF even when captured by MSYS Bash.
+            line="${line%$'\r'}"
             case "$line" in
                 '#include <...> search starts here:') in_list=1; continue ;;
                 'End of search list.') in_list=0; continue ;;

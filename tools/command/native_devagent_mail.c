@@ -1420,10 +1420,13 @@ static bool dvm_streams_list(const char *maildir,
         const char *why;
         if (!dvm_is_stream_name(ent->d_name))
             continue;
-        why = dvm_stream_refusal(ps, filter, ent->d_name);
+        size_t name_length = strlen(ent->d_name);
+        why = name_length >= sizeof(ps->streams[0].name)
+            ? "MAIL_STREAM_NAME_INVALID"
+            : dvm_stream_refusal(ps, filter, ent->d_name);
         if (why) {
-            (void)closedir(d);
             dvm_stream_fail(reply, why, ent->d_name);
+            (void)closedir(d);
             return false;
         }
         s = &ps->streams[ps->nstreams];
@@ -1435,7 +1438,7 @@ static bool dvm_streams_list(const char *maildir,
                      maildir);
             return false;
         }
-        (void)snprintf(s->name, sizeof(s->name), "%s", ent->d_name);
+        memcpy(s->name, ent->d_name, name_length + 1u);
         ps->nstreams++;
     }
     (void)closedir(d);

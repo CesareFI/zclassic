@@ -25,7 +25,11 @@ for dependency in platform/modules/platform/src/clock.c \
     platform/modules/util/include/util/log_macros.h \
     platform/modules/base/include/base/log_macros.h \
     platform/modules/base/include/base/format_attribute.h \
-    platform/modules/base/include/base/log_level.h; do
+    platform/modules/base/include/base/log_level.h \
+    platform/modules/platform/src/private_acl_internal.c \
+    platform/modules/platform/src/private_acl_internal.h \
+    platform/modules/base/src/safe_alloc.c \
+    platform/modules/base/include/base/safe_alloc.h; do
     mkdir -p "$SANDBOX/$(dirname "$dependency")"
     cp "$ROOT/$dependency" "$SANDBOX/$dependency"
 done
@@ -57,6 +61,9 @@ mkdir -p "$SANDBOX/elsewhere/tools"
 # Freeze the qualified driver before the relative fixture overrides HOSTCC.
 # Match the production token grammar; never evaluate a compiler command.
 fixture_host_cc="${HOSTCC:-cc}"
+case "$(uname -s 2>/dev/null)" in
+    MSYS*|MINGW*|CYGWIN*) fixture_host_cc="${HOSTCC:-${ZCL_BOOTSTRAP_CC:-/usr/bin/cc}}" ;;
+esac
 [[ "$fixture_host_cc" =~ ^[A-Za-z0-9_./:+,=%-]+([[:space:]]+[A-Za-z0-9_./:+,=%-]+)*$ ]] ||
     fail 'fixture HOSTCC contains unsupported shell syntax'
 read -r -a fixture_host_argv <<<"$fixture_host_cc"

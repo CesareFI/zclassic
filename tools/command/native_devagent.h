@@ -278,6 +278,7 @@ struct wkr_spawn_out {
     int status;
     long long wall_ms;
     bool signaled;
+    bool cpu_limit_hit; /* Native job accounting observed the CPU cap. */
 };
 
 /* The receipt-facing mapping, shared by both backends. When gate is true

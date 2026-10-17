@@ -1,7 +1,7 @@
 /* Copyright 2026 Rhett Creighton. Licensed under Apache-2.0.
  *
  * Native NUL-path batch hashing and mode capture for source_identity.v2.
- * Output remains byte-identical to GNU sha256sum --zero and stat -c %f.
+ * Output remains byte-identical to GNU sha256sum --binary --zero and stat -c %f.
  *
  * The `token` submode additionally derives the inventory and mutation
  * preimages in one process. It reproduces byte-for-byte what
@@ -501,7 +501,7 @@ static int emit_hash(const char *path,
     zcl_hex_encode(digest, ZSHA256_DIGEST_LEN, hex);
     size_t path_length = strlen(path);
     if (fwrite(hex, 1, sizeof hex - 1u, stdout) != sizeof hex - 1u ||
-        fwrite("  ", 1, 2, stdout) != 2 ||
+        fwrite(" *", 1, 2, stdout) != 2 ||
         fwrite(path, 1, path_length, stdout) != path_length ||
         fputc(0, stdout) == EOF) {
         fprintf(stderr, "source-identity-batch: output write failed\n");
@@ -770,7 +770,7 @@ static const struct gitlink_state *find_gitlink(const struct token_run *run,
     return nullptr;
 }
 
-/* Parse the `hash` mode's output (GNU sha256sum --zero shape) into a
+/* Parse the `hash` mode's output (GNU sha256sum --binary --zero shape) into a
  * path-keyed digest table for the identity pass. */
 /* Read one `digest  path\0` row. Returns 1 on a row, 0 on clean EOF, -1 on
  * a malformed row (diagnostic printed). `hex` receives 64 chars NUL-terminated

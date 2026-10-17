@@ -311,12 +311,22 @@ acquire_vendor_lock() {
     # Bootstrap only host C23, with no vendor archive dependency. Bind reuse
     # to exact helper/compiler/bootstrap bytes and flags, never timestamps.
     local host_cc="${HOSTCC:-cc}" compiler_key source_key key helper temporary
+    # This helper executes inside the POSIX build shell and retains flock's
+    # descriptor across exec. MinGW/UCRT cc builds the product archives, but
+    # cannot provide that host contract. Match zcc's MSYS bootstrap compiler
+    # selection while preserving an explicit HOSTCC override.
+    case "$(uname -s 2>/dev/null)" in
+        MSYS*|MINGW*|CYGWIN*)
+            host_cc="${HOSTCC:-${ZCL_BOOTSTRAP_CC:-/usr/bin/cc}}"
+            ;;
+    esac
     local helper_source script_source key_source provenance_source
     local dependencies="" dependency
     local -a clock_flags=(-D_POSIX_C_SOURCE=200809L -D_DARWIN_C_SOURCE=1
         -I"$REPO_ROOT/platform/modules/platform/include"
         -I"$REPO_ROOT/platform/modules/util/include"
         -I"$REPO_ROOT/platform/modules/base/include")
+    local -a acl_sources=() acl_flags=() acl_dependencies=()
     local -a host_argv
     [[ "$host_cc" =~ ^[A-Za-z0-9_./:+,=%-]+([[:space:]]+[A-Za-z0-9_./:+,=%-]+)*$ ]] ||
         die "vendor lock HOSTCC contains unsupported shell syntax"
@@ -327,6 +337,19 @@ acquire_vendor_lock() {
         /*) ;;
         */*) [[ ! -f "$REPO_ROOT/${host_argv[0]}" ]] ||
             host_argv[0]="$REPO_ROOT/${host_argv[0]}" ;;
+    esac
+    # The MSYS host retains POSIX flock/exec while qualifying real NTFS ACLs.
+    case "$("${host_argv[@]}" -dM -E -x c - </dev/null)" in
+        *'#define __MSYS__ 1'*)
+            clock_flags+=(-I"$REPO_ROOT/platform/modules/platform/src")
+            acl_sources=("$REPO_ROOT/platform/modules/platform/src/private_acl_internal.c"
+                "$REPO_ROOT/platform/modules/base/src/safe_alloc.c")
+            acl_flags=(-ladvapi32)
+            acl_dependencies=(platform/modules/platform/src/private_acl_internal.c
+                platform/modules/platform/src/private_acl_internal.h
+                platform/modules/base/src/safe_alloc.c
+                platform/modules/base/include/base/safe_alloc.h)
+            ;;
     esac
     # compiler-id fingerprints a C driver and a C++ driver. The helper is C
     # only, so the C driver stood in for both -- which refuses outright on a
@@ -357,14 +380,15 @@ acquire_vendor_lock() {
         platform/modules/util/include/util/log_macros.h \
         platform/modules/base/include/base/log_macros.h \
         platform/modules/base/include/base/format_attribute.h \
-        platform/modules/base/include/base/log_level.h; do
+        platform/modules/base/include/base/log_level.h \
+        ${acl_dependencies[@]+"${acl_dependencies[@]}"}; do
         dependencies+=":$(vendor_lock_source_hash "$REPO_ROOT/$dependency")" ||
             die "vendor lock dependency hash failed: $dependency"
     done
     source_key="$(vp_sha256_text "$helper_source:$script_source:$key_source:$provenance_source$dependencies")" ||
         die "vendor lock source aggregate failed"
     zcl_is_sha256 "$source_key" || die "vendor lock source aggregate invalid"
-    key="$(vp_sha256_text "$compiler_key:$source_key:-std=c23 -O2 -Wall -Wextra -Werror:${clock_flags[*]}")" ||
+    key="$(vp_sha256_text "$compiler_key:$source_key:-std=c23 -O2 -Wall -Wextra -Werror:${clock_flags[*]}:${acl_sources[*]-}:${acl_flags[*]-}")" ||
         die "vendor lock build key failed"
     zcl_is_sha256 "$key" || die "vendor lock build key invalid"
     helper="$REPO_ROOT/build/bin/vendor-lock/$key/vendor-lock"
@@ -374,6 +398,7 @@ acquire_vendor_lock() {
         if ! "${host_argv[@]}" -std=c23 -O2 -Wall -Wextra -Werror \
             "${clock_flags[@]}" "$REPO_ROOT/platform/modules/platform/src/clock.c" \
             "-DVENDOR_LOCK_BUILD_KEY=\"$key\"" "$REPO_ROOT/tools/vendor_lock.c" \
+            ${acl_sources[@]+"${acl_sources[@]}"} ${acl_flags[@]+"${acl_flags[@]}"} \
             -o "$temporary"; then
             rm -f "$temporary"
             die "vendor lock C23 bootstrap failed"

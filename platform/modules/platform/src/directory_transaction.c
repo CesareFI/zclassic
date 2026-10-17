@@ -343,9 +343,9 @@ bool platform_directory_transaction_flush(struct platform_directory_transaction 
                 (unsigned long)GetLastError());
     return ok;
 }
-enum platform_directory_result platform_directory_transaction_open_child(
+static enum platform_directory_result directory_transaction_open_child_access(
     struct platform_directory_transaction *parent, const char *leaf,
-    bool create, struct platform_directory_transaction *child)
+    bool create, struct platform_directory_transaction *child, bool namespace_rights)
 {
     nt_create_file_fn create_file = resolve_nt_create_file();
     wchar_t wide[260]; UNICODE_STRING name;
@@ -362,7 +362,8 @@ enum platform_directory_result platform_directory_transaction_open_child(
      * handle at traverse/read-attribute authority so those opens cannot
      * conflict while the capability remains retained. */
     NTSTATUS result = create_file(&handle,
-        FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE | READ_CONTROL,
+        FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE | READ_CONTROL |
+            (namespace_rights ? DELETE | FILE_LIST_DIRECTORY : 0),
         &attributes, &status, NULL, FILE_ATTRIBUTE_DIRECTORY,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         create ? 3u : FILE_OPEN,
@@ -377,6 +378,14 @@ enum platform_directory_result platform_directory_transaction_open_child(
     child->native = (uintptr_t)handle;
     return PLATFORM_DIRECTORY_OK;
 }
+enum platform_directory_result platform_directory_transaction_open_child(
+    struct platform_directory_transaction *parent, const char *leaf,
+    bool create, struct platform_directory_transaction *child)
+{ return directory_transaction_open_child_access(parent, leaf, create, child, false); }
+enum platform_directory_result platform_directory_transaction_open_child_namespace(
+    struct platform_directory_transaction *parent, const char *leaf,
+    bool create, struct platform_directory_transaction *child)
+{ return directory_transaction_open_child_access(parent, leaf, create, child, true); }
 bool platform_directory_child_open(struct platform_directory_transaction *d,
                                    const char *leaf, struct platform_directory_child *f)
 { return child_open(d, leaf, FILE_OPEN, f); }
@@ -931,3 +940,286 @@ bool platform_directory_child_write_exact(struct platform_directory_child *f,
 
 void platform_directory_names_free(struct platform_directory_names *names)
 { if (!names) return; for (size_t i=0;i<names->count;i++) free(names->items[i]); free(names->items); memset(names,0,sizeof(*names)); }
+
+#if defined(_WIN32)
+#include "platform/private_file.h"
+#include "platform/windows_path.h"
+#include <fcntl.h>
+#include <io.h>
+#include <stddef.h>
+#include <winternl.h>
+
+static inline bool directory_namespace_same(const BY_HANDLE_FILE_INFORMATION *a,
+                                            const BY_HANDLE_FILE_INFORMATION *b) {
+    return a->dwVolumeSerialNumber == b->dwVolumeSerialNumber &&
+           a->nFileIndexHigh == b->nFileIndexHigh &&
+           a->nFileIndexLow == b->nFileIndexLow;
+}
+static inline HANDLE
+directory_namespace_capable(struct platform_directory_transaction *d) {
+    if (!d || d->native == UINTPTR_MAX) {
+        errno = EINVAL;
+        return INVALID_HANDLE_VALUE;
+    }
+    BY_HANDLE_FILE_INFORMATION before, after;
+    if (!GetFileInformationByHandle((HANDLE)d->native, &before))
+        return INVALID_HANDLE_VALUE;
+    HANDLE h = INVALID_HANDLE_VALUE;
+    if (!DuplicateHandle(GetCurrentProcess(), (HANDLE)d->native, GetCurrentProcess(),
+                         &h, 0, FALSE, DUPLICATE_SAME_ACCESS))
+        return INVALID_HANDLE_VALUE;
+    if (h != INVALID_HANDLE_VALUE && GetFileInformationByHandle(h, &after) &&
+        directory_namespace_same(&before, &after) &&
+        (after.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+        !(after.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
+        return h;
+    if (h != INVALID_HANDLE_VALUE)
+        CloseHandle(h);
+    return INVALID_HANDLE_VALUE;
+}
+/* Decode only records fully contained in the aligned native response. */
+static bool directory_namespace_entry(BYTE *buffer, size_t size, size_t offset,
+                                      FILE_ID_BOTH_DIR_INFO **entry)
+{
+    size_t header = offsetof(FILE_ID_BOTH_DIR_INFO, FileName);
+    if (offset > size || size - offset < header) {
+        errno = EIO;
+        return false;
+    }
+    FILE_ID_BOTH_DIR_INFO *found = (FILE_ID_BOTH_DIR_INFO *)(buffer + offset);
+    if (found->FileNameLength % sizeof(wchar_t) != 0 ||
+        found->FileNameLength > size - offset - header) {
+        errno = EIO;
+        return false;
+    }
+    *entry = found;
+    return true;
+}
+
+static bool directory_namespace_next(const FILE_ID_BOTH_DIR_INFO *entry,
+                                     size_t available, size_t *offset)
+{
+    size_t header = offsetof(FILE_ID_BOTH_DIR_INFO, FileName);
+    if (entry->NextEntryOffset < header + entry->FileNameLength ||
+        entry->NextEntryOffset % alignof(FILE_ID_BOTH_DIR_INFO) != 0 ||
+        entry->NextEntryOffset > available - header) {
+        errno = EIO;
+        return false;
+    }
+    *offset += entry->NextEntryOffset;
+    return true;
+}
+
+static bool directory_namespace_dot(const FILE_ID_BOTH_DIR_INFO *entry)
+{
+    size_t count = entry->FileNameLength / sizeof(wchar_t);
+    return (count == 1u && entry->FileName[0] == L'.') ||
+           (count == 2u && entry->FileName[0] == L'.' && entry->FileName[1] == L'.');
+}
+
+static bool
+directory_namespace_remove_entry(struct platform_directory_transaction *directory,
+                                 const FILE_ID_BOTH_DIR_INFO *entry, unsigned depth)
+{
+    char leaf[PLATFORM_DIRECTORY_CHILD_LEAF_MAX + 1u];
+    size_t count = entry->FileNameLength / sizeof(wchar_t);
+    int n = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, entry->FileName,
+                                (int)count, leaf, sizeof(leaf) - 1u, NULL, NULL);
+    if (n <= 0 || (entry->FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
+        return false;
+    leaf[n] = 0;
+    if (!(entry->FileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+        return platform_directory_child_unlink(directory, leaf, false);
+    struct platform_directory_transaction child;
+    platform_directory_transaction_init(&child);
+    bool ok = platform_directory_transaction_open_child_namespace(
+                  directory, leaf, false, &child) == PLATFORM_DIRECTORY_OK &&
+              platform_directory_transaction_remove_retained(&child, depth + 1u);
+    platform_directory_transaction_close(&child);
+    return ok;
+}
+
+/* Remove at most one child per pass, restarting enumeration after mutation. */
+static bool
+directory_namespace_remove_one(struct platform_directory_transaction *directory,
+                               HANDLE handle, unsigned depth, bool *empty)
+{
+    alignas(FILE_ID_BOTH_DIR_INFO) BYTE buffer[16384] = {0};
+    if (!GetFileInformationByHandleEx(handle, FileIdBothDirectoryRestartInfo, buffer,
+                                      sizeof(buffer))) {
+        *empty = GetLastError() == ERROR_NO_MORE_FILES;
+        return *empty;
+    }
+    size_t offset = 0;
+    for (;;) {
+        FILE_ID_BOTH_DIR_INFO *entry;
+        if (!directory_namespace_entry(buffer, sizeof(buffer), offset, &entry))
+            return false;
+        if (!directory_namespace_dot(entry))
+            return directory_namespace_remove_entry(directory, entry, depth);
+        if (!entry->NextEntryOffset) {
+            *empty = true;
+            return true;
+        }
+        if (!directory_namespace_next(entry, sizeof(buffer) - offset, &offset))
+            return false;
+    }
+}
+
+bool platform_directory_transaction_remove_retained(
+    struct platform_directory_transaction *directory, unsigned depth)
+{
+    if (depth >= 64u)
+        return false;
+    HANDLE handle = directory_namespace_capable(directory);
+    if (handle == INVALID_HANDLE_VALUE)
+        return false;
+    bool ok = true, empty = false;
+    for (unsigned pass = 0; ok && !empty && pass < 4096u; pass++)
+        ok = directory_namespace_remove_one(directory, handle, depth, &empty);
+    struct {
+        DWORD flags;
+    } disposition = {.flags = 1u | 2u};
+    ok = ok && empty &&
+         SetFileInformationByHandle(handle, (FILE_INFO_BY_HANDLE_CLASS)21, &disposition,
+                                    sizeof(disposition));
+    CloseHandle(handle);
+    return ok;
+}
+
+/* Like the file namespace rail, distinguish a completed move whose proof failed. */
+#ifdef ZCL_TESTING
+static bool g_directory_move_fail_durability;
+void platform_directory_transaction_move_directory_test_fail_durability_once(void)
+{
+    g_directory_move_fail_durability = true;
+}
+#endif
+static bool directory_namespace_source_bound(
+    struct platform_directory_transaction *parent, const char *leaf,
+    struct platform_directory_transaction *source, BY_HANDLE_FILE_INFORMATION *before)
+{
+    struct platform_directory_transaction named;
+    platform_directory_transaction_init(&named);
+    BY_HANDLE_FILE_INFORMATION named_info;
+    bool ok = platform_directory_transaction_open_child_namespace(
+                  parent, leaf, false, &named) == PLATFORM_DIRECTORY_OK &&
+              GetFileInformationByHandle((HANDLE)source->native, before) &&
+              GetFileInformationByHandle((HANDLE)named.native, &named_info) &&
+              directory_namespace_same(before, &named_info);
+    platform_directory_transaction_close(&named);
+    if (!ok || !platform_directory_transaction_flush(source)) {
+        fprintf(stderr, "directory move: source binding/flush failed win32=%lu\n",
+                (unsigned long)GetLastError());
+        return false;
+    }
+    return true;
+}
+
+static bool directory_namespace_same_volume(
+    struct platform_directory_transaction *source_parent,
+    struct platform_directory_transaction *destination_parent,
+    const BY_HANDLE_FILE_INFORMATION *before)
+{
+    uint64_t source_volume = 0, destination_volume = 0;
+    return directory_volume(source_parent, &source_volume) &&
+           directory_volume(destination_parent, &destination_volume) &&
+           source_volume == destination_volume &&
+           before->dwVolumeSerialNumber == source_volume;
+}
+
+static enum platform_directory_result
+directory_namespace_rename(struct platform_directory_transaction *source,
+                           struct platform_directory_transaction *destination_parent,
+                           const wchar_t *wide, const UNICODE_STRING *destination_name)
+{
+    nt_set_information_file_fn set_info = resolve_nt_set_information_file();
+    HANDLE capable = directory_namespace_capable(source);
+    if (!set_info || capable == INVALID_HANDLE_VALUE) {
+        DWORD error = GetLastError();
+        if (capable != INVALID_HANDLE_VALUE)
+            CloseHandle(capable);
+        fprintf(stderr, "directory move: native/capable failed win32=%lu\n",
+                (unsigned long)error);
+        errno = EIO;
+        return PLATFORM_DIRECTORY_REFUSED;
+    }
+    struct rename_ex {
+        ULONG flags;
+        HANDLE root;
+        ULONG length;
+        WCHAR name[260];
+    } rename = {0};
+    rename.root = (HANDLE)destination_parent->native;
+    rename.length = destination_name->Length;
+    memcpy(rename.name, wide, rename.length);
+    IO_STATUS_BLOCK status = {0};
+    NTSTATUS result =
+        set_info(capable, &status, &rename,
+                 (ULONG)(offsetof(struct rename_ex, name) + rename.length),
+                 (FILE_INFORMATION_CLASS)65);
+    CloseHandle(capable);
+    if (result < 0) {
+        fprintf(stderr, "directory move: rename status=0x%08lx\n",
+                (unsigned long)result);
+        return (ULONG)result == 0xC0000035u ? PLATFORM_DIRECTORY_EXISTS
+                                            : PLATFORM_DIRECTORY_IO;
+    }
+    return PLATFORM_DIRECTORY_OK;
+}
+
+static bool directory_namespace_destination_bound(
+    struct platform_directory_transaction *source_parent,
+    struct platform_directory_transaction *destination_parent,
+    const char *destination_leaf, const BY_HANDLE_FILE_INFORMATION *before)
+{
+    struct platform_directory_transaction named;
+    platform_directory_transaction_init(&named);
+    BY_HANDLE_FILE_INFORMATION after;
+    enum platform_directory_result opened =
+        platform_directory_transaction_open_child_namespace(
+            destination_parent, destination_leaf, false, &named);
+    bool ok = opened == PLATFORM_DIRECTORY_OK &&
+              GetFileInformationByHandle((HANDLE)named.native, &after) &&
+              directory_namespace_same(before, &after) &&
+              platform_directory_transaction_flush(destination_parent) &&
+              platform_directory_transaction_flush(source_parent);
+    platform_directory_transaction_close(&named);
+    return ok;
+}
+
+enum platform_directory_result platform_directory_transaction_move_directory(
+    struct platform_directory_transaction *source_parent, const char *source_leaf,
+    struct platform_directory_transaction *source,
+    struct platform_directory_transaction *destination_parent,
+    const char *destination_leaf)
+{
+    if (!source_parent || !source_leaf || !source || !destination_parent ||
+        !destination_leaf || source->native == UINTPTR_MAX)
+        return PLATFORM_DIRECTORY_INVALID;
+    BY_HANDLE_FILE_INFORMATION before;
+    if (!directory_namespace_source_bound(source_parent, source_leaf, source, &before))
+        return PLATFORM_DIRECTORY_REFUSED;
+    wchar_t wide[260];
+    UNICODE_STRING destination_name;
+    if (!wide_leaf(destination_leaf, wide, &destination_name))
+        return PLATFORM_DIRECTORY_INVALID;
+    if (!directory_namespace_same_volume(source_parent, destination_parent, &before))
+        return PLATFORM_DIRECTORY_REFUSED;
+    enum platform_directory_result moved =
+        directory_namespace_rename(source, destination_parent, wide, &destination_name);
+    if (moved != PLATFORM_DIRECTORY_OK)
+        return moved;
+#ifdef ZCL_TESTING
+    if (g_directory_move_fail_durability) {
+        g_directory_move_fail_durability = false;
+        return PLATFORM_DIRECTORY_OUTCOME_UNKNOWN;
+    }
+#endif
+    return directory_namespace_destination_bound(source_parent, destination_parent,
+                                                 destination_leaf, &before)
+               ? PLATFORM_DIRECTORY_OK
+               : PLATFORM_DIRECTORY_OUTCOME_UNKNOWN;
+}
+
+#endif

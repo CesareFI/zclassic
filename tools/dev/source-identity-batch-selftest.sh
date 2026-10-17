@@ -31,13 +31,14 @@ fi
 
 cd "$SANDBOX"
 printf 'plain\n' > plain.c
+printf 'CRLF\r\nCtrl-Z\032tail\r\n' > binary.c
 printf 'space\n' > 'space name.c'
 printf 'newline\n' > $'line\nbreak.c'
 printf 'utf8\n' > 'lambda-λ.c'
 printf '#!/bin/sh\nexit 0\n' > executable.sh
 chmod 0755 executable.sh
 ln -s plain.c source-link
-paths=(plain.c 'space name.c' $'line\nbreak.c' 'lambda-λ.c' executable.sh)
+paths=(plain.c binary.c 'space name.c' $'line\nbreak.c' 'lambda-λ.c' executable.sh)
 for i in {1..140}; do
     printf 'fixture %s\n' "$i" > "fixture-$i.c"
     paths+=("fixture-$i.c")
@@ -51,7 +52,7 @@ if command -v sha256sum >/dev/null 2>&1 &&
    [[ "$sha256sum_help" == *--zero* ]] &&
    stat -c '%f' plain.c >/dev/null 2>&1; then
     "$HELPER" hash < hash-input > native-hashes || fail 'native hash failed'
-    sha256sum --zero -- "${paths[@]}" > legacy-hashes ||
+    sha256sum --binary --zero -- "${paths[@]}" > legacy-hashes ||
         fail 'legacy hash failed'
     cmp -s native-hashes legacy-hashes || fail 'hash output differs'
     "$HELPER" mode < mode-input > native-modes || fail 'native mode failed'

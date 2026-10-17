@@ -152,6 +152,7 @@ bool zcl_native_device_host_shell_json(const struct zcl_native_host_shell_argv *
 
 /* A usable PATH entry is an absolute directory: an empty or relative
  * component would resolve against the caller's working directory. */
+#if !defined(_WIN32)
 static bool shell_path_components_absolute(const char *path_env)
 {
     for (const char *component = path_env;;) {
@@ -163,7 +164,6 @@ static bool shell_path_components_absolute(const char *path_env)
     }
 }
 
-#if !defined(_WIN32)
 static bool shell_executable_file(const char *path)
 {
     struct stat st;

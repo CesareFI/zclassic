@@ -3,8 +3,10 @@
  * strict manifest NAME.plugin.json, the detached Ed25519 signature
  * NAME.plugin.sig and a copy of the executable that
  * plugin_store_install accepts; plugin_keygen creates the signing key file.
- * A key file is exactly the 32-byte Ed25519 seed (RFC 8032), mode 0600, the
- * same form as the onion vanity seed. docs/PLUGINS.md describes publishing. */
+ * A key file is exactly the 32-byte Ed25519 seed (RFC 8032), the same form as
+ * the onion vanity seed. POSIX creates it with mode 0600; Windows requires a protected
+ * owner+SYSTEM-only ACL and an owner-private parent. docs/PLUGINS.md describes
+ * publishing. Storage support does not grant plugin execution or confinement. */
 #ifndef ZCL_PLUGIN_PACK_H
 #define ZCL_PLUGIN_PACK_H
 
@@ -44,8 +46,9 @@ bool plugin_capability_add(const char *name, size_t len, unsigned *mask);
 enum plugin_status plugin_pack(const struct plugin_pack_request *request,
                                struct plugin_pack_result *result);
 
-/* Creates a new key file (O_EXCL, mode 0600, host CSPRNG) and returns the
- * public key as 64 hex characters, the line to add to trusted_keys. An
+/* Exclusively creates a host-CSPRNG key (mode 0600 on POSIX; protected
+ * owner+SYSTEM-only ACL beneath a validated private parent on Windows) and
+ * returns the public key as 64 hex characters, the line for trusted_keys. An
  * existing path is refused with PLUGIN_ERR_KEY_EXISTS; the secret is never
  * returned. */
 enum plugin_status plugin_keygen(const char *key_path,

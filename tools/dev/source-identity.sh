@@ -771,7 +771,7 @@ capture_batched()
                       batch_start < ${#regular_paths[@]};
                       batch_start += batch_size)); do
                     batch=("${regular_paths[@]:batch_start:batch_size}")
-                    sha256sum --zero -- "${batch[@]}" \
+                    sha256sum --binary --zero -- "${batch[@]}" \
                         >> "$WORK/hashes.legacy" ||
                         fail "legacy regular-file hash shadow failed"
                 done
@@ -782,7 +782,7 @@ capture_batched()
             for ((batch_start = 0; batch_start < ${#regular_paths[@]};
                   batch_start += batch_size)); do
                 batch=("${regular_paths[@]:batch_start:batch_size}")
-                sha256sum --zero -- "${batch[@]}" >> "$WORK/hashes" ||
+                sha256sum --binary --zero -- "${batch[@]}" >> "$WORK/hashes" ||
                     fail_racy "dirty source changed while hashing regular files"
             done
         fi

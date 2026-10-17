@@ -8,7 +8,7 @@
 #ifndef ZCL_PLATFORM_PRIVATE_ACL_INTERNAL_H
 #define ZCL_PLATFORM_PRIVATE_ACL_INTERNAL_H
 
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__MSYS__)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif

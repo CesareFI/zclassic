@@ -2,6 +2,11 @@
  * Purpose: install, switch, rollback and list for the signed plugin store. */
 
 #include "plugin_internal.h"
+#if defined(_WIN32)
+#include "platform/directory_transaction.h"
+#include "platform/directory_compat.h"
+#include <io.h>
+#endif
 
 #include "base/safe_alloc.h"
 #include "platform/atomic_link.h"
@@ -81,8 +86,14 @@ static struct dirent *ps_readdir(DIR *d, const char *path)
 
 static bool ps_is_dir(const char *path)
 {
+#if defined(_WIN32)
+    return plugin_check_dir(path) == PLUGIN_OK;
+#else
+
     struct stat st;
     return lstat(path, &st) == 0 && S_ISDIR(st.st_mode);
+
+#endif
 }
 
 static enum plugin_status ps_read_error(enum plugin_status missing,
@@ -282,11 +293,96 @@ static enum plugin_status ps_stage(const struct ps_paths *src, const char *name,
                            : st;
 }
 
-/* Move a generation that failed verification aside and put the verified
- * staging copy at its name; on failure the old directory is restored. */
+/* Move a failed generation aside and publish its verified staging copy.
+ * A definitive publication failure attempts restoration; an unknown outcome
+ * retains the involved objects for reconciliation. */
+#if defined(_WIN32)
+struct ps_windows_replacement {
+    struct platform_directory_transaction from, to, staged, prior;
+    char source[PLATFORM_DIRECTORY_CHILD_LEAF_MAX + 1u];
+    char target[PLATFORM_DIRECTORY_CHILD_LEAF_MAX + 1u];
+    char aside[PLATFORM_DIRECTORY_CHILD_LEAF_MAX + 1u];
+    bool had;
+};
+
+static void ps_windows_replacement_init(struct ps_windows_replacement *state)
+{
+    platform_directory_transaction_init(&state->from);
+    platform_directory_transaction_init(&state->to);
+    platform_directory_transaction_init(&state->staged);
+    platform_directory_transaction_init(&state->prior);
+    state->had = false;
+}
+
+static void ps_windows_replacement_close(struct ps_windows_replacement *state)
+{
+    platform_directory_transaction_close(&state->prior);
+    platform_directory_transaction_close(&state->staged);
+    platform_directory_transaction_close(&state->from);
+    platform_directory_transaction_close(&state->to);
+}
+
+static bool ps_windows_replacement_open(struct ps_windows_replacement *state,
+                                        const char *staging, const char *final_dir)
+{
+    if (!platform_directory_transaction_parent(staging, &state->from, state->source) ||
+        !platform_directory_transaction_parent(final_dir, &state->to, state->target))
+        return false;
+    if (platform_directory_transaction_open_child_namespace(&state->from, state->source,
+                                                            false, &state->staged) !=
+        PLATFORM_DIRECTORY_OK)
+        return false;
+    enum platform_directory_result opened =
+        platform_directory_transaction_open_child_namespace(&state->to, state->target,
+                                                            false, &state->prior);
+    state->had = opened == PLATFORM_DIRECTORY_OK;
+    return state->had || opened == PLATFORM_DIRECTORY_MISSING;
+}
+
+static bool ps_windows_replacement_aside(struct ps_windows_replacement *state)
+{
+    if (!state->had)
+        return true;
+    int n = snprintf(state->aside, sizeof(state->aside), "%s.old.%lu", state->target,
+                     (unsigned long)getpid());
+    return n > 0 && (size_t)n < sizeof(state->aside) &&
+           platform_directory_transaction_move_directory(
+               &state->to, state->target, &state->prior, &state->to, state->aside) ==
+               PLATFORM_DIRECTORY_OK;
+}
+
+static enum plugin_status
+ps_windows_replacement_publish(struct ps_windows_replacement *state)
+{
+    enum platform_directory_result moved =
+        platform_directory_transaction_move_directory(
+            &state->from, state->source, &state->staged, &state->to, state->target);
+    if (moved != PLATFORM_DIRECTORY_OK && moved != PLATFORM_DIRECTORY_OUTCOME_UNKNOWN &&
+        state->had)
+        (void)platform_directory_transaction_move_directory(
+            &state->to, state->aside, &state->prior, &state->to, state->target);
+    /* Unknown namespace outcomes retain both staging/aside for reconciliation.
+     * Only proven publication permits cleanup of the retained prior object. */
+    if (moved == PLATFORM_DIRECTORY_OK && state->had)
+        (void)platform_directory_transaction_remove_retained(&state->prior, 0);
+    return moved == PLATFORM_DIRECTORY_OK ? PLUGIN_OK : PLUGIN_ERR_IO;
+}
+#endif
+
 static enum plugin_status ps_replace(const char *gens, const char *staging,
                                      const char *final_dir)
 {
+#if defined(_WIN32)
+    (void)gens;
+    struct ps_windows_replacement state;
+    ps_windows_replacement_init(&state);
+    bool ready = ps_windows_replacement_open(&state, staging, final_dir) &&
+                 ps_windows_replacement_aside(&state);
+    enum plugin_status status = ready ? ps_windows_replacement_publish(&state) : PLUGIN_ERR_IO;
+    ps_windows_replacement_close(&state);
+    return status;
+#else
+
     char aside[PLUGIN_PATH_MAX];
     struct stat st;
     bool had = lstat(final_dir, &st) == 0;
@@ -305,6 +401,8 @@ static enum plugin_status ps_replace(const char *gens, const char *staging,
     if (had)
         (void)plugin_remove_tree(aside);
     return plugin_fsync_dir(gens) ? PLUGIN_OK : PLUGIN_ERR_IO;
+
+#endif
 }
 
 static enum plugin_status ps_publish(const char *plugdir, const char *name,
@@ -328,8 +426,10 @@ static enum plugin_status ps_publish(const char *plugdir, const char *name,
         st = ps_stage(src, name, staging, trust, m);
     if (st == PLUGIN_OK)
         st = ps_replace(gens, staging, final_dir);
+#if !defined(_WIN32)
     if (st != PLUGIN_OK)
         (void)plugin_remove_tree(staging);
+#endif
     return st;
 }
 
@@ -383,11 +483,22 @@ static enum plugin_status ps_plugin_dir(const char *root, const char *name,
 static enum plugin_status ps_point(const char *plugdir, const char *link,
                                    const char *generation)
 {
+#if defined(_WIN32)
+    char path[PLUGIN_PATH_MAX], pointer[sizeof("generations/") + PLUGIN_HEX_SHA3_512 + 1u];
+    int n = snprintf(pointer, sizeof(pointer), "generations/%s\n", generation);
+    if (n != (int)(sizeof("generations/") - 1u + PLUGIN_HEX_SHA3_512 + 1u) ||
+        !plugin_join(path, sizeof(path), plugdir, link, NULL, NULL))
+        return PLUGIN_ERR_ARGUMENT;
+    return platform_directory_transaction_write_atomic(path, pointer, (size_t)n) ? PLUGIN_OK : PLUGIN_ERR_IO;
+#else
+
     char target[PLUGIN_PATH_MAX], path[PLUGIN_PATH_MAX];
     snprintf(target, sizeof(target), "generations/%s", generation);
     if (!plugin_join(path, sizeof(path), plugdir, link, NULL, NULL))
         return PLUGIN_ERR_ARGUMENT;
     return platform_atomic_symlink(target, path) == 0 ? PLUGIN_OK : PLUGIN_ERR_IO;
+
+#endif
 }
 
 enum plugin_status plugin_store_switch(const char *root, const char *name,
@@ -498,7 +609,9 @@ static enum plugin_status ps_load_info(const char *root, const char *name,
 {
     char plugdir[PLUGIN_PATH_MAX];
     memset(info, 0, sizeof(*info));
-    snprintf(info->name, sizeof(info->name), "%s", name);
+    size_t name_len = strlen(name);
+    if (name_len >= sizeof(info->name)) return PLUGIN_ERR_ARGUMENT;
+    memcpy(info->name, name, name_len + 1u);
     if (!plugin_join(plugdir, sizeof(plugdir), root, name, NULL, NULL))
         return PLUGIN_ERR_IO;
     info->current_state = plugin_link_slot(plugdir, "current", info->current);

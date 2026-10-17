@@ -24,8 +24,9 @@ bool plugin_version_valid(const char *version);
 void plugin_manifest_digest(const char *manifest, size_t len,
                             uint8_t digest[PLUGIN_DIGEST_BYTES]);
 
-/* Read a signing key file: a regular file owned by the effective user, no
- * group or world access, exactly PLUGIN_KEY_FILE_BYTES long. */
+/* Read a regular signing key of exactly PLUGIN_KEY_FILE_BYTES. POSIX requires
+ * current-user ownership and no group/other access; Windows requires a
+ * protected owner+SYSTEM-only ACL and a retained owner-private parent. */
 enum plugin_status plugin_key_load(const char *path,
                                    uint8_t seed[PLUGIN_KEY_FILE_BYTES]);
 void plugin_key_public(const uint8_t seed[PLUGIN_KEY_FILE_BYTES],
@@ -37,7 +38,9 @@ enum { PLUGIN_OPEN_NOFOLLOW = 1, PLUGIN_OPEN_OWNER_ONLY = 2 };
 
 /* Open a regular file read-only. NOFOLLOW refuses a symbolic link; OWNER_ONLY
  * requires the file to belong to the effective user and not be group or world
- * writable. A refusal returns -1 with errno EPERM or ELOOP. */
+ * writable. Windows OWNER_ONLY requires a protected owner+SYSTEM-only file ACL
+ * and a retained private parent; reparse points are refused. A security refusal
+ * returns -1 with errno EPERM or ELOOP. */
 int plugin_open_read(const char *path, unsigned flags);
 
 /* Read a whole file of at most max bytes into a NUL-terminated heap buffer.
@@ -49,17 +52,19 @@ bool plugin_read_file(const char *path, size_t max, unsigned flags,
 enum plugin_status plugin_hash_path(const char *path, unsigned flags,
                                     char hex[PLUGIN_HEX_SHA3_512 + 1]);
 
-/* Copy src to dst created exclusively with mode, hashing the bytes written. */
+/* Copy src to an exclusive destination, hashing the written bytes. POSIX uses
+ * mode; Windows creates a private file under a retained private parent. */
 enum plugin_status plugin_copy_file(const char *src, const char *dst,
                                     unsigned mode,
                                     char hex[PLUGIN_HEX_SHA3_512 + 1]);
 
-/* lstat a directory: it must be a real directory owned by the effective user
- * and not group or world writable. Missing is PLUGIN_ERR_NOT_INSTALLED,
+/* Validate a real directory: POSIX requires current-user ownership and no
+ * group/other writes; Windows requires the protected owner+SYSTEM-only ACL.
+ * Missing is PLUGIN_ERR_NOT_INSTALLED,
  * anything else wrong is PLUGIN_ERR_TRUST_INSECURE. */
 enum plugin_status plugin_check_dir(const char *path);
 
-/* fsync a directory so a rename inside it is durable. */
+/* Apply the platform directory durability barrier to a validated directory. */
 bool plugin_fsync_dir(const char *path);
 
 bool plugin_mkdirs(const char *path);
@@ -69,12 +74,12 @@ bool plugin_join(char *out, size_t cap, const char *a, const char *b,
                  const char *c, const char *d);
 bool plugin_remove_tree(const char *path);
 
-/* Parse a "generations/<hex>" link at dir/link into hex. */
+/* Parse a POSIX generation symlink or exact Windows private pointer file. */
 bool plugin_link_generation(const char *dir, const char *link,
                             char hex[PLUGIN_HEX_SHA3_512 + 1]);
 
-/* As plugin_link_generation, and says why a link did not read: missing (no
- * such link), corrupt (not a generations/<hex> symbolic link) or unreadable
+/* As plugin_link_generation, and says why a slot did not read: missing,
+ * corrupt (invalid platform generation pointer) or unreadable
  * (any other failure). hex is written only for PLUGIN_SLOT_OK. */
 enum plugin_slot_state plugin_link_slot(const char *dir, const char *link,
                                         char hex[PLUGIN_HEX_SHA3_512 + 1]);

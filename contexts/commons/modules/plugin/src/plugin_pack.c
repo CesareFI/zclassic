@@ -3,6 +3,12 @@
  * sign it and write the three files plugin_store_install reads. */
 
 #include "plugin_internal.h"
+#if defined(_WIN32)
+#include "platform/directory_transaction.h"
+#include <unistd.h>
+#include <io.h>
+#include <fcntl.h>
+#endif
 
 #include "base/cleanse.h"
 #include "base/hex.h"
@@ -49,6 +55,10 @@ static bool pp_manifest_build(const struct plugin_pack_request *r,
  * reader never sees a partial file and a leftover sibling is not reused. */
 static bool pp_write_atomic(const char *path, const char *data, size_t len)
 {
+#if defined(_WIN32)
+    return platform_directory_transaction_write_atomic(path, data, len);
+#else
+
     char tmp[PLUGIN_PATH_MAX];
     if (!plugin_join(tmp, sizeof(tmp), path, NULL, NULL, NULL) ||
         strlen(tmp) + 5 >= sizeof(tmp))
@@ -65,6 +75,8 @@ static bool pp_write_atomic(const char *path, const char *data, size_t len)
     if (!ok)
         (void)unlink(tmp);
     return ok;
+
+#endif
 }
 
 static enum plugin_status pp_sign_doc(const uint8_t seed[PLUGIN_KEY_FILE_BYTES],
@@ -102,6 +114,16 @@ static enum plugin_status pp_out_dir(const char *dir)
 static enum plugin_status pp_store_exe(const char *src, const char *dst,
                                        char sha[PLUGIN_HEX_SHA3_512 + 1])
 {
+#if defined(_WIN32)
+    char tmp[PLUGIN_PATH_MAX];
+    int n=snprintf(tmp,sizeof(tmp),"%s.copy.%ld",dst,(long)getpid());
+    if(n<=0 || (size_t)n>=sizeof(tmp)) return PLUGIN_ERR_ARGUMENT;
+    enum plugin_status st=plugin_copy_file(src,tmp,0755,sha);
+    if(st==PLUGIN_OK && !platform_directory_transaction_replace_path(tmp,dst))
+        st=PLUGIN_ERR_IO;
+    return st;
+#else
+
     char tmp[PLUGIN_PATH_MAX];
     if (!plugin_join(tmp, sizeof(tmp), dst, NULL, NULL, NULL) ||
         strlen(tmp) + 5 >= sizeof(tmp))
@@ -114,6 +136,8 @@ static enum plugin_status pp_store_exe(const char *src, const char *dst,
     if (st != PLUGIN_OK)
         (void)unlink(tmp);
     return st;
+
+#endif
 }
 
 static enum plugin_status pp_publish(const struct plugin_pack_request *r,

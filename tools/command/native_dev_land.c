@@ -149,6 +149,7 @@
 #include "zutf8/zutf8.h"
 #include "platform/file_clone.h"
 #include "platform/file_metadata.h"
+#include "platform/path_compat.h"
 #include "platform/logical_cpu.h"
 #include "platform/os_proc.h"
 #include "platform/private_file.h"
@@ -668,6 +669,7 @@ static bool dl_worktree_present(const char *wt)
     return wt && wt[0] && dl_worktree_ok(wt);
 }
 
+#if !defined(_WIN32)
 static bool dl_worktree_file(const char *wt, const char *relative,
                              char *out, size_t cap)
 {
@@ -676,6 +678,7 @@ static bool dl_worktree_file(const char *wt, const char *relative,
     int n = snprintf(out, cap, "%s/%s", wt, relative);
     return n >= 0 && (size_t)n < cap;
 }
+#endif
 
 static bool dl_tor_source_config(const char *wt, char *out, size_t cap)
 {
@@ -3079,7 +3082,7 @@ static bool dl_submit_tip_resolve(const char *root, const char *tip,
             return false;
         }
         dl_trim(rel);
-        int n = rel[0] == '/' ? snprintf(path, sizeof(path), "%s", rel)
+        int n = platform_path_is_absolute(rel) ? snprintf(path, sizeof(path), "%s", rel)
                              : snprintf(path, sizeof(path), "%s/%s", root, rel);
         if (!rel[0] || n < 0 || (size_t)n >= sizeof(path)) {
             dl_fail(reply, "WORKTREE_STATE_UNAVAILABLE", "submit",
@@ -3087,14 +3090,24 @@ static bool dl_submit_tip_resolve(const char *root, const char *tip,
                     marks[i]);
             return false;
         }
+        bool marker_present, marker_unreadable;
+#if defined(_WIN32)
+        enum platform_file_shape shape = platform_file_shape_read(path);
+        marker_present = shape != PLATFORM_FILE_SHAPE_MISSING &&
+                         shape != PLATFORM_FILE_SHAPE_UNREADABLE;
+        marker_unreadable = shape == PLATFORM_FILE_SHAPE_UNREADABLE;
+#else
         struct stat st;
-        if (lstat(path, &st) == 0) {
+        marker_present = lstat(path, &st) == 0;
+        marker_unreadable = !marker_present && errno != ENOENT;
+#endif
+        if (marker_present) {
             dl_fail(reply, "WORKTREE_BUSY", "submit",
                     "finish or abort the unfinished Git operation, then resubmit",
                     marks[i]);
             return false;
         }
-        if (errno != ENOENT) {
+        if (marker_unreadable) {
             dl_fail(reply, "WORKTREE_STATE_UNAVAILABLE", "submit",
                     "cannot inspect the submitting worktree's Git state",
                     marks[i]);
@@ -4770,6 +4783,7 @@ static inline bool dl_counts_span(char *text, char **begin, char **end)
 /* Read one index stage of docs/CODEBASE_MAP.md into an exact-size heap
  * buffer (NUL-terminated). The size comes first so the capture cap is the
  * real length rather than a guess. */
+#if !defined(_WIN32)
 static bool dl_counts_stage(const struct dl_dirs *d, int stage, char **text,
                             size_t *len)
 {
@@ -4798,9 +4812,11 @@ static bool dl_counts_stage(const struct dl_dirs *d, int stage, char **text,
     *len = (size_t)size;
     return strlen(*text) == *len;
 }
+#endif
 
 /* Rebuild each stage with stage 2's count block and write the three-way
  * merge of the results to the working tree. */
+#if !defined(_WIN32)
 static bool dl_counts_combine(const struct dl_dirs *d, const char *scratch,
                               char *const text[3], const size_t len[3],
                               char *const begin[3], char *const end[3])
@@ -4831,6 +4847,7 @@ static bool dl_counts_combine(const struct dl_dirs *d, const char *scratch,
     free(merged);
     return ok;
 }
+#endif
 
 static bool dl_counts_merge(const struct dl_dirs *d)
 {
@@ -5649,6 +5666,7 @@ static int dl_lint_run(struct dl_row *row, const char *const argv[])
  * platform clone seam is available in every build profile; unsupported
  * cloning falls back to bytes copied into the same exclusive temporary file.
  * Preserve mode and mtime before publication, as the old hardlink did. */
+#if !defined(_WIN32)
 static bool dl_same_inode(const struct stat *a, const struct stat *b)
 {
     return a->st_dev == b->st_dev && a->st_ino == b->st_ino;
@@ -5685,7 +5703,6 @@ static bool dl_same_file_snapshot(const struct stat *a, const struct stat *b)
 #endif
 }
 
-#if !defined(_WIN32)
 static int dl_materialize_tmp_open(const char *target, char *tmp,
                                    size_t tmp_size)
 {
@@ -5722,7 +5739,6 @@ static bool dl_materialize_published(const char *target,
     if (ok && repair) ok = dl_materialize_parent_flush(target);
     return ok;
 }
-#endif
 
 static bool dl_materialize_file(const char *source, const char *target,
                                 const struct stat *source_st,
@@ -5878,11 +5894,13 @@ static bool dl_materialize(const char *source, const char *target)
     return closedir(dir) == 0 && ok;
 #endif
 }
+#endif
 
 /* A local mkdir -p for a dependency's target directory. dev_proof.c has its
  * own private version of this (dependency_parent_ensure); it is not
  * exported, so this is the smallest reimplementation rather than a second
  * layering violation to reach it. */
+#if !defined(_WIN32)
 static bool dl_mkdir_parents(const char *path)
 {
     char buf[4096 + 96];
@@ -5906,6 +5924,7 @@ static bool dl_mkdir_parents(const char *path)
     }
     return true;
 }
+#endif
 
 /* vendor/lib, vendor/include and the four vendor/tor archives: expensive to
  * build (minutes of `make vendor`) but cheap to copy from an already-primed
@@ -5919,6 +5938,7 @@ static bool dl_mkdir_parents(const char *path)
  * function's comment for why). Each entry is checked and refused by name,
  * matching dev_proof.c's own vocabulary, so a dependency missing from the
  * submitting checkout too is never silently skipped. */
+#if !defined(_WIN32)
 static const char *const DL_VENDOR_DEPS[] = {
     "vendor/lib",
     "vendor/include",
@@ -5930,10 +5950,12 @@ static const char *const DL_VENDOR_DEPS[] = {
     "vendor/tor/src/ext/ed25519/ref10/libed25519_ref10.a",
     "vendor/tor/src/ext/keccak-tiny/libkeccak-tiny.a",
 };
+#endif
 
 /* .git marks a submodule as actually checked out in this worktree; the
  * gitlink entry every `git worktree add` carries is metadata alone and
  * never populates the working tree the way an init/checkout does. */
+#if !defined(_WIN32)
 static bool dl_wt_submodule_ready(const char *wt, const char *subpath)
 {
     char marker[4096 + 16];
@@ -5944,6 +5966,7 @@ static bool dl_wt_submodule_ready(const char *wt, const char *subpath)
         return false;
     return stat(marker, &st) == 0;
 }
+#endif
 
 /* `make worktree-prime` (Makefile:2400) initialises this submodule BEFORE
  * copying any vendor/tor archive into a fresh worktree; a bare `git
@@ -5956,6 +5979,7 @@ static bool dl_wt_submodule_ready(const char *wt, const char *subpath)
  * materialized — mirroring worktree-prime's ordering instead of inventing
  * a second one. It goes through dl_git(), the one git spawn seam this
  * whole file uses: no second way to launch git. */
+#if !defined(_WIN32)
 static bool dl_wt_submodule_ensure(const struct dl_dirs *d,
                                    const char *subpath, char *why,
                                    size_t why_cap)
@@ -5975,6 +5999,7 @@ static bool dl_wt_submodule_ensure(const struct dl_dirs *d,
     }
     return true;
 }
+#endif
 
 /* Whether the tip's own tree names vendor/tor as a real submodule (a
  * 160000/commit gitlink entry) rather than a plain directory of tracked
@@ -5985,6 +6010,7 @@ static bool dl_wt_submodule_ensure(const struct dl_dirs *d,
  * Only a real gitlink entry triggers the init-then-pin-check sequence
  * below; anything else (a normal tree, or the path missing outright) is
  * left to the existing lstat-and-copy path unchanged. */
+#if !defined(_WIN32)
 static bool dl_wt_vendor_tor_is_submodule(const struct dl_dirs *d,
                                           const struct dl_row *r)
 {
@@ -5994,6 +6020,7 @@ static bool dl_wt_vendor_tor_is_submodule(const struct dl_dirs *d,
         return false;
     return strncmp(out, "160000 commit ", 14) == 0;
 }
+#endif
 
 /* The vendor/tor archives dl_materialize() is about to reuse were built by
  * the SUBMITTING checkout, against whatever commit that checkout's own
@@ -6008,6 +6035,7 @@ static bool dl_wt_vendor_tor_is_submodule(const struct dl_dirs *d,
  * against the submitting checkout's checked-out submodule HEAD, and
  * refuses by name on any mismatch or unresolved side rather than reusing
  * an archive that was never proven to belong to this tip. */
+#if !defined(_WIN32)
 static bool dl_wt_vendor_tor_pin_matches(const struct dl_dirs *d,
                                          const struct dl_row *r, char *why,
                                          size_t why_cap)
@@ -6173,7 +6201,6 @@ static bool dl_wt_vendor_ensure(const struct dl_dirs *d,
 #endif
 }
 
-#if !defined(_WIN32)
 /* The rollback test group dlopens these two fixture images by name on
  * Linux; the proof's own dependency check names `make test_parallel` as
  * their fix and lists them only on Linux. Copying is still a POSIX file
@@ -6230,6 +6257,7 @@ static bool dl_wt_hotswap_ensure(const struct dl_dirs *d,
  * dl_hooks_stub_dir() above. build/dev-loop/restart.env is not covered:
  * building it needs a real Makefile, which the throwaway git rigs this
  * unlocks for have none of. */
+#if !defined(_WIN32)
 static bool dl_deps_test_force(void)
 {
 #if defined(ZCL_DEV_BUILD) || defined(ZCL_TESTING)
@@ -6239,6 +6267,7 @@ static bool dl_deps_test_force(void)
     return false;
 #endif
 }
+#endif
 
 /* Bound on how many extra names one dependency's inode may carry into the
  * leaf's own generation pools before this refuses instead of repairing. A
@@ -6264,6 +6293,7 @@ struct dl_dependency_repair {
     bool has_ram_gen_parent;
 };
 
+#if !defined(_WIN32)
 static void dl_generation_roots_compute(const struct dl_dirs *d,
                                         struct dl_dependency_repair *repair)
 {
@@ -6277,7 +6307,6 @@ static void dl_generation_roots_compute(const struct dl_dirs *d,
         repair->has_ram_gen_parent = true;
 }
 
-#if !defined(_WIN32)
 /* The 32-character lowercase hex tag dev_proof.c's generation_prepare()
  * derives -- the only shape of entry either generation pool ever holds. */
 static bool dl_generation_tag_name(const char *name)
@@ -6343,6 +6372,7 @@ static bool dl_generation_pool_scan(
  * from a race with a proof generation still materialising this same file).
  * Any name outside those roots is not this code's link, so it still
  * refuses -- fail closed, same reason string as before. */
+#if !defined(_WIN32)
 static bool dl_dependency_repair_one(const char *relative, uint64_t links,
                                      void *opaque)
 {
@@ -6495,6 +6525,7 @@ scan_failed:
                        scan_why);
     return false;
 }
+#endif
 
 /* The copy-based dependencies (vendor archives, hotswap fixtures) run
  * whenever a real proof is about to be requested, or when a test forces
@@ -6518,6 +6549,7 @@ scan_failed:
 /* The four installed hook names are symlinks to the one native binary;
  * recreate any that went missing rather than failing a whole proof over a
  * name. */
+#if !defined(_WIN32)
 static bool dl_wt_hook_links_ensure(const struct dl_dirs *d, char *why,
                                      size_t why_cap, bool *repaired)
 {
@@ -6554,9 +6586,11 @@ static bool dl_wt_hook_links_ensure(const struct dl_dirs *d, char *why,
     }
     return true;
 }
+#endif
 
 /* True when the installed hook copy already matches `bin` byte for byte;
  * a missing, non-regular, or drifted copy is repair work, not a failure. */
+#if !defined(_WIN32)
 static bool dl_wt_hooks_installed_matches(const char *bin,
                                            const char *installed)
 {
@@ -6629,6 +6663,7 @@ static bool dl_wt_hooks_refresh(const struct dl_dirs *d,
     return true;
 #endif
 }
+#endif
 
 static bool dl_wt_proof_deps_ensure(const struct dl_dirs *d,
                                     const struct dl_row *r, bool stubbed,
@@ -7396,6 +7431,7 @@ static bool dl_push_proven_pair(const struct dl_dirs *d,
 
 /* Git landing has its own local publication intent. It binds the existing
  * exact proof and configured origin, not a Commons package publication. */
+#if !defined(_WIN32)
 static bool dl_publication_file_sha256(const char *path, uint64_t max_bytes,
                                         char out[65])
 {
@@ -7427,6 +7463,7 @@ static bool dl_publication_file_sha256(const char *path, uint64_t max_bytes,
     zcl_hex_encode(digest, sizeof(digest), out);
     return true;
 }
+#endif
 
 static bool dl_single_url_line(char *out, size_t length)
 {
@@ -7470,6 +7507,7 @@ static bool dl_publication_target(const struct dl_dirs *d, char out[65])
     return true;
 }
 
+#if !defined(_WIN32)
 static bool dl_publication_bundle_path(const struct dl_dirs *d,
                                         const struct dl_row *row,
                                         char *out, size_t cap)
@@ -7478,6 +7516,7 @@ static bool dl_publication_bundle_path(const struct dl_dirs *d,
                      d->land, row->seq, row->local);
     return dl_sha_ok(row->local) && n > 0 && (size_t)n < cap;
 }
+#endif
 
 #if defined(ZCL_DEV_BUILD) || defined(ZCL_TESTING)
 static bool dl_publication_tree_check(const struct dl_dirs *d,
@@ -7646,6 +7685,7 @@ static bool dl_publication_sign(struct dl_row *row)
 #endif
 }
 
+#if !defined(_WIN32)
 static bool dl_publication_fetched_objects_check(const char *scratch,
                                                   const struct dl_row *row,
                                                   const char *tip,
@@ -7682,6 +7722,7 @@ static bool dl_publication_fetched_objects_check(const char *scratch,
     (void)snprintf(source, 65, "%s", tip_tree);
     return true;
 }
+#endif
 
 /* Fetch into a new object store: neither the lander's tracking ref nor its
  * local object database is evidence that the remote contains these bytes. */
@@ -9446,10 +9487,12 @@ static bool dl_fence_anchor_same(const struct dl_row *a, const struct dl_row *b)
 
 #define DL_FENCE_CAP (4u * DL_LINE_CAP)
 
+#if !defined(_WIN32)
 static bool dl_fence_path(const struct dl_dirs *d, char path[4192])
 {
     return snprintf(path, 4192, "%s/fence.jsonl", d->land) < 4192;
 }
+#endif
 
 [[maybe_unused]] static bool dl_fence_prefix(const struct dl_fence *f, char *text, size_t *len)
 {
@@ -9469,6 +9512,7 @@ static bool dl_fence_path(const struct dl_dirs *d, char path[4192])
     return true;
 }
 
+#if !defined(_WIN32)
 static bool dl_fence_write(const struct dl_dirs *d, const struct dl_fence *f)
 {
 #if (defined(ZCL_DEV_BUILD) || defined(ZCL_TESTING)) && !defined(_WIN32)
@@ -9505,6 +9549,7 @@ static bool dl_fence_write(const struct dl_dirs *d, const struct dl_fence *f)
     return false;
 #endif
 }
+#endif
 
 [[maybe_unused]] static bool dl_fence_header_decode(const char *line, struct dl_fence *f)
 {
@@ -9604,6 +9649,7 @@ static bool dl_fence_blocks(const struct dl_dirs *d, long long seq)
     return blocked;
 }
 
+#if !defined(_WIN32)
 static bool dl_fence_repo_byte(char c)
 {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
@@ -9661,9 +9707,11 @@ static bool dl_fence_policy_fetch(const char *endpoint, char digest[65])
     return o.exit_observed && o.exit_code == 0 && o.eof && !o.overflow && !o.timed_out &&
         dl_fence_policy_json(bytes, o.output_len, digest);
 }
+#endif
 
 /* Current enforced-admin main protection grants prospective fencing only;
  * multiple effective receivers and unsupported servers are refused. */
+#if !defined(_WIN32)
 static bool dl_fence_policy(const struct dl_dirs *d, char digest[65])
 {
 #if defined(ZCL_TESTING)
@@ -9716,6 +9764,7 @@ static bool dl_fence_all_signed(const struct dl_dirs *d, const struct dl_row *ro
         if (signatures[i] != 'G' || signatures[i + 1] != '\n') return false;
     return true;
 }
+#endif
 
 static bool dl_fence_publication_same(const struct dl_row *a, const struct dl_row *b)
 {
@@ -9737,6 +9786,7 @@ static bool dl_fence_anchor_same(const struct dl_row *a, const struct dl_row *b)
         strcmp(a->proof_intent, b->proof_intent) == 0;
 }
 
+#if !defined(_WIN32)
 static bool dl_fence_current_anchor(const struct dl_dirs *d, const struct dl_fence *f)
 {
     char path[4192];
@@ -9783,9 +9833,11 @@ static bool dl_fence_row_equal(const struct dl_row *a, const struct dl_row *b)
         memcmp(left, right, left_len) == 0;
     free(left); free(right); return equal;
 }
+#endif
 
 /* Unlike ordinary historical lookup, paired replay must never substitute a
  * loosely matching terminal row for the sealed journal's intended outcome. */
+#if !defined(_WIN32)
 static bool dl_fence_record_outcome(const struct dl_dirs *d, struct dl_row *row)
 {
     struct dl_row prior; bool present = false; long long high_water = 0;
@@ -9804,10 +9856,12 @@ static bool dl_fence_outcomes_project(const struct dl_dirs *d, struct dl_fence *
     dl_fence_test_crash("old_projection");
     return dl_fence_record_outcome(d, &f->next);
 }
+#endif
 
 /* Paired sealed journal precedes any terminal projection. Both outcome appends
  * and the single whole-queue rewrite are replayable while step.lock stays held.
  * A failed/one-sided projection cannot release singleflight. */
+#if !defined(_WIN32)
 static bool dl_fence_project(const struct dl_dirs *d, struct dl_fence *f)
 {
     char qpath[4192];
@@ -9982,8 +10036,10 @@ static void dl_fence_send(const struct dl_dirs *d, const struct dl_dirs *next_di
     /* One send per call, even with missing diagnostics. Next beat observes. */
     dl_fence_blocked(reply, "FENCE_PUSH_OUTCOME_UNKNOWN", f);
 }
+#endif
 
 /* Caller holds step.lock. Definitive answers for both heads precede settlement. */
+#if !defined(_WIN32)
 static void dl_fence_drive(const struct dl_dirs *d, struct dl_fence *f,
                             struct zcl_command_reply *reply)
 {
@@ -10027,6 +10083,7 @@ static bool dl_fence_step(const struct dl_dirs *d, struct zcl_command_reply *rep
     free(f);
     return handled;
 }
+#endif
 
 static void dl_step(const struct zcl_command_request *req,
                     struct zcl_command_reply *reply)

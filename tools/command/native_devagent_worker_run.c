@@ -950,8 +950,11 @@ static struct wkr_spawn_out wkr_spawn_windows(const struct wkr_drive_opts *opts,
     out = wkr_confined_wait(&proc, caps.wall_s, t0_s, terminating);
     if (!platform_confined_report(&proc, &report))
         out.signaled = true; /* stragglers survived the kill: not a clean exit */
-    else if (out.status == 1 && (report.crashed || report.cpu_limit_hit))
-        out.signaled = true;
+    else {
+        out.cpu_limit_hit = report.cpu_limit_hit;
+        if (out.status == 1 && (report.crashed || report.cpu_limit_hit))
+            out.signaled = true;
+    }
     platform_process_close(&proc);
     if (!platform_confined_release_roots(run->roots,
                                          run->spec.write_root_count))

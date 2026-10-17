@@ -327,6 +327,7 @@ static const char *rcv_in_str(const struct zcl_command_request *req,
                                                          : "";
 }
 
+#if !defined(_WIN32)
 static long long rcv_in_int(const struct zcl_command_request *req,
                             const char *key, long long dflt, long long lo,
                             long long hi)
@@ -343,6 +344,7 @@ static long long rcv_in_int(const struct zcl_command_request *req,
         return lo;
     return n > hi ? hi : n;
 }
+#endif /* !defined(_WIN32) */
 
 /* ── alphabets ─────────────────────────────────────────────────────────── */
 
@@ -526,6 +528,7 @@ static bool rcv_paths_resolve(struct rcv_paths *p)
 /* The mail directory is ensured here as well, with the same owner-only mode
  * the mail leaf uses: a watcher cannot be armed on a directory that does not
  * exist, and this loop refuses to run without a watcher rather than poll. */
+#if !defined(_WIN32)
 static bool rcv_dirs_ensure(const struct rcv_paths *p)
 {
     return platform_private_directory_ensure(p->dir) &&
@@ -533,6 +536,7 @@ static bool rcv_dirs_ensure(const struct rcv_paths *p)
            platform_private_directory_ensure(p->ansdir) &&
            platform_private_directory_ensure(p->maildir);
 }
+#endif /* !defined(_WIN32) */
 
 static bool rcv_exists(const char *path)
 {
@@ -3122,6 +3126,7 @@ static void rcv_status(const char *receiver, const char *workspace,
     reply->exit_code = 0;
 }
 
+#if !defined(_WIN32)
 static void rcv_run(const struct zcl_command_request *request,
                     const char *receiver, const char *workspace,
                     struct zcl_command_reply *reply)
@@ -3165,6 +3170,7 @@ static void rcv_run(const struct zcl_command_request *request,
     reply->status = ZCL_COMMAND_STATUS_PASSED;
     reply->exit_code = 0;
 }
+#endif /* !defined(_WIN32) */
 
 void zcl_native_handle_dev_agent_receive(
     const struct zcl_command_request *request, struct zcl_command_reply *reply)

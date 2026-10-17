@@ -993,6 +993,9 @@ static struct zcl_result tw_win_create_shell(HPCON console,
     STARTUPINFOEXW startup;
     memset(&startup, 0, sizeof(startup));
     startup.StartupInfo.cb = sizeof(startup);
+    /* Do not carry the launcher's redirected standard handles into the
+     * shell: NULL slots let its attached pseudoconsole supply the streams. */
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     startup.lpAttributeList = attr_list;
     memset(pi, 0, sizeof(*pi));
     DWORD flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT |

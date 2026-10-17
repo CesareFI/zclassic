@@ -21,7 +21,9 @@
 
 DEFINE_MODEL_CALLBACKS(package_resident_record)
 
+#if !defined(_WIN32)
 static struct zcl_result pr_schema(struct package_resident_store *store);
+#endif
 static void pr_pending_clear(struct package_resident_record *row);
 static bool pr_pending_valid(const struct package_resident_record *row);
 static bool pr_proof_valid(const char *nonce, uint64_t token);
@@ -443,6 +445,7 @@ static bool pr_read_pending(sqlite3_stmt *s, struct package_resident_record *out
 
 
 
+#if !defined(_WIN32)
 static bool pr_migrate_save(struct package_resident_store *store)
 {
     sqlite3_stmt *statement = NULL;
@@ -481,6 +484,7 @@ static struct zcl_result pr_schema(struct package_resident_store *store)
     if (result.ok) result = pr_schema_migrate(store);
     return pr_finish(store, result);
 }
+#endif
 
 static bool pr_app_character(unsigned char c)
 {
