@@ -143,9 +143,14 @@ struct mesh_terminal_worker_config {
     uint64_t idle_seconds;      /* no I/O in either direction */
     /* Optional: run this program instead of the shell. NULL-terminated, at
      * most MESH_TERMINAL_WORKER_ARGV_MAX strings; argv[0] is an absolute path
-     * and becomes the ONE granted binary (read+execute, plus the standard
-     * library directories); the environment stays PATH-less. NULL means the
-     * configured shell, exactly as before. POSIX only. */
+     * and on POSIX becomes the ONE granted binary (read+execute, plus the
+     * standard library directories); the POSIX environment stays PATH-less. NULL means the
+     * configured shell, exactly as before. Windows requires an absolute .exe
+     * image and conventional CRT/CommandLineToArgvW parsing, strict UTF-8,
+     * at most 16 arguments, <=32767 input bytes including string terminators,
+     * and <=32767 UTF-16 command-line units including NUL. Windows retains
+     * its allowlisted environment and owner-accepted unconfined identity.
+     * The worker invokes the selected executable directly without adding a shell. */
     const char *const *argv;
     /* Optional (POSIX): where the supervisor of a session process may read the
      * group id. Written the moment the child exists, zeroed after the group is

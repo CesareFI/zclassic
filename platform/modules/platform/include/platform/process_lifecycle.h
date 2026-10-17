@@ -7,6 +7,15 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#if defined(_WIN32)
+#include <wchar.h>
+/* Conventional CRT/CommandLineToArgvW encoding of UTF-8 argv. Caller supplies
+ * bounded, NULL-terminated input (the encoder does not impose an argc bound).
+ * Heap-owned result (free), NULL on invalid UTF-8 or capacity failure.
+ * Caller enforces CreateProcess's 32767-unit limit including NUL. */
+wchar_t *platform_process_windows_command_line(const char *const *argv);
+#endif
+
 struct platform_process {
     uintptr_t native;
     uintptr_t containment; /* Windows kill-on-close Job Object, else unused. */

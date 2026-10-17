@@ -10,11 +10,11 @@
 #define ZCL_PLATFORM_PROCESS_LIFECYCLE_INTERNAL_H
 
 #if defined(_WIN32)
+#include "platform/process_lifecycle.h"
 #include <stdbool.h>
 #include <wchar.h>
 
 wchar_t *platform_process_windows_utf16(const char *text);
-wchar_t *platform_process_windows_command_line(const char *const *argv);
 wchar_t *platform_process_windows_environment(const char *const *env);
 bool platform_process_windows_absolute(const wchar_t *path);
 #endif

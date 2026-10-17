@@ -41,6 +41,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include "platform/process_lifecycle.h"
 
 #include <bcrypt.h>
 #include <sddl.h>
@@ -947,6 +948,7 @@ static wchar_t *tw_win_env_build(const wchar_t *workdir)
 static struct zcl_result tw_win_create_shell(HPCON console,
                                              const wchar_t *wshell,
                                              const wchar_t *wworkdir,
+                                             wchar_t *cmdline,
                                              PROCESS_INFORMATION *pi)
 {
     SIZE_T attr_size = 0;
@@ -974,13 +976,6 @@ static struct zcl_result tw_win_create_shell(HPCON console,
         return ZCL_ERR(MESH_TERMINAL_WORKER_ERR_SPAWN,
                        "environment block allocation failed");
     }
-    wchar_t cmdline[MESH_TERMINAL_WIN_PATH_MAX + 2u];
-    size_t shell_len = wcslen(wshell);
-    cmdline[0] = L'"';
-    wmemcpy(cmdline + 1, wshell, shell_len);
-    cmdline[1 + shell_len] = L'"';
-    cmdline[2 + shell_len] = L'\0';
-
     STARTUPINFOEXW startup;
     memset(&startup, 0, sizeof(startup));
     startup.StartupInfo.cb = sizeof(startup);
@@ -1030,9 +1025,10 @@ static struct zcl_result tw_win_contain_and_resume(HANDLE job,
 static struct zcl_result tw_win_spawn_config_check(
     const struct mesh_terminal_worker_config *cfg)
 {
-    if (!cfg->shell_path ||
+    const char *image = cfg->argv ? cfg->argv[0] : cfg->shell_path;
+    if (!image ||
         !mesh_terminal_shell_path_valid(MESH_TERMINAL_PLATFORM_WINDOWS,
-                                        cfg->shell_path) ||
+                                        image) ||
         !cfg->workdir || !win_path_is_absolute(cfg->workdir))
         return ZCL_ERR(MESH_TERMINAL_WORKER_ERR_CONFIG,
                        "spawn: shell_path and workdir must be absolute");
@@ -1049,6 +1045,31 @@ static struct zcl_result tw_win_spawn_config_check(
     return ZCL_OK;
 }
 
+/* Validate arguments before creating a job, console or process. The shared
+ * encoder owns quoting and strict UTF-8 conversion. Byte and count bounds
+ * keep its input scan and allocation bounded as well. */
+static wchar_t *tw_win_command_line(const struct mesh_terminal_worker_config *cfg)
+{
+    const char *const fallback[] = { cfg->shell_path, NULL };
+    const char *const *argv = cfg->argv ? cfg->argv : fallback;
+    size_t count = 0, bytes = 0;
+    while (count < MESH_TERMINAL_WORKER_ARGV_MAX && argv[count]) {
+        size_t n = strnlen(argv[count], 32767u);
+        if (n == 32767u || n + 1u > 32767u - bytes)
+            return NULL;
+        bytes += n + 1u;
+        count++;
+    }
+    if (!count || argv[count])
+        return NULL;
+    wchar_t *line = platform_process_windows_command_line(argv);
+    if (line && wcslen(line) + 1u > 32767u) {
+        free(line);
+        line = NULL;
+    }
+    return line;
+}
+
 static struct zcl_result mesh_terminal_worker_spawn_platform_arm(
     const struct mesh_terminal_worker_config *cfg, int64_t now_unix,
     struct mesh_terminal_worker *out)
@@ -1063,20 +1084,30 @@ static struct zcl_result mesh_terminal_worker_spawn_platform_arm(
         return checked;
     wchar_t wshell[MESH_TERMINAL_WIN_PATH_MAX];
     wchar_t wworkdir[MESH_TERMINAL_WIN_PATH_MAX];
-    if (!win_widen(cfg->shell_path, wshell, MESH_TERMINAL_WIN_PATH_MAX) ||
+    const char *image = cfg->argv ? cfg->argv[0] : cfg->shell_path;
+    if (!win_widen(image, wshell, MESH_TERMINAL_WIN_PATH_MAX) ||
         !win_widen(cfg->workdir, wworkdir, MESH_TERMINAL_WIN_PATH_MAX))
         return ZCL_ERR(MESH_TERMINAL_WORKER_ERR_CONFIG,
                        "spawn: shell_path/workdir is not valid UTF-8");
 
+    wchar_t *cmdline = tw_win_command_line(cfg);
+    if (!cmdline)
+        return ZCL_ERR(MESH_TERMINAL_WORKER_ERR_CONFIG,
+                       "spawn: argv is invalid UTF-8, unterminated or exceeds the command-line budget");
+
     HANDLE job = tw_win_job_create();
-    if (!job)
+    if (!job) {
+        DWORD error = GetLastError();
+        free(cmdline);
         return ZCL_ERR(MESH_TERMINAL_WORKER_ERR_CONFINEMENT,
-                       "job object setup failed error=%lu", GetLastError());
+                       "job object setup failed error=%lu", error);
+    }
     struct tw_win_pty pty;
     struct zcl_result r = tw_win_pty_open(cfg->cols, cfg->rows, &pty);
     PROCESS_INFORMATION pi;
     if (r.ok)
-        r = tw_win_create_shell(pty.console, wshell, wworkdir, &pi);
+        r = tw_win_create_shell(pty.console, wshell, wworkdir, cmdline, &pi);
+    free(cmdline);
     if (r.ok) {
         r = tw_win_contain_and_resume(job, &pi);
         CloseHandle(pi.hThread);
@@ -1385,10 +1416,10 @@ static void mesh_terminal_worker_kill_platform_arm(struct mesh_terminal_worker *
 
 #endif /* __linux__ / _WIN32 */
 
-/* An explicit argv is bounded and its program is an absolute path; the
- * program is the ONE binary the cage grants (plus the standard library
- * directories). Windows has no argv grant. NULL when acceptable, otherwise
- * the reason. */
+/* POSIX grants the one absolute argv image plus standard library directories.
+ * Windows validates and encodes argv in its platform arm before creating any
+ * handles; its owner-accepted identity policy remains separate. NULL when
+ * acceptable here, otherwise the reason. */
 static const char *tw_argv_refusal(const struct mesh_terminal_worker_config *cfg,
                                   int *code)
 {
@@ -1396,7 +1427,7 @@ static const char *tw_argv_refusal(const struct mesh_terminal_worker_config *cfg
         return NULL;
 #if defined(_WIN32)
     (void)code;
-    return "spawn: an explicit argv is POSIX-only";
+    return NULL; /* Windows validates and encodes before creating any handles. */
 #else
     size_t n = 0;
     while (n <= MESH_TERMINAL_WORKER_ARGV_MAX && cfg->argv[n])

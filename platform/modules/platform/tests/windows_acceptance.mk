@@ -263,9 +263,11 @@ ZCL_WINDOWS_ACCEPTANCE_mesh_terminal_worker_SOURCES := \
 	tests/harness/src/mesh_terminal_worker_windows_acceptance.c \
 	cognition/modules/session/src/mesh_terminal_worker.c \
 	cognition/modules/session/src/mesh_terminal_shell_policy.c \
+	platform/modules/platform/src/process_lifecycle.c \
+	platform/modules/platform/src/os_proc.c \
 	platform/modules/base/src/result.c \
 	platform/modules/base/src/safe_alloc.c
-ZCL_WINDOWS_ACCEPTANCE_mesh_terminal_worker_LIBS := -ladvapi32 -lbcrypt
+ZCL_WINDOWS_ACCEPTANCE_mesh_terminal_worker_LIBS := -ladvapi32 -lbcrypt -lpsapi -lshell32
 
 ZCL_WINDOWS_ACCEPTANCE_mind_state_SOURCES := \
 	tests/harness/src/mind_state_windows_acceptance.c \

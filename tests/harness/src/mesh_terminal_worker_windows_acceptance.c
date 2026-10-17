@@ -15,6 +15,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <shellapi.h>
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -335,8 +336,128 @@ static void test_input_bounded(const char *shell, const char *workdir)
     free(s);
 }
 
+/* Parse wide command-line data directly: the CRT's narrow argv may use ACP. */
+static int argv_child(void)
+{
+    int argc = 0;
+    wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv)
+        return 91;
+    if (argc > 1 && !wcscmp(argv[1], L"--worker-count-child")) {
+        bool ok = argc == MESH_TERMINAL_WORKER_ARGV_MAX;
+        for (int i = 2; i < argc; i++)
+            ok = ok && !wcscmp(argv[i], L"x");
+        LocalFree(argv);
+        puts(ok ? "MAX_ARGV_OK" : "MAX_ARGV_BAD");
+        fflush(stdout);
+        return ok ? 38 : 93;
+    }
+    bool child = argc > 1 && !wcscmp(argv[1], L"--worker-argv-child");
+    bool exact = child && argc == 8 && !wcscmp(argv[2], L"two words") &&
+        !wcscmp(argv[3], L"") && !wcscmp(argv[4], L"quote\"value") &&
+        !wcscmp(argv[5], L"space tail\\") &&
+        !wcscmp(argv[6], L"slash\\\"quote") &&
+        !wcscmp(argv[7], L"caf\u00e9-\u96ea");
+    LocalFree(argv);
+    if (!child)
+        return -1;
+    puts(exact ? "EXACT_ARGV_OK" : "EXACT_ARGV_BAD");
+    fflush(stdout);
+    return exact ? 37 : 92;
+}
+
+static bool config_refused(struct mesh_terminal_worker_config *cfg)
+{
+    struct mesh_terminal_worker w;
+    struct zcl_result r = mesh_terminal_worker_spawn(cfg, (int64_t)time(NULL), &w);
+    bool refused = !r.ok && r.code == MESH_TERMINAL_WORKER_ERR_CONFIG &&
+        !w.running && !w.win_process && !w.win_job && !w.win_pc;
+    if (r.ok)
+        mesh_terminal_worker_kill(&w);
+    return refused;
+}
+
+static void test_exact_argv(const char *shell, const char *workdir)
+{
+    wchar_t wide[MAX_PATH];
+    char self[MAX_PATH * 4];
+    DWORD n = GetModuleFileNameW(NULL, wide, MAX_PATH);
+    bool have_self = n > 0 && n < MAX_PATH &&
+        WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide, -1,
+                            self, sizeof(self), NULL, NULL) > 0;
+    expect(have_self, "argv fixture has an absolute UTF-8 image");
+    if (!have_self)
+        return;
+    const char *args[] = { self, "--worker-argv-child", "two words", "",
+        "quote\"value", "space tail\\", "slash\\\"quote", "caf\xc3\xa9-\xe9\x9b\xaa", NULL };
+    struct mesh_terminal_worker_config cfg = base_config(shell, workdir);
+    cfg.argv = args;
+    struct session *s = calloc(1, sizeof(*s));
+    expect(s != NULL, "argv fixture allocation");
+    if (!s)
+        return;
+    struct zcl_result r = mesh_terminal_worker_spawn(&cfg, (int64_t)time(NULL), &s->worker);
+    bool exact = r.ok && pump(s, 5000, "EXACT_ARGV_OK");
+    ULONGLONG until = GetTickCount64() + 5000;
+    while (r.ok && mesh_terminal_worker_alive(&s->worker) && GetTickCount64() < until)
+        (void)pump(s, 50, NULL);
+    expect(exact && !s->worker.running && s->worker.exit_code == 37 &&
+           s->worker.close_reason == MESH_TERMINAL_CLOSE_WORKER_EXITED,
+           "explicit image receives exact spaces, empty, quotes, slashes and Unicode argv and exit");
+    mesh_terminal_worker_kill(&s->worker);
+
+    const char *maximum[MESH_TERMINAL_WORKER_ARGV_MAX + 1];
+    maximum[0] = self;
+    maximum[1] = "--worker-count-child";
+    for (size_t i = 2; i < MESH_TERMINAL_WORKER_ARGV_MAX; i++)
+        maximum[i] = "x";
+    maximum[MESH_TERMINAL_WORKER_ARGV_MAX] = NULL;
+    cfg.argv = maximum;
+    memset(s, 0, sizeof(*s));
+    r = mesh_terminal_worker_spawn(&cfg, (int64_t)time(NULL), &s->worker);
+    bool max_ok = r.ok && pump(s, 5000, "MAX_ARGV_OK");
+    until = GetTickCount64() + 5000;
+    while (r.ok && mesh_terminal_worker_alive(&s->worker) && GetTickCount64() < until)
+        (void)pump(s, 50, NULL);
+    expect(max_ok && !s->worker.running && s->worker.exit_code == 38,
+           "exact maximum argument count is admitted intact");
+    mesh_terminal_worker_kill(&s->worker);
+    free(s);
+
+    const char *bad[] = { self, "\xc0\xaf", NULL };
+    cfg.argv = bad;
+    expect(config_refused(&cfg), "invalid UTF-8 argv refuses before creating a process");
+    const char *empty[] = { NULL };
+    cfg.argv = empty;
+    expect(config_refused(&cfg), "empty argv refuses before creating a process");
+    const char *many[MESH_TERMINAL_WORKER_ARGV_MAX + 2];
+    many[0] = self;
+    for (size_t i = 1; i <= MESH_TERMINAL_WORKER_ARGV_MAX; i++)
+        many[i] = "x";
+    many[MESH_TERMINAL_WORKER_ARGV_MAX + 1] = NULL;
+    cfg.argv = many;
+    expect(config_refused(&cfg), "excess argument count refuses before creating a process");
+    char *large = malloc(32768);
+    expect(large != NULL, "oversize argv fixture allocation");
+    if (large) {
+        memset(large, 'x', 32767); large[32767] = 0;
+        const char *oversize[] = { self, large, NULL };
+        cfg.argv = oversize;
+        expect(config_refused(&cfg), "oversize argv bytes refuse before creating a process");
+        memset(large, '"', 17000); large[17000] = 0;
+        expect(config_refused(&cfg), "quote expansion beyond the UTF-16 limit refuses before creating a process");
+        free(large);
+    }
+    const char *relative[] = { "cmd.exe", NULL };
+    cfg.argv = relative;
+    expect(config_refused(&cfg), "relative requested image refuses before creating a process");
+}
+
 int main(void)
 {
+    int child = argv_child();
+    if (child >= 0)
+        return child;
     char workdir[MAX_PATH], cmd[MAX_PATH], pwsh[MAX_PATH];
     if (!make_workdir(workdir, sizeof(workdir)) ||
         !system_path("\\System32\\cmd.exe", cmd, sizeof(cmd))) {
@@ -350,6 +471,7 @@ int main(void)
     test_budgets(cmd, workdir);
     test_output_budget(cmd, workdir);
     test_input_bounded(cmd, workdir);
+    test_exact_argv(cmd, workdir);
     if (system_path("\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", pwsh,
                     sizeof(pwsh)) &&
         GetFileAttributesA(pwsh) != INVALID_FILE_ATTRIBUTES) {
