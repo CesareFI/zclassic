@@ -3707,6 +3707,7 @@ enum { LOCK_ORDER_BLOCK, LOCK_ORDER_PEER };
 struct lock_order_case {
     struct node_db ndb;
     int which;
+    atomic_int started;
     atomic_int arrived;
     atomic_int release;
     atomic_int saved;
@@ -3762,6 +3763,7 @@ static bool lock_order_save(struct lock_order_case *c)
 static void *lock_order_writer(void *arg)
 {
     struct lock_order_case *c = arg;
+    atomic_store(&c->started, 1);
     atomic_store(&c->saved, lock_order_save(c) ? 1 : -1);
     return NULL;
 }
@@ -3781,6 +3783,13 @@ static int lock_order_child(int which)
     sqlite3_mutex_enter(conn);
     if (pthread_create(&writer, NULL, lock_order_writer, &c) != 0)
         return 3;
+    /* The arrival window starts only once the writer runs, so a slow thread
+     * start under load cannot pass a regression. */
+    if (!lock_order_wait(&c.started, 2000)) {
+        sqlite3_mutex_leave(conn);
+        pthread_join(writer, NULL);
+        return 5;
+    }
     /* Where the writer takes state_mutex first it reaches the hook now; where
      * it takes the connection mutex first it queues behind this thread. */
     lock_order_wait(&c.arrived, 500);
@@ -4083,6 +4092,9 @@ int test_sqlite(void) {
 #if !defined(_WIN32)
     check_sqlite_55_db_block_save_takes_connection_first(&failures);
     check_sqlite_56_db_peer_save_takes_connection_first(&failures);
+#else
+    printf("SQLite db_block_save takes the connection mutex before state_mutex... SKIP (no fork on Windows)\n");
+    printf("SQLite db_peer_save takes the connection mutex before state_mutex... SKIP (no fork on Windows)\n");
 #endif
 
     return failures;
