@@ -538,19 +538,6 @@ static int cgs_case_r(const struct ccs_fx *fx)
     return cgs_check(fx, "r", &cfg, 0, need, "R: an object whose source is absent is foreign, counted, and not graded");
 }
 
-/* A symlink to /proc/self/mem opens, then every read fails with EIO. */
-static int cgs_mem_reads_fail(void)
-{
-    FILE *f = fopen("/proc/self/mem", "r");
-    int broke;
-    if (!f)
-        return 0;
-    (void)fgetc(f);
-    broke = ferror(f) != 0;
-    fclose(f);
-    return broke;
-}
-
 static int cgs_skip_root(const char *label)
 {
     if (geteuid() != 0)
@@ -600,23 +587,25 @@ static int cgs_case_t(const struct ccs_fx *fx)
     return f + (chmod(src, 0644) != 0);
 }
 
-/* U. a source that opens but fails to read is FATAL (ferror), never a clean file. */
+/* U. a regular source the walk selects but the gate cannot open is FATAL, never
+ * a clean file. A read that fails after a successful open is covered by the
+ * lc_each_line baseline-read-error case. */
 static int cgs_case_u(const struct ccs_fx *fx)
 {
     struct ccg_cfg cfg;
     char src[CCD_PATH];
-    const char *const need[] = { "FATAL", "cannot scan fixture_src/mem_user.c", "Input/output error", NULL };
-    if (!cgs_mem_reads_fail()) {
-        puts("  SKIP U: /proc/self/mem does not fail reads on this host");
+    const char *const need[] = { "FATAL", "cannot scan fixture_src/locked_user.c", "Permission denied", NULL };
+    int f;
+    if (cgs_skip_root("U: unreadable regular source"))
         return 0;
-    }
     cgs_cfg(&cfg);
-    if (cgs_base(fx, "u", "") != 0 || ccs_put(fx, "u/fixture_src/seed.txt", "x\n") != 0)
+    if (cgs_base(fx, "u", "") != 0 || ccs_put(fx, "u/fixture_src/locked_user.c", "int locked_user(void) { return 0; }\n") != 0)
         return ccs_say(0, "U: fixture");
-    ccs_path(fx, "u/fixture_src/mem_user.c", src);
-    if (symlink("/proc/self/mem", src) != 0)
-        return ccs_say(0, "U: symlink");
-    return cgs_check(fx, "u", &cfg, 2, need, "U: a source that fails to read is FATAL, never clean");
+    ccs_path(fx, "u/fixture_src/locked_user.c", src);
+    if (chmod(src, 0) != 0)
+        return ccs_say(0, "U: chmod");
+    f = cgs_check(fx, "u", &cfg, 2, need, "U: a selected source that cannot be opened is FATAL, never clean");
+    return f + (chmod(src, 0644) != 0);
 }
 
 static int cgs_cases(const struct ccs_fx *fx)
