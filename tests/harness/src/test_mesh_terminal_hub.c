@@ -413,7 +413,11 @@ static int echo_and_resize_cases(void)
                      "command output comes back through DATA frames");
     /* The kernel raises SIGWINCH on the shell's group when the size changes. */
     say(s.fd, "trap 'echo WIN\"CH\"_SEEN' WINCH\n");
-    drv_until(s.fd, "trap", &ex, 3000, seen, sizeof seen);
+    /* The echoed "trap ..." line comes back before the shell has run it, so
+     * wait for output the shell prints only after the trap is installed. */
+    say(s.fd, "echo TRAP\"_\"ARMED\n");
+    failures = check(failures, drv_until(s.fd, "TRAP_ARMED", &ex, 8000, seen, sizeof seen),
+                     "the WINCH trap is installed before RESIZE is sent");
     uint8_t dim[4] = { 0, 120, 0, 40 };
     drv_send(s.fd, MESH_TERMINAL_HUB_RESIZE, dim, 4);
     say(s.fd, "echo\n");
