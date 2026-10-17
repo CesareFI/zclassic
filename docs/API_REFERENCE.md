@@ -74,11 +74,11 @@ z23 discover schema <path> --side=input|output
 
 | Catalog fact | Count |
 |---|---|
-| Registry entries (branches + leaves) | 963 |
+| Registry entries (branches + leaves) | 964 |
 | Top-level roots | 15 |
 | Branches | 209 |
-| Leaves (dispatchable command paths) | 754 |
-| … `ready` (live handler in this build) | 661 |
+| Leaves (dispatchable command paths) | 755 |
+| … `ready` (live handler in this build) | 662 |
 | … `compat` (metadata only, names a fallback) | 63 |
 | … `planned` (fail-closed BLOCKED, exit 3) | 30 |
 | … dev-gated 🔧 (`ready` only in `z23-dev`) | 62 |
