@@ -1115,8 +1115,7 @@ static struct zcl_result mesh_terminal_worker_spawn_platform_arm(
             CloseHandle(pi.hProcess);
     }
     if (!r.ok) {
-        if (pty.console || pty.input_write || pty.output_read)
-            tw_win_pty_close(&pty);
+        tw_win_pty_close(&pty);
         CloseHandle(job);
         return r;
     }
