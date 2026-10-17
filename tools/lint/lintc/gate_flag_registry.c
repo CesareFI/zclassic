@@ -1262,6 +1262,8 @@ static void fr_st_cleanup(void)
     unlink("./fix_filler.c");
     unlink("./fix_ok.c");
     unlink("./fix_gone.c");
+    unlink("./w.c");
+    unlink("./x.c");
 }
 
 int check_flag_registry_selftest(void)
@@ -1299,7 +1301,8 @@ int check_flag_registry_selftest(void)
     fr_st_cleanup();
     if (chdir(cwd) != 0)
         return die("z23-lint: cannot scan %s\n", cwd);
-    rmdir(root);
+    if (rmdir(root) != 0)
+        bad = 1;
     if (bad)
         fputs("FAIL: check_flag_registry selftest\n", stderr);
     return st_ok(bad, "check_flag_registry selftest: OK\n");
